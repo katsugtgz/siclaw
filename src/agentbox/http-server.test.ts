@@ -896,14 +896,14 @@ describe("http-server — prompt + session lifecycle", () => {
     const r = await getJson(port, "/api/prompt", "POST", {
       text: "hi",
       sessionId: "bound-missing-fallback",
-      modelProvider: "sicore-custom-x",
+      modelProvider: "portal-custom-x",
       modelId: "claude-fable-5",
       modelConfig: modelConfigWithInput(["text"]),
       modelRouting: {
         enabled: true,
         strategy: "ordered_fallback",
         candidates: [
-          { provider: "sicore-custom-x", modelId: "claude-fable-5", modelConfig: modelConfigWithInput(["text"]) },
+          { provider: "portal-custom-x", modelId: "claude-fable-5", modelConfig: modelConfigWithInput(["text"]) },
           { provider: "anthropic", modelId: "claude" },
         ],
       },
@@ -925,7 +925,7 @@ describe("http-server — prompt + session lifecycle", () => {
     const r = await getJson(port, "/api/prompt", "POST", {
       text: "hi",
       sessionId: "bound-missing-exhaust",
-      modelProvider: "sicore-custom-x",
+      modelProvider: "portal-custom-x",
       modelId: "claude-fable-5",
       modelConfig: modelConfigWithInput(["text"]),
     });
@@ -935,7 +935,7 @@ describe("http-server — prompt + session lifecycle", () => {
     expect(session.brain.prompt).not.toHaveBeenCalled();
     const exhausted = session._extraEventBuffer.find((event) => event.type === "model_route_exhausted");
     expect(exhausted).toBeDefined();
-    expect(JSON.stringify(exhausted)).toContain("sicore-custom-x/claude-fable-5");
+    expect(JSON.stringify(exhausted)).toContain("portal-custom-x/claude-fable-5");
   });
 
   it("POST /api/prompt surfaces a provider config pi refused, and does not fall back on it by default", async () => {
@@ -958,14 +958,14 @@ describe("http-server — prompt + session lifecycle", () => {
     const r = await getJson(port, "/api/prompt", "POST", {
       text: "hi",
       sessionId: "reg-fail",
-      modelProvider: "sicore-custom-x",
+      modelProvider: "portal-custom-x",
       modelId: "claude-fable-5",
       modelConfig: modelConfigWithInput(["text"]),
       modelRouting: {
         enabled: true,
         strategy: "ordered_fallback",
         candidates: [
-          { provider: "sicore-custom-x", modelId: "claude-fable-5", modelConfig: modelConfigWithInput(["text"]) },
+          { provider: "portal-custom-x", modelId: "claude-fable-5", modelConfig: modelConfigWithInput(["text"]) },
           { provider: "anthropic", modelId: "claude" },
         ],
       },
