@@ -178,6 +178,10 @@ export function registerAgentRoutes(
       sendJson(res, AGENT_RETIRED_STATUS, { error: agentRetiredDetail() });
       return;
     }
+    if (body.agent_type === "ticket") {
+      sendJson(res, 400, { error: "Ticket Agents require a host with instance result contracts" });
+      return;
+    }
     const agentType = normalizeAgentType(body.agent_type);
     await db.query(
       `INSERT INTO agents (id, name, description, status, model_provider, model_id, model_routing, tool_capabilities, subagent_models, agent_type, system_prompt, is_production, idle_timeout_sec, replicas, icon, color, created_by)
@@ -292,6 +296,10 @@ export function registerAgentRoutes(
     const current = currentRows[0];
     if (!current) {
       sendJson(res, 404, { error: "Agent not found" });
+      return;
+    }
+    if (current.agent_type === "ticket" || body.agent_type === "ticket") {
+      sendJson(res, 400, { error: "Ticket Agents must be configured in the integrated host tenant UI" });
       return;
     }
     if (body.agent_type === "coordinator" || current.agent_type === "coordinator") {
