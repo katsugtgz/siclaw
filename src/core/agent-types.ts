@@ -211,9 +211,12 @@ export const AGENT_TYPES: Record<AgentType, AgentTypeDef> = {
     // one thing this type's contract forbids — never fill gaps with unsupported model
     // knowledge, never invent a source. Concurrency belongs in batched retrieval
     // (knowledge_search / Read over several pages), not in a second agent.
-    // Dropping the group also drops task_output / job_stop, which is the consistent
-    // outcome rather than a gap: allowsBackgroundExec() then keeps local_script in the
-    // foreground instead of leaving a background job this agent can neither read nor stop.
+    // Dropping the group also drops task_output / job_stop (see the group's members in
+    // tool-capabilities.ts), which is the consistent outcome rather than a gap:
+    // allowsBackgroundExec() in background-execution-policy.ts requires BOTH of those
+    // tools, so local_script stays in the foreground instead of leaving a background job
+    // this agent can neither read nor stop. Nothing here special-cases QA — check that
+    // policy before changing this group, because the inference lives there, not here.
     capabilities: ["read_files", "run_local_scripts", "write_sandbox", "plan_tasks", "session_output"],
     defaultPrompt: KNOWLEDGE_QA_DEFAULT_PROMPT,
     defaultNoSkills: false,
