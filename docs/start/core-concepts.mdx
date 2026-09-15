@@ -1,0 +1,39 @@
+---
+title: "Core Concepts"
+sidebarTitle: "Core Concepts"
+description: "Key ideas behind Siclaw's investigation approach."
+---
+
+## How Siclaw Investigates
+
+Siclaw uses a **4-phase hypothesis-driven investigation engine**: gather context → generate hypotheses → validate in parallel → produce a structured report with root cause and remediation.
+
+Every investigation is **read-only** — Siclaw never modifies your cluster. See [Deep Investigation](/features/deep-investigation) for the full workflow.
+
+## Runtime Modes
+
+Siclaw runs in three modes sharing one agent core:
+
+| Mode | Use Case | Start Command |
+|------|----------|---------------|
+| **Headless CLI** | One diagnostic run for a shell or script | `siclaw --prompt "..."` |
+| **Local Server** | Team use with Web UI and shared configuration | `siclaw local` |
+| **Kubernetes** | Production multi-tenant deployment | `helm upgrade --install siclaw ./helm/siclaw ...` |
+
+Use `siclaw` for personal terminal workflows, `siclaw local` for a browser-based local setup, and Kubernetes for team deployments.
+
+## Skills
+
+Skills are reusable diagnostic playbooks your team can create, review, and share. See [Skills](/features/skills) for details.
+
+## Investigation Memory
+
+Siclaw can reuse findings from previous incidents so recurring problems are recognized faster. See [Memory](/features/memory) for details.
+
+## Security Model
+
+Siclaw is designed for read-only diagnostics. It investigates, explains, and recommends next steps without changing your environment directly.
+
+## MCP Integration
+
+Siclaw supports the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) for connecting external tools and data sources. See [MCP Servers](/configuration/mcp) for setup and examples.

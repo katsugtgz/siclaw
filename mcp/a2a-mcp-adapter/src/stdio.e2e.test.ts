@@ -1,0 +1,192 @@
+import { createServer, type Server as HttpServer } from "node:http";
+import { fileURLToPath } from "node:url";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { afterEach, describe, expect, it } from "vitest";
+
+const clients: Client[] = [];
+const httpServers: HttpServer[] = [];
+
+afterEach(async () => {
+  await Promise.all(clients.splice(0).map((client) => client.close()));
+  await Promise.all(httpServers.splice(0).map((server) => new Promise<void>((resolve, reject) => {
+    server.close((error) => error ? reject(error) : resolve());
+  })));
+});
+
+async function listen(server: HttpServer): Promise<number> {
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => resolve());
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("mock server did not bind TCP");
+  return address.port;
+}
+
+function completedTask() {
+  return {
+    id: "task-e2e",
+    contextId: "context-e2e",
+    status: {
+      state: "TASK_STATE_COMPLETED",
+      timestamp: "2026-07-18T00:00:00.000Z",
+      message: { parts: [{ text: "completed" }] },
+    },
+    artifacts: [{ parts: [{ text: "e2e root cause" }] }],
+  };
+}
+
+describe("stdio process", () => {
+  it("bridges a real MCP subprocess call to the ControlPlane A2A HTTP contract", async () => {
+    let observedAuth = "";
+    let observedBody: unknown;
+    const mock = createServer(async (request, response) => {
+      observedAuth = request.headers.authorization ?? "";
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(Buffer.from(chunk));
+      observedBody = chunks.length > 0 ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : null;
+      response.writeHead(200, { "content-type": "application/a2a+json" });
+      response.end(JSON.stringify({ task: completedTask() }));
+    });
+    httpServers.push(mock);
+    const port = await listen(mock);
+
+    const adapterEntrypoint = fileURLToPath(new URL("./index.ts", import.meta.url));
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: ["--import", "tsx", adapterEntrypoint],
+      env: {
+        A2A_URL: `http://127.0.0.1:${port}`,
+        SICLAW_AGENT_ID: "agent-e2e",
+        SICLAW_A2A_KEY: "e2e-key",
+      },
+      stderr: "pipe",
+    });
+    const client = new Client({ name: "stdio-e2e", version: "1.0.0" });
+    clients.push(client);
+    await client.connect(transport);
+
+    const result = await client.callTool({
+      name: "siclaw_investigate",
+      arguments: { question: "check e2e", wait_seconds: 0 },
+    });
+    expect(result.isError).not.toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      task_id: "task-e2e",
+      context_id: "context-e2e",
+      state: "completed",
+      result: "e2e root cause",
+    });
+    expect(observedAuth).toBe("Bearer e2e-key");
+    expect(observedBody).toEqual({
+      message: { role: "ROLE_USER", parts: [{ text: "check e2e" }] },
+    });
+  });
+
+  it("self-resolves the agent from the key when SICLAW_AGENT_ID is absent", async () => {
+    const paths: string[] = [];
+    const mock = createServer(async (request, response) => {
+      paths.push(request.url ?? "");
+      for await (const _chunk of request) { /* drain */ }
+      response.writeHead(200, { "content-type": "application/a2a+json" });
+      if (request.url === "/api/v1/a2a/self") {
+        response.end(JSON.stringify({ agentId: "agent-resolved" }));
+        return;
+      }
+      response.end(JSON.stringify({ task: completedTask() }));
+    });
+    httpServers.push(mock);
+    const port = await listen(mock);
+
+    const adapterEntrypoint = fileURLToPath(new URL("./index.ts", import.meta.url));
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: ["--import", "tsx", adapterEntrypoint],
+      env: {
+        A2A_URL: `http://127.0.0.1:${port}`,
+        SICLAW_A2A_KEY: "e2e-key",
+      },
+      stderr: "pipe",
+    });
+    const client = new Client({ name: "stdio-e2e-self", version: "1.0.0" });
+    clients.push(client);
+    await client.connect(transport);
+
+    const result = await client.callTool({
+      name: "siclaw_investigate",
+      arguments: { question: "check self-resolve", wait_seconds: 0 },
+    });
+    expect(result.isError).not.toBe(true);
+    expect(paths[0]).toBe("/api/v1/a2a/self");
+    expect(paths).toContain("/api/v1/a2a/agents/agent-resolved/message:send");
+  });
+
+  it("resolves several named keys, injects aliases into tool descriptions, and routes by alias", async () => {
+    const requests: Array<{ path: string; auth: string }> = [];
+    const mock = createServer(async (request, response) => {
+      const auth = request.headers.authorization ?? "";
+      const path = request.url ?? "";
+      requests.push({ path, auth });
+      for await (const _chunk of request) { /* drain */ }
+      response.writeHead(200, { "content-type": "application/a2a+json" });
+      if (path === "/api/v1/a2a/self") {
+        const agentId = auth === "Bearer secret-key-sre"
+          ? "agent-sre-id"
+          : auth === "Bearer secret-key-kb" ? "agent-kb-id" : "agent-unknown";
+        response.end(JSON.stringify({ agentId }));
+        return;
+      }
+      response.end(JSON.stringify({ task: completedTask() }));
+    });
+    httpServers.push(mock);
+    const port = await listen(mock);
+
+    const adapterEntrypoint = fileURLToPath(new URL("./index.ts", import.meta.url));
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: ["--import", "tsx", adapterEntrypoint],
+      env: {
+        A2A_URL: `http://127.0.0.1:${port}`,
+        SICLAW_A2A_KEYS: JSON.stringify({ sre: "secret-key-sre", kb: "secret-key-kb" }),
+      },
+      stderr: "pipe",
+    });
+    let stderr = "";
+    transport.stderr?.on("data", (chunk) => { stderr += String(chunk); });
+    const client = new Client({ name: "stdio-e2e-multi", version: "1.0.0" });
+    clients.push(client);
+    await client.connect(transport);
+
+    // Both keys are self-resolved once at startup.
+    const selfCalls = requests.filter((entry) => entry.path === "/api/v1/a2a/self");
+    expect(selfCalls.map((entry) => entry.auth).sort()).toEqual([
+      "Bearer secret-key-kb",
+      "Bearer secret-key-sre",
+    ]);
+
+    const listed = await client.listTools();
+    const investigate = listed.tools.find((tool) => tool.name === "siclaw_investigate")!;
+    expect(investigate.description).toContain("sre = agent-sre-id");
+    expect(investigate.description).toContain("kb = agent-kb-id");
+    // The description advertises aliases, never the keys.
+    expect(investigate.description).not.toContain("secret-key");
+    expect(investigate.inputSchema.properties).toHaveProperty("agent");
+    expect(investigate.inputSchema.properties).not.toHaveProperty("key");
+
+    const result = await client.callTool({
+      name: "siclaw_investigate",
+      arguments: { question: "check kb", agent: "kb", wait_seconds: 0 },
+    });
+    expect(result.isError).not.toBe(true);
+    expect(result.structuredContent).toMatchObject({ task_id: "task-e2e", agent: "kb" });
+    const sendCall = requests.find((entry) => entry.path.endsWith("/message:send"));
+    expect(sendCall?.path).toBe("/api/v1/a2a/agents/agent-kb-id/message:send");
+    expect(sendCall?.auth).toBe("Bearer secret-key-kb");
+
+    // The diagnostic ready line reports agent ids, never key material.
+    expect(stderr).toContain("agents=[");
+    expect(stderr).toContain("agent-kb-id");
+    expect(stderr).not.toContain("secret-key");
+  });
+});

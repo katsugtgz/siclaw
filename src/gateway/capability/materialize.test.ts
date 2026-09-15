@@ -1,0 +1,457 @@
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { CapabilityMaterializationError, materializeCapabilityInputs } from "./materialize.js";
+import {
+  CAPABILITY_FETCH_INPUT,
+  CAPABILITY_INPUT_SOURCE_PART_REF,
+  CAPABILITY_INPUT_WORKSPACE_REF,
+} from "./contract.js";
+import type { CapabilityFetchInputResponse } from "./contract.js";
+
+function fakes(opts: {
+  raw?: CapabilityFetchInputResponse;
+  parts?: Record<string, CapabilityFetchInputResponse>;
+  missingParts?: string[];
+  workspace?: { bundle_base64?: string; bundle_sha256?: string };
+  rawError?: Error;
+  workspaceError?: Error;
+  sourcesError?: Error;
+  authoringError?: Error;
+}) {
+  const posts: Array<{ path: string; body: any; timeoutMs?: number }> = [];
+  const client = {
+    postJson: vi.fn(async (path: string, body: any, timeoutMs?: number) => {
+      if (path === "/sources" && opts.sourcesError) throw opts.sourcesError;
+      if (path.startsWith("/sources/") && opts.sourcesError) throw opts.sourcesError;
+      if (path === "/authoring" && opts.authoringError) throw opts.authoringError;
+      posts.push({ path, body, timeoutMs });
+      if (path === "/sources/begin") {
+        return {
+          ok: true,
+          missing_parts: opts.missingParts ?? body.snapshot.parts.map((part: { part_id: string }) => part.part_id),
+        };
+      }
+      return { ok: true };
+    }),
+  };
+  const backend = {
+    request: vi.fn(async (method: string, params: any) => {
+      expect(method).toBe(CAPABILITY_FETCH_INPUT);
+      if (params?.ref === CAPABILITY_INPUT_WORKSPACE_REF) {
+        if (opts.workspaceError) throw opts.workspaceError;
+        return opts.workspace ?? {};
+      }
+      if (params?.ref === CAPABILITY_INPUT_SOURCE_PART_REF) {
+        return opts.parts?.[params.part_id] ?? {};
+      }
+      if (opts.rawError) throw opts.rawError;
+      return opts.raw ?? {};
+    }),
+  };
+  return { client, backend, posts };
+}
+
+beforeEach(() => {
+  vi.spyOn(console, "log").mockImplementation(() => {});
+  vi.spyOn(console, "warn").mockImplementation(() => {});
+});
+
+describe("materializeCapabilityInputs", () => {
+  it("reattaches a live legacy box without resolving changed or retired model policy", async () => {
+    const client = { getJson: vi.fn().mockResolvedValue({ status: "ok", runs: 1 }), postJson: vi.fn() };
+    const backend = { request: vi.fn().mockRejectedValue(new Error("legacy model lacks explicit limits")) };
+    const result = await materializeCapabilityInputs({ client, backend, runId: "r1", inputRevision: "pinned", reuseExisting: true });
+    expect(result).toEqual({ reattached: true, inputRevision: "pinned" });
+    expect(backend.request).not.toHaveBeenCalled();
+    expect(client.postJson).not.toHaveBeenCalled();
+  });
+
+  it.each(["pi_agent", "claude_agent_sdk"])("a restarted %s container with no live session must rehydrate the pinned attempt", async engine => {
+    const { client, backend, posts } = fakes({ raw: { bundle_base64: "UkFX", input_revision: "pinned" } });
+    const result = await materializeCapabilityInputs({
+      client: { ...client, getJson: vi.fn().mockResolvedValue({ runs: 0, engine }) }, backend,
+      runId: "r1", inputRevision: "pinned", reuseExisting: true,
+    });
+    expect(result.reattached).not.toBe(true);
+    expect(posts[0].path).toBe("/sources");
+    expect(backend.request).toHaveBeenCalledWith(CAPABILITY_FETCH_INPUT, { run_id: "r1", input_revision: "pinned" });
+  });
+
+  it.each(["pi_agent", "claude_agent_sdk"])("replaces an empty restarted legacy box only after %s configuration resolves", async engine => {
+    const old = { getJson: vi.fn().mockResolvedValue({ runs: 0, test_sessions: 0 }), postJson: vi.fn() };
+    const fresh = fakes({ raw: { bundle_base64: "UkFX", input_revision: "pinned", llm: { engine } },
+      workspace: { bundle_base64: "V1M=" } });
+    const replace = vi.fn(async () => {
+      expect(fresh.backend.request).toHaveBeenCalledTimes(1);
+      return fresh.client;
+    });
+    await materializeCapabilityInputs({ client: old, backend: fresh.backend, runId: "r1",
+      inputRevision: "pinned", reuseExisting: true, replaceEmptyLegacyBox: replace });
+    expect(replace).toHaveBeenCalledTimes(1);
+    expect(old.postJson).not.toHaveBeenCalled();
+    expect(fresh.posts.map(p => p.path)).toEqual(["/sources", "/authoring"]);
+
+    replace.mockClear();
+    await expect(materializeCapabilityInputs({ client: old, backend: fresh.backend, runId: "r1",
+      inputRevision: "different", reuseExisting: true, replaceEmptyLegacyBox: replace })).rejects.toThrow("input revision mismatch");
+    expect(replace).not.toHaveBeenCalled();
+    old.getJson.mockResolvedValue({ runs: 0, test_sessions: 1 });
+    await expect(materializeCapabilityInputs({ client: old, backend: fresh.backend, runId: "r1",
+      reuseExisting: true, replaceEmptyLegacyBox: replace })).rejects.toThrow("active test sessions");
+    expect(replace).not.toHaveBeenCalled();
+
+    old.getJson.mockResolvedValue({ runs: 0, test_sessions: 0 });
+    fresh.backend.request.mockRejectedValue(new Error("configure the engine first"));
+    await expect(materializeCapabilityInputs({ client: old, backend: fresh.backend, runId: "r1",
+      reuseExisting: true, replaceEmptyLegacyBox: replace })).rejects.toThrow("configure the engine first");
+    expect(replace).not.toHaveBeenCalled();
+  });
+
+  it("a shared local endpoint never uses another run's health count to skip setup", async () => {
+    const { client, backend, posts } = fakes({ raw: { bundle_base64: "UkFX" } });
+    const health = vi.fn().mockResolvedValue({ runs: 1 });
+    const result = await materializeCapabilityInputs({ client: { ...client, getJson: health },
+      backend, runId: "different-run", reuseExisting: false });
+    expect(result.reattached).not.toBe(true);
+    expect(health).not.toHaveBeenCalled();
+    expect(posts[0].body.run_id).toBe("different-run");
+  });
+
+  it("fresh box: posts raw sources, then rehydrates the authoring workspace (locale rides along)", async () => {
+    const { client, backend, posts } = fakes({
+      raw: { bundle_base64: "UkFX", bundle_sha256: "aa", locale: "zh", input_revision: "manifest-1" },
+      workspace: { bundle_base64: "V1M=", bundle_sha256: "bb" },
+    });
+    const result = await materializeCapabilityInputs({ client, backend, runId: "r1" });
+
+    // The consumer-declared locale is surfaced to the caller (→ /session body)
+    // and forwarded on both installs (they seed the constitution).
+    expect(result.locale).toBe("zh");
+    expect(result.inputRevision).toBe("manifest-1");
+    expect(posts.map((p) => p.path)).toEqual(["/sources", "/authoring"]);
+    expect(posts[0].body).toMatchObject({ locale: "zh" });
+    expect(posts[1].body).toEqual({ run_id: "r1", bundle_base64: "V1M=", bundle_sha256: "bb", locale: "zh" });
+    // Two fetches: default ref (raw) then the workspace ref.
+    expect(backend.request).toHaveBeenNthCalledWith(1, CAPABILITY_FETCH_INPUT, { run_id: "r1" });
+    expect(backend.request).toHaveBeenNthCalledWith(2, CAPABILITY_FETCH_INPUT, { run_id: "r1", ref: CAPABILITY_INPUT_WORKSPACE_REF });
+  });
+
+  it("dead-box recovery requests the exact checkpointed input revision", async () => {
+    const { client, backend } = fakes({
+      raw: { bundle_base64: "UkFX", input_revision: "manifest-1" },
+    });
+    const result = await materializeCapabilityInputs({
+      client,
+      backend,
+      runId: "r1",
+      inputRevision: "manifest-1",
+    });
+    expect(backend.request).toHaveBeenNthCalledWith(1, CAPABILITY_FETCH_INPUT, {
+      run_id: "r1",
+      input_revision: "manifest-1",
+    });
+    expect(result.inputRevision).toBe("manifest-1");
+  });
+
+  it("Source Snapshot v2 uploads only box-reported missing parts and commits before workspace", async () => {
+    const snapshot = {
+      version: 2 as const,
+      manifest_sha256: "f".repeat(64),
+      total_bytes: 7,
+      file_count: 2,
+      parts: [
+        {
+          part_id: "part-000001",
+          sha256: "a".repeat(64),
+          bundle_size_bytes: 10,
+          unpacked_size_bytes: 3,
+          file_count: 1,
+          files: [{ path: "a.md", size_bytes: 3, sha256: "1".repeat(64) }],
+        },
+        {
+          part_id: "part-000002",
+          sha256: "b".repeat(64),
+          bundle_size_bytes: 11,
+          unpacked_size_bytes: 4,
+          file_count: 1,
+          files: [{ path: "b.md", size_bytes: 4, sha256: "2".repeat(64) }],
+        },
+      ],
+    };
+    const { client, backend, posts } = fakes({
+      raw: { source_snapshot: snapshot, input_revision: "manifest-2", locale: "zh" },
+      parts: {
+        "part-000002": {
+          bundle_base64: "UDI=",
+          bundle_sha256: "b".repeat(64),
+          input_revision: "manifest-2",
+        },
+      },
+      missingParts: ["part-000002"],
+      workspace: { bundle_base64: "V1M=" },
+    });
+
+    const result = await materializeCapabilityInputs({ client, backend, runId: "r2" });
+
+    expect(result).toMatchObject({ inputRevision: "manifest-2", locale: "zh" });
+    expect(posts.map((post) => post.path)).toEqual([
+      "/sources/begin",
+      "/sources/part",
+      "/sources/commit",
+      "/authoring",
+    ]);
+    expect(backend.request).toHaveBeenNthCalledWith(2, CAPABILITY_FETCH_INPUT, {
+      run_id: "r2",
+      input_revision: "manifest-2",
+      ref: CAPABILITY_INPUT_SOURCE_PART_REF,
+      part_id: "part-000002",
+    }, 600_000);
+    expect(posts.find((post) => post.path === "/sources/part")?.timeoutMs).toBe(600_000);
+    expect(posts.find((post) => post.path === "/sources/commit")?.timeoutMs).toBe(900_000);
+  });
+
+  it("forwards Source Snapshot v3 revision evidence to the box", async () => {
+    const snapshot = {
+      version: 3 as const,
+      manifest_sha256: "f".repeat(64),
+      total_bytes: 3,
+      file_count: 1,
+      parts: [{
+        part_id: "part-000001",
+        sha256: "a".repeat(64),
+        bundle_size_bytes: 10,
+        unpacked_size_bytes: 3,
+        file_count: 1,
+        files: [{ path: "website/a.mdx", size_bytes: 3, sha256: "1".repeat(64) }],
+      }],
+      source_revision: {
+        origin: "git_archive",
+        revision: "0123456789abcdef0123456789abcdef01234567",
+      },
+    };
+    const { client, backend, posts } = fakes({
+      raw: { source_snapshot: snapshot, input_revision: "manifest-v3" },
+      parts: { "part-000001": { bundle_base64: "UDI=", input_revision: "manifest-v3" } },
+      missingParts: ["part-000001"],
+    });
+
+    await materializeCapabilityInputs({ client, backend, runId: "r3" });
+
+    const begin = posts.find((post) => post.path === "/sources/begin");
+    expect(begin?.body).toMatchObject({
+      input_revision: "manifest-v3",
+      snapshot: { version: 3, source_revision: snapshot.source_revision },
+    });
+  });
+
+  it("Source Snapshot v2 rejects a part from another revision before upload", async () => {
+    const snapshot = {
+      version: 2 as const,
+      manifest_sha256: "f".repeat(64),
+      total_bytes: 3,
+      file_count: 1,
+      parts: [{
+        part_id: "part-000001",
+        sha256: "a".repeat(64),
+        bundle_size_bytes: 10,
+        unpacked_size_bytes: 3,
+        file_count: 1,
+        files: [{ path: "a.md", size_bytes: 3, sha256: "1".repeat(64) }],
+      }],
+    };
+    const { client, backend, posts } = fakes({
+      raw: { source_snapshot: snapshot, input_revision: "manifest-2" },
+      parts: { "part-000001": { bundle_base64: "UDE=", input_revision: "manifest-other" } },
+    });
+
+    await expect(materializeCapabilityInputs({ client, backend, runId: "r2" })).rejects.toMatchObject({
+      name: "CapabilityMaterializationError",
+      stage: "source-install",
+      message: expect.stringContaining("revision mismatch"),
+    });
+    expect(posts.map((post) => post.path)).toEqual(["/sources/begin"]);
+  });
+
+  it("Source Snapshot v2 requires an immutable input revision", async () => {
+    const { client, backend, posts } = fakes({
+      raw: {
+        source_snapshot: {
+          version: 2,
+          manifest_sha256: "f".repeat(64),
+          total_bytes: 0,
+          file_count: 0,
+          parts: [],
+        },
+      },
+    });
+
+    await expect(materializeCapabilityInputs({ client, backend, runId: "r2" })).rejects.toMatchObject({
+      name: "CapabilityMaterializationError",
+      stage: "source-install",
+      message: expect.stringContaining("requires input_revision"),
+    });
+    expect(posts).toEqual([]);
+  });
+
+  it("rejects a consumer response for a different pinned revision before installing sources", async () => {
+    const { client, backend, posts } = fakes({
+      raw: { bundle_base64: "UkFX", input_revision: "manifest-2" },
+    });
+
+    await expect(materializeCapabilityInputs({
+      client,
+      backend,
+      runId: "r1",
+      inputRevision: "manifest-1",
+    })).rejects.toMatchObject({
+      name: "CapabilityMaterializationError",
+      stage: "source-fetch",
+      message: expect.stringContaining("input revision mismatch"),
+    });
+    expect(posts).toEqual([]);
+  });
+
+  it("rejects a pinned revision with no source bundle instead of starting empty", async () => {
+    const { client, backend, posts } = fakes({
+      raw: { input_revision: "manifest-1" },
+    });
+
+    await expect(materializeCapabilityInputs({
+      client,
+      backend,
+      runId: "r1",
+      inputRevision: "manifest-1",
+    })).rejects.toMatchObject({
+      name: "CapabilityMaterializationError",
+      stage: "source-fetch",
+      message: expect.stringContaining("returned no source bundle"),
+    });
+    expect(posts).toEqual([]);
+  });
+
+  it("live box (409 on /sources): never touches the workspace", async () => {
+    const { client, backend, posts } = fakes({
+      raw: { bundle_base64: "UkFX", input_revision: "current-but-not-installed" },
+      workspace: { bundle_base64: "V1M=" },
+      sourcesError: new Error(
+        'AgentBox request failed: 409 {"error":"run already exists; upload sources before /session","run_id":"r1"}',
+      ),
+    });
+    const result = await materializeCapabilityInputs({ client, backend, runId: "r1" });
+
+    expect(posts).toEqual([]); // no /authoring — live on-disk state wins
+    expect(backend.request).toHaveBeenCalledTimes(1); // workspace never fetched
+    expect(result.inputRevision).toBeUndefined(); // keep the run's recovered checkpoint
+  });
+
+  it("live box detected via stable conflict code (message wording independent)", async () => {
+    const err = Object.assign(new Error("conflict: box already holds this run"), {
+      status: 409,
+      code: "KBC_RUN_ALREADY_LIVE",
+    });
+    const { client, backend, posts } = fakes({
+      raw: { bundle_base64: "UkFX" },
+      workspace: { bundle_base64: "V1M=" },
+      sourcesError: err,
+    });
+    await materializeCapabilityInputs({ client, backend, runId: "r1" });
+
+    expect(posts).toEqual([]);
+    expect(backend.request).toHaveBeenCalledTimes(1);
+  });
+
+  it("Source Snapshot v2 treats an untagged 409 as an install conflict, not a live reattach", async () => {
+    const snapshot = {
+      version: 2 as const,
+      manifest_sha256: "f".repeat(64),
+      total_bytes: 3,
+      file_count: 1,
+      parts: [{
+        part_id: "part-000001",
+        sha256: "a".repeat(64),
+        bundle_size_bytes: 10,
+        unpacked_size_bytes: 3,
+        file_count: 1,
+        files: [{ path: "a.md", size_bytes: 3, sha256: "1".repeat(64) }],
+      }],
+    };
+    const conflict = Object.assign(
+      new Error("AgentBox request failed: 409 source snapshot descriptor changed for the same run and revision"),
+      { status: 409, code: "CONFLICT" },
+    );
+    const { client, backend, posts } = fakes({
+      raw: { source_snapshot: snapshot, input_revision: "manifest-2" },
+      sourcesError: conflict,
+    });
+
+    await expect(materializeCapabilityInputs({ client, backend, runId: "r2" })).rejects.toMatchObject({
+      name: "CapabilityMaterializationError",
+      stage: "source-install",
+      cause: expect.objectContaining({ status: 409, code: "CONFLICT" }),
+    });
+    expect(posts).toEqual([]);
+    expect(backend.request).toHaveBeenCalledTimes(1);
+  });
+
+  it("empty KB (no raw bundle): posts nothing and does not guess freshness", async () => {
+    const { client, backend, posts } = fakes({ raw: {}, workspace: { bundle_base64: "V1M=" } });
+    await materializeCapabilityInputs({ client, backend, runId: "r1" });
+    expect(posts).toEqual([]);
+    expect(backend.request).toHaveBeenCalledTimes(1);
+  });
+
+  it("raw fetch transport failure is typed and fails closed", async () => {
+    const { client, backend, posts } = fakes({ rawError: new Error("consumer RPC timed out") });
+    const error = await materializeCapabilityInputs({ client, backend, runId: "r1" }).catch((err) => err);
+
+    expect(error).toMatchObject({
+      name: "CapabilityMaterializationError",
+      stage: "source-fetch",
+      cause: expect.objectContaining({ message: "consumer RPC timed out" }),
+    });
+    expect(error).toBeInstanceOf(CapabilityMaterializationError);
+    expect(posts).toEqual([]);
+  });
+
+  it("raw source install failure is typed and fails closed", async () => {
+    const { client, backend, posts } = fakes({
+      raw: { bundle_base64: "UkFX" },
+      sourcesError: new Error("box install failed: 500"),
+    });
+    await expect(materializeCapabilityInputs({ client, backend, runId: "r1" })).rejects.toMatchObject({
+      name: "CapabilityMaterializationError",
+      stage: "source-install",
+    });
+    expect(posts).toEqual([]);
+  });
+
+  it("workspace fetch failure is typed and fails closed", async () => {
+    const { client, backend, posts } = fakes({
+      raw: { bundle_base64: "UkFX" },
+      workspaceError: new Error("store hiccup"),
+    });
+    await expect(materializeCapabilityInputs({ client, backend, runId: "r1" })).rejects.toMatchObject({
+      name: "CapabilityMaterializationError",
+      stage: "workspace-fetch",
+    });
+    expect(posts.map((p) => p.path)).toEqual(["/sources"]);
+  });
+
+  it("workspace install failure is typed and fails closed", async () => {
+    const { client, backend, posts } = fakes({
+      raw: { bundle_base64: "UkFX" },
+      workspace: { bundle_base64: "V1M=" },
+      authoringError: new Error("box authoring install failed: 500"),
+    });
+    await expect(materializeCapabilityInputs({ client, backend, runId: "r1" })).rejects.toMatchObject({
+      name: "CapabilityMaterializationError",
+      stage: "workspace-install",
+    });
+    expect(posts.map((p) => p.path)).toEqual(["/sources"]);
+  });
+
+  it("brand-new attempt (empty workspace bundle): raw only, no /authoring", async () => {
+    const { client, backend, posts } = fakes({ raw: { bundle_base64: "UkFX" }, workspace: {} });
+    await materializeCapabilityInputs({ client, backend, runId: "r1" });
+    expect(posts.map((p) => p.path)).toEqual(["/sources"]);
+  });
+});

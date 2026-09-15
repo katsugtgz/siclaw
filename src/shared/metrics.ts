@@ -1,0 +1,251 @@
+/**
+ * Prometheus metrics subscriber — the ONLY file that depends on prom-client.
+ *
+ * Subscribes to the diagnostic event bus and maps events to Prometheus metrics.
+ * Business code never imports this module directly — it only calls emitDiagnostic().
+ *
+ * Importing this module (side-effect import) registers the subscriber automatically.
+ *
+ * ⚠️ FEDERATION CARDINALITY: in K8s mode every `siclaw_`-prefixed counter/histogram
+ * registered here is pulled by the Gateway and federated into a single long-lived
+ * Prometheus series (see docs metrics-federation-DESIGN.md). Unlike the old direct
+ * scrape — where a short-lived pod's series disappeared on pod GC — federated series
+ * accumulate on the Gateway indefinitely. Adding a metric with an unbounded label
+ * (session_id, request_id, …) therefore grows the Gateway's series set permanently.
+ * Keep new label sets low-cardinality, or they will not be a problem you can GC away.
+ */
+
+import http from "node:http";
+import { randomUUID } from "node:crypto";
+import { Counter, Gauge, Histogram, Registry } from "prom-client";
+import { onDiagnostic, type DiagnosticEvent } from "./diagnostic-events.js";
+import type { PromSampleGroup } from "./metrics-types.js";
+
+/**
+ * Check bearer token authentication for /metrics endpoints.
+ * Returns true if the request is authorized (or no token is configured).
+ * Returns false and sends 401 response if unauthorized.
+ */
+export function checkMetricsAuth(req: http.IncomingMessage, res: http.ServerResponse, configuredToken?: string): boolean {
+  const token = configuredToken || process.env.SICLAW_METRICS_TOKEN;
+  if (token && req.headers.authorization !== `Bearer ${token}`) {
+    res.writeHead(401, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "Unauthorized" }));
+    return false;
+  }
+  return true;
+}
+
+export const metricsRegistry = new Registry();
+
+/**
+ * Per-process start nonce. Generated once when this module is first imported
+ * (which happens once per process). Reported alongside the federation snapshot so
+ * the Gateway aggregator can tell two process incarnations apart even when they
+ * share the same boxId (boxId is derived from agentId and is reused across pod
+ * rebuilds). See metrics-federation-DESIGN.md module 1.
+ */
+export const processIncarnation = randomUUID();
+
+/**
+ * Federation snapshot: the raw cumulative current values of this process's
+ * prom-client registry, for the Gateway to pull and delta-accumulate (K8s mode,
+ * path ②).
+ *
+ * The returned values are CUMULATIVE and must never be cleared by callers.
+ */
+export async function getMetricsAsJSON(): Promise<PromSampleGroup[]> {
+  // prom-client's .d.ts types `type` as the numeric MetricType enum, but the
+  // runtime emits the lowercase string ("counter"/"gauge"/"histogram"/"summary")
+  // that PromSampleGroup expects. The extra fields (aggregator/exemplar) are
+  // harmless on the wire and ignored by the aggregator. Cast over the known gap.
+  return (await metricsRegistry.getMetricsAsJSON()) as unknown as PromSampleGroup[];
+}
+
+/** Whether to include user_id label on token/cost metrics (dynamic, refreshable) */
+let includeUserId = process.env.SICLAW_METRICS_USER_ID !== "false";
+
+/** Update the includeUserId flag at runtime (called by Gateway when DB config changes) */
+export function setIncludeUserId(value: boolean): void {
+  includeUserId = value;
+}
+
+// ── Phase 1: Core metrics (7) ──
+
+const tokensTotal = new Counter({
+  name: "siclaw_tokens_total",
+  help: "Cumulative token consumption",
+  labelNames: ["type", "provider", "model", "user_id"] as const,
+  registers: [metricsRegistry],
+});
+
+const costUsdTotal = new Counter({
+  name: "siclaw_cost_usd_total",
+  help: "Cumulative LLM cost in USD",
+  labelNames: ["provider", "model", "user_id"] as const,
+  registers: [metricsRegistry],
+});
+
+const promptDurationMs = new Histogram({
+  name: "siclaw_prompt_duration_ms",
+  help: "Prompt end-to-end processing latency in milliseconds",
+  labelNames: ["provider", "model", "outcome"] as const,
+  buckets: [500, 1_000, 2_500, 5_000, 10_000, 30_000, 60_000, 120_000, 300_000],
+  registers: [metricsRegistry],
+});
+
+const promptsTotal = new Counter({
+  name: "siclaw_prompts_total",
+  help: "Total prompts processed",
+  labelNames: ["provider", "model", "outcome"] as const,
+  registers: [metricsRegistry],
+});
+
+const sessionsActive = new Gauge({
+  name: "siclaw_sessions_active",
+  help: "Current number of active sessions",
+  registers: [metricsRegistry],
+});
+
+const toolCallsTotal = new Counter({
+  name: "siclaw_tool_calls_total",
+  help: "Total tool invocations",
+  labelNames: ["tool_name", "outcome"] as const,
+  registers: [metricsRegistry],
+});
+
+const wsConnections = new Gauge({
+  name: "siclaw_ws_connections",
+  help: "Current number of WebSocket connections",
+  registers: [metricsRegistry],
+});
+
+// ── Skill metrics ──
+// NOTE: siclaw_skill_calls_total uses skill_name label which is unbounded.
+// If personal skill count grows large, consider dropping this counter and
+// relying solely on the low-cardinality siclaw_skill_calls_by_scope_total.
+
+const skillCallsTotal = new Counter({
+  name: "siclaw_skill_calls_total",
+  help: "Total skill invocations",
+  labelNames: ["skill_name", "scope", "outcome"] as const,
+  registers: [metricsRegistry],
+});
+
+const skillCallsByScopeTotal = new Counter({
+  name: "siclaw_skill_calls_by_scope_total",
+  help: "Total skill invocations aggregated by scope (low-cardinality fallback)",
+  labelNames: ["scope", "outcome"] as const,
+  registers: [metricsRegistry],
+});
+
+// ── Phase 2: Session health metrics (4) ──
+
+const contextTokensUsed = new Gauge({
+  name: "siclaw_context_tokens_used",
+  help: "Current context window tokens used (sampled per turn)",
+  labelNames: ["provider", "model"] as const,
+  registers: [metricsRegistry],
+});
+
+const contextTokensLimit = new Gauge({
+  name: "siclaw_context_tokens_limit",
+  help: "Context window token limit (sampled per turn)",
+  labelNames: ["provider", "model"] as const,
+  registers: [metricsRegistry],
+});
+
+const sessionStuckTotal = new Counter({
+  name: "siclaw_session_stuck_total",
+  help: "Number of stuck sessions detected",
+  registers: [metricsRegistry],
+});
+
+const sessionStuckAgeMs = new Histogram({
+  name: "siclaw_session_stuck_age_ms",
+  help: "Duration of stuck sessions in milliseconds",
+  buckets: [30_000, 60_000, 120_000, 300_000],
+  registers: [metricsRegistry],
+});
+
+// ── Event → metric mapping ──
+
+function handleDiagnostic(event: DiagnosticEvent): void {
+  switch (event.type) {
+    case "prompt_complete": {
+      const { prev, curr, model, durationMs, outcome, userId } = event;
+      const provider = model?.provider ?? "unknown";
+      const modelId = model?.id ?? "unknown";
+
+      // Token deltas (session stats are cumulative — subtract pre-prompt snapshot)
+      const dInput = curr.tokens.input - prev.tokens.input;
+      const dOutput = curr.tokens.output - prev.tokens.output;
+      const dCacheRead = curr.tokens.cacheRead - prev.tokens.cacheRead;
+      const dCacheWrite = curr.tokens.cacheWrite - prev.tokens.cacheWrite;
+
+      const baseLabels = includeUserId && userId
+        ? { provider, model: modelId, user_id: userId }
+        : { provider, model: modelId };
+
+      if (dInput > 0) tokensTotal.inc({ ...baseLabels, type: "input" }, dInput);
+      if (dOutput > 0) tokensTotal.inc({ ...baseLabels, type: "output" }, dOutput);
+      if (dCacheRead > 0) tokensTotal.inc({ ...baseLabels, type: "cache_read" }, dCacheRead);
+      if (dCacheWrite > 0) tokensTotal.inc({ ...baseLabels, type: "cache_write" }, dCacheWrite);
+
+      // Cost delta
+      const dCost = curr.cost - prev.cost;
+      if (dCost > 0) costUsdTotal.inc(baseLabels, dCost);
+
+      // Prompt duration + count
+      const outcomeLabels = { provider, model: modelId, outcome };
+      promptDurationMs.observe(outcomeLabels, durationMs);
+      promptsTotal.inc(outcomeLabels);
+      break;
+    }
+
+    case "session_created":
+      sessionsActive.inc();
+      break;
+
+    case "session_released":
+      sessionsActive.dec();
+      break;
+
+    case "tool_call":
+      toolCallsTotal.inc({ tool_name: event.toolName, outcome: event.outcome });
+      break;
+
+    case "skill_call":
+      skillCallsTotal.inc({
+        skill_name: event.skillName,
+        scope: event.scope,
+        outcome: event.outcome,
+      });
+      skillCallsByScopeTotal.inc({
+        scope: event.scope,
+        outcome: event.outcome,
+      });
+      break;
+
+    case "ws_connected":
+      wsConnections.inc();
+      break;
+
+    case "ws_disconnected":
+      wsConnections.dec();
+      break;
+
+    case "context_usage":
+      contextTokensUsed.set({ provider: event.provider, model: event.model }, event.tokensUsed);
+      contextTokensLimit.set({ provider: event.provider, model: event.model }, event.tokensLimit);
+      break;
+
+    case "session_stuck":
+      sessionStuckTotal.inc();
+      sessionStuckAgeMs.observe(event.idleMs);
+      break;
+  }
+}
+
+// Auto-register subscriber when this module is imported
+onDiagnostic(handleDiagnostic);

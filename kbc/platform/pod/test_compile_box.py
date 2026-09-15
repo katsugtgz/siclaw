@@ -1,0 +1,7727 @@
+#!/usr/bin/env python3
+"""compile_box 协议冒烟:注入假会话驱动(不调 LLM),验 HTTP + SSE 全管线
+(sources/authoring 物化、持久会话、workspace 同步、只读测试会话)。
+
+跑:platform/pod/.venv/bin/python platform/pod/test_compile_box.py
+"""
+import asyncio
+import base64
+import contextlib
+import hashlib
+import io
+import json
+import os
+import shutil
+import tarfile
+import tempfile
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+from aiohttp.test_utils import TestClient, TestServer
+
+import compile_box
+import source_inspector
+import source_snapshot
+
+from copy import deepcopy
+from types import SimpleNamespace
+import pi_config
+from agent_protocol import AgentEvent, AgentTransportError
+
+
+def execution_fixture():
+    roles = {}
+    for role in ("compile", "blue", "judge", "transcribe", "compare"):
+        roles[role] = {"model": {
+            "id": "fixture-" + role, "name": "Fixture " + role,
+            "provider": "fixture", "api": "openai-completions",
+            "baseUrl": "http://127.0.0.1:1/v1", "input": ["text", "image"],
+            "reasoning": False, "contextWindow": 1_000_000, "maxTokens": 32768,
+        }, "api_key": "fixture-key", "thinking_level": "off"}
+    return {"engine": "pi_agent", "execution": {"version": 1, "roles": roles}}
+
+
+# Domain HTTP fixtures still exercise production validation, with an explicit
+# complete model contract. Tests of missing/invalid authority call it directly.
+class TestClient(TestClient):
+    async def _request(self, method, path, **kwargs):
+        if method == "POST" and str(path).startswith("/session/"):
+            body = dict(kwargs.get("json") or {})
+            body.setdefault("llm", execution_fixture())
+            kwargs["json"] = body
+        return await super()._request(method, path, **kwargs)
+
+
+pi_config.configure(execution_fixture()["execution"])
+
+
+def tool_names(options):
+    return [tool.name for tool in options.tools]
+
+
+async def fake_driver(run):
+    """模拟一轮编译会话:summary → 写 candidate 页 → turn_done。不烧 LLM、永不阻塞
+    (矛盾-as-turn 模型:没有 park、没有 rulings、没有 bundle 提交)。"""
+    assert "authoring/CLAUDE.md" in run.instruction, run.instruction
+    await run.emit({"type": "summary", "summary": "read 2 docs, wrote 1 page"})
+    cand = Path(run.workdir) / "candidate"
+    cand.mkdir(parents=True, exist_ok=True)
+    (cand / "index.md").write_text("# smoke candidate\n")
+    await run.emit({"type": "turn_done", "text": "compiled 1 page"})
+
+
+async def read_until(resp, stop_type):
+    events = []
+    while True:
+        raw = await resp.content.readline()
+        if not raw:
+            break
+        line = raw.decode().strip()
+        if not line or line.startswith(":"):  # blank / heartbeat comment
+            continue
+        if line.startswith("data:"):
+            ev = json.loads(line[5:].strip())
+            events.append(ev)
+            if ev.get("type") == stop_type:
+                break
+    return events
+
+
+def make_source_bundle(files):
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        for name, data in files.items():
+            payload = data if isinstance(data, bytes) else data.encode()
+            info = tarfile.TarInfo(name)
+            info.size = len(payload)
+            tf.addfile(info, io.BytesIO(payload))
+    return buf.getvalue()
+
+
+def deterministic_bytes(size):
+    out = bytearray()
+    i = 0
+    while len(out) < size:
+        out.extend(hashlib.sha256(str(i).encode()).digest())
+        i += 1
+    return bytes(out[:size])
+
+
+def make_source_snapshot(groups):
+    parts = []
+    bundles = []
+    all_files = []
+    for index, files in enumerate(groups, start=1):
+        bundle = make_source_bundle(files)
+        descriptors = []
+        for path, data in files.items():
+            payload = data if isinstance(data, bytes) else data.encode()
+            descriptors.append({
+                "path": path,
+                "size_bytes": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            })
+        all_files.extend(descriptors)
+        parts.append({
+            "part_id": f"part-{index:06d}",
+            "sha256": hashlib.sha256(bundle).hexdigest(),
+            "bundle_size_bytes": len(bundle),
+            "unpacked_size_bytes": sum(item["size_bytes"] for item in descriptors),
+            "file_count": len(descriptors),
+            "files": descriptors,
+        })
+        bundles.append(bundle)
+    return {
+        "version": 2,
+        "manifest_sha256": hashlib.sha256(source_snapshot.canonical_file_manifest(all_files)).hexdigest(),
+        "total_bytes": sum(item["size_bytes"] for item in all_files),
+        "file_count": len(all_files),
+        "parts": parts,
+    }, bundles
+
+
+async def test_workspace_sync():
+    """B5: _collect_workspace_artifacts excludes raw/; _sync_workspace emits
+    only changed files."""
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "candidate").mkdir(parents=True)
+        (wd / "eval").mkdir(parents=True)
+        (wd / "raw").mkdir(parents=True)
+        (wd / "candidate" / "01.md").write_text("# Overview\n")
+        (wd / "eval" / "TESTS.md").write_text("# Tests\n")
+        (wd / "raw" / "src.md").write_text("raw stays\n")  # raw must NOT sync
+
+        paths = sorted(a["path"] for a in compile_box._collect_workspace_artifacts(str(wd)))
+        assert paths == ["candidate/01.md", "eval/TESTS.md"], paths
+
+        # A fresh box starts from consumer-rehydrated files. Priming the cursor
+        # must prevent that unchanged index/workspace from being echoed as new.
+        primed = compile_box._workspace_sync_cursor(str(wd))
+        primed_run = compile_box.CompileRun("primed-run", str(wd), 1)
+        assert await compile_box._sync_workspace(primed_run, primed) == 0
+        assert primed_run.events.empty()
+
+        run = compile_box.CompileRun("sync-run", str(wd), 1)
+        sent: dict = {}
+        assert await compile_box._sync_workspace(run, sent) == 2
+        ev = run.events.get_nowait()
+        assert ev["type"] == "syncArtifacts" and len(ev["artifacts"]) == 2, ev
+        # unchanged → no emit
+        assert await compile_box._sync_workspace(run, sent) == 0 and run.events.empty()
+        # one file changes → only it re-syncs
+        (wd / "candidate" / "01.md").write_text("# Overview v2\n")
+        assert await compile_box._sync_workspace(run, sent) == 1
+        ev = run.events.get_nowait()
+        assert [a["path"] for a in ev["artifacts"]] == ["candidate/01.md"], ev
+        # deleted file → tombstone (page merge/rename must not leave orphan rows)
+        (wd / "candidate" / "01.md").unlink()
+        assert await compile_box._sync_workspace(run, sent) == 1
+        ev = run.events.get_nowait()
+        assert ev["artifacts"] == [{"path": "candidate/01.md", "deleted": True}], ev
+        assert sent["candidate/01.md"] == compile_box._SYNC_TOMBSTONE
+        # steady state after the tombstone → no re-emit
+        assert await compile_box._sync_workspace(run, sent) == 0 and run.events.empty()
+        replay = compile_box._workspace_replay_artifacts(run, sent)
+        assert {"path": "candidate/01.md", "deleted": True} in replay
+        # A full-compile commit is explicit and replayable even if its final
+        # content was already caught by a periodic sync.
+        try:
+            await compile_box._sync_workspace(run, sent, commit_input=True)
+            assert False, "compile commit without candidate/index.md must fail"
+        except FileNotFoundError:
+            pass
+        (wd / "candidate" / "index.md").write_text("# Index\n")
+        assert await compile_box._sync_workspace(run, sent, commit_input=True) == 1
+        ev = run.events.get_nowait()
+        assert ev["type"] == "syncArtifacts" and ev["commit_input"] is True, ev
+        assert [a["path"] for a in ev["artifacts"]] == ["candidate/index.md"], ev
+        assert run._commit_input_replay is True
+        # a file that becomes UNCOLLECTABLE (oversized) but still exists on disk
+        # must NOT be tombstoned — deletion is judged by is_file(), not by
+        # absence from the collection.
+        (wd / "eval" / "TESTS.md").write_text("x" * (compile_box.MAX_SYNC_FILE_BYTES + 1))
+        assert await compile_box._sync_workspace(run, sent) == 0 and run.events.empty()
+        assert "eval/TESTS.md" in sent, "row kept: file exists, just oversized"
+    print("✓ workspace sync (B5) + deletion tombstones")
+
+
+async def test_workspace_sync_loop_survives_a_failed_tick():
+    """Seven pre-turn_done syncs swallow their own failure, two of them saying
+    outright that the periodic loop will retry. So the loop has to outlive a
+    failed tick: with the try outside the while, one exception ended the task,
+    nothing looked at it until teardown cancelled it hours later, and a whole
+    compile could sync nothing while every call site believed otherwise."""
+
+    class _Run:
+        # Both fields the lifecycle line reads. A stub missing one raises inside
+        # the except block and kills the loop all over again — which is exactly
+        # how this test caught it.
+        run_id, round = "r-sync-loop", 1
+
+    calls: list[int] = []
+
+    async def flaky(run, sent, **kwargs):
+        calls.append(len(calls))
+        if len(calls) == 1:
+            raise RuntimeError("consumer refused the sync")
+        return 0
+
+    original_sync = compile_box._sync_workspace
+    original_interval = compile_box.SYNC_INTERVAL_SECS
+    compile_box._sync_workspace = flaky
+    compile_box.SYNC_INTERVAL_SECS = 0
+    try:
+        task = asyncio.create_task(compile_box._sync_loop(_Run(), {}))
+        for _ in range(400):
+            if len(calls) >= 3:
+                break
+            await asyncio.sleep(0.005)
+        # Ticked twice more after the failure: the retry those call sites rely on
+        # is real, and the task is still the same loop rather than a fresh one.
+        assert len(calls) >= 3, calls
+        assert not task.done(), task
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+    finally:
+        compile_box._sync_workspace = original_sync
+        compile_box.SYNC_INTERVAL_SECS = original_interval
+    print("OK  workspace sync loop survives a failed tick")
+
+
+def _drain_event_types(run) -> list:
+    types = []
+    while not run.events.empty():
+        types.append(run.events.get_nowait()["type"])
+    return types
+
+
+async def test_run_wrapper_terminal_signals():
+    """_run_wrapper's closing protocol: a CLEAN driver exit emits done→end (so
+    the runtime terminalizes instead of leaving the run idle to 409 forever); a
+    crash emits error→end with NO done; a cancellation emits neither (just end)
+    and propagates."""
+    orig = compile_box._COMPILE_IMPL
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            async def clean(run):
+                return None
+            compile_box._COMPILE_IMPL = clean
+            run = compile_box.CompileRun("wrap-clean", td, 1)
+            await compile_box._run_wrapper(run)
+            types = _drain_event_types(run)
+            assert types[-2:] == ["done", "end"], types
+
+            async def boom(run):
+                raise RuntimeError("boom")
+            compile_box._COMPILE_IMPL = boom
+            run = compile_box.CompileRun("wrap-boom", td, 1)
+            await compile_box._run_wrapper(run)
+            boom_events = []
+            while not run.events.empty():
+                boom_events.append(run.events.get_nowait())
+            types = [e["type"] for e in boom_events]
+            assert "error" in types and "done" not in types and types[-1] == "end", types
+            # Bare crashes must still carry code/stage so Runtime persists failure.
+            boom_err = next(e for e in boom_events if e["type"] == "error")
+            assert boom_err.get("code") == "unhandled" and boom_err.get("stage") == "run", boom_err
+            assert boom_err.get("exception_class") == "RuntimeError", boom_err
+            assert "boom" in boom_err.get("error", ""), boom_err
+            # Safe checkpoint channel: no raw exception body.
+            assert boom_err.get("message") == "unhandled:RuntimeError", boom_err
+
+            async def stalled(run):
+                run._last_stall_diagnostic = {
+                    "code": "model_turn_stalled",
+                    "stage": "model_turn",
+                    "attempts": 4,
+                    "idle_s": 90.2,
+                    "bound_s": 90.0,
+                    "tool_pending": False,
+                    "last_sdk_message": "query",
+                }
+                raise compile_box.ModelStallError("model request stalled; exhausted 4 attempt(s)")
+            compile_box._COMPILE_IMPL = stalled
+            run = compile_box.CompileRun("wrap-stalled", td, 1)
+            await compile_box._run_wrapper(run)
+            events = []
+            while not run.events.empty():
+                events.append(run.events.get_nowait())
+            error = next(e for e in events if e["type"] == "error")
+            # Owner-facing error may carry repr; message is safe short reason only.
+            assert error["type"] == "error", error
+            assert error["error"] == "ModelStallError('model request stalled; exhausted 4 attempt(s)')", error
+            assert error["code"] == "model_turn_stalled", error
+            assert error["stage"] == "model_turn", error
+            assert error["attempts"] == 4, error
+            assert error["idle_s"] == 90.2, error
+            assert error["bound_s"] == 90.0, error
+            assert error["tool_pending"] is False, error
+            assert error["last_sdk_message"] == "query", error
+            assert error["exception_class"] == "ModelStallError", error
+            assert error["message"] == "model_turn_stalled:ModelStallError", error
+            # Safe channel must not echo the owner-facing repr body.
+            assert "exhausted 4" not in error["message"], error
+
+            async def cancelled(run):
+                raise asyncio.CancelledError()
+            compile_box._COMPILE_IMPL = cancelled
+            run = compile_box.CompileRun("wrap-cancel", td, 1)
+            try:
+                await compile_box._run_wrapper(run)
+                raise AssertionError("CancelledError should propagate")
+            except asyncio.CancelledError:
+                pass
+            types = _drain_event_types(run)
+            assert "done" not in types and "error" not in types and types[-1] == "end", types
+    finally:
+        compile_box._COMPILE_IMPL = orig
+    print("✓ run wrapper terminal signals: clean→done+end, crash→error+end, cancel→end only")
+
+
+# Test doubles for the Agent SDK message stream. _emit_message dispatches on
+# type(msg).__name__, so these MUST be named exactly like the SDK's classes.
+def text_block(text):
+    return {"type": "text", "text": text}
+
+
+def tool_block(name="Read", input=None):
+    return {"type": "toolCall", "name": name, "arguments": input or {}}
+
+
+def assistant_event(text):
+    return AgentEvent("assistant", "fixture", data={"content": [text_block(text)]})
+
+
+def result_event(subtype="success", is_error=False):
+    return AgentEvent("result", "fixture", data={
+        "outcome": "failed" if is_error else "completed",
+        "error": "KBC_MODEL_CALL_BUDGET_EXCEEDED" if subtype == "error_max_turns" else subtype,
+    })
+
+
+def activity_event():
+    return AgentEvent("activity", "fixture")
+
+
+def tool_end_event():
+    return AgentEvent("tool_end", "fixture", data={"call_id": "fixture-tool"})
+
+
+class _FakeAgentClient:
+    """Stands in for PiAgentClient: records connect/query, yields preloaded
+    messages then stops (the real client blocks for the next turn)."""
+    last = None
+
+    def __init__(self, **kwargs):
+        self.options = SimpleNamespace(**kwargs)
+        self.connected_prompt = None
+        self.queries = []
+        self._pending = []
+        _FakeAgentClient.last = self
+
+    async def connect(self, prompt=None):
+        self.connected_prompt = prompt
+        self._pending = [assistant_event("seed reply"), result_event()]
+
+    async def query(self, prompt, session_id="default"):
+        self.queries.append(prompt)
+        self._pending += [assistant_event("reply: " + prompt), result_event()]
+
+    async def receive_messages(self):
+        while self._pending:
+            yield self._pending.pop(0)
+
+    async def disconnect(self):
+        pass
+
+
+async def test_session_driver_conversational():
+    """run_session connects WITHOUT a prompt (conversational by construction) and
+    relays assistant text + turn_done; the session id is minted and announced."""
+    orig = compile_box.create_agent_client
+    compile_box.create_agent_client = _FakeAgentClient
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            run = compile_box.CompileRun("ps1", td, 1, instruction="authoring/CLAUDE.md present")
+            await compile_box.run_session(run)  # fake yields seed reply + result, then ends
+            evs = []
+            while not run.events.empty():
+                evs.append(run.events.get_nowait())
+            types = [e["type"] for e in evs]
+            assert "session" in types and "log" in types and "turn_done" in types, types
+            assert run.session_id, "session_id not set"
+            assert _FakeAgentClient.last.connected_prompt is None, "session must connect with no kickoff"
+            turn = next(e for e in evs if e["type"] == "turn_done")
+            assert turn.get("text") == "seed reply", turn
+    finally:
+        compile_box.create_agent_client = orig
+    print("✓ session driver is conversational (no kickoff, log + turn_done)")
+
+
+async def test_conversational_session():
+    """P2.2: a conversational session (no kickoff) connects WITHOUT a prompt and
+    waits — a later /message (query) drives the turn that relays log + turn_done."""
+    orig = compile_box.create_agent_client
+    compile_box.create_agent_client = _FakeAgentClient
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            run = compile_box.CompileRun("cs1", td, 1)
+            # No kickoff → connect() with no prompt. Pre-load a queued turn so the
+            # fake's receive_messages yields it (mirrors a /message arriving).
+            client = _FakeAgentClient()
+            await client.query("what should this KB cover?")  # queue one turn
+            run.client = client
+            run.session_id = "sid-cs1"
+            await run.emit({"type": "session", "session_id": run.session_id})
+            async for msg in client.receive_messages():
+                await compile_box._emit_message(run, msg)
+            evs = []
+            while not run.events.empty():
+                evs.append(run.events.get_nowait())
+            types = [e["type"] for e in evs]
+            assert "session" in types and "log" in types and "turn_done" in types, types
+            turn = next(e for e in evs if e["type"] == "turn_done")
+            assert turn.get("text") == "reply: what should this KB cover?", turn
+    finally:
+        compile_box.create_agent_client = orig
+    print("✓ conversational session (P2.2)")
+
+
+async def test_message_waits_for_connect():
+    """P2.2 race fix: a /message that races ahead of the async connect() must wait
+    for it, not hit the SDK's 'Not connected' (→500). 503 while still connecting,
+    200 once connected, 409 if connect failed (event set but client None)."""
+    os.environ["KBC_CONNECT_TIMEOUT_SECS"] = "0.3"
+    compile_box.RUNS.clear()
+    client = TestClient(TestServer(compile_box.build_app()))
+    await client.start_server()
+    try:
+        # (a) run exists but still connecting (connected unset) → 503, not 500
+        compile_box.RUNS["m-pending"] = compile_box.CompileRun("m-pending", "/tmp", 1)
+        r = await client.post("/message/m-pending", json={"message": "hi"})
+        assert r.status == 503, await r.text()
+
+        # (b) connected + live client → 200 and the turn is injected
+        class _C:
+            def __init__(self):
+                self.queries = []
+
+            async def query(self, text, session_id="default"):
+                self.queries.append(text)
+
+        run_live = compile_box.CompileRun("m-live", "/tmp", 1)
+        fake = _C()
+        run_live.client = fake
+        run_live.connected.set()
+        compile_box.RUNS["m-live"] = run_live
+        r = await client.post("/message/m-live", json={"message": "hello"})
+        assert r.status == 200, await r.text()
+        assert fake.queries == ["hello"], fake.queries
+
+        # (c) connect failed: event set but client None → 409, not 500
+        run_failed = compile_box.CompileRun("m-failed", "/tmp", 1)
+        run_failed.connected.set()
+        compile_box.RUNS["m-failed"] = run_failed
+        r = await client.post("/message/m-failed", json={"message": "hi"})
+        assert r.status == 409, await r.text()
+    finally:
+        await client.close()
+        compile_box.RUNS.clear()
+        os.environ.pop("KBC_CONNECT_TIMEOUT_SECS", None)
+    print("✓ message waits for connect (P2.2 race fix)")
+
+
+async def test_message_idempotency_key():
+    """A lost runtime ack may replay capability.message. The box must inject a
+    stable message_id once, while a dispatch error releases the id for retry."""
+    compile_box.RUNS.clear()
+    client = TestClient(TestServer(compile_box.build_app()))
+    await client.start_server()
+    try:
+        class _C:
+            def __init__(self):
+                self.queries = []
+
+            async def query(self, text, session_id="default"):
+                self.queries.append(text)
+
+        run = compile_box.CompileRun("idem-live", "/tmp", 1)
+        fake = _C()
+        run.client = fake
+        run.connected.set()
+        compile_box.RUNS[run.run_id] = run
+        first = await client.post(f"/message/{run.run_id}", json={"message_id": "op-1", "message": "compile once"})
+        second = await client.post(f"/message/{run.run_id}", json={"message_id": "op-1", "message": "compile twice"})
+        assert first.status == 200 and second.status == 200, (await first.text(), await second.text())
+        assert (await second.json()).get("duplicate") is True
+        assert fake.queries == ["compile once"], fake.queries
+
+        class _Flaky:
+            def __init__(self):
+                self.calls = 0
+
+            async def query(self, text, session_id="default"):
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("dispatch failed")
+
+        retry_run = compile_box.CompileRun("idem-retry", "/tmp", 1)
+        flaky = _Flaky()
+        retry_run.client = flaky
+        retry_run.connected.set()
+        compile_box.RUNS[retry_run.run_id] = retry_run
+        failed = await client.post(f"/message/{retry_run.run_id}", json={"message_id": "op-2", "message": "retry me"})
+        retried = await client.post(f"/message/{retry_run.run_id}", json={"message_id": "op-2", "message": "retry me"})
+        assert failed.status == 500 and retried.status == 200, (failed.status, retried.status)
+        assert flaky.calls == 2, flaky.calls
+    finally:
+        await client.close()
+        compile_box.RUNS.clear()
+    print("✓ /message message_id is once-only and releases on dispatch failure")
+
+
+# ── 起测试会话 (read-only test session) ──
+
+async def test_test_path_escape_guard():
+    """C4 guard predicate: relative + in-snapshot absolute paths pass; absolute /
+    ../ escapes to the live workspace are named; Glob absolute patterns are caught
+    (Grep patterns are regex content — never treated as paths)."""
+    with tempfile.TemporaryDirectory() as snap:
+        root = Path(snap)
+        (root / ".siclaw" / "knowledge").mkdir(parents=True)
+        (root / "raw").mkdir()
+        (root / "candidate").mkdir()
+        (root / "raw" / "escape").symlink_to(root.parent, target_is_directory=True)
+        ok = compile_box._test_path_escape
+        # inside: relative, absolute-in-root, dotted-but-contained
+        assert ok(root, "Read", {"file_path": ".siclaw/knowledge/index.md"}) is None
+        assert ok(root, "Read", {"file_path": str(root / ".siclaw" / "knowledge" / "a.md")}) is None
+        assert ok(root, "Grep", {"path": ".siclaw/knowledge", "pattern": "/dev/infiniband"}) is None  # regex content, not a path
+        assert ok(root, "Glob", {"pattern": ".siclaw/knowledge/*.md"}) is None
+        # escapes: absolute out-of-root, ../ traversal, Glob absolute pattern
+        assert ok(root, "Read", {"file_path": "/work/candidate/index.md"}) == "file_path=/work/candidate/index.md"
+        assert ok(root, "Read", {"file_path": "../../work/raw/src.md"}) is not None
+        assert ok(root, "Grep", {"path": "/work"}) == "path=/work"
+        assert ok(root, "Glob", {"pattern": "/work/**/*.md"}) == "pattern=/work/**/*.md"
+        assert ok(root, "Glob", {"pattern": "../../etc/*.conf"}) == "pattern=../../etc/*.conf"
+
+        # the PreToolUse hook wraps the predicate into a deny decision
+        guard = compile_box._make_test_path_guard(root)
+        deny = await guard({"tool_name": "Read", "tool_input": {"file_path": "/work/raw/x.md"}}, "t1", None)
+        assert deny["hookSpecificOutput"]["permissionDecision"] == "deny", deny
+        allow = await guard({"tool_name": "Read", "tool_input": {"file_path": "index.md"}}, "t2", None)
+        assert allow == {}, allow
+
+        # Compile sessions use the same confinement over /work and do not expose
+        # Bash. The hook denies it too as defense-in-depth against profile drift.
+        assert "Bash" not in compile_box.DEFAULT_COMPILE_ALLOWED_TOOLS
+        compile_guard = compile_box._make_compile_path_guard(root)
+        deny = await compile_guard({"tool_name": "Read", "tool_input": {"file_path": "/etc/passwd"}}, "c1", None)
+        assert deny["hookSpecificOutput"]["permissionDecision"] == "deny", deny
+        deny = await compile_guard({"tool_name": "Bash", "tool_input": {"command": "env"}}, "c2", None)
+        assert deny["hookSpecificOutput"]["permissionDecision"] == "deny", deny
+        deny = await compile_guard({"tool_name": "Glob", "tool_input": {"pattern": "../outside/*"}}, "c2b", None)
+        assert deny["hookSpecificOutput"]["permissionDecision"] == "deny", deny
+        allow = await compile_guard({"tool_name": "Write", "tool_input": {"file_path": "candidate/a.md"}}, "c3", None)
+        assert allow == {}, allow
+
+        # A PDF-slice map session may read its assigned Raw PDF only with the
+        # exact pages from the validated plan. The same guard leaves unrelated
+        # workspace reads alone.
+        pdf = root / "raw" / "manual.pdf"
+        pdf.touch()
+        pdf_guard = compile_box._make_compile_path_guard(
+            root,
+            pdf_page_ranges={
+                "manual.pdf": {"start_page": 21, "end_page": 40, "part": 2, "parts": 3}
+            },
+        )
+        allow = await pdf_guard({
+            "tool_name": "Read",
+            "tool_input": {"file_path": "raw/manual.pdf", "pages": "21-40"},
+        }, "p1", None)
+        assert allow == {}, allow
+        for tool_input in (
+            {"file_path": "raw/manual.pdf"},
+            {"file_path": str(pdf), "pages": "1-20"},
+        ):
+            deny = await pdf_guard({"tool_name": "Read", "tool_input": tool_input}, "p2", None)
+            assert deny["hookSpecificOutput"]["permissionDecision"] == "deny", deny
+        allow = await pdf_guard({
+            "tool_name": "Read",
+            "tool_input": {"file_path": "candidate/index.md"},
+        }, "p3", None)
+        assert allow == {}, allow
+
+        # A NON-consulting structural scope stays mechanically
+        # confined to the validated Raw list. A text-slice batch omits the
+        # original Markdown and may read only its helper; a regular/PDF source
+        # remains directly readable. Directory or cwd-wide Grep cannot bypass
+        # the per-file Read boundary.
+        (root / "raw" / "other.md").touch()
+        scoped_guard = compile_box._make_compile_path_guard(
+            root, raw_scope={"account": ["manual.pdf"], "deny_read": [],
+                             "consult": False})
+        allow = await scoped_guard({
+            "tool_name": "Read",
+            "tool_input": {"file_path": "raw/manual.pdf"},
+        }, "s1", None)
+        assert allow == {}, allow
+        allow = await scoped_guard({
+            "tool_name": "Read",
+            "tool_input": {"file_path": "candidate/index.md"},
+        }, "s2", None)
+        assert allow == {}, allow
+        for tool_name, tool_input in (
+            ("Read", {"file_path": "raw/other.md"}),
+            ("Grep", {"pattern": "secret"}),
+            ("Grep", {"path": ".", "pattern": "secret"}),
+            ("Grep", {"path": "raw", "pattern": "secret"}),
+            ("Grep", {"path": "raw/other.md", "pattern": "secret"}),
+        ):
+            deny = await scoped_guard({
+                "tool_name": tool_name, "tool_input": tool_input,
+            }, "s3", None)
+            assert deny["hookSpecificOutput"]["permissionDecision"] == "deny", deny
+        allow = await scoped_guard({
+            "tool_name": "Grep",
+            "tool_input": {"path": "raw/manual.pdf", "pattern": "needle"},
+        }, "s4", None)
+        assert allow == {}, allow
+        deny_all_raw = compile_box._make_compile_path_guard(
+            root, raw_scope=compile_box.NO_RAW_SCOPE)
+        deny = await deny_all_raw({
+            "tool_name": "Read", "tool_input": {"file_path": "raw/manual.pdf"},
+        }, "s5", None)
+        assert deny["hookSpecificOutput"]["permissionDecision"] == "deny", deny
+
+        # A CONSULTING batch scope (the hook-guarded engine, i.e. every normal
+        # compile) may cross-read the corpus: the batch list is the deliverable,
+        # not the field of view. Only bounded-view originals stay denied, so a
+        # slice session still cannot pull the whole oversized file into context.
+        (root / "raw" / "huge.md").touch()
+        consult_guard = compile_box._make_compile_path_guard(
+            root, raw_scope={"account": ["manual.pdf"], "deny_read": ["huge.md"],
+                             "consult": True})
+        for tool_name, tool_input in (
+            ("Read", {"file_path": "raw/other.md"}),
+            ("Read", {"file_path": "raw/manual.pdf"}),
+            ("Grep", {"pattern": "who-embeds-this"}),
+            ("Grep", {"path": "raw", "pattern": "who-embeds-this"}),
+            ("Grep", {"path": ".", "pattern": "who-embeds-this"}),
+        ):
+            allow = await consult_guard({
+                "tool_name": tool_name, "tool_input": tool_input,
+            }, "s6", None)
+            assert allow == {}, (tool_name, tool_input, allow)
+        deny = await consult_guard({
+            "tool_name": "Read", "tool_input": {"file_path": "raw/huge.md"},
+        }, "s7", None)
+        assert deny["hookSpecificOutput"]["permissionDecision"] == "deny", deny
+
+        # raw/ is a frozen snapshot: writing there is always a mistake and a
+        # silent one (a mutated source still matches its own citation). The
+        # model's real work surface stays fully writable.
+        for tool_name, tool_input in (
+            ("Write", {"file_path": "raw/manual.pdf", "content": "x"}),
+            ("Edit", {"file_path": str(root / "raw" / "other.md")}),
+        ):
+            deny = await consult_guard({
+                "tool_name": tool_name, "tool_input": tool_input,
+            }, "s8", None)
+            assert deny["hookSpecificOutput"]["permissionDecision"] == "deny", deny
+        allow = await consult_guard({
+            "tool_name": "Write",
+            "tool_input": {"file_path": "candidate/p.md", "content": "x"},
+        }, "s9", None)
+        assert allow == {}, allow
+
+        # The recommendation session is narrower than a compiler: only raw/
+        # and candidate/ may inform the proposed test. Internal workflow,
+        # evaluation and release artifacts remain invisible to the red team.
+        recommend = compile_box._recommendation_path_escape
+        assert recommend(root, "Read", {"file_path": "raw/source.md"}) is None
+        assert recommend(root, "Read", {"file_path": "candidate/index.md"}) is None
+        assert recommend(root, "Grep", {"path": "raw", "pattern": "retry"}) is None
+        assert recommend(root, "Glob", {"pattern": "candidate/**/*.md"}) is None
+        assert recommend(root, "Glob", {"path": "raw", "pattern": "**/*.md"}) is None
+        # Claude Code commonly sends cwd as Glob.path and scopes the actual
+        # search in Glob.pattern. Judge both fields together: the pair is safe,
+        # while cwd + an unscoped wildcard is not.
+        assert recommend(root, "Glob", {"path": str(root), "pattern": "raw/**/*.md"}) is None
+        assert recommend(root, "Glob", {"path": str(root), "pattern": "candidate/**/*.md"}) is None
+        assert recommend(root, "Glob", {"path": str(root), "pattern": "**/*.md"}) is not None
+        assert recommend(root, "Glob", {"path": "raw", "pattern": "escape/**/*.md"}) is not None
+        assert recommend(root, "Glob", {"pattern": str(root / "raw" / "escape" / "**/*.md")}) is not None
+        assert recommend(root, "Read", {"file_path": "authoring/PLAN.md"}) is not None
+        assert recommend(root, "Read", {"file_path": "eval/TESTS.md"}) is not None
+        assert recommend(root, "Read", {"file_path": "release/bundle.json"}) is not None
+        assert recommend(root, "Grep", {"pattern": "reference"}) == "path=None"
+        assert recommend(root, "Glob", {"pattern": "**/*.md"}) == "pattern=**/*.md"
+        assert recommend(root, "Glob", {"pattern": "raw*/**/*.md"}) == "pattern=raw*/**/*.md"
+
+        recommendation_guard = compile_box._make_recommendation_path_guard(root)
+        deny = await recommendation_guard(
+            {"tool_name": "Read", "tool_input": {"file_path": "authoring/CLAUDE.md"}}, "r1", None)
+        assert deny["hookSpecificOutput"]["permissionDecision"] == "deny", deny
+        reason = deny["hookSpecificOutput"]["permissionDecisionReason"]
+        assert "raw/" in reason and "candidate/" in reason, reason
+        assert ".siclaw/knowledge/index.md" not in reason, reason
+        allow = await recommendation_guard(
+            {"tool_name": "Read", "tool_input": {"file_path": "raw/source.md"}}, "r2", None)
+        assert allow == {}, allow
+    print("✓ test-session path guard (C4): snapshot-confined, live /work denied")
+
+
+
+async def test_batch_planner_uses_compile_path_guard():
+    original = compile_box.create_agent_client
+    previous = os.environ.get("KBC_BATCH_PLANNER")
+    compile_box.create_agent_client = _FakeAgentClient
+    os.environ["KBC_BATCH_PLANNER"] = "model"
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            run = compile_box.CompileRun("planner-guard", td, 1)
+            await compile_box._plan_batches(run, [{"path": "a.md", "bytes": 10, "effective": 10}])
+            opts = _FakeAgentClient.last.options
+            assert tool_names(opts) == ["Read", "Write", "Glob"]
+            assert opts.model_config["model"]["id"] == pi_config.role_model("compile")
+            write = next(t for t in opts.tools if t.name == "Write")
+            try:
+                await write.handler({"file_path": "../outside.md", "content": "escape"})
+                raise AssertionError("planner escaped its workspace")
+            except PermissionError:
+                pass
+    finally:
+        compile_box.create_agent_client = original
+        if previous is None:
+            os.environ.pop("KBC_BATCH_PLANNER", None)
+        else:
+            os.environ["KBC_BATCH_PLANNER"] = previous
+
+
+
+def test_pack_candidates_to_wiki():
+    """_pack_candidates_to_wiki mirrors buildPublishBundleFromCandidates: candidate/
+    prefix stripped, only .md|.json, root index.md required, content byte-identical —
+    so the test session reads exactly what a publish would serve. Hash is stable."""
+    with tempfile.TemporaryDirectory() as wd, tempfile.TemporaryDirectory() as dest_root:
+        cand = Path(wd) / "candidate"
+        (cand / "sub").mkdir(parents=True)
+        (cand / "index.md").write_text("# index\n- [[roce-modes]]\n")
+        (cand / "roce-modes.md").write_text("# roce modes\nbody\n")
+        (cand / "meta.json").write_text('{"k":1}')
+        (cand / "ignore.txt").write_text("not a wiki file")
+        (cand / "sub" / "nested.md").write_text("# nested\n")
+        dest = Path(dest_root) / "snap"
+        h, pages = compile_box._pack_candidates_to_wiki(wd, dest)
+        kdir = dest / ".siclaw" / "knowledge"
+        # candidate/ stripped & rooted, byte-identical; .txt excluded; nesting kept
+        assert (kdir / "index.md").read_text() == "# index\n- [[roce-modes]]\n"
+        assert (kdir / "roce-modes.md").is_file()
+        assert (kdir / "meta.json").read_text() == '{"k":1}'
+        assert (kdir / "sub" / "nested.md").is_file()
+        assert not (kdir / "ignore.txt").exists()
+        assert pages == 4, pages
+        assert len(h) == 64, h
+        # deterministic: same draft → same hash
+        dest2 = Path(dest_root) / "snap2"
+        h2, _ = compile_box._pack_candidates_to_wiki(wd, dest2)
+        assert h == h2, (h, h2)
+
+    # no root index.md → error (cannot serve without an index)
+    with tempfile.TemporaryDirectory() as wd, tempfile.TemporaryDirectory() as dr:
+        (Path(wd) / "candidate").mkdir()
+        (Path(wd) / "candidate" / "page.md").write_text("x")
+        try:
+            compile_box._pack_candidates_to_wiki(wd, Path(dr) / "s")
+            assert False, "expected FileNotFoundError (no index)"
+        except FileNotFoundError:
+            pass
+    # no candidate pages at all → error
+    with tempfile.TemporaryDirectory() as wd, tempfile.TemporaryDirectory() as dr:
+        try:
+            compile_box._pack_candidates_to_wiki(wd, Path(dr) / "s")
+            assert False, "expected FileNotFoundError (no pages)"
+        except FileNotFoundError:
+            pass
+    print("✓ pack candidates to wiki (snapshot parity with publish)")
+
+
+def test_pack_candidates_symlink_confinement():
+    """Security: a compromised workspace can still contain a symlink, so a host file
+    into candidate/. The pinner must NOT copy content whose real path escapes
+    candidate/ — neither a file symlink nor a symlinked directory."""
+    with tempfile.TemporaryDirectory() as wd, tempfile.TemporaryDirectory() as dest_root, tempfile.TemporaryDirectory() as outside:
+        secret = Path(outside) / "secret.md"
+        secret.write_text("TOP-SECRET host content\n")
+        secret_dir = Path(outside) / "hostdir"
+        secret_dir.mkdir()
+        (secret_dir / "leak2.md").write_text("SECRET via symlinked dir\n")
+
+        cand = Path(wd) / "candidate"
+        cand.mkdir()
+        (cand / "index.md").write_text("# index\n")
+        (cand / "real.md").write_text("legit page\n")
+        # (a) file symlink escaping candidate/ (relative name, no "..", is_file() true)
+        os.symlink(secret, cand / "leak.md")
+        # (b) symlinked directory pointing outside candidate/
+        os.symlink(secret_dir, cand / "sub")
+
+        dest = Path(dest_root) / "snap"
+        h, pages = compile_box._pack_candidates_to_wiki(wd, dest)
+        kdir = dest / ".siclaw" / "knowledge"
+        # Only the two real pages are packed; neither symlink target leaked.
+        assert pages == 2, pages
+        assert (kdir / "index.md").is_file()
+        assert (kdir / "real.md").is_file()
+        assert not (kdir / "leak.md").exists(), "file symlink escaped confinement"
+        assert not (kdir / "sub" / "leak2.md").exists(), "symlinked dir escaped confinement"
+        # And the secret content never entered the snapshot bytes.
+        for p in kdir.rglob("*"):
+            if p.is_file():
+                assert "SECRET" not in p.read_text(), p
+    print("✓ pack candidates symlink confinement (no host-file exfil into snapshot)")
+
+
+
+async def test_test_session_driver_readonly():
+    original = compile_box.create_agent_client
+    compile_box.create_agent_client = _FakeAgentClient
+    try:
+        with tempfile.TemporaryDirectory() as snap:
+            run = compile_box.TestRun("t-drv", snap, parent_run_id="p1", snapshot_hash="h")
+            await compile_box.test_session_driver(run)
+            opts = _FakeAgentClient.last.options
+            assert tool_names(opts) == ["Read", "Glob", "Grep"]
+            assert opts.cwd == snap
+            assert opts.system_prompt == compile_box._prompt("test_role", None)
+            assert _FakeAgentClient.last.connected_prompt is None
+            read = next(t for t in opts.tools if t.name == "Read")
+            try:
+                await read.handler({"file_path": "../outside.md"})
+                raise AssertionError("consumer escaped its pinned snapshot")
+            except PermissionError:
+                pass
+            types = [event["type"] for event in _drain(run)]
+            assert {"session", "log", "turn_done"}.issubset(types)
+            assert run.session_id
+    finally:
+        compile_box.create_agent_client = original
+
+
+
+async def test_test_session_driver_uses_captured_contract():
+    original = compile_box.create_agent_client
+    compile_box.create_agent_client = _FakeAgentClient
+    try:
+        with tempfile.TemporaryDirectory() as snap:
+            run = compile_box.TestRun("t-contract", snap, parent_run_id="p1", snapshot_hash="h")
+            run.allowed_tools = ["Read", "Bash"]
+            run.consumer_model = pi_config.role_model("blue")
+            run.consumer_max_turns = 7
+            await compile_box.test_session_driver(run)
+            opts = _FakeAgentClient.last.options
+            assert tool_names(opts) == ["Read"]
+            assert opts.model_config["model"]["id"] == run.consumer_model
+            assert opts.max_model_calls == 7
+            run.consumer_model = "changed-catalog-model"
+            try:
+                compile_box._build_test_client(run, "rebuild")
+                raise AssertionError("captured model silently changed")
+            except ValueError:
+                pass
+    finally:
+        compile_box.create_agent_client = original
+
+
+async def test_open_close_test_session_http():
+    """POST /test-session pins the parent draft into a snapshot dir and starts a
+    session (200 + snapshot/consumer hashes + pages); unknown parent → 404;
+    missing index.md → 400; concurrency cap → 429; close tears down
+    (snapshot dir + registry entry gone)."""
+    orig = compile_box.create_agent_client
+    compile_box.create_agent_client = _FakeAgentClient
+    compile_box.RUNS.clear()
+    compile_box.TEST_SESSIONS.clear()
+    snap_root = tempfile.mkdtemp()
+    os.environ["KBC_TEST_SNAPSHOT_ROOT"] = snap_root
+    client = TestClient(TestServer(compile_box.build_app()))
+    await client.start_server()
+    try:
+        wd = tempfile.mkdtemp()
+        cand = Path(wd) / "candidate"
+        cand.mkdir()
+        (cand / "index.md").write_text("# index\n")
+        (cand / "p.md").write_text("# page\n")
+        compile_box.RUNS["p1"] = compile_box.CompileRun("p1", wd, 1)
+
+        # unknown parent run → 404
+        assert (await client.post("/test-session/nope")).status == 404
+
+        # open → 200 + snapshot materialized at .siclaw/knowledge/
+        r = await client.post("/test-session/p1")
+        assert r.status == 200, await r.text()
+        body = await r.json()
+        tid = body["test_session_id"]
+        assert body["pages"] == 2 and len(body["snapshot_hash"]) == 64, body
+        assert len(body["consumer_fingerprint"]) == 64, body
+        assert body["consumer_fingerprint"] == compile_box.TEST_SESSIONS[tid].consumer_fingerprint
+        kidx = Path(snap_root) / tid / ".siclaw" / "knowledge" / "index.md"
+        assert kidx.read_text() == "# index\n"
+
+        # close → teardown removes the snapshot dir + registry entry
+        assert (await client.post(f"/test-session/{tid}/close")).status == 200
+        assert tid not in compile_box.TEST_SESSIONS
+        assert not (Path(snap_root) / tid).exists()
+
+        # concurrency cap → 429 (deterministic: a non-done stub occupies the only slot)
+        os.environ["KBC_MAX_TEST_SESSIONS"] = "1"
+        compile_box.TEST_SESSIONS["busy"] = compile_box.TestRun("busy", "/tmp/x", "p1", "h")
+        capped = await client.post("/test-session/p1")
+        assert capped.status == 429
+        # structured error so the runtime maps a stable code + retriable=false
+        err = (await capped.json())["error"]
+        assert err["code"] == compile_box.TEST_SESSION_LIMIT_ERROR_CODE, err
+        assert err["retriable"] is False, err
+        assert "too many concurrent test session" in err["message"], err
+        compile_box.TEST_SESSIONS.clear()
+        os.environ.pop("KBC_MAX_TEST_SESSIONS", None)
+
+        # parent draft with no root index.md → 400
+        wd2 = tempfile.mkdtemp()
+        (Path(wd2) / "candidate").mkdir()
+        (Path(wd2) / "candidate" / "only.md").write_text("x")
+        compile_box.RUNS["p2"] = compile_box.CompileRun("p2", wd2, 1)
+        assert (await client.post("/test-session/p2")).status == 400
+
+        # consumer-provided snapshot bundle (e.g. a published version) → the box
+        # installs THAT instead of pinning candidate/, same hash formula.
+        vbundle = make_source_bundle({"index.md": "# v1 index\n", "gpu.md": "# gpu v1\n"})
+        r = await client.post("/test-session/p1", json={
+            "bundle_base64": base64.b64encode(vbundle).decode(),
+            "bundle_sha256": hashlib.sha256(vbundle).hexdigest(),
+        })
+        assert r.status == 200, await r.text()
+        vb = await r.json()
+        assert vb["pages"] == 2, vb
+        vtid = vb["test_session_id"]
+        vidx = Path(snap_root) / vtid / ".siclaw" / "knowledge" / "index.md"
+        assert vidx.read_text() == "# v1 index\n"
+        want = hashlib.sha256()
+        for rp, data in sorted([("gpu.md", b"# gpu v1\n"), ("index.md", b"# v1 index\n")]):
+            want.update(rp.encode()); want.update(b"\0"); want.update(data); want.update(b"\0")
+        assert vb["snapshot_hash"] == want.hexdigest(), vb
+        assert (await client.post(f"/test-session/{vtid}/close")).status == 200
+
+        # provided bundle missing index.md → 400, snapshot dir cleaned
+        nobidx = make_source_bundle({"only.md": "x"})
+        r = await client.post("/test-session/p1", json={"bundle_base64": base64.b64encode(nobidx).decode()})
+        assert r.status == 400, await r.text()
+
+        # sha mismatch → 400
+        r = await client.post("/test-session/p1", json={
+            "bundle_base64": base64.b64encode(vbundle).decode(),
+            "bundle_sha256": "0" * 64,
+        })
+        assert r.status == 400, await r.text()
+    finally:
+        await client.close()
+        compile_box.create_agent_client = orig
+        compile_box.RUNS.clear()
+        compile_box.TEST_SESSIONS.clear()
+        os.environ.pop("KBC_TEST_SNAPSHOT_ROOT", None)
+        os.environ.pop("KBC_MAX_TEST_SESSIONS", None)
+        shutil.rmtree(snap_root, ignore_errors=True)
+    print("✓ open/close test session over HTTP (snapshot pinned, cap, teardown)")
+
+
+class _AliveFakeClient:
+    """A test-session SDK stand-in that connects and then BLOCKS in receive
+    (emits nothing, session stays live / not-done) until disconnect. The default
+    _FakeAgentClient self-completes almost immediately, which would race the
+    idempotency replay against the session going done — this keeps it live so the
+    replay deterministically hits an active session."""
+
+    def __init__(self, **kwargs):
+        self.options = SimpleNamespace(**kwargs)
+        self._closed = asyncio.Event()
+
+    async def connect(self, prompt=None):
+        pass
+
+    async def query(self, text, session_id="default"):
+        pass
+
+    async def receive_messages(self):
+        await self._closed.wait()
+        return
+        yield  # unreachable; makes this an async generator
+
+    async def disconnect(self):
+        self._closed.set()
+
+
+async def test_open_test_session_idempotency():
+    """A retried testStart (same client_request_id) returns the SAME live session —
+    same tid/snapshot_hash/pages, flagged idempotent_replay, no new session, no new
+    concurrency slot. A different key opens a new session. Teardown drops the key
+    so a later same-key open starts fresh (never replays a dead tid)."""
+    orig = compile_box.create_agent_client
+    compile_box.create_agent_client = _AliveFakeClient
+    compile_box.RUNS.clear()
+    compile_box.TEST_SESSIONS.clear()
+    compile_box.TEST_SESSION_IDEMPOTENCY.clear()
+    snap_root = tempfile.mkdtemp()
+    os.environ["KBC_TEST_SNAPSHOT_ROOT"] = snap_root
+    os.environ["KBC_MAX_TEST_SESSIONS"] = "10"  # exercise idempotency, not the cap
+    client = TestClient(TestServer(compile_box.build_app()))
+    await client.start_server()
+
+    async def active():
+        return sum(1 for t in compile_box.TEST_SESSIONS.values() if not t.done)
+
+    try:
+        wd = tempfile.mkdtemp()
+        cand = Path(wd) / "candidate"
+        cand.mkdir()
+        (cand / "index.md").write_text("# index\n")
+        compile_box.RUNS["p1"] = compile_box.CompileRun("p1", wd, 1)
+
+        # first open with a key → a fresh session (idempotent_replay False)
+        b1 = await (await client.post("/test-session/p1", json={"client_request_id": "k-1"})).json()
+        tid1 = b1["test_session_id"]
+        assert b1["idempotent_replay"] is False, b1
+        n1 = await active()
+
+        # retry SAME key → same tid + snapshot_hash + pages, replay flagged, count unchanged
+        b2 = await (await client.post("/test-session/p1", json={"client_request_id": "k-1"})).json()
+        assert b2["test_session_id"] == tid1, (b1, b2)
+        assert b2["snapshot_hash"] == b1["snapshot_hash"] and b2["pages"] == b1["pages"], (b1, b2)
+        assert b2["idempotent_replay"] is True, b2
+        assert await active() == n1, "replay must not consume a new slot"
+        assert len(compile_box.TEST_SESSIONS) == 1, compile_box.TEST_SESSIONS
+
+        # a DIFFERENT key opens a new session
+        b3 = await (await client.post("/test-session/p1", json={"client_request_id": "k-2"})).json()
+        assert b3["test_session_id"] != tid1 and len(compile_box.TEST_SESSIONS) == 2
+
+        # teardown drops the key → the same key opens FRESH afterwards (no dead replay)
+        assert (await client.post(f"/test-session/{tid1}/close")).status == 200
+        assert "k-1" not in compile_box.TEST_SESSION_IDEMPOTENCY, compile_box.TEST_SESSION_IDEMPOTENCY
+        b4 = await (await client.post("/test-session/p1", json={"client_request_id": "k-1"})).json()
+        assert b4["test_session_id"] != tid1 and b4["idempotent_replay"] is False, b4
+
+        # no-key opens are never deduped (old-consumer behavior unchanged)
+        b5 = await (await client.post("/test-session/p1")).json()
+        b6 = await (await client.post("/test-session/p1")).json()
+        assert b5["test_session_id"] != b6["test_session_id"], (b5, b6)
+
+        for t in list(compile_box.TEST_SESSIONS.keys()):
+            await client.post(f"/test-session/{t}/close")
+    finally:
+        await client.close()
+        compile_box.create_agent_client = orig
+        compile_box.RUNS.clear()
+        compile_box.TEST_SESSIONS.clear()
+        compile_box.TEST_SESSION_IDEMPOTENCY.clear()
+        os.environ.pop("KBC_TEST_SNAPSHOT_ROOT", None)
+        os.environ.pop("KBC_MAX_TEST_SESSIONS", None)
+        shutil.rmtree(snap_root, ignore_errors=True)
+    print("✓ test-session open is idempotent per key (same tid, no new slot, replay flagged)")
+
+
+async def test_test_message_path():
+    """/test-message injects a user turn into a LIVE test session (200 + query
+    forwarded); an unknown test session → 404."""
+    compile_box.TEST_SESSIONS.clear()
+    client = TestClient(TestServer(compile_box.build_app()))
+    await client.start_server()
+    try:
+        assert (await client.post("/test-message/nope", json={"message": "hi"})).status == 404
+
+        class _C:
+            def __init__(self):
+                self.queries = []
+
+            async def query(self, text, session_id="default"):
+                self.queries.append(text)
+
+        run = compile_box.TestRun("tm1", "/tmp", "p1", "h")
+        fake = _C()
+        run.client = fake
+        run.connected.set()
+        compile_box.TEST_SESSIONS["tm1"] = run
+        r = await client.post("/test-message/tm1", json={"message": "what is roce?"})
+        assert r.status == 200, await r.text()
+        assert fake.queries == ["what is roce?"], fake.queries
+    finally:
+        await client.close()
+        compile_box.TEST_SESSIONS.clear()
+    print("✓ test-message injects a turn into a live test session")
+
+
+async def test_test_session_step_frames():
+    """Test sessions surface each consumer tool call as a display-ready `step`
+    frame (the collapsible retrieval trace in the test UI); compile runs never
+    do — their live contract stays log/turn_done. Labels route through _loc."""
+    async def drain(run):
+        evs = []
+        while not run.events.empty():
+            evs.append(run.events.get_nowait())
+        return evs
+
+    # zh consumer: localized labels; Read strips the dir prefix and .md
+    zh = compile_box.TestRun("t-step-zh", "/tmp", "p1", "h", locale="zh")
+    am = assistant_event("结论文本")
+    am.data["content"] = [
+        tool_block("Read", {"file_path": ".siclaw/knowledge/skill-guide.md"}),
+        tool_block("Grep", {"pattern": "重置卡"}),
+        text_block("结论文本"),
+    ]
+    await compile_box._emit_message(zh, am)
+    evs = await drain(zh)
+    steps = [e["text"] for e in evs if e["type"] == "step"]
+    assert steps == ["读「skill-guide」", "检索「重置卡」"], steps
+    logs = [e for e in evs if e["type"] == "log"]
+    assert len(logs) == 1 and logs[0]["text"] == "结论文本", evs
+
+    # platform default locale (en); unknown tool falls back to the generic label
+    en = compile_box.TestRun("t-step-en", "/tmp", "p1", "h")
+    am2 = assistant_event("x")
+    am2.data["content"] = [tool_block("Read", {"file_path": "index.md"}), tool_block("TodoWrite", {})]
+    await compile_box._emit_message(en, am2)
+    steps = [e["text"] for e in await drain(en) if e["type"] == "step"]
+    assert steps == ['Reading "index"', "Consulting material"], steps
+
+    # the SAME blocks on a compile run emit NO step frames (contract unchanged)
+    with tempfile.TemporaryDirectory() as td:
+        comp = compile_box.CompileRun("c-step", td, 1)
+        am3 = assistant_event("calling read")
+        am3.data["content"] = [tool_block("Read", {"file_path": "a.md"}), text_block("calling read")]
+        await compile_box._emit_message(comp, am3)
+        evs = await drain(comp)
+        assert all(e["type"] != "step" for e in evs), evs
+        assert any(e["type"] == "log" for e in evs), evs
+    print("✓ test-session step frames (retrieval trace); compile runs unaffected")
+
+
+class _TestStallFake:
+    """First query black-holes (receive blocks on a gate) so the watchdog must
+    reap it; interrupt() yields the torn-down result_event. A SECOND query
+    produces a real answer then closes → proves the session stayed live after the
+    reap (the whole point of defect 1: recover the UI without killing the session)."""
+
+    def __init__(self):
+        self.queries = []
+        self.interrupts = 0
+        self._gate = asyncio.Event()
+        self._mode = "idle"
+        self._closed = False
+
+    async def connect(self, prompt=None):
+        pass
+
+    async def query(self, text, session_id="default"):
+        self.queries.append(text)
+        if len(self.queries) == 1:
+            self._mode = "blackhole"          # no gate set → receive blocks (the wedge)
+        else:
+            self._mode = "produce"
+            self._gate.set()
+
+    async def interrupt(self):
+        self.interrupts += 1
+        self._mode = "interrupted"
+        self._gate.set()
+
+    async def receive_messages(self):
+        while not self._closed:
+            await self._gate.wait()
+            self._gate.clear()
+            if self._mode == "interrupted":
+                yield result_event()             # the reaped attempt ends
+            elif self._mode == "produce":
+                yield assistant_event("RoCE is a transport")
+                yield result_event()
+                self._closed = True
+                return
+
+    async def disconnect(self):
+        self._closed = True
+
+
+async def test_test_session_stall_reaps_turn_keeps_session_live():
+    """Defect 1: a black-holed test turn used to hang the UI on "思考中" forever —
+    the test path had no stall watchdog. Now a wedged turn is reaped (interrupt +
+    turn-level error + turn_done so the UI goes idle), and the session stays live:
+    a fresh question after the stall still gets a real answer. Also asserts the
+    turn.stalled / turn.done stdout lines carry tid+parent and NO user content."""
+    saved = (compile_box._TEST_MODEL_IDLE_TIMEOUT_S, compile_box._MODEL_WATCHDOG_POLL_S)
+    compile_box._TEST_MODEL_IDLE_TIMEOUT_S = 0.25
+    compile_box._MODEL_WATCHDOG_POLL_S = 0.03
+    buf = io.StringIO()
+    fake = _TestStallFake()
+    try:
+        with tempfile.TemporaryDirectory() as snap, contextlib.redirect_stdout(buf):
+            run = compile_box.TestRun("t-stall", snap, parent_run_id="p-stall", snapshot_hash="h")
+            run.client = fake
+            run.connected.set()
+            wdog = asyncio.create_task(compile_box._test_stall_watchdog(run))
+            consume = asyncio.create_task(compile_box._consume_test_turn_stream(run, fake))
+            try:
+                # turn 1 → black-holed; the watchdog must interrupt/reap it
+                compile_box._arm_test_turn(run)
+                await fake.query("what is roce?")
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline and fake.interrupts == 0:
+                    await asyncio.sleep(0.02)
+                assert fake.interrupts == 1, fake.interrupts
+                # turn 2 → the SAME live session answers a fresh question
+                compile_box._arm_test_turn(run)
+                await fake.query("again")
+                await asyncio.wait_for(consume, timeout=3)
+            finally:
+                run.done = True
+                wdog.cancel()
+                try:
+                    await wdog
+                except asyncio.CancelledError:
+                    pass
+        evs = _drain(run)
+        types = [e["type"] for e in evs]
+        assert "turn_stalled" in types and "error" in types and "turn_done" in types, types
+        td = next(e for e in evs if e["type"] == "turn_done")
+        assert "timed out" in td["text"], td       # UI-facing timeout wording (en default)
+        # the post-stall question produced a real answer → session stayed usable
+        assert any(e["type"] == "log" and "RoCE" in e.get("text", "") for e in evs), evs
+        assert fake.queries == ["what is roce?", "again"], fake.queries
+        out = buf.getvalue()
+        assert "turn.stalled tid=t-stall parent=p-stall" in out, out
+        assert "turn.done tid=t-stall parent=p-stall" in out, out
+        assert "roce" not in out.lower(), out    # never leak the question text to stdout
+    finally:
+        (compile_box._TEST_MODEL_IDLE_TIMEOUT_S, compile_box._MODEL_WATCHDOG_POLL_S) = saved
+    print("✓ test-session stall watchdog reaps a wedged turn and keeps the session live")
+
+
+_STREAM_STOP = object()
+
+
+class _QueuedFrameFake:
+    """A test-session SDK stand-in whose receive stream is fed one frame at a time
+    by the test via an asyncio.Queue. Unlike _TestStallFake's single _mode, this
+    lets a test enqueue a reaped turn's LATE frames (a partial + its torn-down
+    result_event) AFTER the next turn is armed, reproducing the exact stall→reap→
+    immediate-new-query→late-frame race. connect/query record only; interrupt is
+    counted but injects no frame (the test controls when the reaped result lands)."""
+
+    def __init__(self):
+        self.queries = []
+        self.interrupts = 0
+        self._q: asyncio.Queue = asyncio.Queue()
+
+    async def connect(self, prompt=None):
+        pass
+
+    async def query(self, text, session_id="default"):
+        self.queries.append(text)
+
+    async def interrupt(self):
+        self.interrupts += 1
+
+    def push(self, msg):
+        self._q.put_nowait(msg)
+
+    def close_stream(self):
+        self._q.put_nowait(_STREAM_STOP)
+
+    async def receive_messages(self):
+        while True:
+            msg = await self._q.get()
+            if msg is _STREAM_STOP:
+                return
+            yield msg
+
+    async def disconnect(self):
+        self.close_stream()
+
+
+async def test_test_session_late_reaped_frames_never_terminate_new_turn():
+    """Race guard (per-turn generation): the stall watchdog frees the UI the instant
+    it reaps a wedged turn, so a new /test-message can arm the NEXT turn before the
+    reaped turn's straggler frames (a partial + its interrupted result_event) drain
+    from the stream. Those stale frames must be dropped (logged), never fold into or
+    terminate the freshly-armed turn — the new answer must complete on its OWN result.
+    Drives the real watchdog for the reap, then injects the late frames deterministically."""
+    saved = (compile_box._TEST_MODEL_IDLE_TIMEOUT_S, compile_box._MODEL_WATCHDOG_POLL_S)
+    compile_box._TEST_MODEL_IDLE_TIMEOUT_S = 0.25
+    compile_box._MODEL_WATCHDOG_POLL_S = 0.03
+    buf = io.StringIO()
+    fake = _QueuedFrameFake()
+    try:
+        with tempfile.TemporaryDirectory() as snap, contextlib.redirect_stdout(buf):
+            run = compile_box.TestRun("t-race", snap, parent_run_id="p-race", snapshot_hash="h")
+            run.client = fake
+            run.connected.set()
+            wdog = asyncio.create_task(compile_box._test_stall_watchdog(run))
+            consume = asyncio.create_task(compile_box._consume_test_turn_stream(run, fake))
+            try:
+                # turn 1 (gen 1) black-holes (no frames pushed) → the watchdog reaps
+                # it: turn_done frees the UI, _stall_reaped set, interrupt() fired.
+                compile_box._arm_test_turn(run)
+                await fake.query("first question (black-holed)")
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline and fake.interrupts == 0:
+                    await asyncio.sleep(0.02)
+                assert fake.interrupts == 1, fake.interrupts
+                assert run._turn_generation == 1 and run._stall_reaped, run._turn_generation
+                # the reap is done; stop the watchdog so turn 2's controlled
+                # injection can't be spuriously reaped by idle timing.
+                wdog.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await wdog
+
+                # UI immediately asks the NEXT question → turn 2 (gen 2). This clears
+                # _stall_reaped, so ONLY the generation guard can protect turn 2.
+                compile_box._arm_test_turn(run)
+                await fake.query("second question (the real one)")
+                assert run._turn_generation == 2 and not run._stall_reaped
+
+                # NOW turn 1's stragglers arrive late — a partial then its torn-down
+                # result_event. Both belong to gen 1 < armed gen 2 → dropped.
+                fake.push(assistant_event("stale text from the reaped turn"))
+                fake.push(result_event())
+                drain_deadline = time.monotonic() + 3
+                while time.monotonic() < drain_deadline and run._results_seen < 1:
+                    await asyncio.sleep(0.01)
+                assert run._results_seen == 1, run._results_seen
+                # the late reaped result must NOT have terminated the live turn 2
+                assert run._turn_active is True, "a stale reaped frame terminated the new turn"
+
+                # turn 2's real answer completes the turn on its own result frame
+                fake.push(assistant_event("real answer for the second question"))
+                fake.push(result_event())
+                fake.close_stream()
+                await asyncio.wait_for(consume, timeout=3)
+            finally:
+                run.done = True
+                wdog.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await wdog
+        evs = _drain(run)
+        logs = [e["text"] for e in evs if e["type"] == "log"]
+        # the surviving turn answered with turn 2's text, never the reaped turn's
+        assert any("real answer for the second question" in t for t in logs), logs
+        assert not any("stale text from the reaped turn" in t for t in logs), logs
+        # exactly one clean turn_done carried turn 2's real answer (the reap emitted
+        # its own timeout turn_done earlier; turn 2 must not double- or mis-terminate)
+        clean_dones = [e for e in evs if e["type"] == "turn_done"
+                       and "real answer for the second question" in e.get("text", "")]
+        assert len(clean_dones) == 1, [e for e in evs if e["type"] == "turn_done"]
+        assert run._turn_active is False, run._turn_active
+        out = buf.getvalue()
+        # both reaped stragglers were dropped as stale and logged with tid+parent
+        assert out.count("turn.stale_frame_dropped tid=t-race parent=p-race") == 2, out
+        assert "answer" not in out.lower() and "question" not in out.lower(), out  # no content leak
+    finally:
+        (compile_box._TEST_MODEL_IDLE_TIMEOUT_S, compile_box._MODEL_WATCHDOG_POLL_S) = saved
+    print("✓ test-session late reaped frames are dropped, never terminate the freshly-armed turn")
+
+
+class _RebuildFake:
+    """Multi-epoch test-session SDK stand-in for the client-rebuild P1. The FIRST
+    connected instance black-holes its first query (forcing a stall reap); its
+    interrupt() behaviour is scenario-driven:
+      - "interrupt_fails":      interrupt() RAISES → the torn-down result can never
+                                come, so the watchdog flags a rebuild at once.
+      - "terminator_never":     interrupt() is accepted but no result_event is ever
+                                delivered → the post-interrupt window elapses → rebuild.
+      - "terminator_in_window": interrupt() delivers the torn-down result_event →
+                                the generation stream realigns → NO rebuild.
+    A SECOND instance (built by the driver's rebuild) answers the next turn normally.
+    Instances are tracked class-side so a test asserts how many connects happened
+    (2 = a rebuild occurred; 1 = the existing drop path handled it)."""
+
+    instances: list = []
+    scenario = "interrupt_fails"
+
+    def __init__(self, **kwargs):
+        self.options = SimpleNamespace(**kwargs)
+        self.idx = len(_RebuildFake.instances)
+        _RebuildFake.instances.append(self)
+        self.queries = []
+        self.interrupts = 0
+        self._q: asyncio.Queue = asyncio.Queue()
+        self._closed = False
+
+    async def connect(self, prompt=None):
+        pass
+
+    async def query(self, text, session_id="default"):
+        self.queries.append(text)
+        if self.idx == 0 and len(self.queries) == 1:
+            return  # first turn on the first client black-holes (push nothing)
+        self._q.put_nowait(assistant_event("answer: " + text))
+        self._q.put_nowait(result_event())
+
+    async def interrupt(self):
+        self.interrupts += 1
+        if _RebuildFake.scenario == "interrupt_fails":
+            raise RuntimeError("interrupt swallowed by the black hole")
+        if _RebuildFake.scenario == "terminator_in_window":
+            self._q.put_nowait(result_event())  # the torn-down terminator lands
+        # "terminator_never": accepted, but nothing is ever delivered
+
+    async def receive_messages(self):
+        while not self._closed:
+            msg = await self._q.get()
+            if msg is _STREAM_STOP:
+                return
+            yield msg
+
+    async def disconnect(self):
+        self._closed = True
+        self._q.put_nowait(_STREAM_STOP)
+
+
+class _RetryRebuildFake:
+    """Rebuild-retry stand-in: instance 0 connects fine but black-holes turn 1 and
+    its interrupt() raises (forcing a rebuild); instance 1 — the rebuild's
+    reconnect — FAILS to connect (a transient error); instance 2 connects and
+    answers normally. Exercises the failed-rebuild retry path end to end."""
+
+    instances: list = []
+
+    def __init__(self, **kwargs):
+        self.options = SimpleNamespace(**kwargs)
+        self.idx = len(_RetryRebuildFake.instances)
+        _RetryRebuildFake.instances.append(self)
+        self.queries = []
+        self._q: asyncio.Queue = asyncio.Queue()
+        self._closed = False
+
+    async def connect(self, prompt=None):
+        if self.idx == 1:
+            raise RuntimeError("transient reconnect failure")
+
+    async def query(self, text, session_id="default"):
+        self.queries.append(text)
+        if self.idx == 0:
+            return  # black-hole every turn on the doomed first client
+        self._q.put_nowait(assistant_event("answer: " + text))
+        self._q.put_nowait(result_event())
+
+    async def interrupt(self):
+        raise RuntimeError("interrupt swallowed by the black hole")
+
+    async def receive_messages(self):
+        while not self._closed:
+            msg = await self._q.get()
+            if msg is _STREAM_STOP:
+                return
+            yield msg
+
+    async def disconnect(self):
+        self._closed = True
+        self._q.put_nowait(_STREAM_STOP)
+
+
+class _ImmediateRetryFake:
+    """Immediate-retry-within-window stand-in: instance 0 black-holes query 1;
+    its interrupt() is ACCEPTED but the torn-down result_event never arrives
+    (terminator lost, window pending). Any LATER query on instance 0 answers
+    normally — pre-fix, those frames landed while the window was still pending
+    and were dropped one generation behind, with their result_event mistaken
+    for the lost terminator. Instance 1 (the rebuild) answers normally."""
+
+    instances: list = []
+
+    def __init__(self, **kwargs):
+        self.options = SimpleNamespace(**kwargs)
+        self.idx = len(_ImmediateRetryFake.instances)
+        _ImmediateRetryFake.instances.append(self)
+        self.queries = []
+        self._q: asyncio.Queue = asyncio.Queue()
+        self._closed = False
+
+    async def connect(self, prompt=None):
+        pass
+
+    async def query(self, text, session_id="default"):
+        self.queries.append(text)
+        if self.idx == 0 and len(self.queries) == 1:
+            return  # black-hole the first turn only
+        self._q.put_nowait(assistant_event("answer: " + text))
+        self._q.put_nowait(result_event())
+
+    async def interrupt(self):
+        pass  # accepted — but no torn-down result_event is ever delivered
+
+    async def receive_messages(self):
+        while not self._closed:
+            msg = await self._q.get()
+            if msg is _STREAM_STOP:
+                return
+            yield msg
+
+    async def disconnect(self):
+        self._closed = True
+        self._q.put_nowait(_STREAM_STOP)
+
+
+class _BlockedInterruptFake:
+    """Reap-to-arm race stand-in: instance 0 black-holes query 1 and its
+    interrupt() BLOCKS until the test releases it (a slow SDK round-trip) —
+    modelling the gap in which the UI has already received the stall turn_done
+    but the terminator window used to be armed only after interrupt() returned.
+    A retry landing in that gap must still be gated. Later queries on instance 0
+    answer normally (pre-fix, they were the frames dropped one generation
+    behind). Instance 1 (the rebuild) answers normally."""
+
+    instances: list = []
+    interrupt_entered: asyncio.Event
+    interrupt_release: asyncio.Event
+
+    def __init__(self, **kwargs):
+        self.options = SimpleNamespace(**kwargs)
+        self.idx = len(_BlockedInterruptFake.instances)
+        _BlockedInterruptFake.instances.append(self)
+        self.queries = []
+        self._q: asyncio.Queue = asyncio.Queue()
+        self._closed = False
+
+    async def connect(self, prompt=None):
+        pass
+
+    async def query(self, text, session_id="default"):
+        self.queries.append(text)
+        if self.idx == 0 and len(self.queries) == 1:
+            return  # black-hole the first turn only
+        self._q.put_nowait(assistant_event("answer: " + text))
+        self._q.put_nowait(result_event())
+
+    async def interrupt(self):
+        _BlockedInterruptFake.interrupt_entered.set()
+        await _BlockedInterruptFake.interrupt_release.wait()
+        # released: accepted, but the torn-down result_event never arrives
+
+    async def receive_messages(self):
+        while not self._closed:
+            msg = await self._q.get()
+            if msg is _STREAM_STOP:
+                return
+            yield msg
+
+    async def disconnect(self):
+        self._closed = True
+        self._q.put_nowait(_STREAM_STOP)
+
+
+async def _await(cond, *, timeout=3.0, poll=0.02):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if cond():
+            return True
+        await asyncio.sleep(poll)
+    return False
+
+
+async def _drive_rebuild_scenario(scenario):
+    """Boot a real test session (driver + watchdog via _test_session_wrapper) over
+    a _RebuildFake, black-hole turn 1, let the watchdog reap it, then reproduce the
+    NEXT /test-message exactly as handle_test_message does (rebuild-if-flagged →
+    arm → query). Returns (run, buf, rebuilt) where rebuilt says a reconnect
+    happened. Caller drains + asserts, then this restores globals."""
+    saved = (compile_box._TEST_MODEL_IDLE_TIMEOUT_S,
+             compile_box._MODEL_WATCHDOG_POLL_S,
+             compile_box._TEST_STALL_REBUILD_WINDOW_S,
+             compile_box.create_agent_client)
+    compile_box._TEST_MODEL_IDLE_TIMEOUT_S = 0.25
+    compile_box._MODEL_WATCHDOG_POLL_S = 0.03
+    compile_box._TEST_STALL_REBUILD_WINDOW_S = 0.2
+    _RebuildFake.instances = []
+    _RebuildFake.scenario = scenario
+    compile_box.create_agent_client = _RebuildFake
+    buf = io.StringIO()
+    snap = tempfile.mkdtemp()
+    run = compile_box.TestRun("t-rb", snap, parent_run_id="p-rb", snapshot_hash="h")
+    try:
+        with contextlib.redirect_stdout(buf):
+            run.task = asyncio.create_task(compile_box._test_session_wrapper(run))
+            assert await compile_box._await_session_live(run) is None
+            # turn 1 → black-holed; the watchdog must reap it
+            compile_box._arm_test_turn(run)
+            await run.client.query("first question")
+            assert await _await(lambda: _RebuildFake.instances[0].interrupts == 1), "turn 1 was never reaped"
+            # the rebuild decision settles asynchronously (immediately for a failed
+            # interrupt, after the window for a lost terminator, never in-window)
+            if scenario == "terminator_in_window":
+                assert await _await(lambda: run._results_seen >= 1), "the in-window terminator was not consumed"
+                await asyncio.sleep(compile_box._TEST_STALL_REBUILD_WINDOW_S + 0.2)  # let the window pass
+                assert run._needs_rebuild is False, "an in-window terminator must NOT force a rebuild"
+            else:
+                assert await _await(lambda: run._needs_rebuild), f"{scenario}: rebuild was never flagged"
+
+            # the NEXT /test-message: mirror handle_test_message's decision path
+            rebuilt = run._needs_rebuild
+            if run._needs_rebuild:
+                assert await compile_box._rebuild_test_client(run) is None, "rebuild reported an error"
+            compile_box._arm_test_turn(run)
+            await run.client.query("second question")
+            assert await _await(lambda: run._turn_active is False and run._results_seen >= 1), "turn 2 never completed"
+        evs = _drain(run)
+        return run, buf, rebuilt, evs
+    finally:
+        run.done = True
+        if run.task and not run.task.done():
+            run.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await run.task
+        shutil.rmtree(snap, ignore_errors=True)
+        (compile_box._TEST_MODEL_IDLE_TIMEOUT_S,
+         compile_box._MODEL_WATCHDOG_POLL_S,
+         compile_box._TEST_STALL_REBUILD_WINDOW_S,
+         compile_box.create_agent_client) = saved
+
+
+async def test_test_session_rebuild_after_failed_interrupt():
+    """Review P1 (a): the stall reaper's interrupt() can FAIL, so the wedged turn's
+    torn-down result_event never arrives — _results_seen can never catch up to the
+    armed generation, and every later turn would be dropped forever. The watchdog
+    now flags _needs_rebuild the instant interrupt() raises; the next /test-message
+    reconnects a fresh SDK client (2nd connect) with a clean generation, and the new
+    turn answers normally on it."""
+    run, buf, rebuilt, evs = await _drive_rebuild_scenario("interrupt_fails")
+    assert rebuilt is True, "a failed interrupt must trigger a client rebuild"
+    assert len(_RebuildFake.instances) == 2, _RebuildFake.instances  # reconnected
+    logs = [e["text"] for e in evs if e["type"] == "log"]
+    assert any("answer: second question" in t for t in logs), logs
+    assert any(e["type"] == "turn_done" and "answer: second question" in e.get("text", "") for e in evs), evs
+    out = buf.getvalue()
+    assert "turn.rebuild_armed tid=t-rb parent=p-rb reason=interrupt_failed" in out, out
+    assert "turn.rebuilt tid=t-rb parent=p-rb" in out, out
+    assert "question" not in out.lower() and "answer" not in out.lower(), out  # no content leak
+    print("✓ test-session rebuild: a failed stall interrupt reconnects a clean client")
+
+
+async def test_test_session_rebuild_after_lost_terminator():
+    """Review P1 (b): interrupt() is ACCEPTED but its torn-down result_event never
+    lands (a true black-hole swallows it too). The post-interrupt window elapses
+    with _results_seen unchanged → the watchdog flags a rebuild → the next
+    /test-message reconnects a fresh client and the new turn answers normally."""
+    run, buf, rebuilt, evs = await _drive_rebuild_scenario("terminator_never")
+    assert rebuilt is True, "a lost terminator must trigger a client rebuild"
+    assert len(_RebuildFake.instances) == 2, _RebuildFake.instances  # reconnected
+    logs = [e["text"] for e in evs if e["type"] == "log"]
+    assert any("answer: second question" in t for t in logs), logs
+    out = buf.getvalue()
+    assert "turn.rebuild_armed tid=t-rb parent=p-rb reason=terminator_lost" in out, out
+    assert "turn.rebuilt tid=t-rb parent=p-rb" in out, out
+    print("✓ test-session rebuild: a lost stall terminator reconnects after the window")
+
+
+async def test_test_session_terminator_in_window_no_rebuild():
+    """Review P1 (c) — regression guard: when interrupt() DOES deliver the torn-down
+    result_event within the window, _results_seen realigns, no rebuild is flagged,
+    and the next turn is served on the SAME client via the existing generation-drop
+    path (only ONE connect ever happens)."""
+    run, buf, rebuilt, evs = await _drive_rebuild_scenario("terminator_in_window")
+    assert rebuilt is False, "an in-window terminator must NOT rebuild"
+    assert len(_RebuildFake.instances) == 1, _RebuildFake.instances  # no reconnect
+    logs = [e["text"] for e in evs if e["type"] == "log"]
+    assert any("answer: second question" in t for t in logs), logs
+    out = buf.getvalue()
+    assert "turn.rebuild_armed" not in out, out
+    assert "turn.rebuilt" not in out, out
+    print("✓ test-session no rebuild: an in-window stall terminator keeps the same client")
+
+
+async def test_test_session_immediate_retry_within_terminator_window():
+    """Review P1: interrupt() succeeds but the reaped turn's terminator is lost,
+    and the user retries IMMEDIATELY after the stall turn_done — inside the
+    pending-terminator window. Pre-fix, arming that retry on the old client
+    counted its frames one generation behind (all silently dropped), and its own
+    result_event was mistaken for the lost terminator, cancelling the rebuild
+    decision: the user's valid retry was never displayed and timed out again.
+    Now /test-message treats an unresolved window like _needs_rebuild: the retry
+    rebuilds a fresh client, exactly ONE stall timeout is ever surfaced, and the
+    second question is answered normally."""
+    saved = (compile_box._TEST_MODEL_IDLE_TIMEOUT_S,
+             compile_box._MODEL_WATCHDOG_POLL_S,
+             compile_box._TEST_STALL_REBUILD_WINDOW_S,
+             compile_box.create_agent_client)
+    compile_box._TEST_MODEL_IDLE_TIMEOUT_S = 0.25
+    compile_box._MODEL_WATCHDOG_POLL_S = 0.03
+    compile_box._TEST_STALL_REBUILD_WINDOW_S = 5.0  # wide: the retry always lands inside it
+    _ImmediateRetryFake.instances = []
+    compile_box.create_agent_client = _ImmediateRetryFake
+    compile_box.TEST_SESSIONS.clear()
+    buf = io.StringIO()
+    snap = tempfile.mkdtemp()
+    client = TestClient(TestServer(compile_box.build_app()))
+    await client.start_server()
+    run = compile_box.TestRun("t-ir", snap, parent_run_id="p-ir", snapshot_hash="h")
+    compile_box.TEST_SESSIONS["t-ir"] = run
+    try:
+        with contextlib.redirect_stdout(buf):
+            run.task = asyncio.create_task(compile_box._test_session_wrapper(run))
+            assert await compile_box._await_session_live(run) is None
+            r1 = await client.post("/test-message/t-ir", json={"message": "first question"})
+            assert r1.status == 200, await r1.text()
+            # the stall reap frees the UI (turn_done) and arms the terminator window
+            assert await _await(lambda: run._pending_terminator_deadline is not None), \
+                "the stall was never reaped / the window never armed"
+            # the UI retries at once, well inside the window
+            r2 = await client.post("/test-message/t-ir", json={"message": "second question"})
+            assert r2.status == 200, await r2.text()
+            assert await _await(lambda: run._turn_active is False and run._results_seen >= 1), \
+                "the immediate retry never completed"
+        evs = _drain(run)
+        stalls = [e for e in evs if e["type"] == "turn_stalled"]
+        assert len(stalls) == 1, stalls  # exactly one timeout ever surfaced
+        logs = [e["text"] for e in evs if e["type"] == "log"]
+        assert any("answer: second question" in t for t in logs), logs
+        assert any(e["type"] == "turn_done" and "answer: second question" in e.get("text", "")
+                   for e in evs), evs
+        assert len(_ImmediateRetryFake.instances) == 2, _ImmediateRetryFake.instances  # rebuilt
+        out = buf.getvalue()
+        assert "turn.rebuilt tid=t-ir" in out, out
+        assert "turn.stale_frame_dropped" not in out, out  # the retry's frames were never eaten
+        assert "question" not in out.lower() and "answer" not in out.lower(), out  # no content leak
+    finally:
+        run.done = True
+        if run.task and not run.task.done():
+            run.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await run.task
+        await client.close()
+        compile_box.TEST_SESSIONS.clear()
+        shutil.rmtree(snap, ignore_errors=True)
+        (compile_box._TEST_MODEL_IDLE_TIMEOUT_S,
+         compile_box._MODEL_WATCHDOG_POLL_S,
+         compile_box._TEST_STALL_REBUILD_WINDOW_S,
+         compile_box.create_agent_client) = saved
+    print("✓ test-session immediate retry inside the terminator window rebuilds; one timeout, answer shown")
+
+
+async def test_test_session_retry_during_interrupt_in_flight():
+    """Review (Medium): the stall reaper frees the UI (turn_done) BEFORE awaiting
+    interrupt(), so a retry can land while interrupt() is still in flight. The
+    window used to be armed only after interrupt() returned — a retry in that gap
+    saw neither _needs_rebuild nor a pending window, armed a misaligned turn on
+    the wedged client, and (with the terminator lost) every later frame was
+    silently dropped until the idle TTL, while the retry's own result_event
+    impersonated the lost terminator and cancelled the rebuild decision. The
+    window is now armed at the reap itself (before any await) and the resolver
+    compares against the reaped turn's generation, so the in-flight-interrupt
+    retry rebuilds a fresh client: exactly one stall, the retry's answer is
+    displayed."""
+    saved = (compile_box._TEST_MODEL_IDLE_TIMEOUT_S,
+             compile_box._MODEL_WATCHDOG_POLL_S,
+             compile_box._TEST_STALL_REBUILD_WINDOW_S,
+             compile_box.create_agent_client)
+    compile_box._TEST_MODEL_IDLE_TIMEOUT_S = 0.25
+    compile_box._MODEL_WATCHDOG_POLL_S = 0.03
+    compile_box._TEST_STALL_REBUILD_WINDOW_S = 5.0
+    _BlockedInterruptFake.instances = []
+    _BlockedInterruptFake.interrupt_entered = asyncio.Event()
+    _BlockedInterruptFake.interrupt_release = asyncio.Event()
+    compile_box.create_agent_client = _BlockedInterruptFake
+    compile_box.TEST_SESSIONS.clear()
+    buf = io.StringIO()
+    snap = tempfile.mkdtemp()
+    client = TestClient(TestServer(compile_box.build_app()))
+    await client.start_server()
+    run = compile_box.TestRun("t-race2", snap, parent_run_id="p-race2", snapshot_hash="h")
+    compile_box.TEST_SESSIONS["t-race2"] = run
+    try:
+        with contextlib.redirect_stdout(buf):
+            run.task = asyncio.create_task(compile_box._test_session_wrapper(run))
+            assert await compile_box._await_session_live(run) is None
+            r1 = await client.post("/test-message/t-race2", json={"message": "first question"})
+            assert r1.status == 200, await r1.text()
+            # the reap has emitted turn_done and is now parked INSIDE interrupt()
+            await asyncio.wait_for(_BlockedInterruptFake.interrupt_entered.wait(), timeout=3)
+            # the user retries in exactly that gap
+            r2 = await client.post("/test-message/t-race2", json={"message": "second question"})
+            assert r2.status == 200, await r2.text()
+            assert await _await(lambda: run._turn_active is False and run._results_seen >= 1), \
+                "the in-gap retry never completed"
+            _BlockedInterruptFake.interrupt_release.set()   # let the reaper's interrupt return
+            await asyncio.sleep(0.2)                        # give the watchdog a settle beat
+        evs = _drain(run)
+        stalls = [e for e in evs if e["type"] == "turn_stalled"]
+        assert len(stalls) == 1, stalls
+        logs = [e["text"] for e in evs if e["type"] == "log"]
+        assert any("answer: second question" in t for t in logs), logs
+        assert len(_BlockedInterruptFake.instances) == 2, _BlockedInterruptFake.instances  # rebuilt
+        out = buf.getvalue()
+        assert "turn.rebuilt tid=t-race2" in out, out
+        assert "turn.stale_frame_dropped" not in out, out
+        assert "question" not in out.lower() and "answer" not in out.lower(), out  # no content leak
+    finally:
+        _BlockedInterruptFake.interrupt_release.set()
+        run.done = True
+        if run.task and not run.task.done():
+            run.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await run.task
+        await client.close()
+        compile_box.TEST_SESSIONS.clear()
+        shutil.rmtree(snap, ignore_errors=True)
+        (compile_box._TEST_MODEL_IDLE_TIMEOUT_S,
+         compile_box._MODEL_WATCHDOG_POLL_S,
+         compile_box._TEST_STALL_REBUILD_WINDOW_S,
+         compile_box.create_agent_client) = saved
+    print("✓ test-session retry during an in-flight interrupt rebuilds; one stall, answer shown")
+
+
+async def test_test_session_rebuild_retry_after_failed_reconnect():
+    """Review P1: a rebuild whose reconnect FAILS must stay retryable over HTTP.
+    After a failed reconnect the driver clears `connected` and parks until the next
+    rebuild request, so /test-message must consult _needs_rebuild BEFORE the
+    liveness gate — gating on `connected` first turns every retry into a connect
+    timeout → 503 "session is still starting" and the retry logic never runs (the
+    session is then stuck until the idle TTL). First retry → 503 rebuild failed
+    (flag re-armed); second retry → fresh client, 200, turn answered on it."""
+    saved = (compile_box._TEST_MODEL_IDLE_TIMEOUT_S,
+             compile_box._MODEL_WATCHDOG_POLL_S,
+             compile_box._TEST_STALL_REBUILD_WINDOW_S,
+             compile_box.create_agent_client)
+    compile_box._TEST_MODEL_IDLE_TIMEOUT_S = 0.25
+    compile_box._MODEL_WATCHDOG_POLL_S = 0.03
+    compile_box._TEST_STALL_REBUILD_WINDOW_S = 0.2
+    _RetryRebuildFake.instances = []
+    compile_box.create_agent_client = _RetryRebuildFake
+    # keep the pre-fix failure mode fast: the old ordering would eat this timeout
+    # on every retry instead of ever reaching the rebuild
+    os.environ["KBC_CONNECT_TIMEOUT_SECS"] = "1"
+    compile_box.TEST_SESSIONS.clear()
+    buf = io.StringIO()
+    snap = tempfile.mkdtemp()
+    client = TestClient(TestServer(compile_box.build_app()))
+    await client.start_server()
+    run = compile_box.TestRun("t-rr", snap, parent_run_id="p-rr", snapshot_hash="h")
+    compile_box.TEST_SESSIONS["t-rr"] = run
+    try:
+        with contextlib.redirect_stdout(buf):
+            run.task = asyncio.create_task(compile_box._test_session_wrapper(run))
+            assert await compile_box._await_session_live(run) is None
+            # turn 1 black-holes; the watchdog reaps it and interrupt() raises → rebuild flagged
+            r1 = await client.post("/test-message/t-rr", json={"message": "first question"})
+            assert r1.status == 200, await r1.text()
+            assert await _await(lambda: run._needs_rebuild), "rebuild was never flagged"
+
+            # retry 1: the rebuild's reconnect fails (instance 1) → an immediate
+            # retryable 503, NOT a liveness-gate timeout
+            r2 = await client.post("/test-message/t-rr", json={"message": "second question"})
+            assert r2.status == 503, await r2.text()
+            assert "rebuild failed" in (await r2.json())["error"], await r2.text()
+            assert run._needs_rebuild is True, "a failed rebuild must re-arm the flag for the next retry"
+
+            # retry 2: the rebuild succeeds (instance 2) and the turn is answered on it
+            r3 = await client.post("/test-message/t-rr", json={"message": "third question"})
+            assert r3.status == 200, await r3.text()
+            assert await _await(lambda: run._turn_active is False and run._results_seen >= 1), \
+                "the retried turn never completed"
+        evs = _drain(run)
+        logs = [e["text"] for e in evs if e["type"] == "log"]
+        assert any("answer: third question" in t for t in logs), logs
+        assert len(_RetryRebuildFake.instances) == 3, _RetryRebuildFake.instances
+        out = buf.getvalue()
+        assert "turn.rebuild_failed tid=t-rr" in out, out
+        assert "turn.rebuilt tid=t-rr" in out, out
+        assert "question" not in out.lower() and "answer" not in out.lower(), out  # no content leak
+    finally:
+        run.done = True
+        if run.task and not run.task.done():
+            run.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await run.task
+        await client.close()
+        compile_box.TEST_SESSIONS.clear()
+        os.environ.pop("KBC_CONNECT_TIMEOUT_SECS", None)
+        shutil.rmtree(snap, ignore_errors=True)
+        (compile_box._TEST_MODEL_IDLE_TIMEOUT_S,
+         compile_box._MODEL_WATCHDOG_POLL_S,
+         compile_box._TEST_STALL_REBUILD_WINDOW_S,
+         compile_box.create_agent_client) = saved
+    print("✓ test-session rebuild retry: a failed reconnect 503s fast and the next retry rebuilds")
+
+
+async def test_open_test_session_idempotency_is_run_scoped():
+    """P1: the open-test dedup key is (parent_run_id, client_request_id). On a shared
+    box two runs that mint the SAME client_request_id must each open their OWN session
+    (no cross-run aliasing of tid/snapshot/fingerprint); the same key on the SAME run
+    still replays. Teardown drops only the run-scoped key."""
+    orig = compile_box.create_agent_client
+    compile_box.create_agent_client = _AliveFakeClient
+    compile_box.RUNS.clear()
+    compile_box.TEST_SESSIONS.clear()
+    compile_box.TEST_SESSION_IDEMPOTENCY.clear()
+    snap_root = tempfile.mkdtemp()
+    os.environ["KBC_TEST_SNAPSHOT_ROOT"] = snap_root
+    os.environ["KBC_MAX_TEST_SESSIONS"] = "10"  # exercise idempotency, not the cap
+    client = TestClient(TestServer(compile_box.build_app()))
+    await client.start_server()
+    try:
+        for rid in ("p1", "p2"):
+            wd = tempfile.mkdtemp()
+            cand = Path(wd) / "candidate"
+            cand.mkdir()
+            (cand / "index.md").write_text(f"# index {rid}\n")
+            compile_box.RUNS[rid] = compile_box.CompileRun(rid, wd, 1)
+
+        # SAME client_request_id on TWO different runs → two DISTINCT fresh sessions
+        a = await (await client.post("/test-session/p1", json={"client_request_id": "shared"})).json()
+        b = await (await client.post("/test-session/p2", json={"client_request_id": "shared"})).json()
+        assert a["test_session_id"] != b["test_session_id"], (a, b)
+        assert a["idempotent_replay"] is False and b["idempotent_replay"] is False, (a, b)
+        assert len(compile_box.TEST_SESSIONS) == 2, compile_box.TEST_SESSIONS
+        # the two run-scoped keys coexist, each pointing at its own run's session
+        assert compile_box.TEST_SESSION_IDEMPOTENCY[("p1", "shared")] == a["test_session_id"]
+        assert compile_box.TEST_SESSION_IDEMPOTENCY[("p2", "shared")] == b["test_session_id"]
+
+        # same key + SAME run → replay of THAT run's session (never the other run's)
+        a2 = await (await client.post("/test-session/p1", json={"client_request_id": "shared"})).json()
+        assert a2["test_session_id"] == a["test_session_id"] and a2["idempotent_replay"] is True, (a, a2)
+        assert len(compile_box.TEST_SESSIONS) == 2, "replay must not open a new session"
+
+        for t in list(compile_box.TEST_SESSIONS.keys()):
+            await client.post(f"/test-session/{t}/close")
+        # teardown removed both run-scoped keys
+        assert compile_box.TEST_SESSION_IDEMPOTENCY == {}, compile_box.TEST_SESSION_IDEMPOTENCY
+    finally:
+        await client.close()
+        compile_box.create_agent_client = orig
+        compile_box.RUNS.clear()
+        compile_box.TEST_SESSIONS.clear()
+        compile_box.TEST_SESSION_IDEMPOTENCY.clear()
+        os.environ.pop("KBC_TEST_SNAPSHOT_ROOT", None)
+        os.environ.pop("KBC_MAX_TEST_SESSIONS", None)
+        shutil.rmtree(snap_root, ignore_errors=True)
+    print("✓ test-session idempotency is run-scoped (same key, different runs → distinct sessions)")
+
+
+async def test_test_session_idle_ttl_reaper():
+    """Defect 2 (TTL): a test session idle past KBC_TEST_SESSION_IDLE_TTL_S is torn
+    down by the periodic sweep — the snapshot dir + registry slot are freed and a
+    ttl.reap stdout line fires. A recently-active session is left alone."""
+    compile_box.TEST_SESSIONS.clear()
+    saved = compile_box._TEST_SESSION_IDLE_TTL_S
+    compile_box._TEST_SESSION_IDLE_TTL_S = 100.0
+    buf = io.StringIO()
+    stale_dir = tempfile.mkdtemp()
+    fresh_dir = tempfile.mkdtemp()
+    try:
+        stale = compile_box.TestRun("t-stale", stale_dir, parent_run_id="p-ttl", snapshot_hash="h")
+        stale._last_activity_monotonic = time.monotonic() - 500.0   # idle > TTL
+        fresh = compile_box.TestRun("t-fresh", fresh_dir, parent_run_id="p-ttl", snapshot_hash="h")
+        compile_box._touch_test_activity(fresh)                     # just active
+        compile_box.TEST_SESSIONS["t-stale"] = stale
+        compile_box.TEST_SESSIONS["t-fresh"] = fresh
+        with contextlib.redirect_stdout(buf):
+            reaped = await compile_box._reap_idle_test_sessions()
+        assert reaped == 1, reaped
+        assert "t-stale" not in compile_box.TEST_SESSIONS, compile_box.TEST_SESSIONS
+        assert "t-fresh" in compile_box.TEST_SESSIONS
+        assert not Path(stale_dir).exists(), "stale snapshot dir not dropped"
+        # the reaped session got a close (summary) event before teardown emitted end
+        se = [stale.events.get_nowait() for _ in range(stale.events.qsize())]
+        assert any(e["type"] == "summary" for e in se), se
+        out = buf.getvalue()
+        assert "ttl.reap tid=t-stale parent=p-ttl" in out, out
+        assert "test.close tid=t-stale parent=p-ttl" in out, out
+    finally:
+        compile_box._TEST_SESSION_IDLE_TTL_S = saved
+        compile_box.TEST_SESSIONS.clear()
+        shutil.rmtree(stale_dir, ignore_errors=True)
+        shutil.rmtree(fresh_dir, ignore_errors=True)
+    print("✓ test-session idle-TTL reaper drops orphans, spares active sessions")
+
+
+async def test_list_test_sessions_endpoint():
+    """Defect 2 (list): GET /test-sessions returns the agreed control-plane wire contract
+    exactly — tid / parent_run_id / created_at / last_activity_at / done — one row
+    per live session."""
+    compile_box.TEST_SESSIONS.clear()
+    client = TestClient(TestServer(compile_box.build_app()))
+    await client.start_server()
+    try:
+        empty = await (await client.get("/test-sessions")).json()
+        assert empty == {"sessions": []}, empty
+
+        run = compile_box.TestRun("tl1", "/tmp", parent_run_id="pl1", snapshot_hash="h")
+        run.done = False
+        compile_box.TEST_SESSIONS["tl1"] = run
+        body = await (await client.get("/test-sessions")).json()
+        assert list(body.keys()) == ["sessions"], body
+        assert len(body["sessions"]) == 1, body
+        row = body["sessions"][0]
+        assert set(row.keys()) == {"tid", "parent_run_id", "created_at", "last_activity_at", "done"}, row
+        assert row["tid"] == "tl1" and row["parent_run_id"] == "pl1" and row["done"] is False, row
+        assert row["created_at"].endswith("Z") and row["last_activity_at"].endswith("Z"), row
+    finally:
+        await client.close()
+        compile_box.TEST_SESSIONS.clear()
+    print("✓ GET /test-sessions lists live sessions in the agreed wire contract")
+
+
+async def test_explicit_test_recommendation_http():
+    """The explicit red-team endpoint is stable-draft-only, single-flight, and
+    returns one validated raw-grounded recommendation without mutating files."""
+    original = compile_box._RECOMMEND_TEST_IMPL
+    compile_box.RUNS.clear()
+    compile_box.RECOMMENDATIONS_ACTIVE.clear()
+    calls = []
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fake_recommend(parent):
+        calls.append(parent.run_id)
+        started.set()
+        await release.wait()
+        return {
+            "question": "What is the supported retry limit?",
+            "reference_answer": "Three attempts.",
+            "evidence_paths": ["raw/policy.md"],
+        }
+
+    compile_box._RECOMMEND_TEST_IMPL = fake_recommend
+    client = TestClient(TestServer(compile_box.build_app()))
+    await client.start_server()
+    try:
+        assert (await client.post("/test-recommendation/missing")).status == 404
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "raw").mkdir()
+            (root / "candidate").mkdir()
+            (root / "raw" / "policy.md").write_text("retry = 3\n")
+            (root / "candidate" / "index.md").write_text("# Policy\n")
+            parent = compile_box.CompileRun("recommend-1", td, 1)
+            compile_box.RUNS[parent.run_id] = parent
+
+            parent._turn_active = True
+            assert (await client.post(f"/test-recommendation/{parent.run_id}")).status == 409
+            parent._turn_active = False
+
+            first = asyncio.create_task(client.post(f"/test-recommendation/{parent.run_id}"))
+            await asyncio.wait_for(started.wait(), timeout=1)
+            concurrent = await client.post(f"/test-recommendation/{parent.run_id}")
+            assert concurrent.status == 409, await concurrent.text()
+            release.set()
+            response = await first
+            assert response.status == 200, await response.text()
+            body = await response.json()
+            assert body["question"] == "What is the supported retry limit?", body
+            assert body["evidence_paths"] == ["raw/policy.md"], body
+            assert calls == [parent.run_id]
+            assert not compile_box.RECOMMENDATIONS_ACTIVE
+
+            # The feature is repeatable by explicit owner action; single-flight
+            # prevents overlap, not future recommendations after completion.
+            response = await client.post(f"/test-recommendation/{parent.run_id}")
+            assert response.status == 200, await response.text()
+            assert calls == [parent.run_id, parent.run_id]
+
+            valid = compile_box._validate_test_recommendation(root, body)
+            assert valid["reference_answer"] == "Three attempts."
+            try:
+                compile_box._validate_test_recommendation(root, {
+                    "question": "leak?", "reference_answer": "secret", "evidence_paths": ["../secret.md"],
+                })
+                raise AssertionError("escaped evidence path was accepted")
+            except ValueError:
+                pass
+
+            async def exhausted(_parent):
+                raise ValueError("the red-team reviewer exhausted its turn budget before submitting a recommendation")
+
+            compile_box._RECOMMEND_TEST_IMPL = exhausted
+            response = await client.post(f"/test-recommendation/{parent.run_id}")
+            assert response.status == 422, await response.text()
+            body = await response.json()
+            assert body["error"]["code"] == "turn_budget_exhausted", body
+            assert body["error"]["retriable"] is True, body
+
+            async def crashed(_parent):
+                raise RuntimeError("provider detail must stay in logs")
+
+            compile_box._RECOMMEND_TEST_IMPL = crashed
+            response = await client.post(f"/test-recommendation/{parent.run_id}")
+            assert response.status == 500, await response.text()
+            body = await response.json()
+            assert body == {
+                "error": {
+                    "code": "internal_error",
+                    "message": "test recommendation failed",
+                    "retriable": True,
+                },
+            }, body
+    finally:
+        release.set()
+        await client.close()
+        compile_box._RECOMMEND_TEST_IMPL = original
+        compile_box.RUNS.clear()
+        compile_box.RECOMMENDATIONS_ACTIVE.clear()
+    print("✓ explicit red-team test recommendation (stable, single-flight, raw-grounded)")
+
+
+async def test_reference_assist_http_and_validation():
+    """Reference assistance is stable-draft-only, shares the red-review lock,
+    and accepts only distinct raw-grounded structured results."""
+    original = compile_box._REFERENCE_ASSIST_IMPL
+    compile_box.RUNS.clear()
+    compile_box.RECOMMENDATIONS_ACTIVE.clear()
+    calls = []
+
+    async def fake_assist(parent, payload):
+        calls.append((parent.run_id, payload))
+        return {
+            "mode": "suggest",
+            "candidates": [
+                {"style": "concise", "answer": "Three attempts.", "evidence_paths": ["raw/policy.md"]},
+                {"style": "complete", "answer": "Retry no more than three times.", "evidence_paths": ["raw/policy.md"]},
+            ],
+        }
+
+    compile_box._REFERENCE_ASSIST_IMPL = fake_assist
+    client = TestClient(TestServer(compile_box.build_app()))
+    await client.start_server()
+    try:
+        assert (await client.post("/test-reference-assist/missing", json={
+            "mode": "suggest", "question": "What is the retry limit?",
+        })).status == 404
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "raw").mkdir()
+            (root / "candidate").mkdir()
+            (root / "raw" / "policy.md").write_text("retry = 3\n")
+            (root / "candidate" / "index.md").write_text("# Policy\n")
+            parent = compile_box.CompileRun("assist-1", td, 1)
+            compile_box.RUNS[parent.run_id] = parent
+
+            invalid = await client.post(f"/test-reference-assist/{parent.run_id}", json={
+                "mode": "polish", "question": "What is the retry limit?",
+            })
+            assert invalid.status == 400, await invalid.text()
+
+            parent._turn_active = True
+            busy = await client.post(f"/test-reference-assist/{parent.run_id}", json={
+                "mode": "suggest", "question": "What is the retry limit?",
+            })
+            assert busy.status == 409, await busy.text()
+            parent._turn_active = False
+
+            response = await client.post(f"/test-reference-assist/{parent.run_id}", json={
+                "mode": "suggest", "question": "What is the retry limit?",
+            })
+            assert response.status == 200, await response.text()
+            body = await response.json()
+            assert body["candidates"][0]["answer"] == "Three attempts.", body
+            assert calls[0][1]["evidence_paths"] == [], calls
+
+            validated = compile_box._validate_reference_suggestions(root, {
+                "candidates": body["candidates"],
+            })
+            assert validated["mode"] == "suggest"
+            polished = compile_box._validate_polished_reference(root, {
+                "polished_answer": "Three attempts.",
+                "evidence_paths": ["raw/policy.md"],
+                "warnings": ["Draft overstated the limit."],
+            })
+            assert polished["warnings"] == ["Draft overstated the limit."]
+            try:
+                compile_box._validate_reference_assist_request(root, {
+                    "mode": "suggest", "question": "leak?", "evidence_paths": ["../secret.md"],
+                })
+                raise AssertionError("escaped evidence hint was accepted")
+            except ValueError:
+                pass
+    finally:
+        await client.close()
+        compile_box._REFERENCE_ASSIST_IMPL = original
+        compile_box.RUNS.clear()
+        compile_box.RECOMMENDATIONS_ACTIVE.clear()
+    print("✓ reference-answer assist HTTP + raw-grounded validation")
+
+
+async def test_reference_assist_driver_is_fast_isolated_and_structured():
+    original_client = compile_box.create_agent_client
+    previous_turns = os.environ.get("KBC_REFERENCE_ASSIST_MAX_TURNS")
+    previous_light_model = os.environ.get("KBC_PK_BLUE_MODEL")
+    seen = {}
+
+    class SubmittingClient:
+        def __init__(self, **kwargs):
+            self.options = SimpleNamespace(**kwargs)
+            self.pending = []
+            seen["options"] = self.options
+
+        async def connect(self):
+            pass
+
+        async def query(self, directive, session_id="default"):
+            seen["directive"] = directive
+            registered = [t for t in self.options.tools if t.name == "submit_reference_suggestions"]
+            await registered[0].handler({
+                "candidates": [
+                    {"style": "concise", "answer": "Three attempts.", "evidence_paths": ["raw/policy.md"]},
+                    {"style": "complete", "answer": "Retry no more than three times.", "evidence_paths": ["raw/policy.md"]},
+                ],
+            })
+            self.pending.append(result_event())
+
+        async def receive_messages(self):
+            while self.pending:
+                yield self.pending.pop(0)
+
+        async def disconnect(self):
+            pass
+
+    compile_box.create_agent_client = SubmittingClient
+    os.environ.pop("KBC_REFERENCE_ASSIST_MAX_TURNS", None)
+    os.environ["KBC_PK_BLUE_MODEL"] = "claude-light-admin-config"
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "raw").mkdir()
+            (root / "candidate").mkdir()
+            (root / "raw" / "policy.md").write_text("retry = 3\n")
+            (root / "candidate" / "index.md").write_text("# Policy\n")
+            parent = compile_box.CompileRun("assist-driver", td, 1)
+            parent.locale = "en"
+            result = await compile_box.assist_reference_answer(parent, {
+                "mode": "suggest", "question": "What is the retry limit?",
+            })
+            assert result["mode"] == "suggest", result
+            opts = seen["options"]
+            assert opts.system_prompt == compile_box._prompt("reference_assist_role", "en")
+            assert tool_names(opts) == ["Read", "Glob", "Grep", "submit_reference_suggestions"]
+            assert opts.max_model_calls == 20
+            assert opts.model_config["role"] == "blue"
+            assert '"question": "What is the retry limit?"' in seen["directive"]
+            assert "2-3 independently usable candidates" in seen["directive"]
+    finally:
+        compile_box.create_agent_client = original_client
+        if previous_turns is None:
+            os.environ.pop("KBC_REFERENCE_ASSIST_MAX_TURNS", None)
+        else:
+            os.environ["KBC_REFERENCE_ASSIST_MAX_TURNS"] = previous_turns
+        if previous_light_model is None:
+            os.environ.pop("KBC_PK_BLUE_MODEL", None)
+        else:
+            os.environ["KBC_PK_BLUE_MODEL"] = previous_light_model
+    print("✓ reference-answer assist driver: fast + isolated + structured")
+
+
+async def test_recommendation_driver_is_minimal_and_submits_through_registered_mcp_tool():
+    """The explicit reviewer is a narrow red-team capability, not a compiler.
+
+    Exercise the public driver with a fake SDK transport that can only complete
+    by invoking the exact SDK MCP tool registered in its options. This keeps the
+    test sensitive to both option drift and callback wiring.
+    """
+    original_client = compile_box.create_agent_client
+    previous_turns = os.environ.get("KBC_TEST_RECOMMEND_MAX_TURNS")
+    seen = {}
+
+    class SubmittingClient:
+        def __init__(self, **kwargs):
+            self.options = SimpleNamespace(**kwargs)
+            self.pending = []
+            seen["options"] = self.options
+
+        async def connect(self):
+            seen["connected"] = True
+
+        async def query(self, directive, session_id="default"):
+            seen["directive"] = directive
+            registered = [t for t in self.options.tools if t.name == "submit_recommended_test"]
+            assert len(registered) == 1
+            result = await registered[0].handler({
+                "question": "What retry limit does the source require?",
+                "reference_answer": "Three attempts.",
+                "evidence_paths": ["raw/policy.md"],
+            })
+            assert "accepted" in result.lower(), result
+            self.pending.append(result_event())
+
+        async def receive_messages(self):
+            while self.pending:
+                yield self.pending.pop(0)
+
+        async def disconnect(self):
+            seen["disconnected"] = True
+
+    compile_box.create_agent_client = SubmittingClient
+    os.environ["KBC_TEST_RECOMMEND_MAX_TURNS"] = "20"
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "raw").mkdir()
+            (root / "candidate").mkdir()
+            (root / "raw" / "policy.md").write_text("retry = 3\n")
+            (root / "candidate" / "index.md").write_text("# Policy\n")
+            parent = compile_box.CompileRun("recommend-driver", td, 1)
+            parent.locale = "en"
+
+            result = await compile_box.recommend_test_question(parent)
+            assert result == {
+                "question": "What retry limit does the source require?",
+                "reference_answer": "Three attempts.",
+                "evidence_paths": ["raw/policy.md"],
+            }, result
+
+            opts = seen["options"]
+            assert isinstance(opts.system_prompt, str), opts.system_prompt
+            assert opts.system_prompt == compile_box._prompt("recommend_test_role", "en")
+            assert tool_names(opts) == ["Read", "Glob", "Grep", "submit_recommended_test"]
+            assert opts.max_model_calls == 20
+            assert opts.model_config["role"] == "compile"
+            assert seen["connected"] and seen["disconnected"]
+    finally:
+        compile_box.create_agent_client = original_client
+        if previous_turns is None:
+            os.environ.pop("KBC_TEST_RECOMMEND_MAX_TURNS", None)
+        else:
+            os.environ["KBC_TEST_RECOMMEND_MAX_TURNS"] = previous_turns
+    print("✓ recommendation driver: minimal tools + registered MCP submission")
+
+
+async def test_recommendation_driver_reports_max_turn_exhaustion():
+    """A reviewer that spends its bounded turn budget without submitting must
+    surface a distinct diagnostic instead of the generic no-result error."""
+    original_client = compile_box.create_agent_client
+
+    class ExhaustedClient:
+        def __init__(self, **kwargs):
+            self.options = SimpleNamespace(**kwargs)
+
+        async def connect(self):
+            pass
+
+        async def query(self, directive, session_id="default"):
+            pass
+
+        async def receive_messages(self):
+            yield result_event("error_max_turns", True)
+
+        async def disconnect(self):
+            pass
+
+    compile_box.create_agent_client = ExhaustedClient
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "raw").mkdir()
+            (root / "candidate").mkdir()
+            (root / "raw" / "policy.md").write_text("retry = 3\n")
+            (root / "candidate" / "index.md").write_text("# Policy\n")
+            parent = compile_box.CompileRun("recommend-max-turns", td, 1)
+            parent.locale = "en"
+            try:
+                await compile_box.recommend_test_question(parent)
+                raise AssertionError("max-turn exhaustion was accepted as an empty recommendation")
+            except ValueError as exc:
+                assert "turn budget" in str(exc) and "submitting" in str(exc), exc
+    finally:
+        compile_box.create_agent_client = original_client
+    print("✓ recommendation driver: max-turn exhaustion is explicit")
+
+
+async def test_prompt_packs_locale():
+    """Prompt packs: en/zh ship the same asset set; unknown locales fall back to
+    en (the platform default); guard steering + constitution seed follow the
+    locale; KBC_PLAYBOOK env still overrides the playbook (local dev)."""
+    en = sorted(q.name for q in (compile_box._PROMPTS_DIR / "en").iterdir())
+    zh = sorted(q.name for q in (compile_box._PROMPTS_DIR / "zh").iterdir())
+    assert en == zh and "box_role.md" in en, (en, zh)
+    assert compile_box._prompt("box_role", "no-such-locale") == compile_box._prompt("box_role", "en")
+    zh_box_role = compile_box._prompt("box_role", "zh")
+    en_box_role = compile_box._prompt("box_role", "en")
+    assert "只读的知识消费者" in compile_box._prompt("test_role", "zh")
+    assert "read-only knowledge consumer" in compile_box._prompt("test_role", "en")
+    # Answer discipline (clean-answer contract): conclusion-first, no process
+    # narration; the SOURCES trailing-line protocol must survive the edit.
+    zh_role = compile_box._prompt("test_role", "zh")
+    en_role = compile_box._prompt("test_role", "en")
+    assert "回答纪律" in zh_role and "不要叙述你的操作过程" in zh_role, zh_role
+    assert "Answer discipline" in en_role and "Never narrate your process" in en_role, en_role
+    assert "SOURCES:" in zh_role and "SOURCES:" in en_role
+    # Retrieval discipline matches the actual read-only tool surface: index-first,
+    # scoped search as a fallback, full-page reads, and no premature "not covered".
+    assert "Glob/Grep" in zh_role and "Glob/Grep" in en_role
+    assert ".siclaw/knowledge/" in zh_role and ".siclaw/knowledge/" in en_role
+    assert "全部合理候选页之后" in zh_role, zh_role
+    assert "only after checking the index and every plausible page" in en_role, en_role
+    assert "没有检索工具" not in zh_role and "there is no search tool" not in en_role
+
+    # The code profile is a reusable source-understanding kernel, not a hidden
+    # Kubernetes/runbook template. Architecture/component understanding is the
+    # stable goal; operational lenses are conditional on evidence or the owner
+    # brief. The generic document rule must not reintroduce file-shaped pages.
+    assert "可追溯的系统理解模型" in zh_box_role, zh_box_role
+    assert "traceable system-understanding model" in en_box_role, en_box_role
+    assert "有源码证据或 brief 明确要求时才展开" in zh_box_role, zh_box_role
+    assert "only when source evidence supports them or the brief asks for them" in en_box_role, en_box_role
+    assert "不要为了凑模板" in zh_box_role, zh_box_role
+    assert "Do not invent empty sections to satisfy a template" in en_box_role, en_box_role
+    assert "代码 profile 按架构概念和组件组织页面" in zh_box_role, zh_box_role
+    assert "the code profile organizes pages around architectural concepts and components" in en_box_role, en_box_role
+    assert "**一页一个文件" not in zh_box_role, zh_box_role
+    assert "**One page per file" not in en_box_role, en_box_role
+    assert "4–12 条高信号" in zh_box_role and "4–12 high-signal" in en_box_role
+    assert "每个链接条目都带该页的一句话 `description`" in zh_box_role, zh_box_role
+    assert "every link entry includes the page's one-line `description`" in en_box_role, en_box_role
+
+    # A regression round's consumer identity is deterministic and changes only
+    # with answer-affecting contract inputs. Tool order is not semantic.
+    fp_en = compile_box._test_consumer_fingerprint("en", ["Read", "Glob", "Grep"], "model-a", "sdk-a", 60)
+    assert len(fp_en) == 64
+    assert fp_en == compile_box._test_consumer_fingerprint("en", ["Grep", "Read", "Glob"], "model-a", "sdk-a", 60)
+    assert fp_en != compile_box._test_consumer_fingerprint("zh", ["Read", "Glob", "Grep"], "model-a", "sdk-a", 60)
+    assert fp_en != compile_box._test_consumer_fingerprint("en", ["Read", "Glob", "Grep"], "model-b", "sdk-a", 60)
+    assert fp_en != compile_box._test_consumer_fingerprint("en", ["Read", "Glob", "Grep"], "model-a", "sdk-b", 60)
+    assert fp_en != compile_box._test_consumer_fingerprint("en", ["Read"], "model-a", "sdk-a", 60)
+    assert fp_en != compile_box._test_consumer_fingerprint("en", ["Read", "Glob", "Grep"], "model-a", "sdk-a", 61)
+    assert (
+        compile_box._test_consumer_fingerprint("en", ["Read", "Bash"], "model-a", "sdk-a", 60)
+        == compile_box._test_consumer_fingerprint("en", ["Read"], "model-a", "sdk-a", 60)
+    )
+    assert compile_box._effective_test_allowed_tools([]) == []
+
+    with tempfile.TemporaryDirectory() as snap:
+        root = Path(snap)
+        deny = await compile_box._make_test_path_guard(root, "zh")(
+            {"tool_name": "Read", "tool_input": {"file_path": "/work/x"}}, "t", None)
+        assert "只读测试会话" in deny["hookSpecificOutput"]["permissionDecisionReason"]
+        deny = await compile_box._make_test_path_guard(root, "en")(
+            {"tool_name": "Read", "tool_input": {"file_path": "/work/x"}}, "t", None)
+        assert "read-only test session" in deny["hookSpecificOutput"]["permissionDecisionReason"]
+
+    with tempfile.TemporaryDirectory() as wd:
+        compile_box._ensure_workdir_constitution(wd, "zh")
+        zh_const = (Path(wd) / "constitution.md").read_text(encoding="utf-8")
+        assert "铁则" in zh_const  # zh playbook section header (parallels en "Iron rules")
+        assert "全集清单要不要建数据页**不在此列**——必须建" in zh_const
+        assert "摘若干「决策高频」样例 + 其余指路回 raw ≠ 编完" in zh_const
+        assert "普通记录集合" in zh_const and "仍由你判断" in zh_const
+        assert "全集清单不同" in zh_const and "每一行" in zh_const
+    with tempfile.TemporaryDirectory() as wd:
+        compile_box._ensure_workdir_constitution(wd, None)  # platform default = en
+        en_const = (Path(wd) / "constitution.md").read_text(encoding="utf-8")
+        assert "Iron rules" in en_const
+        assert (
+            "Whether a complete inventory gets a data page is **not** in this column — it must get one"
+            in en_const
+        )
+        assert "high-frequency decision" in en_const and "is not compiled" in en_const
+        assert "ordinary collection" in en_const and "yours to judge" in en_const
+        assert "complete-set inventory" in en_const and "every row of the source table" in en_const
+
+    with tempfile.TemporaryDirectory() as td:
+        override = Path(td) / "pb.md"
+        override.write_text("OVERRIDE PLAYBOOK", encoding="utf-8")
+        os.environ["KBC_PLAYBOOK"] = str(override)
+        try:
+            assert compile_box._playbook_text("zh") == "OVERRIDE PLAYBOOK"
+        finally:
+            del os.environ["KBC_PLAYBOOK"]
+
+    # Model-facing tool strings are locale-selected too (descriptions + results).
+    zh_ts = compile_box._tool_strings("zh")
+    en_ts = compile_box._tool_strings("en")
+    assert zh_ts.keys() == en_ts.keys()
+    for key in zh_ts:
+        assert zh_ts[key].keys() == en_ts[key].keys(), key
+    assert "批准" in zh_ts["propose_plan"]["ack"] and "approval" in en_ts["propose_plan"]["ack"]
+    assert compile_box._tool_strings("no-such") == en_ts
+    assert "{tid}" in en_ts["resolve_ticket"]["not_found"]  # format slots survive
+    print("✓ prompt packs: en/zh parity, en fallback, localized guard/constitution/tools, env override")
+
+
+def test_default_allowlist_covers_every_compile_tool():
+    """A compile tool the default allowlist omits is unreachable — and for the
+    ledger tools that is a mandate-3 dead end by permissions (every prompt
+    steers exclusions through them, so a model that cannot call them cannot
+    account a source it will not compile). Today's session runs with
+    bypassPermissions, which is exactly why this drift goes unnoticed until a
+    profile declares a restrictive list. Pin the registry to the allowlist."""
+    with tempfile.TemporaryDirectory() as td:
+        run = compile_box.CompileRun("allowlist", td, 1)
+        registered = {t.name for t in compile_box._compile_engine_tools(run)}
+    allowed = set(compile_box.DEFAULT_COMPILE_ALLOWED_TOOLS)
+    missing = sorted(n for n in registered if f"mcp__compile__{n}" not in allowed)
+    assert not missing, f"compile tools missing from DEFAULT_COMPILE_ALLOWED_TOOLS: {missing}"
+    # And no stale entry pointing at a tool that no longer exists.
+    stale = sorted(
+        a for a in allowed
+        if a.startswith("mcp__compile__") and a[len("mcp__compile__"):] not in registered
+    )
+    assert not stale, f"allowlist references unregistered compile tools: {stale}"
+    print("✓ default allowlist covers every registered compile tool (no permission dead end)")
+
+
+async def test_source_inspector_is_engine_neutral_bounded_and_complete():
+    """Every compiler engine gets the same full-corpus fact-finding surface.
+
+    Batch assignment limits what the session must compile, not what it may
+    consult. Mechanically sliced originals remain discoverable but unreadable,
+    so visibility never bypasses the context-safety boundary.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "raw" / "assigned").mkdir(parents=True)
+        (root / "raw" / "other").mkdir(parents=True)
+        (root / "raw" / "bounded").mkdir(parents=True)
+        (root / "raw" / "src" / "deep").mkdir(parents=True)
+        (root / "raw" / ".github" / "workflows").mkdir(parents=True)
+        (root / "raw" / "assigned" / "app.ts").write_text(
+            "export const app = true;\n", encoding="utf-8")
+        (root / "raw" / "other" / "peer.go").write_text(
+            "package peer\nfunc PeerService() {}\n", encoding="utf-8")
+        (root / "raw" / "bounded" / "huge.py").write_text(
+            "LOAD_BEARING_SECRET = True\n", encoding="utf-8")
+        (root / "raw" / "Dockerfile.agentbox").write_text(
+            "FROM python:3.12\n", encoding="utf-8")
+        (root / "raw" / ".github" / "workflows" / "release.yml").write_text(
+            "name: release\n", encoding="utf-8")
+        (root / "raw" / "src" / "top.py").write_text(
+            "TOP_LEVEL = True\n", encoding="utf-8")
+        (root / "raw" / "src" / "deep" / "nested.py").write_text(
+            "NESTED = True\n", encoding="utf-8")
+        (root / "raw" / "src" / "long.py").write_text(
+            "x" * (source_inspector.MAX_READ_CHARS + 100) + "\nsecond\n",
+            encoding="utf-8")
+        (root / "raw" / "diagram.png").write_bytes(b"not-text")
+        (root / "raw" / ".env").write_text(
+            "AWS_SECRET_ACCESS_KEY=must-not-be-readable\n", encoding="utf-8")
+        (root / "raw" / ".git").mkdir()
+        (root / "raw" / ".git" / "config").write_text(
+            "url = https://token@example.invalid/repo.git\n", encoding="utf-8")
+        (root / "raw" / "alias.py").symlink_to("bounded/huge.py")
+        run = compile_box.CompileRun("source-inspector", td, 1)
+        scope = {
+            "account": ["assigned/app.ts"],
+            "deny_read": ["bounded/huge.py"],
+            "consult": True,
+        }
+        tools = {t.name: t for t in compile_box._compile_engine_tools(run, scope)}
+        assert {"source_inventory", "source_read", "source_search"} <= tools.keys()
+
+        inventory = json.loads(await tools["source_inventory"].handler({}))
+        rows = {row["path"]: row for row in inventory["sources"]}
+        assert rows["raw/other/peer.go"]["availability"] == "readable", rows
+        assert rows["raw/bounded/huge.py"]["availability"] == "bounded_view_only", rows
+        assert rows["raw/Dockerfile.agentbox"]["kind"] == "text", rows
+        assert rows["raw/.github/workflows/release.yml"]["kind"] == "text", rows
+
+        root_glob = json.loads(await tools["source_inventory"].handler({
+            "pattern": "**/Dockerfile*",
+        }))
+        assert [row["path"] for row in root_glob["sources"]] == [
+            "raw/Dockerfile.agentbox"
+        ], root_glob
+        one_level = json.loads(await tools["source_inventory"].handler({
+            "pattern": "src/*.py",
+        }))
+        assert [row["path"] for row in one_level["sources"]] == [
+            "raw/src/long.py", "raw/src/top.py",
+        ], one_level
+        recursive = json.loads(await tools["source_inventory"].handler({
+            "pattern": "src/**/*.py",
+        }))
+        assert [row["path"] for row in recursive["sources"]] == [
+            "raw/src/deep/nested.py", "raw/src/long.py", "raw/src/top.py",
+        ], recursive
+        searched = json.loads(await tools["source_search"].handler({
+            "query": "PeerService", "pattern": "**/*.go",
+        }))
+        assert searched["matches"][0]["path"] == "raw/other/peer.go", searched
+        read = json.loads(await tools["source_read"].handler({
+            "path": "other/peer.go", "offset": 2, "limit": 1,
+        }))
+        assert "PeerService" in read["content"] and read["lines"] == 1, read
+        long_read = json.loads(await tools["source_read"].handler({
+            "path": "src/long.py", "limit": 1,
+        }))
+        assert len(long_read["content"]) == source_inspector.MAX_READ_CHARS, long_read
+        assert long_read["lines"] == 1 and long_read["truncated"] is True, long_read
+
+        media_search = json.loads(await tools["source_search"].handler({
+            "query": "not-text", "pattern": "**/*.png",
+        }))
+        assert media_search["matches"] == [] and media_search["skipped_non_text"] == 1, media_search
+
+        old_search_files = source_inspector.MAX_SEARCH_FILES
+        source_inspector.MAX_SEARCH_FILES = 1
+        try:
+            bounded_search = json.loads(await tools["source_search"].handler({
+                "query": "definitely-absent",
+            }))
+            assert bounded_search["budget_exhausted"] is True, bounded_search
+            assert bounded_search["truncated"] is True, bounded_search
+            assert bounded_search["scanned_files"] == 1, bounded_search
+        finally:
+            source_inspector.MAX_SEARCH_FILES = old_search_files
+
+        for name, args in (
+            ("source_read", {"path": "bounded/huge.py"}),
+            ("source_search", {"query": "LOAD_BEARING_SECRET"}),
+        ):
+            try:
+                result = await tools[name].handler(args)
+            except ValueError:
+                continue
+            if name == "source_search":
+                assert json.loads(result)["matches"] == [], result
+                continue
+            raise AssertionError(f"{name} bypassed the bounded-source guard")
+
+        for hidden in (".env", ".git/config"):
+            try:
+                await tools["source_read"].handler({"path": hidden})
+                raise AssertionError(f"source_read exposed unmanaged path {hidden}")
+            except ValueError:
+                pass
+        try:
+            await tools["source_read"].handler({"path": "alias.py"})
+            raise AssertionError("source_read followed a symbolic-link alias")
+        except ValueError:
+            pass
+
+        structural = {
+            t.name for t in compile_box._compile_engine_tools(
+                run, compile_box.NO_RAW_SCOPE)
+        }
+        assert not ({"source_inventory", "source_read", "source_search"} & structural)
+    print("✓ Source Inspector: engine-neutral full Raw consultation with bounded-source guards")
+
+
+async def test_a_session_records_what_it_actually_spent():
+    """Every batch budget is an estimate of how much of the context window a
+    session will hold, and nothing measured it — a 151-batch run produced no
+    evidence at all.
+
+    The source has to be get_context_usage(), which reports what `/context`
+    shows: tokens resident in the window right now. result_event.usage is the
+    last API request's own counts — a live session holding real context
+    reported 748, the increment of one tool result — so reading that answered a
+    different question than the one the budget asks."""
+    with tempfile.TemporaryDirectory() as td:
+        run = compile_box.CompileRun("usage", td, 1)
+        assert run._peak_context_tokens == 0
+
+        class Client:
+            async def get_context_usage(self):
+                return {"totalTokens": 214_000, "maxTokens": 1_000_000,
+                        "categories": [{"name": "messages", "tokens": 180_000},
+                                       {"name": "system prompt", "tokens": 20_000},
+                                       {"name": "tools", "tokens": 14_000}]}
+
+        def Result():
+            return AgentEvent("result", "fixture", data={"outcome": "completed", "num_turns": 12,
+                "usage": {"input_tokens": 748, "output_tokens": 9_000}})
+
+        await compile_box._record_turn_usage(run, Client(), Result())
+        assert run._turn_usage["context_tokens"] == 214_000, run._turn_usage
+        assert run._turn_usage["max_tokens"] == 1_000_000
+        assert run._turn_usage["output_tokens"] == 9_000
+        # The breakdown is the half that says WHY a session was heavy.
+        assert "messages=180000" in run._turn_usage["breakdown"], run._turn_usage
+        assert run._peak_context_tokens == 214_000
+
+        class Smaller(Client):
+            async def get_context_usage(self):
+                return {"totalTokens": 40_000, "maxTokens": 1_000_000, "categories": []}
+
+        await compile_box._record_turn_usage(run, Smaller(), Result())
+        assert run._peak_context_tokens == 214_000, "the peak is a high-water mark"
+
+        # A measurement is never worth failing a compile turn for.
+        class Broken:
+            async def get_context_usage(self):
+                raise RuntimeError("control request timed out")
+
+        await compile_box._record_turn_usage(run, Broken(), Result())
+        assert run._peak_context_tokens == 214_000
+
+    import batching as bt
+
+    plan = {"batches": [{"id": "b01", "status": "pending"}]}
+    bt.stamp_done(plan, "b01", usage={"context_tokens": 214_000})
+    assert plan["batches"][0]["usage"] == {"context_tokens": 214_000}
+    assert plan["batches"][0]["status"] == "done"
+    print("\u2713 a session measures its real context share; the peak rides the plan")
+
+
+
+def test_compile_session_denies_subagents():
+    """Only the parent compiler sees Raw and owns its accounting ledger."""
+    original = compile_box.create_agent_client
+    compile_box.create_agent_client = _FakeAgentClient
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            run = compile_box.CompileRun("deny", td, 1)
+            client = compile_box._compile_session_client(run, td, "role", "sess-1")
+            names = set(tool_names(client.options))
+            assert not names.intersection({"Agent", "Task", "WebFetch", "WebSearch", "Bash"})
+            assert names == set(compile_box.DEFAULT_COMPILE_ALLOWED_TOOLS)
+    finally:
+        compile_box.create_agent_client = original
+
+
+
+def test_compile_surface_excludes_auto_question_proposals():
+    """Owner-managed questions stay separate from compilation."""
+    for locale in ("en", "zh"):
+        role = compile_box._prompt("box_role", locale)
+        assert "propose_questions" not in role
+        assert "QUESTIONS_PROPOSED" not in role
+        assert "propose_questions" not in compile_box._tool_strings(locale)
+        with tempfile.TemporaryDirectory() as td:
+            run = compile_box.CompileRun("surface", td, 1)
+            run.locale = locale
+            assert "propose_questions" not in [t.name for t in compile_box._compile_engine_tools(run)]
+    assert "mcp__compile__propose_questions" not in compile_box.DEFAULT_COMPILE_ALLOWED_TOOLS
+
+
+def test_ledger_instructions_agree_across_surfaces():
+    """R3-2b: no surface may still carry an ABSOLUTE hand-edit prohibition.
+
+    A compliant model follows the SYSTEM prompt, so while box_role.md said "never
+    edit EXCLUSIONS.json by hand" and tools.json called exclude_source "the ONLY
+    way", the repair prompt's "hand repair is a permitted fallback" was
+    unreachable — a self-contradicting contract, and (before remove_exclusion
+    existed) a real dead end for correcting a wrong row. The standing prompt, the
+    tool descriptions and the repair prompt must now say the same thing in both
+    locales: tools first, hand edit permitted as a last resort."""
+    import selfcheck
+
+    banned_en = ("never edit", "the ONLY way", "do NOT hand-write", "ONLY write path")
+    banned_zh = ("绝不要手工编辑", "【唯一】方式", "可以读,不要改")
+    report = {
+        "coverage": {"unaccounted": ["meta.md"], "dangling_citations": [],
+                     "noop_exclusions": [], "over_broad_exclusions": []},
+        "lint": {"ok": True, "violations": []},
+    }
+    for locale, banned, fallback in (("en", banned_en, "last resort"),
+                                     ("zh", banned_zh, "兜底")):
+        role = compile_box._prompt("box_role", locale)
+        tools_desc = "\n".join(
+            v.get("desc", "") for v in compile_box._tool_strings(locale).values())
+        repair = selfcheck.build_repair_prompt(report, locale)
+        for phrase in banned:
+            assert phrase not in role, (locale, phrase)
+            assert phrase not in tools_desc, (locale, phrase)
+            assert phrase not in repair, (locale, phrase)
+        # …and the escape hatch is stated where the model actually reads it.
+        assert fallback in role, (locale, role)
+        assert fallback in repair, (locale, repair)
+        # Both lifecycle tools are advertised on the standing prompt.
+        assert "exclude_source" in role and "remove_exclusion" in role, locale
+    print("✓ ledger instructions agree across role prompt / tool descs / repair prompt (en+zh)")
+
+
+async def test_propose_plan_never_bounces():
+    """propose_plan is the deterministic approve signal: the handler itself writes
+    authoring/PROPOSED_PLAN.json (code, not model formatting) and always emits —
+    the owner UI must never be held hostage by how the model kept its notes."""
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "authoring").mkdir(parents=True)
+        events = []
+
+        class FakeRun:
+            workdir = str(wd)
+            locale = "zh"  # model-facing tool strings come from the locale pack
+
+            async def emit(self, ev):
+                events.append(ev)
+
+        pp = next(t.handler for t in compile_box._compile_engine_tools(FakeRun())
+                  if t.name == "propose_plan")
+
+        # no PLAN.md checkboxes at all → STILL proposes (advisory reminder only)
+        r1 = await pp({"plan": "## 计划\n- 00 概览\n- 10 用法"})
+        assert events and events[0]["type"] == "plan_proposed"
+        assert "提醒" in r1
+        proposal = json.loads((wd / "authoring" / "PROPOSED_PLAN.json").read_text("utf-8"))
+        assert proposal["text"].startswith("## 计划") and proposal["proposed_at"]
+
+        # with a maintained checklist → no reminder; re-propose overwrites
+        (wd / "authoring" / "PLAN.md").write_text(
+            "# Plan\n\n## Next Pages\n- [ ] 00 概览 — 平台是什么\n\n## Blocked\n- None\n", "utf-8"
+        )
+        r2 = await pp({"plan": "v2"})
+        assert len(events) == 2
+        assert "提醒" not in r2
+        assert json.loads((wd / "authoring" / "PROPOSED_PLAN.json").read_text("utf-8"))["text"] == "v2"
+    print("✓ propose_plan always signals; PROPOSED_PLAN.json written by code")
+
+
+async def test_delete_candidate_page_is_scoped():
+    """The compiler can remove a merged-away page without Bash."""
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "candidate/guide").mkdir(parents=True)
+        (wd / "raw").mkdir()
+        (wd / "candidate/index.md").write_text("# Index", encoding="utf-8")
+        (wd / "candidate/guide/index.md").write_text("# Guide", encoding="utf-8")
+        engine_dead = wd / "candidate/guide/engine-dead.md"
+        engine_dead.write_text("old", encoding="utf-8")
+        second_dead = wd / "candidate/guide/second-dead.md"
+        second_dead.write_text("old", encoding="utf-8")
+        outside = wd / "raw/source.md"
+        outside.write_text("raw", encoding="utf-8")
+        events = []
+
+        class FakeRun:
+            workdir = str(wd)
+            locale = "en"
+
+            async def emit(self, ev):
+                events.append(ev)
+
+        engine_tools = {
+            item.name: item for item in compile_box._compile_engine_tools(FakeRun())
+        }
+        engine_delete = engine_tools["delete_candidate_page"]
+        assert engine_delete.input_schema == {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        }
+        engine_result = await engine_delete.handler({"path": "guide/engine-dead.md"})
+        assert not engine_dead.exists(), engine_result
+        assert "deleted candidate page" in engine_result
+
+        delete = engine_delete.handler
+
+        assert "mcp__compile__delete_candidate_page" in compile_box.DEFAULT_COMPILE_ALLOWED_TOOLS
+        result = await delete({"path": "guide/second-dead.md"})
+        assert not second_dead.exists(), result
+        assert len(events) == 2 and events[-1]["type"] == "summary", events
+
+        for refused in ("../raw/source.md", "/tmp/out.md", "index.md",
+                        "guide/index.md", "guide/data.json"):
+            result = await delete({"path": refused})
+            assert "deleted candidate page" not in result, (refused, result)
+        assert outside.read_text(encoding="utf-8") == "raw"
+    print("✓ delete_candidate_page is engine-neutral and confined to non-routing candidate Markdown files")
+
+
+def test_install_wiki_snapshot_size_guard():
+    """Fix A: the published-snapshot installer rejects an oversized compressed
+    bundle AND a decompression bomb (accumulated-unpacked cap), like its sibling
+    installers — else a gzip-bomb bundle_base64 OOMs the pod + the parent run."""
+    import tempfile as _tf
+    ok = make_source_bundle({"index.md": "# i\n", "p.md": "x" * 100})
+    with _tf.TemporaryDirectory() as d:
+        dest = Path(d)
+        os.environ["KBC_MAX_SNAPSHOT_BUNDLE_BYTES"] = "10"      # compressed cap
+        try:
+            try:
+                compile_box._install_wiki_snapshot(ok, dest / "a")
+                assert False, "should reject oversized compressed bundle"
+            except ValueError as e:
+                assert "too large" in str(e), e
+        finally:
+            del os.environ["KBC_MAX_SNAPSHOT_BUNDLE_BYTES"]
+        os.environ["KBC_MAX_SNAPSHOT_UNPACKED_BYTES"] = "5"     # unpacked cap
+        try:
+            try:
+                compile_box._install_wiki_snapshot(ok, dest / "b")
+                assert False, "should reject bundle that unpacks too large"
+            except ValueError as e:
+                assert "unpacks too large" in str(e), e
+        finally:
+            del os.environ["KBC_MAX_SNAPSHOT_UNPACKED_BYTES"]
+        h, pages = compile_box._install_wiki_snapshot(ok, dest / "c")  # within limits → ok
+        assert pages == 2 and len(h) == 64, (pages, h)
+    print("✓ install_wiki_snapshot size guards (compressed + unpacked caps)")
+
+
+# ── Protocol v3: brief consumption + append-only proposed questions ──
+
+
+def test_apply_session_config():
+    """One complete authority, frozen roles, namespaced policy, operational stop."""
+    backup = dict(os.environ)
+    roles = deepcopy(pi_config._roles)
+    kill = compile_box._PK_KILL_AT_BOOT
+    try:
+        compile_box._PK_KILL_AT_BOOT = False
+        os.environ["ANTHROPIC_API_KEY"] = "stale-key"
+        body = {"llm": execution_fixture(), "settings": {
+            "KBC_COMPILE_MODEL": "untrusted-override", "KBC_ENGINE": "codex_sdk",
+            "KBC_PK_MODE": "auto", "EVIL_KEY": "nope", "PATH": "/pwn"}}
+        compile_box._apply_session_config(body)
+        assert compile_box._engine_kind() == "pi_agent"
+        assert compile_box._compile_model() == "fixture-compile"
+        assert compile_box._test_model() == "fixture-blue"
+        assert "ANTHROPIC_API_KEY" not in os.environ
+        assert os.environ["KBC_PK_MODE"] == "auto"
+        assert "EVIL_KEY" not in os.environ and os.environ["PATH"] != "/pwn"
+        body["llm"]["execution"]["roles"]["compile"]["model"]["id"] = "changed"
+        assert compile_box._compile_model() == "fixture-compile"
+        for invalid in ({}, {"llm": None}, {"llm": {"engine": "claude_agent_sdk"}},
+                        {"llm": {"engine": "pi_agent", "execution": {}}}):
+            try:
+                compile_box._apply_session_config(invalid)
+                raise AssertionError("incomplete execution authority accepted")
+            except ValueError:
+                pass
+        os.environ["KBC_PK_MODE"] = "off"
+        compile_box._PK_KILL_AT_BOOT = True
+        compile_box._apply_session_config({"llm": execution_fixture(), "settings": {"KBC_PK_MODE": "auto"}})
+        assert os.environ["KBC_PK_MODE"] == "off"
+    finally:
+        os.environ.clear()
+        os.environ.update(backup)
+        pi_config._roles = roles
+        compile_box._PK_KILL_AT_BOOT = kill
+def test_parse_brief_block():
+    """The wizard's 定调标签 block parses into the BRIEF.json record (tags split on
+    Chinese separators, raw kept from the marker); an ordinary message → None."""
+    msg = (
+        "开始生成知识库。\n\n"
+        "我的定调标签(请作为本次编译的 brief):\n"
+        "- 给谁看:内部工程师\n"
+        "- 内容倾向:详尽百科、保留内部信息、只留最新版本\n"
+        "- 自定义:偏排障场景、少写背景\n"
+        "请按这些标签作为编译 brief 执行。"
+    )
+    brief = compile_box.parse_brief_block(msg)
+    assert brief["source"] == "quickstart_message"
+    assert brief["audience"] == "内部工程师", brief
+    assert brief["styles"] == ["详尽百科", "保留内部信息", "只留最新版本"], brief
+    assert brief["custom"] == ["偏排障场景", "少写背景"], brief
+    assert brief["raw"].startswith("我的定调标签"), brief  # QUICKSTART prefix stripped off
+    # no brief block → None (an ordinary prepare/compile message is left untouched)
+    assert compile_box.parse_brief_block("把 raw/ 编成候选页") is None
+    assert compile_box.parse_brief_block("") is None
+    print("✓ parse_brief_block (tags split, raw from marker, None when absent)")
+
+
+async def test_message_captures_brief():
+    """POST /message persists a 定调标签 block to authoring/BRIEF.json before the
+    turn (message still reaches the agent verbatim); an ordinary message writes none."""
+    compile_box.RUNS.clear()
+    client = TestClient(TestServer(compile_box.build_app()))
+    await client.start_server()
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            class _C:
+                def __init__(self):
+                    self.queries = []
+
+                async def query(self, text, session_id="default"):
+                    self.queries.append(text)
+
+            run = compile_box.CompileRun("brief-run", td, 1)
+            run.client = _C()
+            run.connected.set()
+            compile_box.RUNS["brief-run"] = run
+
+            msg = ("开始生成知识库\n\n我的定调标签(请作为本次编译的 brief):\n"
+                   "- 给谁看:内部工程师\n- 内容倾向:详尽百科、只留最新版本\n"
+                   "- 自定义:偏排障场景\n请按这些标签作为编译 brief 执行。")
+            r = await client.post("/message/brief-run", json={"message": msg})
+            assert r.status == 200, await r.text()
+            brief = json.loads((Path(td) / "authoring" / "BRIEF.json").read_text())
+            assert brief["audience"] == "内部工程师", brief
+            assert brief["styles"] == ["详尽百科", "只留最新版本"], brief
+            assert brief["custom"] == ["偏排障场景"], brief
+            assert run.client.queries == [msg], run.client.queries  # agent still sees the block
+
+            # ordinary message → no clobber (BRIEF.json stays the first brief)
+            r = await client.post("/message/brief-run", json={"message": "继续编下一篇"})
+            assert r.status == 200, await r.text()
+            assert json.loads((Path(td) / "authoring" / "BRIEF.json").read_text())["audience"] == "内部工程师"
+    finally:
+        await client.close()
+        compile_box.RUNS.clear()
+    print("✓ /message captures 定调 brief → BRIEF.json (ordinary msg leaves it)")
+
+
+
+async def test_incremental_route():
+    """Scoped incremental (DESIGN-kb-incremental-recompile-v2): a compile trigger +
+    the consumer's machine-computed RAW_CHANGES routes to the scoped path — materializes
+    CHANGESET.json (affected pages reverse-looked-up), arms the byte-integrity guard
+    state, injects the scoped directive — instead of a full-corpus re-plan."""
+    import json as _json
+
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "candidate").mkdir(parents=True)
+        (wd / "authoring").mkdir(parents=True)
+        (wd / "candidate" / "index.md").write_text("---\nokf_version: \"0.2\"\n---\n# Index\n- [a](a.md)")
+        (wd / "candidate" / "a.md").write_text(
+            "---\ntype: Topic\ntitle: t\nsources:\n  - resource: raw/snap/one.md\n---\n正文。")
+        run = compile_box.CompileRun("incr1", str(wd), 1)
+        # no RAW_CHANGES yet → NOT incremental (falls through to normal/full route)
+        assert not compile_box._should_route_to_incremental(run, "请增量重编")
+        # the consumer writes the machine-computed changeset input
+        (wd / "authoring" / "RAW_CHANGES.json").write_text(_json.dumps({
+            "modified": ["snap/one.md"], "added": [], "deleted": [],
+            "diffs": {"snap/one.md": "- old fact\n+ new fact"},
+            "snapshot_fingerprint": "SNAP"}))
+        assert compile_box._should_route_to_incremental(run, "请增量重编")
+        assert not compile_box._should_route_to_incremental(run, "随便聊两句")  # non-trigger never routes
+
+        fake = _FakeAgentClient()
+        run.client = fake
+        await compile_box._start_incremental(run, "请增量重编")
+        # CHANGESET.json materialized: affected page reverse-looked-up + the consumer's diff
+        cs = _json.loads((wd / "authoring" / "CHANGESET.json").read_text())
+        assert cs["affected_pages"] == ["a.md"], cs
+        assert cs["modified"][0]["diff"] == "- old fact\n+ new fact"
+        # byte-integrity guard state armed (before-hashes captured for the post-turn check)
+        assert run._incr_pending is not None and "a.md" in run._incr_pending["before"]
+        # the scoped directive was injected (not a batch orchestrator)
+        assert any("[Incremental recompile]" in q and "CHANGESET.json" in q for q in fake.queries), fake.queries
+        # review fix: the incremental kickoff arms the stall watchdog like
+        # every other model-turn injection site
+        assert run._turn_active and "[Incremental recompile]" in run._last_directive
+    print("OK  incremental route (RAW_CHANGES → scoped CHANGESET + guard-armed + scoped directive; absent/non-trigger → no route)")
+
+
+async def test_incremental_integrity_guard():
+    """M3: on an incremental turn a page touched OUTSIDE the authorized set forces a
+    repair even when the coverage ledger is clean — "leave the rest untouched" is
+    enforced by byte comparison, not the model's word. The guard state is one-shot."""
+    import json as _json
+    import incremental
+
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "raw" / "snap").mkdir(parents=True)
+        (wd / "candidate").mkdir()
+        (wd / "authoring").mkdir()
+        (wd / "raw" / "snap" / "one.md").write_text("one")
+        (wd / "raw" / "snap" / "two.md").write_text("two")
+        (wd / "candidate" / "index.md").write_text("---\nokf_version: \"0.2\"\n---\n# Index\n- [a](a.md)\n- [c](c.md)")
+        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: raw/snap/one.md\n---\n正文a。")
+        (wd / "candidate" / "c.md").write_text("---\ntype: Topic\ntitle: c\nsources:\n  - resource: raw/snap/two.md\n---\n正文c。")
+        run = compile_box.CompileRun("incrg", str(wd), 1)
+        run._selfcheck_key = None
+        run._l1_repairs_used = 0
+        # arm the guard: this round's changeset only authorizes a.md
+        cs = {"affected_pages": ["a.md"], "added": [], "deleted": [],
+              "modified": [{"path": "snap/one.md", "affected_pages": ["a.md"], "diff": ""}]}
+        run._incr_pending = {"before": incremental.page_hashes(str(wd)), "changeset": cs}
+        # model edits a.md (authorized) AND drifts into c.md (unauthorized)
+        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: raw/snap/one.md\n---\n正文a 更新。")
+        (wd / "candidate" / "c.md").write_text("---\ntype: Topic\ntitle: c\nsources:\n  - resource: raw/snap/two.md\n---\n正文c 擅自改。")
+        repair = await compile_box._post_turn_selfcheck(run)
+        # coverage ledger is clean (both sources still cited) yet integrity forces a repair naming c.md
+        assert repair is not None and "Incremental scope violation" in repair and "c.md" in repair, repair
+        # review fix: on a violation the guard RE-ARMS for the repair turn itself
+        # (the repair restores toward the ORIGINAL baseline) — it used to be
+        # consumed here, leaving the repair turn unguarded.
+        assert run._incr_pending is not None and run._incr_pending["changeset"] is cs
+        # the repair restores c.md → the re-armed guard clears cleanly
+        (wd / "candidate" / "c.md").write_text("---\ntype: Topic\ntitle: c\nsources:\n  - resource: raw/snap/two.md\n---\n正文c。")
+        run._selfcheck_key = None
+        repair2 = await compile_box._post_turn_selfcheck(run)
+        assert repair2 is None, repair2
+        assert run._incr_pending is None  # consumed on the clean pass
+        sc = _json.loads((wd / "authoring" / "SELFCHECK.json").read_text())
+        assert sc["incremental"]["out_of_scope_pages"] == [], sc
+    print("OK  incremental integrity guard (violation → repair + re-armed guard; clean pass consumes)")
+
+
+async def test_incremental_guard_rearms_on_ledger_repair():
+    """Round-4 review fix: an incremental turn that stayed IN scope but failed
+    the coverage ledger enters repairing too — the guard must re-arm for that
+    ledger-repair turn as well (it used to be gated on violations only)."""
+    import json as _json
+    import incremental
+
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "raw" / "snap").mkdir(parents=True)
+        (wd / "candidate").mkdir()
+        (wd / "authoring").mkdir()
+        (wd / "raw" / "snap" / "one.md").write_text("one")
+        (wd / "raw" / "snap" / "orphaned-src.md").write_text("never cited")  # → unaccounted
+        (wd / "candidate" / "index.md").write_text("---\nokf_version: \"0.2\"\n---\n# Index\n- [a](a.md)")
+        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: raw/snap/one.md\n---\n正文a。")
+        run = compile_box.CompileRun("incrl", str(wd), 1)
+        run._selfcheck_key = None
+        run._l1_repairs_used = 0
+        cs = {"affected_pages": ["a.md"], "added": [], "deleted": [],
+              "modified": [{"path": "snap/one.md", "affected_pages": ["a.md"], "diff": ""}]}
+        armed = {"before": incremental.page_hashes(str(wd)), "changeset": cs}
+        run._incr_pending = armed
+        # the turn edits ONLY the authorized page (no byte violations)…
+        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: raw/snap/one.md\n---\n正文a 更新。")
+        repair = await compile_box._post_turn_selfcheck(run)
+        # …but the ledger is unclean (orphaned-src.md unaccounted) → repairing
+        assert repair is not None and "orphaned-src.md" in repair, repair
+        sc = _json.loads((wd / "authoring" / "SELFCHECK.json").read_text())
+        assert sc["incremental"]["out_of_scope_pages"] == [], sc
+        # the guard is re-armed for the ledger-repair turn
+        assert run._incr_pending is not None and run._incr_pending["changeset"] is cs
+    print("OK  incremental guard re-arms on in-scope ledger repair (round-4 fix)")
+
+
+async def test_incremental_violation_auto_restored():
+    """L0: with the byte snapshot armed, an out-of-scope edit is restored BY CODE
+    before the ledger runs — no repair turn, byte-exact tree, restored_pages in
+    the report. The model cannot un-edit toward a hash; asking it to burned the
+    whole repair budget and always landed unconverged (3/3 live rounds, 07-09)."""
+    import json as _json
+    import incremental
+
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "raw" / "snap").mkdir(parents=True)
+        (wd / "candidate").mkdir()
+        (wd / "authoring").mkdir()
+        (wd / "raw" / "snap" / "one.md").write_text("one")
+        (wd / "raw" / "snap" / "two.md").write_text("two")
+        (wd / "candidate" / "index.md").write_text("---\nokf_version: \"0.2\"\n---\n# Index\n- [a](a.md)\n- [c](c.md)")
+        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: raw/snap/one.md\n---\n正文a。")
+        c_original = "---\ntype: Topic\ntitle: c\nsources:\n  - resource: raw/snap/two.md\n---\n正文c。"
+        (wd / "candidate" / "c.md").write_text(c_original)
+        run = compile_box.CompileRun("incrr", str(wd), 1)
+        run._selfcheck_key = None
+        run._l1_repairs_used = 0
+        cs = {"affected_pages": ["a.md"], "added": [], "deleted": [],
+              "modified": [{"path": "snap/one.md", "affected_pages": ["a.md"], "diff": ""}]}
+        run._incr_pending = {"before": incremental.page_hashes(str(wd)),
+                             "before_bytes": incremental.page_bytes(str(wd)), "changeset": cs}
+        # model edits a.md (authorized) AND drifts into c.md (unauthorized)
+        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: raw/snap/one.md\n---\n正文a 更新。")
+        (wd / "candidate" / "c.md").write_text("---\ntype: Topic\ntitle: c\nsources:\n  - resource: raw/snap/two.md\n---\n正文c 擅自改。")
+        repair = await compile_box._post_turn_selfcheck(run)
+        assert repair is None, repair  # violation auto-restored, ledger clean → no repair turn
+        assert (wd / "candidate" / "c.md").read_text() == c_original  # byte-exact restore
+        sc = _json.loads((wd / "authoring" / "SELFCHECK.json").read_text())
+        assert sc["state"] == "passed", sc
+        assert sc["incremental"]["out_of_scope_pages"] == [], sc
+        assert sc["incremental"]["restored_pages"] == ["c.md"], sc
+        assert sc["incremental"]["grandfathered_format_violation_count"] == 0, sc
+        assert run._incr_pending is None  # consumed: nothing left to guard
+    print("OK  incremental violation auto-restored by code (no repair turn, byte-exact, reported)")
+
+
+async def test_unconverged_files_residual_ticket():
+    """L2: repair budget spent with residuals → the driver files ONE ticket in
+    the owner's question queue by code. The publish page only displays residual
+    state — it must never be where the owner discovers work."""
+    import json as _json
+
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "raw" / "snap").mkdir(parents=True)
+        (wd / "candidate").mkdir()
+        (wd / "authoring").mkdir()
+        (wd / "raw" / "snap" / "one.md").write_text("one")
+        (wd / "raw" / "snap" / "never-compiled.md").write_text("orphan")  # → unaccounted forever
+        (wd / "candidate" / "index.md").write_text("---\nokf_version: \"0.2\"\n---\n# Index\n- [a](a.md)")
+        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: raw/snap/one.md\n---\n正文a。")
+        run = compile_box.CompileRun("uncv", str(wd), 1)
+        run._selfcheck_key = None
+        run._l1_repairs_used = 99  # budget long spent → unconverged, not repairing
+        repair = await compile_box._post_turn_selfcheck(run)
+        assert repair is None, repair  # unconverged does not inject another repair
+        sc = _json.loads((wd / "authoring" / "SELFCHECK.json").read_text())
+        assert sc["state"] == "unconverged", sc
+        tickets = _json.loads((wd / "authoring" / "CONTRADICTIONS.json").read_text())
+        assert len(tickets) == 1 and tickets[0]["id"].startswith("selfcheck-residual-"), tickets
+        assert "never-compiled.md" in tickets[0]["sources"][0]["quote"]
+        # a second settle with the same residuals does not duplicate the ticket
+        run._selfcheck_key = None
+        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: raw/snap/one.md\n---\n正文a 又动了。")
+        await compile_box._post_turn_selfcheck(run)
+        tickets2 = _json.loads((wd / "authoring" / "CONTRADICTIONS.json").read_text())
+        assert len(tickets2) == 1, tickets2
+    print("OK  unconverged files a residual ticket (once, code-written, question queue)")
+
+
+async def test_exact_source_alias_is_repaired_before_l1_budget():
+    """Mechanical provenance repair settles without spending a model round."""
+    import json as _json
+
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "raw" / "docs").mkdir(parents=True)
+        (wd / "candidate").mkdir()
+        (wd / "authoring").mkdir()
+        (wd / "raw" / "docs" / "专题目录.md").write_text("source")
+        (wd / "candidate" / "index.md").write_text(
+            "---\nokf_version: \"0.2\"\n---\n# Index\n- [Guide](guide.md)\n")
+        (wd / "candidate" / "guide.md").write_text(
+            "---\ntype: Guide\ntitle: Guide\nlabels:\n"
+            "  - facet: topic\n    value: source guide\nsources:\n"
+            "  - resource: docs/专题目录.md\n---\n正文。(source: 专题目录)\n")
+        run = compile_box.CompileRun("mechanical-source", str(wd), 1)
+        run._selfcheck_key = None
+        run._l1_repairs_used = 0
+        run._full_compile_pending = True
+
+        repair = await compile_box._post_turn_selfcheck(run)
+
+        assert repair is None, repair
+        assert run._l1_repairs_used == 0
+        assert "(source: docs/专题目录.md)" in (
+            wd / "candidate" / "guide.md").read_text()
+        sc = _json.loads((wd / "authoring" / "SELFCHECK.json").read_text())
+        assert sc["state"] == "passed" and sc["lint"]["ok"], sc
+        assert sc["mechanical_fixes"]["count"] == 1, sc
+        events = []
+        while not run.events.empty():
+            events.append(run.events.get_nowait())
+        summaries = [event.get("text", "") for event in events
+                     if event.get("type") == "summary"]
+        assert any("without using a repair round" in text for text in summaries), summaries
+    print("OK  exact source alias auto-repairs before L1 model budget")
+
+
+async def test_incremental_grandfathers_untouched_format_debt():
+    """An ordinary scoped edit must not turn a legacy page into a migration
+    target merely because it was authorized. The same rule still blocks a new
+    profile violation on a page actually changed this round, so grandfathering
+    cannot become a blanket lint bypass."""
+    import incremental
+    import selfcheck
+
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "raw" / "snap").mkdir(parents=True)
+        (wd / "candidate").mkdir()
+        (wd / "authoring").mkdir()
+        (wd / "raw" / "snap" / "one.md").write_text("one")
+        (wd / "raw" / "snap" / "two.md").write_text("two")
+        legacy_index = "# Index\n- [a](a.md)\n- [b](b.md)"
+        (wd / "candidate" / "index.md").write_text(legacy_index)
+        (wd / "candidate" / "a.md").write_text(
+            "---\ntype: Topic\nsources:\n  - resource: raw/snap/one.md\n---\nA")
+        # This untouched page carries both legacy format debt and a valid
+        # filename-plus-locator citation. Neither may wedge an unrelated scoped
+        # edit, while the same citation would still be checked if its filename
+        # were absent from sources[].resource.
+        legacy = ("---\ntype: Topic\nsources:\n  - resource: raw/snap/two.md\n---\n"
+                  "See [[a]]. (source: snap/two.md §3)")
+        (wd / "candidate" / "b.md").write_text(legacy)
+        cs = {"affected_pages": ["a.md"], "added": [], "deleted": [],
+              "modified": [{"path": "snap/one.md", "affected_pages": ["a.md"], "diff": ""}]}
+
+        def arm(run):
+            run._incr_pending = {
+                "before": incremental.page_hashes(str(wd)),
+                "before_bytes": incremental.page_bytes(str(wd)),
+                "baseline_format_violations": selfcheck.format_violation_keys(
+                    selfcheck.candidate_pages(str(wd))),
+                "changeset": cs,
+            }
+
+        run = compile_box.CompileRun("legacy-format", str(wd), 1)
+        run._selfcheck_key = None
+        run._l1_repairs_used = 0
+        arm(run)
+        (wd / "candidate" / "a.md").write_text(
+            "---\ntype: Topic\nsources:\n  - resource: raw/snap/one.md\n---\nA updated")
+        repair = await compile_box._post_turn_selfcheck(run)
+        assert repair is None, repair
+        assert (wd / "candidate" / "index.md").read_text() == legacy_index
+        assert (wd / "candidate" / "b.md").read_text() == legacy
+        sc = json.loads((wd / "authoring" / "SELFCHECK.json").read_text())
+        assert sc["state"] == "passed" and sc["lint"]["ok"], sc
+        inherited = sc["incremental"]
+        assert inherited["grandfathered_format_violation_count"] == 2, inherited
+        assert {v["page"] for v in inherited["grandfathered_format_violations"]} == {
+            "index.md", "b.md",
+        }, inherited
+
+        # A fresh wikilink on a page actually changed this round is not inherited
+        # and blocks, even though the untouched legacy index remains grandfathered.
+        run._selfcheck_key = None
+        arm(run)
+        (wd / "candidate" / "a.md").write_text(
+            "---\ntype: Topic\nsources:\n  - resource: raw/snap/one.md\n---\nSee [[b]].")
+        repair2 = await compile_box._post_turn_selfcheck(run)
+        assert repair2 is not None and "siclaw_profile_wikilink" in repair2, repair2
+        sc2 = json.loads((wd / "authoring" / "SELFCHECK.json").read_text())
+        assert any(v["page"] == "a.md" and v["kind"] == "siclaw_profile_wikilink"
+                   for v in sc2["lint"]["violations"]), sc2
+    print("OK  incremental format baseline (unchanged legacy debt grandfathered; changed violations block)")
+
+
+async def test_repair_turn_may_edit_ledger_target_pages():
+    """Interlock (live 07-09): the ledger repair ordered edits on pages OUTSIDE
+    the round's authorized set (a dangling-citing page) and the re-armed guard's
+    mechanical restore reverted the repair itself → unconverged forever. The
+    re-arm now widens the authorized set by exactly the repair's target pages."""
+    import json as _json
+    import incremental
+
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "raw" / "snap").mkdir(parents=True)
+        (wd / "candidate").mkdir()
+        (wd / "authoring").mkdir()
+        (wd / "raw" / "snap" / "one.md").write_text("one")
+        (wd / "raw" / "snap" / "two.md").write_text("two")
+        (wd / "candidate" / "index.md").write_text("---\nokf_version: \"0.2\"\n---\n# Index\n- [a](a.md)\n- [c](c.md)")
+        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: raw/snap/one.md\n---\n正文a。")
+        # c.md cites a source that no longer exists → dangling (out of this round's scope)
+        (wd / "candidate" / "c.md").write_text("---\ntype: Topic\ntitle: c\nsources:\n  - resource: raw/snap/ghost.md\n---\n正文c。")
+        run = compile_box.CompileRun("interlock", str(wd), 1)
+        run._selfcheck_key = None
+        run._l1_repairs_used = 0
+        cs = {"affected_pages": ["a.md"], "added": [], "deleted": [],
+              "modified": [{"path": "snap/one.md", "affected_pages": ["a.md"], "diff": ""}]}
+        run._incr_pending = {"before": incremental.page_hashes(str(wd)),
+                             "before_bytes": incremental.page_bytes(str(wd)), "changeset": cs}
+        # turn 1: model edits ONLY the authorized page — in scope, but the ledger
+        # is unclean (dangling citation on c.md) → repairing, guard re-armed
+        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: raw/snap/one.md\n---\n正文a 更新。")
+        repair = await compile_box._post_turn_selfcheck(run)
+        assert repair is not None and "ghost.md" in repair, repair
+        assert run._incr_pending is not None
+        assert run._incr_pending.get("repair_pages") == ["c.md"], run._incr_pending.get("repair_pages")
+        # repair turn: model fixes the dangling citation on the OUT-OF-SCOPE page
+        (wd / "candidate" / "c.md").write_text("---\ntype: Topic\ntitle: c\nsources:\n  - resource: raw/snap/two.md\n---\n正文c。")
+        run._selfcheck_key = None
+        repair2 = await compile_box._post_turn_selfcheck(run)
+        assert repair2 is None, repair2
+        sc = _json.loads((wd / "authoring" / "SELFCHECK.json").read_text())
+        assert sc["state"] == "passed", sc
+        # the guard did NOT restore the repair's edit
+        assert sc["incremental"]["out_of_scope_pages"] == [], sc
+        assert sc["incremental"]["restored_pages"] == [], sc
+        assert "snap/two.md" in (wd / "candidate" / "c.md").read_text()
+    print("OK  repair turn may edit ledger-target pages (guard widened, repair survives)")
+
+
+async def test_incremental_index_deletion_cannot_escape_guard():
+    """Review fix: an incremental turn that deletes candidate/index.md used to
+    hit the mid-Execute early-return AFTER the guard state was consumed — the
+    deletion escaped the byte freeze entirely. The turn must fall through: the
+    guard restores out-of-scope damage and the ledger runs on the real tree."""
+    import json as _json
+    import incremental
+
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "raw" / "snap").mkdir(parents=True)
+        (wd / "candidate").mkdir()
+        (wd / "authoring").mkdir()
+        (wd / "raw" / "snap" / "one.md").write_text("one")
+        (wd / "raw" / "snap" / "two.md").write_text("two")
+        (wd / "candidate" / "index.md").write_text("---\nokf_version: \"0.2\"\n---\n# Index\n- [a](a.md)\n- [c](c.md)")
+        c_original = "---\ntype: Topic\ntitle: c\nsources:\n  - resource: raw/snap/two.md\n---\n正文c。"
+        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: raw/snap/one.md\n---\n正文a。")
+        (wd / "candidate" / "c.md").write_text(c_original)
+        run = compile_box.CompileRun("incrx", str(wd), 1)
+        run._selfcheck_key = None
+        run._l1_repairs_used = 0
+        cs = {"affected_pages": ["a.md"], "added": [], "deleted": [],
+              "modified": [{"path": "snap/one.md", "affected_pages": ["a.md"], "diff": ""}]}
+        run._incr_pending = {"before": incremental.page_hashes(str(wd)),
+                             "before_bytes": incremental.page_bytes(str(wd)), "changeset": cs}
+        # model edits a.md (authorized), DELETES index.md and drifts into c.md
+        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: raw/snap/one.md\n---\n正文a 更新。")
+        (wd / "candidate" / "index.md").unlink()
+        (wd / "candidate" / "c.md").write_text("---\ntype: Topic\ntitle: c\nsources:\n  - resource: raw/snap/two.md\n---\n擅自改。")
+        repair = await compile_box._post_turn_selfcheck(run)
+        # the guard ran: c.md restored byte-exact; index.md (always-editable, no
+        # snapshot restore) leaves the tree index-less → orphan lint → repair
+        assert (wd / "candidate" / "c.md").read_text() == c_original
+        assert repair is not None and "index_missing" in repair, repair
+        sc = _json.loads((wd / "authoring" / "SELFCHECK.json").read_text())
+        assert sc["incremental"]["restored_pages"] == ["c.md"], sc
+        assert sc["state"] == "repairing", sc
+    print("OK  index deletion on an incremental turn cannot escape the guard")
+
+
+async def test_incremental_arm_cleared_when_dispatch_fails():
+    """Review fix: the snapshot must precede query (edits begin right after
+    send), so a query that RAISES must clear the arm — a stale arm would judge
+    the next unrelated turn against this round's snapshot and silently restore
+    over the owner's edits. Also: ADDED_TARGETS is a per-round declaration and
+    resets at round start."""
+    import json as _json
+
+    class _ExplodingClient:
+        async def query(self, text):
+            raise RuntimeError("stdin write failed")
+
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "candidate").mkdir(parents=True)
+        (wd / "authoring").mkdir(parents=True)
+        (wd / "candidate" / "index.md").write_text("---\nokf_version: \"0.2\"\n---\n# Index\n- [a](a.md)")
+        (wd / "candidate" / "a.md").write_text(
+            "---\ntype: Topic\ntitle: t\nsources:\n  - resource: raw/snap/one.md\n---\n正文。")
+        # stale per-round declaration from an earlier round must not survive
+        (wd / "authoring" / "ADDED_TARGETS.json").write_text('["stale-page.md"]')
+        (wd / "authoring" / "RAW_CHANGES.json").write_text(_json.dumps({
+            "modified": ["snap/one.md"], "added": [], "deleted": [],
+            "diffs": {}, "snapshot_fingerprint": "SNAP"}))
+        run = compile_box.CompileRun("incrfail", str(wd), 1)
+        run.client = _ExplodingClient()
+        try:
+            await compile_box._start_incremental(run, "请增量重编")
+            assert False, "query failure must propagate"
+        except RuntimeError:
+            pass
+        assert run._incr_pending is None  # no stale arm on a turn that never started
+        assert not (wd / "authoring" / "ADDED_TARGETS.json").exists()  # per-round reset
+    print("OK  incremental arm cleared on dispatch failure + ADDED_TARGETS per-round reset")
+
+
+async def test_noop_repair_turn_reaches_the_gate():
+    """Review fix: a repair turn that changes nothing ledger-relevant used to
+    hit the state_key dedup early-return — state stayed 'repairing' forever,
+    NO residual ticket, while the seam settled. It must fall through, spend
+    the budget, and file the ticket."""
+    import json as _json
+
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "raw" / "snap").mkdir(parents=True)
+        (wd / "candidate").mkdir()
+        (wd / "authoring").mkdir()
+        (wd / "raw" / "snap" / "one.md").write_text("one")
+        (wd / "raw" / "snap" / "never-compiled.md").write_text("orphan")  # unaccounted forever
+        (wd / "candidate" / "index.md").write_text("---\nokf_version: \"0.2\"\n---\n# Index\n- [a](a.md)")
+        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: raw/snap/one.md\n---\n正文a。")
+        run = compile_box.CompileRun("noop", str(wd), 1)
+        run._selfcheck_key = None
+        run._l1_repairs_used = 0
+        os.environ["KBC_L1_REPAIR_ROUNDS"] = "1"  # pin: the default is now 2
+        repair = await compile_box._post_turn_selfcheck(run)
+        assert repair is not None and "never-compiled.md" in repair  # round 1: repairing
+        sc = _json.loads((wd / "authoring" / "SELFCHECK.json").read_text())
+        assert sc["state"] == "repairing", sc
+        # the repair turn does NOTHING ledger-relevant (tree unchanged, key matches)
+        run._begin_turn(repair)
+        repair2 = await compile_box._post_turn_selfcheck(run)
+        assert repair2 is None, repair2
+        sc2 = _json.loads((wd / "authoring" / "SELFCHECK.json").read_text())
+        assert sc2["state"] == "unconverged", sc2  # budget spent honestly, not stuck 'repairing'
+        tickets = _json.loads((wd / "authoring" / "CONTRADICTIONS.json").read_text())
+        assert any(str(tk.get("id", "")).startswith("selfcheck-residual-") for tk in tickets), tickets
+        del os.environ["KBC_L1_REPAIR_ROUNDS"]
+    print("OK  no-op repair turn reaches the gate (unconverged + residual ticket, not silent)")
+
+
+def test_media_verify_suppresses_text_backed_beyond_transcript():
+    """A beyond-transcript image doubt whose claim is verbatim-backed by a
+    co-cited TEXT source is corroboration noise, not an owner question (live
+    adoption run 2026-07-22: "FP4 +46%" flagged while the co-cited markdown
+    states the figure verbatim). Inconsistent findings are never suppressed."""
+    import mediaverify
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "raw" / "snap").mkdir(parents=True)
+        (wd / "raw" / "snap" / "perf.md").write_text(
+            "B300较B200，FP4有46%提升；整体也只 +39.7%，不太符合预期。")
+        page_text = (
+            "---\ntype: Comparison\ntitle: c\nsources:\n"
+            "  - resource: raw/snap/perf.md\n  - resource: raw/snap/assets/tok1.png\n---\n"
+            "B300 FP4 较 B200 +46%。整体 +39.7%。另一个编造值 +87.5%。")
+        findings = [
+            {"image": "snap/assets/tok1.png", "claim": "B300 FP4 较 B200 +46%",
+             "kind": "超出转写范围", "expected": "not in the transcript", "fix": "…"},
+            {"image": "snap/assets/tok1.png", "claim": "整体 +39.7%",
+             "kind": "超出转写范围", "expected": "not in the transcript", "fix": "…"},
+            {"image": "snap/assets/tok1.png", "claim": "编造值 +87.5%",
+             "kind": "超出转写范围", "expected": "not in the transcript", "fix": "…"},
+            {"image": "snap/assets/tok1.png", "claim": "FP4 较 B200 +46%",
+             "kind": "不一致", "expected": "图中为 40%", "fix": "…"},
+        ]
+        kept, suppressed = mediaverify.suppress_text_backed(
+            str(wd), "c.md", page_text, findings)
+        s_claims = {s["claim"] for s in suppressed}
+        assert s_claims == {"B300 FP4 较 B200 +46%", "整体 +39.7%"}, suppressed
+        k_kinds = [(f["kind"], f["claim"]) for f in kept]
+        assert ("超出转写范围", "编造值 +87.5%") in k_kinds, kept   # not in text → real doubt
+        assert ("不一致", "FP4 较 B200 +46%") in k_kinds, kept      # conflicts never suppressed
+        assert all(s["suppressed_reason"] == "text_source_backed" for s in suppressed)
+        # qualitative claim without distinctive numbers → never suppressed
+        kept2, sup2 = mediaverify.suppress_text_backed(
+            str(wd), "c.md", page_text,
+            [{"image": "snap/assets/tok1.png", "claim": "该型号为 X 系列",
+              "kind": "超出转写范围", "expected": "not in the transcript", "fix": "…"}])
+        assert not sup2 and len(kept2) == 1
+    print("OK  media verify suppresses text-backed beyond-transcript doubts (keeps real ones + conflicts)")
+
+
+def test_l1_repair_budget_scales_with_workload():
+    """Flat budget stays the floor for ordinary drift; a first-compile-sized
+    violation pile earns proportionally more bounded rounds; the operator cap
+    fences runaways (2026-07-22 adoption run: 55 residuals vs 2 flat rounds)."""
+    def rep(unacc=0, dangling=0, lint=0):
+        return {"coverage": {"unaccounted": ["x"] * unacc,
+                             "dangling_citations": ["y"] * dangling},
+                "lint": {"violations": [{}] * lint}}
+    assert compile_box._l1_repair_round_limit(rep()) == compile_box._l1_repair_rounds()
+    assert compile_box._l1_repair_round_limit(rep(unacc=3)) == compile_box._l1_repair_rounds()
+    assert compile_box._l1_repair_round_limit(rep(unacc=40, lint=15)) == 5  # ceil(55/12)
+    assert compile_box._l1_repair_round_limit(rep(unacc=500)) == 16  # capped
+    os.environ["KBC_L1_REPAIR_MAX_ROUNDS"] = "6"
+    try:
+        assert compile_box._l1_repair_round_limit(rep(unacc=500)) == 6
+    finally:
+        del os.environ["KBC_L1_REPAIR_MAX_ROUNDS"]
+    os.environ["KBC_L1_REPAIR_VIOLATIONS_PER_ROUND"] = "5"
+    try:
+        assert compile_box._l1_repair_round_limit(rep(unacc=20)) == 4
+    finally:
+        del os.environ["KBC_L1_REPAIR_VIOLATIONS_PER_ROUND"]
+    print("OK  L1 repair budget scales with open-violation workload (floor + cap)")
+
+
+async def test_l1_repair_budget_high_water_survives_shrinking_workload():
+    """Loop-level pin for the review finding on PR #430: the limit is derived
+    from the OPEN workload, which shrinks as repairs land. Gating on a per-turn
+    recomputation closes the gate at ~half-repaired; the episode must keep its
+    high-water allowance, and the persisted report must stay coherent
+    (used <= limit) even on the unconverged exit."""
+    import json as _json
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "raw" / "snap").mkdir(parents=True)
+        (wd / "candidate").mkdir()
+        (wd / "authoring").mkdir()
+        (wd / "raw" / "snap" / "one.md").write_text("one")
+        for i in range(30):  # 30 unaccounted -> limit ceil(30/12)=3 with floor pinned to 1
+            (wd / "raw" / "snap" / f"orphan{i}.md").write_text("x")
+        (wd / "candidate" / "index.md").write_text("---\nokf_version: \"0.2\"\n---\n# Index\n- [a](a.md)")
+        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: raw/snap/one.md\n---\n正文a。")
+        run = compile_box.CompileRun("noop", str(wd), 1)
+        run._selfcheck_key = None
+        os.environ["KBC_L1_REPAIR_ROUNDS"] = "1"
+        try:
+            repair = await compile_box._post_turn_selfcheck(run)
+            assert repair is not None  # round 1: repairing, high-water = 3
+            sc = _json.loads((wd / "authoring" / "SELFCHECK.json").read_text())
+            assert sc["repair_rounds_limit"] == 3, sc["repair_rounds_limit"]
+            # "repair" lands: 28 orphans fixed -> workload shrinks to 2 (limit would be 1)
+            for i in range(28):
+                (wd / "raw" / "snap" / f"orphan{i}.md").unlink()
+            run._begin_turn(repair)
+            repair2 = await compile_box._post_turn_selfcheck(run)
+            assert repair2 is not None, "high-water must keep the gate open (used=1 < 3)"
+            run._begin_turn(repair2)
+            repair3 = await compile_box._post_turn_selfcheck(run)
+            assert repair3 is not None, "used=2 < 3 still repairing"
+            run._begin_turn(repair3)
+            repair4 = await compile_box._post_turn_selfcheck(run)
+            assert repair4 is None  # used=3 == limit -> unconverged
+            sc = _json.loads((wd / "authoring" / "SELFCHECK.json").read_text())
+            assert sc["state"] == "unconverged", sc["state"]
+            assert sc["repair_rounds_used"] == 3 and sc["repair_rounds_limit"] == 3, sc
+        finally:
+            del os.environ["KBC_L1_REPAIR_ROUNDS"]
+    print("OK  L1 repair budget keeps its episode high-water while the workload shrinks")
+
+
+async def test_unchanged_owner_turn_does_not_migrate_legacy_format():
+    """An ordinary conversation over an inherited draft must not become an
+    implicit whole-library OKF migration merely because this is a fresh box.
+    A changed page stays strict, but inherited format debt on untouched pages
+    is grandfathered. Non-format findings and full compiles remain blocking."""
+
+    def make_legacy_workspace(root: Path) -> None:
+        (root / "raw" / "snap").mkdir(parents=True)
+        (root / "candidate").mkdir()
+        (root / "authoring").mkdir()
+        (root / "raw" / "snap" / "one.md").write_text("source")
+        (root / "candidate" / "index.md").write_text(
+            "# Index\n- [Legacy](legacy.md)\n- [Clean](clean.md)"
+        )
+        (root / "candidate" / "legacy.md").write_text(
+            "---\ntitle: Legacy\nsources:\n  - resource: raw/snap/one.md\n---\n# Legacy\nInherited body.\n"
+        )
+        (root / "candidate" / "clean.md").write_text(
+            "---\ntype: Topic\ntitle: Clean\nlabels:\n"
+            "  - facet: topic\n    value: stable knowledge\nsources:\n"
+            "  - resource: raw/snap/one.md\n---\n# Clean\nStable body.\n"
+        )
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+
+        chat = base / "chat"
+        make_legacy_workspace(chat)
+        chat_run = compile_box.CompileRun("legacy-chat", str(chat), 1)
+        chat_run._begin_turn(
+            "Explain the current scope without editing the draft.",
+            grandfather_legacy_format=True,
+        )
+        assert await compile_box._post_turn_selfcheck(chat_run) is None
+        assert not (chat / "authoring" / "SELFCHECK.json").exists()
+
+        changed = base / "changed"
+        make_legacy_workspace(changed)
+        changed_run = compile_box.CompileRun("legacy-changed", str(changed), 1)
+        changed_run._begin_turn("Update the draft.", grandfather_legacy_format=True)
+        page = changed / "candidate" / "legacy.md"
+        page.write_text(page.read_text() + "Changed this turn.\n")
+        changed_repair = await compile_box._post_turn_selfcheck(changed_run)
+        assert changed_repair is not None and "okf_type" in changed_repair, changed_repair
+
+        clean_edit = base / "clean-edit"
+        make_legacy_workspace(clean_edit)
+        clean_run = compile_box.CompileRun("legacy-clean-edit", str(clean_edit), 1)
+        clean_run._begin_turn("Fix one clean page.", grandfather_legacy_format=True)
+        clean_page = clean_edit / "candidate" / "clean.md"
+        clean_page.write_text(clean_page.read_text() + "Small wording fix.\n")
+        assert await compile_box._post_turn_selfcheck(clean_run) is None
+        clean_sc = json.loads((clean_edit / "authoring" / "SELFCHECK.json").read_text())
+        assert clean_sc["state"] == "passed" and clean_sc["lint"]["ok"], clean_sc
+        inherited = clean_sc["grandfathered_format"]
+        assert inherited["violation_count"] == 2, inherited
+        assert {v["page"] for v in inherited["violations"]} == {
+            "index.md", "legacy.md",
+        }, inherited
+
+        broken = base / "broken-link"
+        make_legacy_workspace(broken)
+        broken_legacy = broken / "candidate" / "legacy.md"
+        broken_legacy.write_text(broken_legacy.read_text() + "[Missing](missing.md)\n")
+        broken_run = compile_box.CompileRun("legacy-broken-link", str(broken), 1)
+        broken_run._begin_turn("Fix one clean page.", grandfather_legacy_format=True)
+        broken_page = broken / "candidate" / "clean.md"
+        broken_page.write_text(broken_page.read_text() + "Small wording fix.\n")
+        broken_repair = await compile_box._post_turn_selfcheck(broken_run)
+        assert broken_repair is not None and "broken_link" in broken_repair, broken_repair
+
+        compile_wd = base / "compile"
+        make_legacy_workspace(compile_wd)
+        compile_run = compile_box.CompileRun("legacy-compile", str(compile_wd), 1)
+        compile_run._full_compile_pending = True
+        compile_run._begin_turn("Run an explicit full compile.")
+        compile_repair = await compile_box._post_turn_selfcheck(compile_run)
+        assert compile_repair is not None and "okf_type" in compile_repair, compile_repair
+
+    print("OK  owner chat grandfathers only untouched legacy format debt; changed/non-format/full stay strict")
+
+
+async def test_batch_final_ledger_check_requires_index():
+    """Batch C: the mid-Execute index exemption wrongly applied to the batch-
+    final ledger pass — a train that finished without an index settled an
+    unroutable draft. With _ledger_forced the pass falls through and the
+    index_missing lint orders the rebuild."""
+    import json as _json
+
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "raw" / "snap").mkdir(parents=True)
+        (wd / "candidate").mkdir()
+        (wd / "authoring").mkdir()
+        (wd / "raw" / "snap" / "one.md").write_text("one")
+        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: raw/snap/one.md\n---\n正文a。")
+        run = compile_box.CompileRun("bfx", str(wd), 1)
+        run._selfcheck_key = None
+        run._l1_repairs_used = 0
+        # plain call (mid-Execute shape): exemption applies → no check
+        assert await compile_box._post_turn_selfcheck(run) is None
+        # batch-final shape: forced → index_missing repair ordered
+        run._selfcheck_key = None
+        run._ledger_forced = True
+        try:
+            repair = await compile_box._post_turn_selfcheck(run)
+        finally:
+            run._ledger_forced = False
+        assert repair is not None and "index_missing" in repair, repair
+    print("OK  batch-final ledger pass requires the index (exemption is mid-Execute only)")
+
+
+async def test_batch_orchestrator_routing_and_resume():
+    """Batch mode (DESIGN-kb-batch-compile-2026-07-05): trigger routing honors
+    the threshold gate (small KBs never batch), the orchestrator stamps batches
+    done and emits exactly ONE turn_done, mid-batch owner chat queues, and an
+    interrupted plan resumes from the first pending batch."""
+    import batching
+
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        raw = wd / "raw"
+        (raw / "a").mkdir(parents=True)
+        (raw / "b").mkdir(parents=True)
+        (raw / "a" / "one.md").write_bytes(b"x" * 300)
+        (raw / "b" / "two.md").write_bytes(b"y" * 300)
+        run = compile_box.CompileRun("rb1", str(wd), 1)
+
+        # threshold gate: big threshold → single-session path untouched
+        os.environ["KBC_BATCH_THRESHOLD_BYTES"] = "100000"
+        assert not compile_box._should_route_to_batch(run, "直接开始编译")
+        # over threshold + trigger → batch; non-trigger chat never batches
+        os.environ["KBC_BATCH_THRESHOLD_BYTES"] = "100"
+        os.environ["KBC_BATCH_BUDGET_BYTES"] = "400"
+        os.environ["KBC_BATCH_PLANNER"] = "code"
+        assert compile_box._should_route_to_batch(run, "直接开始编译")
+        assert compile_box._should_route_to_batch(run, "原料已更新,请增量重编: xx")
+        assert not compile_box._should_route_to_batch(run, "你好")
+        assert not compile_box._should_route_to_batch(run, "请解释一下“请增量重编”是什么意思")
+
+        # stub the session driver: record directives, pretend each session works
+        driven: list[str] = []
+
+        async def fake_drive(run_, directive, label, pdf_page_ranges=None,
+                             raw_scope=None):
+            driven.append(label + "|" + directive.split("\n")[0])
+            return f"done {label}"
+
+        real_drive = compile_box._drive_batch_session
+        real_accounted = compile_box._unaccounted_batch_sources
+        compile_box._drive_batch_session = fake_drive
+        compile_box._unaccounted_batch_sources = lambda run_, sources: []
+        try:
+            await compile_box._run_batch_compile(run, "直接开始编译")
+        finally:
+            compile_box._drive_batch_session = real_drive
+            compile_box._unaccounted_batch_sources = real_accounted
+
+        events = []
+        while not run.events.empty():
+            events.append(run.events.get_nowait())
+        types = [e["type"] for e in events]
+        assert types.count("turn_done") == 1, types
+        turn = next(e for e in events if e["type"] == "turn_done")
+        assert "[Batch 1/2]" in turn["text"] and "[Final review]" in turn["text"], turn
+        plan = json.loads((wd / batching.BATCH_PLAN_PATH).read_text())
+        assert all(b["status"] == "done" for b in plan["batches"]), plan
+        assert (wd / batching.SOURCES_INVENTORY_PATH).is_file()
+        # two batches + 终审 were driven, in order
+        assert len(driven) == 3 and driven[-1].startswith("final review"), driven
+
+        # resume: mark one batch pending again → next trigger routes to batch even
+        # under a huge threshold, and only the pending batch (+终审) re-runs
+        plan["batches"][1]["status"] = "pending"
+        plan["phase"] = "map"
+        compile_box._write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
+        os.environ["KBC_BATCH_THRESHOLD_BYTES"] = "100000"
+        assert compile_box._should_route_to_batch(run, "直接开始编译")
+        driven.clear()
+        compile_box._drive_batch_session = fake_drive
+        compile_box._unaccounted_batch_sources = lambda run_, sources: []
+        try:
+            await compile_box._run_batch_compile(run, "直接开始编译")
+        finally:
+            compile_box._drive_batch_session = real_drive
+            compile_box._unaccounted_batch_sources = real_accounted
+        assert len(driven) == 2 and driven[0].startswith("batch 2/2"), driven
+
+        # mid-batch owner chat queues and is relayed into the next directive
+        run._batch_active = True
+        run._batch_notes.append("注意保密条款")
+        note = compile_box._drain_batch_notes(run)
+        assert "注意保密条款" in note and compile_box._drain_batch_notes(run) == ""
+        run._batch_active = False
+
+        # Explicit control reset: a corrupt plan is revoked, but Candidate and
+        # Raw remain. The trusted resume command rebuilds a plan in-place and
+        # consumes the reset marker instead of requiring a fresh generation.
+        (wd / batching.BATCH_PLAN_PATH).unlink()
+        reset_marker = wd / compile_box.RECOVERY_RESET_PATH
+        reset_marker.write_text(
+            '{"version":1,"reason":"explicit_control_reset","candidate_preserved":true}',
+            "utf-8",
+        )
+        compile_box._prepare_command(
+            run, {"action": "compile.resume", "parameters": {}})
+        driven.clear()
+        compile_box._drive_batch_session = fake_drive
+        compile_box._unaccounted_batch_sources = lambda run_, sources: []
+        try:
+            await compile_box._run_batch_compile(run, "ignored localized text")
+        finally:
+            compile_box._drive_batch_session = real_drive
+            compile_box._unaccounted_batch_sources = real_accounted
+        assert len(driven) == 3, driven
+        assert not reset_marker.exists(), "reset marker survived replacement-plan seal"
+        assert (wd / batching.BATCH_PLAN_PATH).is_file()
+        del os.environ["KBC_BATCH_THRESHOLD_BYTES"]
+        del os.environ["KBC_BATCH_BUDGET_BYTES"]
+    print("\u2713 batch orchestrator: gate/stamps/single turn_done/resume/notes")
+
+
+async def test_exclude_source_tool_owns_the_ledger():
+    """The 2026-07-24 mandate: the model never hand-authors a machine format.
+    exclude_source is the sanctioned write path (validated, canonical,
+    de-duplicated), and the post-session normalizer guarantees a hand-edited
+    ledger is strictly parseable at rest again."""
+    import selfcheck
+
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "raw" / "docs").mkdir(parents=True)
+        (wd / "raw" / "docs" / "empty-nav.md").write_text("# nav\n", encoding="utf-8")
+        (wd / "raw" / "docs" / "real.md").write_text("# real\ncontent\n", encoding="utf-8")
+        run = compile_box.CompileRun("tool1", str(wd), 1)
+        tools = {t.name: t for t in compile_box._compile_engine_tools(run)}
+        exclude = tools["exclude_source"].handler
+
+        # Valid path (raw/ prefix tolerated) → canonical row lands once.
+        out = await exclude({"path": "raw/docs/empty-nav.md", "reason": "empty navigation page"})
+        assert "docs/empty-nav.md" in out, out
+        entries, errs = selfcheck.load_exclusions(str(wd))
+        assert not errs and len(entries) == 1, (entries, errs)
+        # Identical reason → idempotent no-op (a DIFFERENT reason corrects the row
+        # instead; that lifecycle is covered by test_exclusion_tools_cover_the_full_lifecycle).
+        again = await exclude({"path": "docs/empty-nav.md", "reason": "empty navigation page"})
+        assert "already" in again or "早已" in again, again
+        assert len(selfcheck.load_exclusions(str(wd))[0]) == 1
+
+        # Unknown path → refused with a close-match hint, ledger untouched.
+        miss = await exclude({"path": "docs/empty-nav2.md", "reason": "typo"})
+        assert "empty-nav.md" in miss, miss
+        entries, _ = selfcheck.load_exclusions(str(wd))
+        assert len(entries) == 1, entries
+
+        # Missing reason → refused.
+        bad = await exclude({"path": "docs/real.md", "reason": " "})
+        assert "reason" in bad or "path" in bad or "需要" in bad, bad
+
+        # Machine-owned at rest: a hand edit with a trailing comma is
+        # re-canonicalized by the post-session normalizer, rows preserved.
+        excl = wd / selfcheck.EXCLUSIONS_PATH
+        excl.write_text('[\n  {"pattern": "docs/empty[-]nav.md", "reason": "empty navigation page"},\n]\n', encoding="utf-8")
+        assert selfcheck.normalize_exclusions_file(str(wd)) is None
+        strict = json.loads(excl.read_text(encoding="utf-8"))
+        assert isinstance(strict, list) and len(strict) == 1, strict
+        # Corruption beyond mechanical repair: reported, file untouched.
+        excl.write_text("{nope", encoding="utf-8")
+        err = selfcheck.normalize_exclusions_file(str(wd))
+        assert err and "corrupted" in err, err
+        assert excl.read_text(encoding="utf-8") == "{nope"
+    print("✓ exclude_source tool: validated canonical writes; ledger machine-owned at rest")
+
+
+async def test_exclusion_tools_cover_the_full_lifecycle():
+    """R3-2a: add / CORRECT / REMOVE all have a tool expression.
+
+    Pre-fix the ledger tools were append-only, so fixing a wrong reason or lifting
+    a wrong row could ONLY be done by hand — which the standing role prompt
+    forbade outright. That is the mandate-3 dead end (a prohibition with no legal
+    path forward), expressed in instructions instead of permissions. Both halves
+    now exist as tools; the hand edit stays available as a genuine last resort."""
+    import selfcheck
+
+    def rows(wd):
+        return json.loads((wd / selfcheck.EXCLUSIONS_PATH).read_text(encoding="utf-8"))
+
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "raw" / "docs").mkdir(parents=True)
+        (wd / "raw" / "docs" / "live.csv").write_text("a,b\n", encoding="utf-8")
+        (wd / "raw" / "docs" / "keep.md").write_text("# keep\n", encoding="utf-8")
+        run = compile_box.CompileRun("tool2", str(wd), 1)
+        tools = {t.name: t for t in compile_box._compile_engine_tools(run)}
+        exclude, remove = tools["exclude_source"].handler, tools["remove_exclusion"].handler
+
+        assert "docs/live.csv" in await exclude({"path": "docs/live.csv", "reason": "wrong reason"})
+        # Same reason again → idempotent no-op, still exactly one row.
+        same = await exclude({"path": "docs/live.csv", "reason": "wrong reason"})
+        assert "already" in same or "早已" in same, same
+        assert len(rows(wd)) == 1, rows(wd)
+
+        # DIFFERENT reason → the row is CORRECTED in place, never duplicated.
+        upd = await exclude({"path": "docs/live.csv", "reason": "live data, refreshed hourly"})
+        assert "updated" in upd or "更新" in upd, upd
+        assert rows(wd) == [{"pattern": "docs/live.csv",
+                             "reason": "live data, refreshed hourly"}], rows(wd)
+        entries, errs = selfcheck.load_exclusions(str(wd))
+        assert not errs and len(entries) == 1, (entries, errs)
+
+        # REMOVE by the exact source path lifts it (raw/ prefix tolerated).
+        gone = await remove({"path": "raw/docs/live.csv"})
+        assert "1" in gone, gone
+        assert rows(wd) == [], rows(wd)
+
+        # Removing what is not there REFUSES with a close-match hint (mirrors
+        # exclude_source): a silent zero-removal reads as a landed fix.
+        await exclude({"path": "docs/keep.md", "reason": "meta"})
+        miss = await remove({"path": "docs/keeps.md"})
+        assert "docs/keep.md" in miss, miss
+        assert len(rows(wd)) == 1, rows(wd)
+        need = await remove({"path": "  "})
+        assert "path" in need or "需要" in need, need
+
+        # LEGACY hand-written row (a glob the tools never write): removable
+        # verbatim, and ONLY it — the neighbouring row is not glob-swept away.
+        excl = wd / selfcheck.EXCLUSIONS_PATH
+        excl.write_text(json.dumps(
+            [{"pattern": "docs/keep.md", "reason": "meta"},
+             {"pattern": "docs/**", "reason": "hand-written, too broad"}],
+            ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        legacy = await remove({"path": "docs/**"})
+        assert "1" in legacy, legacy
+        assert rows(wd) == [{"pattern": "docs/keep.md", "reason": "meta"}], rows(wd)
+
+        # Duplicate rows for one pattern are ALL taken out by a single call.
+        excl.write_text(json.dumps(
+            [{"pattern": "docs/keep.md", "reason": "meta"},
+             {"pattern": "docs/keep.md", "reason": "meta (dup)"}],
+            ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        both = await remove({"path": "docs/keep.md"})
+        assert "2" in both, both
+        assert rows(wd) == [], rows(wd)
+    print("✓ exclusion tools: add / correct-reason / remove (incl. legacy pattern) all have a tool path")
+
+
+async def test_batch_standalone_media_is_retained():
+    """A repository asset is Raw evidence even without a Markdown edge.
+
+    MDX components and product configs can reference media in syntax the batch
+    layer does not understand, so a pinned plan must keep the asset and must not
+    manufacture an exclusion row.
+    """
+    import batching
+    import selfcheck
+
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        raw = wd / "raw"
+        (raw / "docs" / "assets").mkdir(parents=True)
+        (raw / "docs" / "one.md").write_bytes(
+            "# One\n![embedded](assets/linked.png)\n".encode("utf-8") + b"x" * 300)
+        (raw / "docs" / "assets" / "linked.png").write_bytes(b"\x89PNG-linked")
+        (raw / "docs" / "assets" / "orphan.png").write_bytes(b"\x89PNG-orphan")
+        run = compile_box.CompileRun("orb1", str(wd), 1)
+        os.environ["KBC_BATCH_THRESHOLD_BYTES"] = "100"
+        os.environ["KBC_BATCH_BUDGET_BYTES"] = "100000"
+        os.environ["KBC_BATCH_PLANNER"] = "code"
+
+        # A pinned plan carries every repository file, including standalone media.
+        inventory = batching.scan_sources(raw)
+        plan = batching.build_plan(
+            inventory, batching.pack_batches(inventory), planner="code")
+        assert any(
+            any("orphan.png" in s for s in b["sources"]) for b in plan["batches"]
+        ), plan
+        compile_box._write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
+
+        async def fake_drive(run_, directive, label, pdf_page_ranges=None,
+                             raw_scope=None):
+            return f"done {label}"
+
+        real_drive = compile_box._drive_batch_session
+        real_accounted = compile_box._unaccounted_batch_sources
+        compile_box._drive_batch_session = fake_drive
+        compile_box._unaccounted_batch_sources = lambda run_, sources: []
+        try:
+            await compile_box._run_batch_compile(run, "直接开始编译")
+        finally:
+            compile_box._drive_batch_session = real_drive
+            compile_box._unaccounted_batch_sources = real_accounted
+
+        exclusions, errs = selfcheck.load_exclusions(str(wd))
+        assert not errs, errs
+        assert not [e for e in exclusions if "orphan.png" in e["pattern"]], exclusions
+        plan = json.loads((wd / batching.BATCH_PLAN_PATH).read_text())
+        assert any(any("orphan.png" in s for s in b["sources"]) for b in plan["batches"]), plan
+        assert all(b["status"] == "done" for b in plan["batches"]), plan
+        events = []
+        while not run.events.empty():
+            events.append(run.events.get_nowait())
+        assert not [e for e in events if e["type"] == "error"], events
+        assert [e for e in events if e["type"] == "turn_done"], events
+        del os.environ["KBC_BATCH_THRESHOLD_BYTES"]
+        del os.environ["KBC_BATCH_BUDGET_BYTES"]
+    print("✓ batch standalone media: retained in Raw plan without parser-derived exclusion")
+
+
+async def test_batch_unaccounted_gets_corrective_then_auto_excluded():
+    """The accounting gate is an accountant, not a gatekeeper: an unaccounted
+    source gets ONE corrective session; whatever remains is auto-excluded with
+    a machine reason and the train continues — it must never raise."""
+    import batching
+    import selfcheck
+
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        raw = wd / "raw"
+        raw.mkdir(parents=True)
+        (raw / "good.md").write_bytes(b"g" * 400)
+        (raw / "stubborn.md").write_bytes(b"z" * 400)
+        run = compile_box.CompileRun("gate1", str(wd), 1)
+        os.environ["KBC_BATCH_THRESHOLD_BYTES"] = "100"
+        os.environ["KBC_BATCH_BUDGET_BYTES"] = "100000"
+        os.environ["KBC_BATCH_PLANNER"] = "code"
+
+        driven: list[str] = []
+
+        async def fake_drive(run_, directive, label, pdf_page_ranges=None,
+                             raw_scope=None):
+            driven.append(label)
+            return f"done {label}"
+
+        # PARTIAL progress: before the turn both sources are unaccounted; the
+        # turn lands good.md but stubborn.md resists the corrective pass too.
+        # (Zero progress would instead be classified as a provider fault.)
+        # The stub is LEDGER-AWARE: once a source is auto-excluded it must read as
+        # accounted, so the post-exclude landed-check (F6) sees the write took.
+        calls = {"n": 0}
+
+        def fake_unaccounted(run_, sources):
+            if not sources:
+                return []
+            excluded = {e["pattern"] for e in selfcheck.load_exclusions(str(wd))[0]}
+            calls["n"] += 1
+            base = ["good.md", "stubborn.md"] if calls["n"] == 1 else ["stubborn.md"]
+            return [s for s in base if s not in excluded]
+
+        real_drive = compile_box._drive_batch_session
+        real_accounted = compile_box._unaccounted_batch_sources
+        compile_box._drive_batch_session = fake_drive
+        compile_box._unaccounted_batch_sources = fake_unaccounted
+        try:
+            await compile_box._run_batch_compile(run, "直接开始编译")
+        finally:
+            compile_box._drive_batch_session = real_drive
+            compile_box._unaccounted_batch_sources = real_accounted
+
+        assert any("补账" in l or "accounting fix" in l for l in driven), driven
+        exclusions, _ = selfcheck.load_exclusions(str(wd))
+        row = next(e for e in exclusions if "stubborn.md" in e["pattern"])
+        assert "could not account" in row["reason"], row
+        assert not any("good.md" in e["pattern"] for e in exclusions), exclusions
+        plan = json.loads((wd / batching.BATCH_PLAN_PATH).read_text())
+        assert all(b["status"] == "done" for b in plan["batches"]), plan
+        events = []
+        while not run.events.empty():
+            events.append(run.events.get_nowait())
+        assert not [e for e in events if e["type"] == "error"], events
+        del os.environ["KBC_BATCH_THRESHOLD_BYTES"]
+        del os.environ["KBC_BATCH_BUDGET_BYTES"]
+    print("✓ batch accounting gate: partial progress → corrective pass → auto-exclusion, never a raise")
+
+
+async def test_batch_content_fault_skips_batch_but_stall_interrupts():
+    """Failure classification is the load-bearing wall: a content/output-shape
+    fault (BatchOutputError) skips ONLY its batch with a recorded exclusion and
+    the train completes; an infra fault (ModelStallError) still interrupts the
+    train resumably — auto-excluding content over a gateway stall would lie."""
+    import batching
+
+    async def run_train(raiser):
+        td = tempfile.mkdtemp()
+        wd = Path(td)
+        raw = wd / "raw"
+        (raw / "a").mkdir(parents=True)
+        (raw / "b").mkdir(parents=True)
+        (raw / "a" / "one.md").write_bytes(b"x" * 300)
+        (raw / "b" / "two.md").write_bytes(b"y" * 300)
+        run = compile_box.CompileRun("cls1", str(wd), 1)
+        os.environ["KBC_BATCH_THRESHOLD_BYTES"] = "100"
+        os.environ["KBC_BATCH_BUDGET_BYTES"] = "400"
+        os.environ["KBC_BATCH_PLANNER"] = "code"
+
+        async def fake_drive(run_, directive, label, pdf_page_ranges=None,
+                             raw_scope=None):
+            if label.startswith(("batch 1/", "批 1/")):
+                raise raiser
+            return f"done {label}"
+
+        real_drive = compile_box._drive_batch_session
+        real_accounted = compile_box._unaccounted_batch_sources
+        compile_box._drive_batch_session = fake_drive
+        compile_box._unaccounted_batch_sources = lambda run_, sources: []
+        try:
+            await compile_box._run_batch_compile(run, "直接开始编译")
+        finally:
+            compile_box._drive_batch_session = real_drive
+            compile_box._unaccounted_batch_sources = real_accounted
+            del os.environ["KBC_BATCH_THRESHOLD_BYTES"]
+            del os.environ["KBC_BATCH_BUDGET_BYTES"]
+        events = []
+        while not run.events.empty():
+            events.append(run.events.get_nowait())
+        plan = json.loads((wd / batching.BATCH_PLAN_PATH).read_text())
+        return wd, events, plan
+
+    # Content fault: batch 1 skipped+stamped, batch 2 ran, train completed clean.
+    wd, events, plan = await run_train(
+        compile_box.BatchOutputError("batch h001 produced an unusable page"))
+    assert all(b["status"] == "done" for b in plan["batches"]), plan
+    assert not [e for e in events if e["type"] == "error"], events
+    skipped = [e for e in events if e["type"] == "summary"
+               and ("could not complete" in e["text"] or "无法完成" in e["text"])]
+    assert skipped, events
+
+    # Infra fault: the train interrupts resumably — batch 1 NOT stamped, an
+    # error event surfaces, and the turn closes with the resumable story.
+    wd, events, plan = await run_train(compile_box.ModelStallError("gateway stalled"))
+    statuses = [b["status"] for b in plan["batches"]]
+    assert statuses[0] != "done", plan
+    assert [e for e in events if e["type"] == "error"], events
+    turn = next(e for e in events if e["type"] == "turn_done")
+    assert "断点" in turn["text"] or "resume" in turn["text"], turn
+    print("✓ batch failure classification: content skips one batch, infra interrupts resumably")
+
+
+async def test_batch_zero_progress_second_run_auto_excludes():
+    """Finding 2 (07-24 review): a healthy model that simply never writes
+    sources[].resource would loop provider-fault → control-plane auto-resume → provider-fault
+    until the breaker suspends it for a human. The FIRST zero-progress run stays a
+    provider blip (batch pending, no exclusion — a blip must not drop good
+    content); a SECOND independent zero-progress run for the SAME batch reclassifies
+    as content and auto-excludes, so the train converges without a human. A
+    per-batch accounting_stalls counter persisted in BATCH_PLAN.json separates the
+    two runs."""
+    import batching
+    import selfcheck
+
+    real_drive = compile_box._drive_batch_session
+    real_repairs = compile_box._run_ledger_repairs
+    real_media = compile_box._media_verify_enabled
+    real_pk = compile_box._maybe_start_pk
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "raw" / "a").mkdir(parents=True)
+        (wd / "raw" / "a" / "one.md").write_bytes(b"x" * 400)
+        (wd / "raw" / "a" / "two.md").write_bytes(b"y" * 400)
+        os.environ["KBC_BATCH_THRESHOLD_BYTES"] = "100"
+        os.environ["KBC_BATCH_BUDGET_BYTES"] = "100000"   # both sources in ONE batch
+        os.environ["KBC_BATCH_PLANNER"] = "code"
+
+        async def fake_drive(run_, directive, label, pdf_page_ranges=None, raw_scope=None):
+            return f"done {label}"   # a valid session that never writes a candidate page → nothing accounts
+
+        async def noop_repairs(run_, replies):
+            return None
+
+        compile_box._drive_batch_session = fake_drive
+        compile_box._run_ledger_repairs = noop_repairs
+        compile_box._media_verify_enabled = lambda: False
+        compile_box._maybe_start_pk = lambda run_: False
+        try:
+            # RUN 1: zero progress across turn + corrective → provider fault. The
+            # batch stays PENDING, no content is excluded, the counter is persisted.
+            run1 = compile_box.CompileRun("zp1", str(wd), 1)
+            await compile_box._run_batch_compile(run1, "直接开始编译")
+            plan1 = json.loads((wd / batching.BATCH_PLAN_PATH).read_text())
+            assert all(b["status"] != "done" for b in plan1["batches"]), plan1
+            assert any(int(b.get("accounting_stalls") or 0) >= 1 for b in plan1["batches"]), plan1
+            assert selfcheck.load_exclusions(str(wd))[0] == [], "a provider blip must not exclude content"
+            evs1 = _drain(run1)
+            assert [e for e in evs1 if e["type"] == "error"], evs1
+
+            # RUN 2 (the auto-resume): STILL zero progress, but the counter is now
+            # ≥1 → reclassify as content, auto-exclude the stragglers, complete.
+            run2 = compile_box.CompileRun("zp1", str(wd), 1)
+            await compile_box._run_batch_compile(run2, "直接开始编译")
+            plan2 = json.loads((wd / batching.BATCH_PLAN_PATH).read_text())
+            assert all(b["status"] == "done" for b in plan2["batches"]), plan2
+            reasons = [e["reason"] for e in selfcheck.load_exclusions(str(wd))[0]]
+            assert reasons and all("no accounting progress across two independent runs" in r for r in reasons), reasons
+            evs2 = _drain(run2)
+            assert not [e for e in evs2 if e["type"] == "error"], evs2
+            assert [e for e in evs2 if e["type"] == "turn_done"], evs2
+        finally:
+            compile_box._drive_batch_session = real_drive
+            compile_box._run_ledger_repairs = real_repairs
+            compile_box._media_verify_enabled = real_media
+            compile_box._maybe_start_pk = real_pk
+            del os.environ["KBC_BATCH_THRESHOLD_BYTES"]
+            del os.environ["KBC_BATCH_BUDGET_BYTES"]
+    print("✓ batch zero-progress: 1st run provider-fault (pending, no exclusion), 2nd run auto-excludes and completes")
+
+
+async def test_batch_media_round_cap_marks_pending_exhausted():
+    """Finding 3 (07-24 review): when the image verify/repair loop hits its round
+    cap with pages still pending, it must mark those pages EXHAUSTED through the
+    per-page mechanism — recording their current fingerprint (so
+    pending_media_verification stops reporting them) and flagging them visibly.
+    Before, the cap just broke: the plan went complete and converge settled while
+    pending_media_verification still named pages, and _pk_due refused to start — a
+    contradictory settled-but-pending state."""
+    import batching
+    import selfcheck
+
+    real_drive = compile_box._drive_batch_session
+    real_repairs = compile_box._run_ledger_repairs
+    real_media_enabled = compile_box._media_verify_enabled
+    real_blind_verify = compile_box.mediaverify.run_blind_verify
+    real_engine = compile_box.selected_readonly_engine
+    real_pk = compile_box._maybe_start_pk
+    previous = {k: os.environ.get(k) for k in
+                ("KBC_MEDIA_VERIFY_ROUNDS", "KBC_MEDIA_VERIFY_ATTEMPTS")}
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            wd = Path(td)
+            (wd / "raw").mkdir()
+            (wd / "raw" / "chart.png").write_bytes(b"image-bytes")
+            (wd / "candidate").mkdir()
+            (wd / "candidate" / "page.md").write_text(
+                "---\ntype: Topic\ntitle: Page\nsources:\n"
+                "  - resource: chart.png\n---\nasserts a number (source: chart.png)\n")
+            (wd / "authoring").mkdir()
+            plan = {
+                "version": 1, "planner": "code", "mode": "flat", "phase": "final",
+                "batches": [{"id": "b01", "sources": ["chart.png"], "bytes": 11, "status": "done"}],
+            }
+            (wd / batching.BATCH_PLAN_PATH).write_text(batching.dump_json(plan))
+            run = compile_box.CompileRun("mediacap", str(wd), 1)
+
+            # Round cap = 1 (flat), attempts high so a page can NEVER exhaust via
+            # the attempt budget in one round — the only route to exhausted here is
+            # the round-cap fix under test.
+            os.environ["KBC_MEDIA_VERIFY_ROUNDS"] = "1"
+            os.environ["KBC_MEDIA_VERIFY_ATTEMPTS"] = "5"
+
+            verify_calls = {"n": 0}
+
+            async def never_verifies(engine, workdir, pending, progress=None, locale=None):
+                verify_calls["n"] += 1
+                return {"findings": [], "errors": [], "images": 1,
+                        "completed_pages": [], "failed_pages": ["page.md"]}
+
+            async def fake_drive(run_, directive, label, pdf_page_ranges=None, raw_scope=None):
+                return f"done {label}"
+
+            async def noop_repairs(run_, replies):
+                return None
+
+            compile_box._drive_batch_session = fake_drive
+            compile_box._run_ledger_repairs = noop_repairs
+            compile_box._media_verify_enabled = lambda: True
+            compile_box.mediaverify.run_blind_verify = never_verifies
+            compile_box.selected_readonly_engine = lambda: object()
+            compile_box._maybe_start_pk = lambda run_: False
+
+            # Sanity: the page really is pending before the train runs.
+            assert "page.md" in selfcheck.pending_media_verification(str(wd))
+            await compile_box._run_batch_compile(run, "直接开始编译")
+
+            assert verify_calls["n"] == 1, verify_calls          # exactly one real round before the cap
+            # HONEST settle: nothing pending, but the page is VISIBLY exhausted.
+            assert selfcheck.pending_media_verification(str(wd)) == {}, "cap must clear pending"
+            report = selfcheck.read_selfcheck(str(wd))
+            assert "page.md" in (report["media_verify"].get("exhausted") or []), report
+            assert report["media_verify"]["summary"]["pending_pages"] == 0, report
+            saved = json.loads((wd / batching.BATCH_PLAN_PATH).read_text())
+            assert saved["phase"] == "complete", saved
+            evs = _drain(run)
+            assert not [e for e in evs if e["type"] == "error"], evs
+            assert [e for e in evs if e["type"] == "turn_done"], evs
+    finally:
+        compile_box._drive_batch_session = real_drive
+        compile_box._run_ledger_repairs = real_repairs
+        compile_box._media_verify_enabled = real_media_enabled
+        compile_box.mediaverify.run_blind_verify = real_blind_verify
+        compile_box.selected_readonly_engine = real_engine
+        compile_box._maybe_start_pk = real_pk
+        for k, v in previous.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    print("✓ batch media round cap: remaining pending pages marked exhausted → settles honestly, PK unblocked")
+
+
+async def test_lifecycle_logs_never_leak_content_to_stdout():
+    """Finding 4 (07-24 review): lifecycle lines are pod stdout, which is
+    operator-visible. A failure MESSAGE can carry raw source paths or provider
+    fragments, so stdout gets a WHITELIST only (class name + batch id/index +
+    machine code); the full message keeps flowing to the OWNER-facing SSE events.
+
+    Covers EVERY stdout lifecycle path, not just the batch train. While this
+    test knew only about batch.skipped / batch.interrupted, the next code to
+    print a failure — the workspace sync loop — embedded the exception repr and
+    nothing caught it. A guard that knows one path guards only that path."""
+    import batching
+
+    secret = "secret/private-leak-path.md"
+
+    async def run_train_capturing(raiser):
+        td = tempfile.mkdtemp()
+        wd = Path(td)
+        (wd / "raw" / "a").mkdir(parents=True)
+        (wd / "raw" / "b").mkdir(parents=True)
+        (wd / "raw" / "a" / "one.md").write_bytes(b"x" * 300)
+        (wd / "raw" / "b" / "two.md").write_bytes(b"y" * 300)
+        run = compile_box.CompileRun("leak1", str(wd), 1)
+        os.environ["KBC_BATCH_THRESHOLD_BYTES"] = "100"
+        os.environ["KBC_BATCH_BUDGET_BYTES"] = "400"
+        os.environ["KBC_BATCH_PLANNER"] = "code"
+
+        async def fake_drive(run_, directive, label, pdf_page_ranges=None, raw_scope=None):
+            if label.startswith(("batch 1/", "批 1/")):
+                raise raiser
+            return f"done {label}"
+
+        real_drive = compile_box._drive_batch_session
+        real_accounted = compile_box._unaccounted_batch_sources
+        compile_box._drive_batch_session = fake_drive
+        compile_box._unaccounted_batch_sources = lambda run_, sources: []
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                await compile_box._run_batch_compile(run, "直接开始编译")
+        finally:
+            compile_box._drive_batch_session = real_drive
+            compile_box._unaccounted_batch_sources = real_accounted
+            del os.environ["KBC_BATCH_THRESHOLD_BYTES"]
+            del os.environ["KBC_BATCH_BUDGET_BYTES"]
+        return buf.getvalue(), _drain(run)
+
+    # Skip path (content/output-shape fault): the exception message names a source.
+    out, events = await run_train_capturing(
+        compile_box.BatchOutputError(f"batch produced an unusable page from raw/{secret}"))
+    assert "batch.skipped" in out, out                    # the lifecycle line is still emitted…
+    assert "code=content_shape" in out, out               # …with a routable machine code…
+    assert secret not in out, out                         # …but never the source path.
+    assert any(secret in e.get("text", "") for e in events if e["type"] == "summary"), events
+
+    # Interrupt path (unclassified fault): the exception message names a source.
+    out, events = await run_train_capturing(RuntimeError(f"boom reading raw/{secret}"))
+    assert "batch.interrupted" in out, out
+    assert "class=RuntimeError" in out, out
+    assert secret not in out, out
+    assert any(secret in e.get("error", "") for e in events if e["type"] == "error"), events
+
+    # Sync path: the periodic workspace sync fails with a message naming a
+    # candidate page. A page filename IS the owner's KB content, and this loop
+    # runs for the whole compile, so it gets the same whitelist. No SSE
+    # counterpart to assert here — the loop's job is to retry, and the owner
+    # hears about a sync that never recovers from the final sync's error event.
+    class _SyncRun:
+        run_id, round = "leak-sync", 1
+
+    async def failing_sync(run_, sent, **kwargs):
+        raise OSError(f"cannot read candidate/{secret}")
+
+    real_sync, real_interval = compile_box._sync_workspace, compile_box.SYNC_INTERVAL_SECS
+    compile_box._sync_workspace, compile_box.SYNC_INTERVAL_SECS = failing_sync, 0
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            task = asyncio.create_task(compile_box._sync_loop(_SyncRun(), {}))
+            for _ in range(400):
+                if "sync.failing" in buf.getvalue():
+                    break
+                await asyncio.sleep(0.005)
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+    finally:
+        compile_box._sync_workspace, compile_box.SYNC_INTERVAL_SECS = real_sync, real_interval
+    out = buf.getvalue()
+    assert "sync.failing" in out, out                     # the lifecycle line is still emitted…
+    assert "class=OSError" in out, out                    # …with a routable class…
+    assert secret not in out, out                         # …but never the page path.
+
+    print("✓ lifecycle logs (batch + sync): stdout whitelisted (class/id/code); full message only on owner SSE")
+
+
+async def test_batch_auto_exclude_refused_interrupts_resumably():
+    """Finding 6 (07-24 review): after an auto-exclude the code must confirm the
+    rows actually landed. If the ledger is corrupted beyond mechanical repair the
+    write is refused and the source is STILL unaccounted — stamping the batch done
+    would silently drop it. That is a protect-integrity hard stop (the charset-guard
+    class), not a content-shape gate: the train interrupts RESUMABLY (batch stays
+    pending) with a message that names authoring/EXCLUSIONS.json."""
+    import batching
+    import selfcheck
+
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        raw = wd / "raw"
+        raw.mkdir(parents=True)
+        (raw / "good.md").write_bytes(b"g" * 400)
+        (raw / "stubborn.md").write_bytes(b"z" * 400)
+        # Corrupt the ledger beyond the mechanical trailing-comma repair.
+        (wd / "authoring").mkdir()
+        (wd / selfcheck.EXCLUSIONS_PATH).write_text("{nope", encoding="utf-8")
+        run = compile_box.CompileRun("led-corrupt", str(wd), 1)
+        os.environ["KBC_BATCH_THRESHOLD_BYTES"] = "100"
+        os.environ["KBC_BATCH_BUDGET_BYTES"] = "100000"
+        os.environ["KBC_BATCH_PLANNER"] = "code"
+
+        async def fake_drive(run_, directive, label, pdf_page_ranges=None, raw_scope=None):
+            return f"done {label}"
+
+        # PARTIAL progress so the GATE (auto-exclude) path runs, not the
+        # zero-progress provider-fault branch: before → both unaccounted, after →
+        # only stubborn.md. The corrupt ledger then refuses the exclusion, so
+        # stubborn.md stays unaccounted and the landed-check must fire.
+        calls = {"n": 0}
+
+        def fake_unaccounted(run_, sources):
+            if not sources:
+                return []
+            calls["n"] += 1
+            return ["good.md", "stubborn.md"] if calls["n"] == 1 else ["stubborn.md"]
+
+        real_drive = compile_box._drive_batch_session
+        real_accounted = compile_box._unaccounted_batch_sources
+        compile_box._drive_batch_session = fake_drive
+        compile_box._unaccounted_batch_sources = fake_unaccounted
+        try:
+            await compile_box._run_batch_compile(run, "直接开始编译")
+        finally:
+            compile_box._drive_batch_session = real_drive
+            compile_box._unaccounted_batch_sources = real_accounted
+            del os.environ["KBC_BATCH_THRESHOLD_BYTES"]
+            del os.environ["KBC_BATCH_BUDGET_BYTES"]
+
+        plan = json.loads((wd / batching.BATCH_PLAN_PATH).read_text())
+        assert all(b["status"] != "done" for b in plan["batches"]), plan   # NOT stamped over corruption
+        events = _drain(run)
+        errors = [e for e in events if e["type"] == "error"]
+        assert errors and any("EXCLUSIONS.json" in e["error"] for e in errors), errors
+        assert (wd / selfcheck.EXCLUSIONS_PATH).read_text(encoding="utf-8") == "{nope"  # left for a human
+    print("✓ batch auto-exclude landed-check: a corrupted ledger interrupts resumably, batch not stamped done")
+
+
+async def test_slice_failure_auto_exclude_refused_interrupts_resumably():
+    """R2-3: the slice-failures pre-loop auto-excludes a batch whose read-bounded
+    view could not be built, then stamps it done. If the ledger is corrupted the
+    exclusion write is refused and the source stays unaccounted — it must NOT be
+    stamped done. Same resumable protect-integrity hard stop as the per-batch
+    gate/skip paths, naming authoring/EXCLUSIONS.json."""
+    import batching
+    import selfcheck
+
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "raw").mkdir()
+        (wd / "raw" / "big.md").write_text("line1\nline2\n", encoding="utf-8")
+        (wd / "authoring").mkdir()
+        (wd / selfcheck.EXCLUSIONS_PATH).write_text("{nope", encoding="utf-8")  # corrupt beyond repair
+        # A pinned plan whose one batch is a text slice with an out-of-range span
+        # → _materialize_batch_slices raises → slice_failures for that batch.
+        plan = {
+            "version": 3, "planner": "hierarchical-code", "mode": "hierarchical", "phase": "map",
+            "batches": [{
+                "id": "h001", "sources": ["big.md"], "context_sources": [],
+                "source_ranges": {"big.md": {
+                    "slice_file": ".kbc-batch-slices/big.md.p1",
+                    "start_line": 1, "end_line": 9999, "bytes": 10, "part": 1, "parts": 1}},
+                "bytes": 10, "status": "pending",
+            }],
+            "reductions": [],
+        }
+        (wd / batching.BATCH_PLAN_PATH).write_text(batching.dump_json(plan))
+        run = compile_box.CompileRun("slicecorrupt", str(wd), 1)
+
+        async def fake_drive(run_, directive, label, pdf_page_ranges=None, raw_scope=None):
+            return f"done {label}"
+
+        real_drive = compile_box._drive_batch_session
+        compile_box._drive_batch_session = fake_drive
+        try:
+            await compile_box._run_batch_compile(run, "直接开始编译")
+        finally:
+            compile_box._drive_batch_session = real_drive
+
+        saved = json.loads((wd / batching.BATCH_PLAN_PATH).read_text())
+        assert all(b["status"] != "done" for b in saved["batches"]), saved   # NOT stamped over corruption
+        events = _drain(run)
+        errors = [e for e in events if e["type"] == "error"]
+        assert errors and any("EXCLUSIONS.json" in e["error"] for e in errors), errors
+        assert (wd / selfcheck.EXCLUSIONS_PATH).read_text(encoding="utf-8") == "{nope"  # left for a human
+    print("✓ slice-failure landed-check: corrupted ledger interrupts resumably, batch not stamped done")
+
+
+async def test_lifecycle_line_drops_unsafe_batch_id():
+    """R2-6: a batch id reaches pod stdout via batch.done / batch.skipped. Plan
+    validation now rejects unsafe ids, but a PINNED plan created before the check
+    can still carry one — so the lifecycle logger prints the index always and the
+    id ONLY when it is a safe token."""
+    import batching
+    # Unit: the safe-token gate on the log ref.
+    assert compile_box._lifecycle_batch_ref({"id": "h001"}, 1, 3) == "batch=1/3 id=h001"
+    forged = "x\nFORGED=1 id=evil"
+    ref = compile_box._lifecycle_batch_ref({"id": forged}, 2, 3)
+    assert ref == "batch=2/3" and "FORGED" not in ref, ref
+
+    # Integration: a pinned plan carrying a hostile id drives to batch.done; the
+    # forged value never reaches stdout, the index-only identity does.
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "raw").mkdir()
+        (wd / "raw" / "a.md").write_bytes(b"x" * 50)
+        (wd / "authoring").mkdir()
+        plan = {
+            "version": 1, "planner": "code", "mode": "flat", "phase": "map",
+            "batches": [{"id": "safe/../\nFORGED-LOGLEAK", "sources": ["a.md"], "status": "pending"}],
+        }
+        (wd / batching.BATCH_PLAN_PATH).write_text(batching.dump_json(plan))
+        run = compile_box.CompileRun("logleak", str(wd), 1)
+
+        async def fake_drive(run_, directive, label, pdf_page_ranges=None, raw_scope=None):
+            return f"done {label}"
+
+        async def noop_repairs(run_, replies):
+            return None
+
+        real_drive = compile_box._drive_batch_session
+        real_accounted = compile_box._unaccounted_batch_sources
+        real_repairs = compile_box._run_ledger_repairs
+        real_media = compile_box._media_verify_enabled
+        real_pk = compile_box._maybe_start_pk
+        compile_box._drive_batch_session = fake_drive
+        compile_box._unaccounted_batch_sources = lambda run_, sources: []
+        compile_box._run_ledger_repairs = noop_repairs
+        compile_box._media_verify_enabled = lambda: False
+        compile_box._maybe_start_pk = lambda run_: False
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                await compile_box._run_batch_compile(run, "直接开始编译")
+        finally:
+            compile_box._drive_batch_session = real_drive
+            compile_box._unaccounted_batch_sources = real_accounted
+            compile_box._run_ledger_repairs = real_repairs
+            compile_box._media_verify_enabled = real_media
+            compile_box._maybe_start_pk = real_pk
+        out = buf.getvalue()
+        assert "FORGED-LOGLEAK" not in out, out            # hostile id never hits stdout
+        assert "batch.done" in out and "batch=1/1" in out, out   # index-only identity present
+    print("✓ lifecycle line: a pre-fix pinned hostile batch id is dropped from stdout (index only)")
+
+
+async def test_post_turn_normalizes_hand_edited_ledger():
+    """R2-1c: the escape hatch stays open (a model MAY hand-edit EXCLUSIONS.json
+    when exclude_source cannot express a fix), so the normalizer must run at the
+    interactive/flat turn seam too — not only in the batch path. _post_turn_selfcheck
+    normalizes the ledger at its head: a hand-edit with a trailing comma AND a
+    redundant invalid duplicate is absorbed back to canonical strict JSON."""
+    import selfcheck
+
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "raw").mkdir()
+        (wd / "raw" / "one.md").write_text("one", encoding="utf-8")
+        (wd / "raw" / "skip.md").write_text("meta", encoding="utf-8")
+        (wd / "candidate").mkdir()
+        (wd / "candidate" / "index.md").write_text(
+            "---\nokf_version: \"0.2\"\n---\n# Index\n- [a](a.md)\n", encoding="utf-8")
+        (wd / "candidate" / "a.md").write_text(
+            "---\ntype: Topic\ntitle: a\nsources:\n  - resource: one.md\n---\nbody a\n", encoding="utf-8")
+        (wd / "authoring").mkdir()
+        # A hand edit: trailing comma (invalid strict JSON) + a redundant invalid
+        # duplicate row (skip.md with no reason) alongside the valid one.
+        (wd / selfcheck.EXCLUSIONS_PATH).write_text(
+            '[\n  {"pattern": "skip.md", "reason": "meta file"},\n  {"pattern": "skip.md"},\n]\n',
+            encoding="utf-8")
+        try:
+            json.loads((wd / selfcheck.EXCLUSIONS_PATH).read_text(encoding="utf-8"))
+            raise AssertionError("test setup should be strictly-invalid JSON")
+        except json.JSONDecodeError:
+            pass
+
+        run = compile_box.CompileRun("normseam", str(wd), 1)
+        run._selfcheck_key = None
+        run._l1_repairs_used = 0
+        await compile_box._post_turn_selfcheck(run)
+
+        # After the turn: canonical strict JSON, invalid duplicate pruned.
+        rows = json.loads((wd / selfcheck.EXCLUSIONS_PATH).read_text(encoding="utf-8"))
+        assert rows == [{"pattern": "skip.md", "reason": "meta file"}], rows
+    print("✓ post-turn seam normalizes a hand-edited ledger (escape hatch stays open, file kept honest)")
+
+
+def test_small_kb_batch_gate_skips_poppler_metadata():
+    """Ordinary compile routing keeps the pre-PDF-slicing cheap scan. Poppler
+    metadata is execution detail for a selected batch plan, never a new cost on
+    every small-KB compile trigger."""
+    import batching
+
+    real_pdfinfo = batching._pdfinfo_page_count
+    try:
+        batching._pdfinfo_page_count = lambda path: (_ for _ in ()).throw(
+            AssertionError("pdfinfo must not run in the small-KB route gate"))
+        with tempfile.TemporaryDirectory() as td:
+            raw = Path(td) / "raw"
+            raw.mkdir()
+            (raw / "small.pdf").write_bytes(b"%PDF-1.7 /Type /Page")
+            run = compile_box.CompileRun("small-pdf-route", td, 1)
+            assert not compile_box._should_route_to_batch(
+                run, "", action="compile.generate")
+    finally:
+        batching._pdfinfo_page_count = real_pdfinfo
+    print("\u2713 small KB route: no Poppler metadata subprocess")
+
+
+def test_long_line_slices_materialize_identically_after_resume(tmp_path, monkeypatch):
+    import batching
+    monkeypatch.setenv("KBC_HIERARCHICAL_TEXT_BUDGET_BYTES", "1000")
+    monkeypatch.setenv("KBC_HIERARCHICAL_TEXT_SLICE_BYTES", "1000")
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    body = ("header\n" + "中文🚀事实" * 1000 + "TAIL-812\nend\n").encode()
+    (raw / "manual.txt").write_bytes(body)
+    inventory = batching.scan_sources(raw)
+    plan = batching.build_plan(inventory, batching.pack_hierarchical_batches(inventory),
+                               planner="hierarchical-code")
+    run = compile_box.CompileRun("long-line-materialize", str(tmp_path), 1)
+    assert compile_box._materialize_batch_slices(run, plan) == {}
+    views = [tmp_path / batch["source_ranges"]["manual.txt"]["slice_file"] for batch in plan["batches"]]
+    original = [view.read_bytes() for view in views]
+    assert b"".join(view.split(b"\n", 1)[1] for view in original) == body
+    assert all(view.decode("utf-8") for view in original)
+    plan["batches"][0]["status"] = "done"
+    assert compile_box._materialize_batch_slices(run, plan) == {}
+    assert not views[0].exists()
+    assert [view.read_bytes() for view in views[1:]] == original[1:]
+
+
+def test_hierarchical_text_slice_materialization_and_directive():
+    """Oversized-text helpers are bounded, ephemeral views of Raw. The model
+    reads the helper, but durable Candidate provenance still names the original
+    Raw source rather than an internal slice path."""
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        source = wd / "raw" / "gpu" / "manual.md"
+        source.parent.mkdir(parents=True)
+        source.write_text("".join(f"line-{line}\n" for line in range(1, 7)))
+        batch = {
+            "id": "h001",
+            "sources": ["gpu/manual.md"],
+            "context_sources": [],
+            "source_ranges": {
+                "gpu/manual.md": {
+                    "start_line": 2,
+                    "end_line": 4,
+                    "part": 1,
+                    "parts": 2,
+                    "bytes": 21,
+                    "slice_file": ".kbc-batch-slices/manual-p001.md",
+                }
+            },
+            "defer_accounting": True,
+        }
+        run = compile_box.CompileRun("slice-materialize", str(wd), 1)
+        compile_box._materialize_batch_slices(run, {"batches": [batch]})
+
+        helper = wd / ".kbc-batch-slices" / "manual-p001.md"
+        excerpt = helper.read_text()
+        assert "raw/gpu/manual.md, lines 2-4" in excerpt, excerpt
+        assert "line-2\nline-3\nline-4\n" in excerpt, excerpt
+        assert "line-1" not in excerpt and "line-5" not in excerpt, excerpt
+
+        directive = compile_box._compose_batch_directive(batch, 1, 2, "", "zh-CN")
+        assert ".kbc-batch-slices/manual-p001.md" in directive, directive
+        assert "本批绝不要直接打开原 Raw 全文" in directive, directive
+        assert "sources[].resource 必须引用原 Raw 路径(raw/gpu/manual.md)" in directive, directive
+        assert "sources[].resource 必须引用原 Raw 路径(.kbc-batch-slices" not in directive
+        # A completed map batch is durable history, not a future model turn.
+        # If its Raw source disappears before reduce/final resumes, rebuilding
+        # its ephemeral slice would make the train fail forever even though the
+        # batch's Candidate output has already landed.
+        batch["status"] = "done"
+        source.unlink()
+        compile_box._materialize_batch_slices(run, {"batches": [batch]})
+        assert not helper.exists()
+
+        assert compile_box._batch_raw_read_allowlist(batch) == []
+
+        regular = {
+            "sources": ["gpu/spec.md", "gpu/manual.pdf"],
+            "context_sources": ["gpu/anchor.md"],
+            "source_ranges": {
+                "gpu/spec.md": {
+                    "start_line": 1,
+                    "end_line": 2,
+                    "part": 1,
+                    "parts": 2,
+                    "slice_file": ".kbc-batch-slices/spec-p001.md",
+                }
+            },
+        }
+        assert compile_box._batch_raw_read_allowlist(regular) == [
+            "gpu/anchor.md", "gpu/manual.pdf",
+        ]
+        # Consulting scope: the accountable face stays the batch list, while
+        # bounded-view originals (from the WHOLE plan, not just this batch) are
+        # the only Raw reads still denied.
+        paged = dict(regular, source_page_ranges={
+            "gpu/manual.pdf": {"start_page": 1, "end_page": 2, "part": 1, "parts": 2}})
+        plan = {"batches": [paged]}
+        bounded = compile_box.plan_bounded_sources(plan)
+        assert bounded == {"text": ["gpu/spec.md"], "pdf": ["gpu/manual.pdf"]}, bounded
+        scope = compile_box._batch_raw_scope(paged, bounded)
+        assert scope["account"] == ["gpu/anchor.md", "gpu/manual.pdf"]
+        # Text-sliced original: helper only. Page-sliced PDF: still readable HERE
+        # (the page-range guard bounds it) — denying it would break the very
+        # batch that must read those pages.
+        assert scope["deny_read"] == ["gpu/spec.md"], scope
+        assert scope["consult"] is True
+        previous_engine = os.environ.get("KBC_ENGINE")
+        os.environ["KBC_ENGINE"] = "codex_sdk"
+        try:
+            assert compile_box._batch_raw_scope(paged, bounded)["consult"] is True
+        finally:
+            if previous_engine is None:
+                os.environ.pop("KBC_ENGINE", None)
+            else:
+                os.environ["KBC_ENGINE"] = previous_engine
+        # A batch with no assigned range for that PDF may not pull it in whole.
+        other = compile_box._batch_raw_scope({"sources": ["gpu/other.md"]}, bounded)
+        assert other["deny_read"] == ["gpu/manual.pdf", "gpu/spec.md"], other
+        final = compile_box.semantic_review_raw_scope(plan)
+        assert final == {
+            "account": [],
+            "deny_read": ["gpu/manual.pdf", "gpu/spec.md"],
+            "consult": True,
+        }, final
+    print("\u2713 hierarchical text slices: bounded helper with original-Raw provenance")
+
+
+def test_batch_relay_brief_hands_off_progress_and_prior_pages():
+    """A fresh map session must not have to GUESS what earlier batches did.
+
+    Without this hand-off the session cannot know an earlier slice of the SAME
+    source already produced a page, so it invents a new shape every round \u2014 how
+    one source ended up spread over pages sectioned by batch number."""
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        (base / "raw" / "ops").mkdir(parents=True)
+        (base / "raw" / "other").mkdir(parents=True)
+        (base / "raw" / "ops" / "big.md").write_text("# big", encoding="utf-8")
+        (base / "raw" / "ops" / "sibling.md").write_text("# sibling", encoding="utf-8")
+        (base / "raw" / "other" / "far.md").write_text("# far", encoding="utf-8")
+        (base / "candidate").mkdir()
+        (base / "authoring").mkdir()
+        (base / "candidate" / "tickets.md").write_text(
+            "---\ntype: Topic\nsources:\n  - resource: raw/ops/big.md\n---\nx",
+            encoding="utf-8")
+        (base / "candidate" / "neighbour.md").write_text(
+            "---\ntype: Topic\nsources:\n  - resource: raw/ops/sibling.md\n---\nx",
+            encoding="utf-8")
+        (base / "candidate" / "elsewhere.md").write_text(
+            "---\ntype: Topic\nsources:\n  - resource: raw/other/far.md\n---\nx",
+            encoding="utf-8")
+        run = compile_box.CompileRun("relay", str(base), 1)
+        plan = {"batches": [
+            {"id": "h001", "sources": ["ops/big.md"], "status": "done"},
+            {"id": "h002", "sources": ["ops/big.md"], "status": "pending"},
+        ]}
+        brief = compile_box._batch_relay_brief(
+            run, plan, plan["batches"][1], 2, 2, locale="en")
+        assert "batch 2/2 (1 done)" in brief, brief
+        # The prior slice's page is named as the one to CONTINUE...
+        assert "candidate/tickets.md" in brief, brief
+        assert "do not start a parallel page" in brief, brief
+        # ...a same-folder page is offered as a merge target...
+        assert "candidate/neighbour.md" in brief, brief
+        # ...and an unrelated page is not noise in the hand-off.
+        assert "elsewhere.md" not in brief, brief
+        # The directive carries it through to the session.
+        directive = compile_box._compose_batch_directive(
+            plan["batches"][1], 2, 2, "", locale="en", relay=brief)
+        assert "candidate/tickets.md" in directive, directive
+        assert "not your field of view" in directive, directive
+
+        # The durable hand-off names the ENTIRE Candidate tree and source map;
+        # responsibility is bounded, visibility is not.
+        compile_box._write_compilation_state(run, plan)
+        state = json.loads((base / "authoring" / "COMPILATION_STATE.json").read_text())
+        assert state["visibility"] == "complete_frozen_raw_and_candidate_tree", state
+        assert state["candidate_pages"] == [
+            "elsewhere.md", "neighbour.md", "tickets.md"
+        ], state
+        assert state["source_to_pages"]["ops/big.md"] == ["tickets.md"], state
+        assert len(state["candidate_tree_hash"]) == 64, state
+
+        # No prior work \u2192 a hand-off that is still honest, never fabricated.
+        fresh = compile_box._batch_relay_brief(
+            run, plan, {"id": "h003", "sources": ["new/area.md"]}, 1, 2, locale="en")
+        assert "Candidate pages so far: 3" in fresh, fresh
+        assert "candidate/tickets.md" not in fresh, fresh
+    print("\u2713 batch relay brief: machine-computed hand-off between sessions")
+
+
+def test_batch_checkpoint_digest_is_verified_before_resume():
+    """A damaged checkpoint must pause for explicit reset/restore, never look
+    like no checkpoint and silently restart an expensive semantic compile."""
+    import batching
+
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        run = compile_box.CompileRun("checkpoint-integrity", str(wd), 1)
+        plan = {"phase": "map", "batches": [
+            {"id": "b01", "sources": ["one.md"], "status": "pending"}
+        ]}
+        compile_box._write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
+        assert compile_box._load_batch_plan(run)["checkpoint_digest"]
+
+        stored = json.loads((wd / batching.BATCH_PLAN_PATH).read_text())
+        stored["batches"][0]["status"] = "done"
+        (wd / batching.BATCH_PLAN_PATH).write_text(batching.dump_json(stored))
+        try:
+            compile_box._load_batch_plan(run)
+        except compile_box.PlanIntegrityError as error:
+            assert "digest" in str(error)
+            assert compile_box._batch_error_code(error) == "plan_integrity"
+        else:
+            raise AssertionError("tampered checkpoint was accepted")
+    print("\u2713 batch checkpoint: digest mismatch pauses instead of replanning")
+
+
+def test_hierarchical_resume_state_contract():
+    """Typed resume accepts every unfinished hierarchical phase, including
+    reduce/final after all map batches are done, while complete stays closed."""
+    import batching
+
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "authoring").mkdir()
+        run = compile_box.CompileRun("hier-resume-state", str(wd), 1)
+        command = {"action": "compile.resume", "parameters": {}}
+        plan = {
+            "version": 3,
+            "mode": "hierarchical",
+            "batches": [{"id": "h001", "sources": ["done.md"], "status": "done"}],
+            "reductions": [],
+        }
+
+        for phase in ("map", "reduce", "final", "commit"):
+            plan["phase"] = phase
+            (wd / batching.BATCH_PLAN_PATH).write_text(batching.dump_json(plan))
+            assert compile_box._batch_plan_resumable(plan), phase
+            compile_box._prepare_command(run, command)
+            assert compile_box._should_route_to_batch(
+                run, "ignored localized text", "compile.resume"
+            ), phase
+
+        plan["phase"] = "complete"
+        (wd / batching.BATCH_PLAN_PATH).write_text(batching.dump_json(plan))
+        assert not compile_box._batch_plan_resumable(plan)
+        # A completed plan is not resumable work; with nothing else in the
+        # workspace the command falls through to the restart route (it is no
+        # longer refused — the control plane sends compile.resume for every
+        # recovery lineage, see test_resume_without_plan_routes_by_workspace).
+        compile_box._prepare_command(run, command)
+        assert compile_box._resume_workspace_state(run) == "restart"
+        assert not compile_box._should_route_to_batch(run, "ignored localized text", "compile.resume")
+    print("\u2713 hierarchical resume: typed command covers map/reduce/final/commit only")
+
+
+def test_resume_without_plan_routes_by_workspace():
+    """compile.resume is the single continuation command. Without a pending
+    batch plan the WORKSPACE decides: landed pages → finish the coverage ledger
+    (complete); nothing landed → full compile of the same raw/ (restart); a
+    recovered incremental lineage → the scoped path. The command is never
+    refused. This is the box half of the control plane's plan-less recovery
+    (single-session compiles and planning-phase failures used to be lost)."""
+    import batching
+
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "authoring").mkdir()
+        run = compile_box.CompileRun("resume-state", str(wd), 1)
+        command = {"action": "compile.resume", "parameters": {}}
+        strings = compile_box._command_strings(run.locale)
+
+        (wd / "raw").mkdir()
+        (wd / "raw" / "a.md").write_text("# A\n\nfact a\n", "utf-8")
+        (wd / "raw" / "b.md").write_text("# B\n\nfact b\n", "utf-8")
+
+        # Empty candidate/: restart — a full compile over the same raw/.
+        compile_box._prepare_command(run, command)
+        assert compile_box._resume_workspace_state(run) == "restart"
+        assert compile_box._render_command(run, command) == strings["compile.resume_restart"]
+        assert not compile_box._should_route_to_incremental(run, "", "compile.resume")
+
+        # Landed pages: complete — the directive names exactly the unaccounted sources.
+        (wd / "candidate").mkdir()
+        (wd / "candidate" / "a.md").write_text(
+            "---\ntype: Concept\ntitle: A\nsources:\n  - resource: raw/a.md\n---\n\n# A\n\nfact a (source: a.md)\n", "utf-8")
+        (wd / "candidate" / "index.md").write_text(
+            '---\nokf_version: "0.2"\n---\n\n## Pages\n\n* [A](a.md) - a\n', "utf-8")
+        assert compile_box._resume_workspace_state(run) == "complete"
+        text = compile_box._render_command(run, command)
+        assert text.startswith(strings["compile.resume_complete"].split("{pages}")[0])
+        assert "produced 1 candidate page" in text and "1 source(s)" in text
+        assert "- raw/b.md" in text and "- raw/a.md" not in text
+        assert "was also written by this compile" in text  # no control-plane provenance → nothing inherited
+
+        # A recovered incremental lineage still carries its changeset → scoped path.
+        (wd / "authoring" / "RAW_CHANGES.json").write_text(json.dumps({
+            "added": ["b.md"], "modified": [], "deleted": [], "diffs": {}, "summary": {},
+        }), "utf-8")
+        assert compile_box._should_route_to_incremental(run, "", "compile.resume")
+        (wd / "authoring" / "RAW_CHANGES.json").unlink()
+
+        # The control plane's decision wins over file existence. A regeneration
+        # clones the stable draft into staging, so an inherited a.md with a
+        # matching source is NOT this lineage's output: the control plane says restart.
+        restart_cmd = {"action": "compile.resume", "parameters": {"recovery_mode": "restart", "produced_count": 0, "produced_pages": []}}
+        compile_box._prepare_command(run, restart_cmd)
+        assert compile_box._resume_workspace_state(run) == "restart"
+        assert compile_box._render_command(run, restart_cmd) == strings["compile.resume_restart"]
+        # ...and when it says complete, only the named pages are kept; the rest
+        # are called out as inherited and to be regenerated.
+        (wd / "candidate" / "c.md").write_text(
+            "---\ntype: Concept\ntitle: C\nsources:\n  - resource: raw/b.md\n---\n\n# C\n\nfact b (source: b.md)\n", "utf-8")
+        complete_cmd = {"action": "compile.resume", "parameters": {"recovery_mode": "complete", "produced_count": 1, "produced_pages": ["c.md"]}}
+        compile_box._prepare_command(run, complete_cmd)
+        assert compile_box._resume_workspace_state(run) == "complete"
+        text = compile_box._render_command(run, complete_cmd)
+        assert "produced 1 candidate page" in text and "- candidate/c.md" in text
+        assert "inherited from the previous published draft" in text and "- candidate/a.md" in text
+        assert "regenerate" in text.lower()
+        # The classification set must be COMPLETE. A partial inline list (the
+        # control plane only previews up to 200 inline) is not accepted on its
+        # own; the workspace provenance artifact is the authority.
+        partial = {"action": "compile.resume", "parameters": {"recovery_mode": "complete", "produced_count": 2, "produced_pages": ["c.md"], "produced_pages_ref": compile_box.RECOVERY_PROVENANCE_PATH}}
+        try:
+            compile_box._prepare_command(run, partial)
+        except compile_box.CommandRejected as error:
+            assert error.status == 409 and "incomplete" in str(error)
+        else:
+            raise AssertionError("a partial produced list must be refused, never used to classify pages")
+        (wd / compile_box.RECOVERY_PROVENANCE_PATH).write_text(json.dumps({
+            "version": 1, "recovery_mode": "complete", "produced_count": 2, "produced_pages": ["a.md", "c.md"],
+        }), "utf-8")
+        compile_box._prepare_command(run, partial)
+        assert run._recovery["produced_pages"] == ["a.md", "c.md"]
+        text = compile_box._render_command(run, partial)
+        assert "produced 2 candidate page" in text and "- candidate/a.md" in text and "- candidate/c.md" in text
+        assert "was also written by this compile" in text  # nothing falsely inherited
+        # A provenance file that disagrees with the command count is not trusted either.
+        (wd / compile_box.RECOVERY_PROVENANCE_PATH).write_text(json.dumps({"produced_count": 1, "produced_pages": ["a.md"]}), "utf-8")
+        try:
+            compile_box._prepare_command(run, partial)
+        except compile_box.CommandRejected as error:
+            assert error.status == 409
+        else:
+            raise AssertionError("mismatched provenance must be refused")
+        (wd / compile_box.RECOVERY_PROVENANCE_PATH).unlink()
+        (wd / "candidate" / "c.md").unlink()
+        # Bad parameters are refused, and any other command clears the decision.
+        try:
+            compile_box._prepare_command(run, {"action": "compile.resume", "parameters": {"recovery_mode": "finish"}})
+        except compile_box.CommandRejected as error:
+            assert error.status == 400
+        else:
+            raise AssertionError("unknown recovery_mode must be refused")
+        compile_box._prepare_command(run, {"action": "compile.refresh_domain", "parameters": {}})
+        assert run._recovery is None
+
+        # A pending plan always wins and keeps the original resume directive.
+        plan = {"version": 3, "phase": "map", "batches": [{"id": "b1", "sources": ["b.md"], "status": "pending"}]}
+        (wd / batching.BATCH_PLAN_PATH).write_text(batching.dump_json(plan))
+        assert compile_box._resume_workspace_state(run) == "plan"
+        assert compile_box._render_command(run, command) == strings["compile.resume"]
+        assert not compile_box._should_route_to_incremental(run, "", "compile.resume")
+        # Even a control-plane "complete" cannot override a pending batch plan.
+        compile_box._prepare_command(run, complete_cmd)
+        assert compile_box._resume_workspace_state(run) == "plan"
+    print("\u2713 plan-less compile.resume routes by workspace: restart / complete / incremental / plan")
+
+
+def test_hierarchical_pdf_page_directive():
+    """A PDF slice stays on its original Raw identity while the directive
+    requires the exact validated Read.pages range."""
+    batch = {
+        "id": "h042",
+        "sources": ["gpu/manual.pdf"],
+        "context_sources": [],
+        "source_page_ranges": {
+            "gpu/manual.pdf": {
+                "start_page": 41,
+                "end_page": 53,
+                "part": 3,
+                "parts": 3,
+            }
+        },
+        "defer_accounting": False,
+    }
+    previous_engine = os.environ.get("KBC_ENGINE")
+    os.environ["KBC_ENGINE"] = "pi_agent"
+    try:
+        directive = compile_box._compose_batch_directive(batch, 42, 50, "", "en")
+        assert "raw/gpu/manual.pdf (PDF pages 41-53, part 3/3)" in directive, directive
+        assert '`pages: "41-53"`' in directive, directive
+        assert "EXACT listed range" in directive, directive
+        assert "sources[].resource must cite the original Raw PDF path (raw/gpu/manual.pdf)" in directive
+
+        directive_zh = compile_box._compose_batch_directive(batch, 42, 50, "", "zh-CN")
+        assert '`pages: "41-53"`' in directive_zh, directive_zh
+        assert "Read 工具的 `pages` 参数必须严格等于清单页段" in directive_zh, directive_zh
+        assert "sources[].resource 必须引用原 Raw PDF 路径(raw/gpu/manual.pdf)" in directive_zh
+    finally:
+        if previous_engine is None:
+            os.environ.pop("KBC_ENGINE", None)
+        else:
+            os.environ["KBC_ENGINE"] = previous_engine
+    print("\u2713 hierarchical PDF slices: exact Read.pages directive and Raw provenance")
+
+
+
+
+
+async def test_hierarchical_batch_plan_and_section_reduce():
+    """Only the second, very-large-corpus gate selects hierarchical planning.
+    The map keeps anchor context explicit, section reduce runs after all maps,
+    and the persisted phase closes as complete. No model planner is spent on a
+    huge inventory."""
+    import batching
+
+    env_names = [
+        "KBC_BATCH_THRESHOLD_BYTES",
+        "KBC_HIERARCHICAL_THRESHOLD_BYTES",
+        "KBC_HIERARCHICAL_BATCH_BUDGET_BYTES",
+        "KBC_BATCH_PLANNER",
+    ]
+    previous = {name: os.environ.get(name) for name in env_names}
+    real_drive = compile_box._drive_batch_session
+    real_repairs = compile_box._run_ledger_repairs
+    real_media_enabled = compile_box._media_verify_enabled
+    real_hierarchical_idle_timeout = compile_box._HIERARCHICAL_MODEL_IDLE_TIMEOUT_S
+    try:
+        os.environ["KBC_BATCH_THRESHOLD_BYTES"] = "100"
+        os.environ["KBC_HIERARCHICAL_THRESHOLD_BYTES"] = "100"
+        os.environ["KBC_HIERARCHICAL_BATCH_BUDGET_BYTES"] = "400"
+        os.environ["KBC_BATCH_PLANNER"] = "model"
+        compile_box._HIERARCHICAL_MODEL_IDLE_TIMEOUT_S = 123
+
+        # Hierarchical mode is deterministic and must bypass the model planner.
+        inventory = [
+            {"path": "gpu/a.md", "bytes": 300, "effective": 300},
+            {"path": "gpu/b.md", "bytes": 300, "effective": 300},
+        ]
+        with tempfile.TemporaryDirectory() as plan_td:
+            plan = await compile_box._plan_batches(
+                compile_box.CompileRun("hier-plan", plan_td, 1), inventory)
+        assert plan["planner"] == "hierarchical-code" and plan["mode"] == "hierarchical", plan
+        assert len(plan["batches"]) == 2, plan
+
+        with tempfile.TemporaryDirectory() as td:
+            wd = Path(td)
+            (wd / "raw" / "gpu").mkdir(parents=True)
+            (wd / "raw" / "gpu" / "a.md").write_bytes(b"a" * 300)
+            (wd / "raw" / "gpu" / "b.md").write_bytes(b"b" * 300)
+            run = compile_box.CompileRun("hier-run", str(wd), 1)
+            driven: list[str] = []
+            observed_idle_timeouts: list[float | None] = []
+            observed_raw_scopes: list[tuple[str, dict]] = []
+
+            async def fake_drive(run_, directive, label, pdf_page_ranges=None,
+                                 raw_scope=None):
+                driven.append(label + "|" + directive.splitlines()[0])
+                observed_idle_timeouts.append(run_._model_idle_timeout_s)
+                observed_raw_scopes.append((label, dict(raw_scope or {})))
+                if label.startswith("batch ") or label.startswith("批 "):
+                    candidate = wd / "candidate"
+                    candidate.mkdir(exist_ok=True)
+                    source = "gpu/a.md" if not (candidate / "a.md").exists() else "gpu/b.md"
+                    page = Path(source).name
+                    (candidate / page).write_text(
+                        "---\n"
+                        f"type: Topic\ntitle: {page}\nsources:\n  - resource: {source}\n"
+                        "---\n# Body\nsource-backed detail\n")
+                return f"done {label}"
+
+            async def no_repairs(run_, replies):
+                return None
+
+            compile_box._drive_batch_session = fake_drive
+            compile_box._run_ledger_repairs = no_repairs
+            compile_box._media_verify_enabled = lambda: False
+            await compile_box._run_batch_compile(run, "直接开始编译")
+
+            assert sum(item.startswith("batch ") for item in driven) == 2, driven
+            assert sum(item.startswith("section reduce ") for item in driven) == 1, driven
+            assert driven[-1].startswith("final review"), driven
+            assert observed_raw_scopes[:2] == [
+                ("batch 1/2", {"account": ["gpu/a.md"], "deny_read": [], "consult": True}),
+                ("batch 2/2", {"account": ["gpu/b.md"], "deny_read": [], "consult": True}),
+            ], observed_raw_scopes
+            reduce_scopes = [scope for label, scope in observed_raw_scopes
+                             if label.startswith("section reduce ")]
+            final_scopes = [scope for label, scope in observed_raw_scopes
+                            if label.startswith("final review")]
+            saved = json.loads((wd / batching.BATCH_PLAN_PATH).read_text())
+            assert reduce_scopes == [compile_box.NO_RAW_SCOPE], observed_raw_scopes
+            assert final_scopes == [compile_box.semantic_review_raw_scope(saved)], observed_raw_scopes
+            assert set(observed_idle_timeouts) == {
+                max(compile_box._MODEL_IDLE_TIMEOUT_S, 123)
+            }, observed_idle_timeouts
+            assert run._model_idle_timeout_s is None, run._model_idle_timeout_s
+            assert saved["phase"] == "complete", saved
+            assert all(r["status"] == "done" for r in saved["reductions"]), saved
+
+            # A crash during final close-out resumes final only — it must never
+            # replay the expensive map or reduce train, even if raw has since
+            # shrunk below the ordinary batch threshold.
+            saved["phase"] = "final"
+            compile_box._write_batch_file(run, batching.BATCH_PLAN_PATH, saved)
+            os.environ["KBC_BATCH_THRESHOLD_BYTES"] = "100000"
+            assert compile_box._should_route_to_batch(run, "直接开始编译")
+            driven.clear()
+            await compile_box._run_batch_compile(run, "直接开始编译")
+            assert len(driven) == 1 and driven[0].startswith("final review"), driven
+
+            # A crash after semantic finalization but before the durable commit
+            # retries delivery only. No model session is replayed.
+            committed = json.loads((wd / batching.BATCH_PLAN_PATH).read_text())
+            committed["phase"] = "commit"
+            compile_box._write_batch_file(run, batching.BATCH_PLAN_PATH, committed)
+            driven.clear()
+            await compile_box._run_batch_compile(run, "直接开始编译")
+            assert driven == [], driven
+            assert json.loads((wd / batching.BATCH_PLAN_PATH).read_text())["phase"] == "complete"
+    finally:
+        compile_box._drive_batch_session = real_drive
+        compile_box._run_ledger_repairs = real_repairs
+        compile_box._media_verify_enabled = real_media_enabled
+        compile_box._HIERARCHICAL_MODEL_IDLE_TIMEOUT_S = real_hierarchical_idle_timeout
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+    print("\u2713 hierarchical batch: deterministic map / section reduce / complete phase")
+
+
+def test_hierarchical_media_verify_round_limit():
+    """Large trains scale the image-tail budget; ordinary/flat compiles retain
+    the established three-round latency bound, and an operator cap stays hard."""
+    names = (
+        "KBC_MEDIA_VERIFY_ROUNDS",
+        "KBC_MEDIA_VERIFY_ATTEMPTS",
+        "KBC_HIERARCHICAL_MEDIA_VERIFY_MAX_ROUNDS",
+    )
+    previous = {name: os.environ.get(name) for name in names}
+    try:
+        os.environ["KBC_MEDIA_VERIFY_ROUNDS"] = "3"
+        os.environ["KBC_MEDIA_VERIFY_ATTEMPTS"] = "2"
+        os.environ["KBC_HIERARCHICAL_MEDIA_VERIFY_MAX_ROUNDS"] = "256"
+        pending = {f"page-{i}.md": [f"image-{i}.png"] for i in range(4)}
+        assert compile_box._batch_media_verify_round_limit(
+            {"mode": "flat"}, pending) == 3
+        assert compile_box._batch_media_verify_round_limit(
+            {"mode": "hierarchical"}, pending) == 11
+        os.environ["KBC_HIERARCHICAL_MEDIA_VERIFY_MAX_ROUNDS"] = "5"
+        assert compile_box._batch_media_verify_round_limit(
+            {"mode": "hierarchical"}, pending) == 5
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+    print("\u2713 hierarchical media verify: scales by pending pages, flat unchanged, hard cap")
+
+
+async def test_hierarchical_media_rechecks_after_ledger_repair():
+    """A media repair followed by a ledger-format repair must be verified at
+    the ledger-clean fingerprint. The old tail verified the media edit first,
+    then changed the page in a final ledger pass and still marked the plan
+    complete with that final revision pending image verification."""
+    import batching
+    import selfcheck
+
+    real_drive = compile_box._drive_batch_session
+    real_repairs = compile_box._run_ledger_repairs
+    real_media_enabled = compile_box._media_verify_enabled
+    real_blind_verify = compile_box.mediaverify.run_blind_verify
+    real_engine_selector = compile_box.selected_readonly_engine
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            wd = Path(td)
+            (wd / "raw").mkdir()
+            (wd / "raw" / "chart.png").write_bytes(b"image")
+            (wd / "candidate").mkdir()
+            (wd / "candidate" / "index.md").write_text(
+                "---\nokf_version: \"0.2\"\n---\n# Index\n- [Page](page.md)\n")
+            page = wd / "candidate" / "page.md"
+            page.write_text(
+                "---\ntype: Topic\ntitle: Page\nsources:\n"
+                "  - resource: chart.png\n---\ninitial (source: chart.png)\n")
+            (wd / "authoring").mkdir()
+            plan = {
+                "version": 2,
+                "planner": "hierarchical-code",
+                "mode": "hierarchical",
+                "phase": "final",
+                "batches": [{
+                    "id": "h001",
+                    "sources": ["chart.png"],
+                    "context_sources": [],
+                    "bytes": 5,
+                    "status": "done",
+                }],
+                "reductions": [],
+            }
+            (wd / batching.BATCH_PLAN_PATH).write_text(batching.dump_json(plan))
+            run = compile_box.CompileRun("media-ledger-fingerprint", str(wd), 1)
+            order: list[str] = []
+            media_calls = 0
+
+            async def fake_drive(run_, directive, label, pdf_page_ranges=None,
+                                 raw_scope=None):
+                order.append(f"drive:{label}")
+                if label == "final review":
+                    assert "source_inventory/source_search/source_read" in directive, directive
+                    assert raw_scope == compile_box.semantic_review_raw_scope(plan), raw_scope
+                if label in {"image verification", "图像复核"}:
+                    page.write_text(page.read_text() + "media-repair\n")
+                return f"done {label}"
+
+            async def fake_repairs(run_, replies):
+                order.append("ledger")
+                if "media-repair" in page.read_text() and "ledger-repair" not in page.read_text():
+                    page.write_text(page.read_text() + "ledger-repair\n")
+
+            async def fake_blind_verify(engine, workdir, pending, progress=None, locale=None):
+                nonlocal media_calls
+                media_calls += 1
+                order.append(f"verify:{media_calls}:{'ledger-repair' in page.read_text()}")
+                if media_calls == 1:
+                    return {
+                        "findings": [{
+                            "page": "page.md",
+                            "image": "chart.png",
+                            "kind": "不一致",
+                            "claim": "initial",
+                            "expected": "corrected",
+                            "fix": "repair",
+                        }],
+                        "errors": [],
+                        "images": 1,
+                        "completed_pages": ["page.md"],
+                        "failed_pages": [],
+                    }
+                return {
+                    "findings": [],
+                    "errors": [],
+                    "images": 1,
+                    "completed_pages": ["page.md"],
+                    "failed_pages": [],
+                }
+
+            compile_box._drive_batch_session = fake_drive
+            compile_box._run_ledger_repairs = fake_repairs
+            compile_box._media_verify_enabled = lambda: True
+            compile_box.mediaverify.run_blind_verify = fake_blind_verify
+            compile_box.selected_readonly_engine = lambda: object()
+            await compile_box._run_batch_compile(run, "直接开始编译")
+
+            assert media_calls == 2, order
+            assert order.index("ledger", order.index("verify:1:False")) < order.index("verify:2:True"), order
+            assert selfcheck.pending_media_verification(td) == {}, order
+            report = selfcheck.read_selfcheck(td)
+            assert report["media_verify"]["summary"]["pending_pages"] == 0, report
+            saved = json.loads((wd / batching.BATCH_PLAN_PATH).read_text())
+            assert saved["phase"] == "complete", saved
+    finally:
+        compile_box._drive_batch_session = real_drive
+        compile_box._run_ledger_repairs = real_repairs
+        compile_box._media_verify_enabled = real_media_enabled
+        compile_box.mediaverify.run_blind_verify = real_blind_verify
+        compile_box.selected_readonly_engine = real_engine_selector
+    print("\u2713 hierarchical media verify: ledger-clean revision is rechecked")
+
+
+async def test_batch_orchestrator_review_fixes():
+    """Review fixes: (a) resume prunes sources deleted from raw/ (no directive
+    points at a missing file; an emptied batch is skipped); (b) an orchestrator
+    error still CLOSES the logical turn (error + turn_done, never-block); (c)
+    owner notes arriving during the tail phases get a bounded digest session
+    instead of being silently abandoned at turn_done; (e) an SDK error result
+    leaves the current batch pending instead of falsely stamping it done; (f)
+    even a successful no-op result cannot stamp unaccounted sources done."""
+    import batching
+
+    def _events(run):
+        evs = []
+        while not run.events.empty():
+            evs.append(run.events.get_nowait())
+        return evs
+
+    os.environ["KBC_BATCH_THRESHOLD_BYTES"] = "100"
+    os.environ["KBC_BATCH_BUDGET_BYTES"] = "400"
+    os.environ["KBC_BATCH_PLANNER"] = "code"
+    real_drive = compile_box._drive_batch_session
+    real_accounted = compile_box._unaccounted_batch_sources
+    compile_box._unaccounted_batch_sources = lambda run_, sources: []
+    try:
+        # (a) resume after a source vanished: plan pins deleted.md in a pending
+        # batch (and a fully-vanished batch) — directives must not mention them.
+        with tempfile.TemporaryDirectory() as td:
+            wd = Path(td)
+            raw = wd / "raw"
+            (raw / "a").mkdir(parents=True)
+            (raw / "a" / "kept.md").write_bytes(b"x" * 300)
+            plan = batching.build_plan(
+                [{"path": "a/kept.md", "bytes": 300, "effective": 300}],
+                [{"id": "b01", "sources": ["a/kept.md", "a/deleted.md"]},
+                 {"id": "b02", "sources": ["a/vanished.md"]}],
+                planner="code")
+            (wd / "authoring").mkdir()
+            (wd / batching.BATCH_PLAN_PATH).write_text(json.dumps(plan))
+            run = compile_box.CompileRun("rf1", str(wd), 1)
+            driven: list[str] = []
+
+            async def fake_drive(run_, directive, label, pdf_page_ranges=None,
+                                 raw_scope=None):
+                driven.append(f"{label}|{directive}")
+                return f"done {label}"
+
+            compile_box._drive_batch_session = fake_drive
+            await compile_box._run_batch_compile(run, "直接开始编译")
+            evs = _events(run)
+            assert any("no longer in raw/" in e.get("text", "") for e in evs
+                       if e["type"] == "summary"), evs
+            assert not any("deleted.md" in d or "vanished.md" in d for d in driven), driven
+            assert sum(d.startswith("batch ") for d in driven) == 1, driven  # b02 emptied → skipped
+            saved = json.loads((wd / batching.BATCH_PLAN_PATH).read_text())
+            assert all(b["status"] == "done" for b in saved["batches"]), saved
+
+        # (b) orchestrator error → error AND turn_done both emitted
+        with tempfile.TemporaryDirectory() as td:
+            wd = Path(td)
+            (wd / "raw" / "a").mkdir(parents=True)
+            (wd / "raw" / "a" / "one.md").write_bytes(b"x" * 300)
+            run = compile_box.CompileRun("rf2", str(wd), 1)
+
+            async def boom(run_, directive, label, pdf_page_ranges=None,
+                           raw_scope=None):
+                raise RuntimeError("session exploded")
+
+            compile_box._drive_batch_session = boom
+            await compile_box._run_batch_compile(run, "直接开始编译")
+            types = [e["type"] for e in _events(run)]
+            assert "error" in types and types.count("turn_done") == 1, types
+
+        # (c) a note landing during the tail phases (after the last batch has
+        # drained the queue) gets its own 留言消化 session carrying the text
+        with tempfile.TemporaryDirectory() as td:
+            wd = Path(td)
+            (wd / "raw" / "a").mkdir(parents=True)
+            (wd / "raw" / "a" / "one.md").write_bytes(b"x" * 300)
+            run = compile_box.CompileRun("rf3", str(wd), 1)
+            driven = []
+
+            async def drive_and_note(run_, directive, label, pdf_page_ranges=None,
+                                     raw_scope=None):
+                driven.append(f"{label}|{directive}")
+                if label == "final review":  # owner speaks while the tail is running
+                    run_._batch_notes.append("附录不要发布")
+                return f"done {label}"
+
+            compile_box._drive_batch_session = drive_and_note
+            await compile_box._run_batch_compile(run, "直接开始编译")
+            digest = [d for d in driven if d.startswith("note digest|")]
+            assert len(digest) == 1 and "附录不要发布" in digest[0], driven
+            assert [e for e in _events(run) if e["type"] == "turn_done"], "turn still closes"
+
+        # (d) zh locale branch: the same flow narrates in Chinese when the
+        # consumer declares locale=zh (platform default above was English)
+        with tempfile.TemporaryDirectory() as td:
+            wd = Path(td)
+            (wd / "raw" / "a").mkdir(parents=True)
+            (wd / "raw" / "a" / "one.md").write_bytes(b"x" * 300)
+            run = compile_box.CompileRun("rf4", str(wd), 1)
+            run.locale = "zh"
+            driven = []
+
+            async def fake_zh(run_, directive, label, pdf_page_ranges=None,
+                              raw_scope=None):
+                driven.append(f"{label}|{directive}")
+                return f"done {label}"
+
+            compile_box._drive_batch_session = fake_zh
+            await compile_box._run_batch_compile(run, "直接开始编译")
+            assert driven and driven[-1].startswith("终审"), driven
+            assert any(d.startswith("批 1/1|【分批编译 · 批 1/1") for d in driven), driven
+            turn = next(e for e in _events(run) if e["type"] == "turn_done")
+            assert "【批 1/1】" in turn["text"] and "【终审】" in turn["text"], turn
+
+        # (e) The real GPU corpus exposed this path: Claude Code returned an
+        # authentication error result_event with no assistant output. Treating
+        # it like a successful empty result stamped every map batch done. The
+        # batch must remain pending so the next valid run can resume honestly.
+        compile_box._drive_batch_session = real_drive
+        compile_box._unaccounted_batch_sources = real_accounted
+
+        class _ErrorResultClient:
+            def __init__(self, **kwargs):
+                self.options = SimpleNamespace(**kwargs)
+
+            async def connect(self, prompt=None):
+                pass
+
+            async def query(self, prompt, session_id="default"):
+                pass
+
+            async def receive_messages(self):
+                yield result_event("error_during_execution", is_error=True)
+
+            async def disconnect(self):
+                pass
+
+        real_client = compile_box.create_agent_client
+        compile_box.create_agent_client = _ErrorResultClient
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                wd = Path(td)
+                (wd / "raw" / "a").mkdir(parents=True)
+                (wd / "raw" / "a" / "one.md").write_bytes(b"x" * 300)
+                run = compile_box.CompileRun("rf5", str(wd), 1)
+                await compile_box._run_batch_compile(run, "直接开始编译")
+                saved = json.loads((wd / batching.BATCH_PLAN_PATH).read_text())
+                assert saved["batches"][0]["status"] == "pending", saved
+                evs = _events(run)
+                assert any(e["type"] == "error" and "ModelResultError" in e.get("error", "")
+                           for e in evs), evs
+                assert sum(e["type"] == "turn_done" for e in evs) == 1, evs
+        finally:
+            compile_box.create_agent_client = real_client
+
+        # (f) is_error=False is necessary but not sufficient: a provider/SDK
+        # regression may return an empty successful result. Every assigned
+        # source must now be cited or explicitly excluded before the done stamp.
+        class _NoopResultClient(_ErrorResultClient):
+            async def receive_messages(self):
+                yield result_event()
+
+        compile_box.create_agent_client = _NoopResultClient
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                wd = Path(td)
+                (wd / "raw" / "a").mkdir(parents=True)
+                (wd / "raw" / "a" / "one.md").write_bytes(b"x" * 300)
+                run = compile_box.CompileRun("rf6", str(wd), 1)
+                await compile_box._run_batch_compile(run, "直接开始编译")
+                saved = json.loads((wd / batching.BATCH_PLAN_PATH).read_text())
+                assert saved["batches"][0]["status"] == "pending", saved
+                evs = _events(run)
+                assert any(e["type"] == "error" and "BatchOutputError" in e.get("error", "")
+                           for e in evs), evs
+        finally:
+            compile_box.create_agent_client = real_client
+    finally:
+        compile_box._drive_batch_session = real_drive
+        compile_box._unaccounted_batch_sources = real_accounted
+        del os.environ["KBC_BATCH_THRESHOLD_BYTES"]
+        del os.environ["KBC_BATCH_BUDGET_BYTES"]
+    print("✓ batch orchestrator review fixes: resume-prune / error turn_done / tail-note digest")
+
+
+async def test_stall_interrupt_deadline_closes_turn():
+    """Review fix: a true black-hole can swallow interrupt() too — the retry
+    latch used to stay set forever (receive loop blocked, watchdog muted). Past
+    the deadline the watchdog closes the turn honestly (error + turn_done) and
+    disconnects to unblock the loop."""
+    class _SwallowingClient(_StallingFakeClient):
+        def __init__(self):
+            super().__init__(produce_on_query=999)
+            self.disconnects = 0
+
+        async def interrupt(self):
+            self.interrupts += 1          # accepted — but nothing ever arrives
+
+        async def disconnect(self):
+            self.disconnects += 1
+            self._closed = True
+            self._gate.set()              # let receive_messages exit
+
+    fake = _SwallowingClient()
+    saved = (compile_box._MODEL_IDLE_TIMEOUT_S, compile_box._MODEL_WATCHDOG_POLL_S,
+             compile_box._MODEL_MAX_RETRIES, compile_box._STALL_INTERRUPT_DEADLINE_S)
+    compile_box._MODEL_IDLE_TIMEOUT_S = 0.2
+    compile_box._MODEL_WATCHDOG_POLL_S = 0.03
+    compile_box._MODEL_MAX_RETRIES = 3
+    compile_box._STALL_INTERRUPT_DEADLINE_S = 0.2
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            run = compile_box.CompileRun("wdl", td, 1)
+            run._suppress_turn_done = True
+            run.client = fake
+            wdog = asyncio.create_task(compile_box._model_stall_watchdog(run))
+            try:
+                await run.inject_user_message("批 1/10")
+                await asyncio.wait_for(
+                    compile_box._consume_turn_stream(run, fake, stop_on_result=True),
+                    timeout=5)
+            finally:
+                run.done = True
+                wdog.cancel()
+                try:
+                    await wdog
+                except asyncio.CancelledError:
+                    pass
+            evs = _drain(run)
+            types = [e["type"] for e in evs]
+            assert fake.interrupts >= 1 and fake.disconnects == 1, (fake.interrupts, fake.disconnects)
+            assert "error" in types and "turn_done" in types, types
+            done_text = next(e["text"] for e in evs if e["type"] == "turn_done")
+            assert "recreated automatically" in done_text, done_text  # honest: no in-place retry on this box
+            assert not run._turn_active and not run._stall_retrying
+    finally:
+        (compile_box._MODEL_IDLE_TIMEOUT_S, compile_box._MODEL_WATCHDOG_POLL_S,
+         compile_box._MODEL_MAX_RETRIES, compile_box._STALL_INTERRUPT_DEADLINE_S) = saved
+    print("✓ stall interrupt deadline: wedged latch closes the turn (error + turn_done) and unblocks")
+
+
+async def test_run_wrapper_cancels_detached_verify_tasks():
+    """Audit batch B: a media/PK verify task mid-flight when the run ends kept
+    burning model calls for minutes, then no-op'd its injection into a dead
+    session. The wrapper's teardown now cancels both."""
+    async def impl(run):
+        loop = asyncio.get_running_loop()
+        run._media_task = loop.create_task(asyncio.sleep(999))
+        run._pk_task = loop.create_task(asyncio.sleep(999))
+
+    saved = compile_box._COMPILE_IMPL
+    compile_box._COMPILE_IMPL = impl
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            run = compile_box.CompileRun("bgc", td, 1)
+            await compile_box._run_wrapper(run)
+            assert run._media_task.cancelled(), run._media_task
+            assert run._pk_task.cancelled(), run._pk_task
+    finally:
+        compile_box._COMPILE_IMPL = saved
+    print("✓ run wrapper cancels detached media/PK tasks (no token burn after run end)")
+
+
+async def test_run_wrapper_closes_turn_on_driver_crash():
+    """Review fix (never-block symmetry): a driver that dies mid-turn must not
+    leave a consumer gating on turn_done hanging — error AND turn_done both fire."""
+    async def dying_impl(run):
+        run._begin_turn("owner message")   # a turn is in flight…
+        raise compile_box.ModelStallError("exhausted")
+
+    saved_impl = compile_box._COMPILE_IMPL
+    compile_box._COMPILE_IMPL = dying_impl
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            run = compile_box.CompileRun("wcr", td, 1)
+            await compile_box._run_wrapper(run)
+            evs = _drain(run)
+            types = [e["type"] for e in evs]
+            assert "error" in types and "turn_done" in types and types[-1] == "end", types
+            assert types.index("error") < types.index("turn_done"), types
+            assert getattr(run, "_ended", False) is True
+    finally:
+        compile_box._COMPILE_IMPL = saved_impl
+    print("✓ run wrapper: driver crash mid-turn still closes the logical turn")
+
+
+# ── Model-stall watchdog (L1) ────────────────────────────────────────────────
+
+
+def _drain(run):
+    evs = []
+    while not run.events.empty():
+        evs.append(run.events.get_nowait())
+    return evs
+
+
+class _StallingFakeClient:
+    """Black-holes each attempt (receive blocks on a gate) until the Nth query;
+    interrupt() unblocks with a bare result_event (the interrupted attempt). The
+    Nth query produces a real reply + result_event. `produce_on_query=999` never
+    recovers (exhaustion path)."""
+
+    def __init__(self, produce_on_query=2, **kwargs):
+        self.options = SimpleNamespace(**kwargs)
+        self.queries = []
+        self.interrupts = 0
+        self._produce_on = produce_on_query
+        self._gate = asyncio.Event()
+        self._mode = "blackhole"
+        self._closed = False
+
+    async def connect(self, prompt=None):
+        pass
+
+    async def query(self, prompt, session_id="default"):
+        self.queries.append(prompt)
+        if len(self.queries) >= self._produce_on:
+            self._mode = "produce"
+        else:
+            self._mode = "blackhole"          # no gate → receive blocks (the wedge)
+        if self._mode == "produce":
+            self._gate.set()
+
+    async def interrupt(self):
+        self.interrupts += 1
+        self._mode = "interrupted"
+        self._gate.set()
+
+    async def receive_messages(self):
+        while not self._closed:
+            await self._gate.wait()
+            self._gate.clear()
+            if self._mode == "interrupted":
+                yield result_event()          # the interrupted attempt ends
+            elif self._mode == "produce":
+                yield assistant_event("批 1/10 完成")
+                yield result_event()
+                self._closed = True
+                return
+            # blackhole → loop back and block on the gate again
+
+    async def disconnect(self):
+        self._closed = True
+
+
+class _LiveStreamFake:
+    """A live-but-slow generation: emits activity_event liveness faster than the idle
+    bound, so the watchdog must never reap it."""
+
+    def __init__(self, ticks=6, dt=0.05, **kwargs):
+        self.options = SimpleNamespace(**kwargs)
+        self.queries = []
+        self.interrupts = 0
+        self._ticks = ticks
+        self._dt = dt
+
+    async def connect(self, prompt=None):
+        pass
+
+    async def query(self, prompt, session_id="default"):
+        self.queries.append(prompt)
+
+    async def interrupt(self):
+        self.interrupts += 1
+
+    async def receive_messages(self):
+        for _ in range(self._ticks):
+            await asyncio.sleep(self._dt)
+            yield activity_event()
+        yield assistant_event("done streaming")
+        yield result_event()
+
+    async def disconnect(self):
+        pass
+
+
+class _ToolGapFake:
+    """A tool the CLI runs for a while: after the assistant asks for a tool
+    (tool_pending), there is a model-silent gap longer than the idle bound but
+    shorter than the tool bound — must NOT be reaped."""
+
+    def __init__(self, gap=0.3, **kwargs):
+        self.options = SimpleNamespace(**kwargs)
+        self.queries = []
+        self.interrupts = 0
+        self._gap = gap
+
+    async def connect(self, prompt=None):
+        pass
+
+    async def query(self, prompt, session_id="default"):
+        self.queries.append(prompt)
+
+    async def interrupt(self):
+        self.interrupts += 1
+
+    async def receive_messages(self):
+        am = assistant_event("calling read")
+        am.data["content"] = [text_block("calling read"), tool_block()]
+        yield am                                # tool_pending = True
+        # The real Agent SDK emits assistant-tail activity_events
+        # (content_block_stop/message_delta/message_stop) before the CLI
+        # returns the tool_end_event carrying the tool result.  Those events prove
+        # transport liveness, but they do not mean the tool has finished.
+        yield activity_event()
+        yield activity_event()
+        yield activity_event()
+        await asyncio.sleep(self._gap)          # model-silent while the CLI runs the tool
+        yield tool_end_event()                     # tool_result → tool_pending = False
+        yield assistant_event("read done")
+        yield result_event()
+
+    async def disconnect(self):
+        pass
+
+
+async def _run_stall_scenario(fake, *, idle, poll, max_retries, tool_idle=660.0,
+                              rate_base=None, rate_cap=None, rate_max=None):
+    """Drive one turn through _consume_turn_stream with the watchdog running, at
+    test-tuned knobs (restored after). Returns (run, drained events, raised)."""
+    saved = (
+        compile_box._MODEL_IDLE_TIMEOUT_S,
+        compile_box._MODEL_TOOL_IDLE_TIMEOUT_S,
+        compile_box._MODEL_MAX_RETRIES,
+        compile_box._MODEL_WATCHDOG_POLL_S,
+        compile_box._MODEL_RATE_BACKOFF_BASE_S,
+        compile_box._MODEL_RATE_BACKOFF_CAP_S,
+        compile_box._MODEL_RATE_MAX_RETRIES,
+    )
+    compile_box._MODEL_IDLE_TIMEOUT_S = idle
+    compile_box._MODEL_TOOL_IDLE_TIMEOUT_S = tool_idle
+    compile_box._MODEL_MAX_RETRIES = max_retries
+    compile_box._MODEL_WATCHDOG_POLL_S = poll
+    if rate_base is not None:
+        compile_box._MODEL_RATE_BACKOFF_BASE_S = rate_base
+    if rate_cap is not None:
+        compile_box._MODEL_RATE_BACKOFF_CAP_S = rate_cap
+    if rate_max is not None:
+        compile_box._MODEL_RATE_MAX_RETRIES = rate_max
+    raised = None
+    with tempfile.TemporaryDirectory() as td:
+        run = compile_box.CompileRun("wd", td, 1)
+        run._suppress_turn_done = True          # isolate the watchdog from post-turn machinery
+        run.client = fake
+        wdog = asyncio.create_task(compile_box._model_stall_watchdog(run))
+        try:
+            await run.inject_user_message("批 1/10")
+            await compile_box._consume_turn_stream(run, fake, stop_on_result=True)
+        except compile_box.ModelStallError as e:
+            raised = e
+        finally:
+            run.done = True
+            wdog.cancel()
+            try:
+                await wdog
+            except asyncio.CancelledError:
+                pass
+            (
+                compile_box._MODEL_IDLE_TIMEOUT_S,
+                compile_box._MODEL_TOOL_IDLE_TIMEOUT_S,
+                compile_box._MODEL_MAX_RETRIES,
+                compile_box._MODEL_WATCHDOG_POLL_S,
+                compile_box._MODEL_RATE_BACKOFF_BASE_S,
+                compile_box._MODEL_RATE_BACKOFF_CAP_S,
+                compile_box._MODEL_RATE_MAX_RETRIES,
+            ) = saved
+    return run, _drain(run), raised
+
+
+async def test_model_stall_retries_then_completes():
+    """A black-holed model request is interrupted and re-issued on a fresh query;
+    the retry produces output and the turn finishes (turn_stalled then completes)."""
+    fake = _StallingFakeClient(produce_on_query=2)
+    run, evs, raised = await _run_stall_scenario(fake, idle=0.25, poll=0.03, max_retries=3)
+    types = [e["type"] for e in evs]
+    assert raised is None, raised
+    assert fake.interrupts == 1, fake.interrupts
+    assert fake.queries == ["批 1/10", "批 1/10"], fake.queries
+    assert "turn_stalled" in types, types
+    assert run._last_turn_reply == "批 1/10 完成", run._last_turn_reply
+    print("✓ model stall: interrupt + retry recovers a black-holed request")
+
+
+async def test_model_stall_live_stream_not_reaped():
+    """A live-but-slow generation (activity_events flowing) is never reaped (I4)."""
+    fake = _LiveStreamFake(ticks=6, dt=0.05)
+    run, evs, raised = await _run_stall_scenario(fake, idle=0.25, poll=0.03, max_retries=3)
+    assert raised is None, raised
+    assert fake.interrupts == 0, fake.interrupts
+    assert "turn_stalled" not in [e["type"] for e in evs]
+    print("✓ model stall: a live-but-slow stream is never reaped")
+
+
+async def test_model_stall_tool_gap_not_reaped():
+    """A model-silent gap while the CLI runs a tool (tool_pending) uses the longer
+    tool bound — not mistaken for a model stall (I4)."""
+    fake = _ToolGapFake(gap=0.3)
+    run, evs, raised = await _run_stall_scenario(fake, idle=0.25, poll=0.03, max_retries=3, tool_idle=1.0)
+    assert raised is None, raised
+    assert fake.interrupts == 0, fake.interrupts
+    assert "turn_stalled" not in [e["type"] for e in evs]
+    print("✓ model stall: a long tool (tool_pending) is not mistaken for a stall")
+
+
+async def test_model_stall_exhausts_to_error():
+    """A request that never recovers is retried up to the bound, then fails the
+    turn with ModelStallError (the run fails fast instead of hanging for ~1h)."""
+    fake = _StallingFakeClient(produce_on_query=999)
+    run, evs, raised = await _run_stall_scenario(fake, idle=0.2, poll=0.03, max_retries=2)
+    types = [e["type"] for e in evs]
+    assert isinstance(raised, compile_box.ModelStallError), raised
+    assert fake.interrupts == 3, fake.interrupts          # 2 retries + the fatal attempt
+    assert types.count("turn_stalled") == 3, types
+    fatal = next(e for e in evs if e["type"] == "turn_stalled" and e.get("fatal"))
+    assert fatal["code"] == "model_turn_stalled", fatal
+    assert fatal["stage"] == "model_turn", fatal
+    assert fatal["attempts"] == 3, fatal
+    assert fatal["bound_s"] == 0.2, fatal
+    assert fatal["tool_pending"] is False, fatal
+    assert fatal["last_sdk_message"] == "query", fatal
+    print("✓ model stall: retries exhausted → ModelStallError (fails fast, no hang)")
+
+
+# ── Batch-path stall recovery: client rebuild + continue (07-24 incident) ─────
+
+
+
+
+
+class _BatchTurnFake:
+    """A per-attempt fake compile-session client for _drive_batch_session.
+
+    mode:
+      'ok'          — a clean turn: assistant_event(reply) + result_event.
+      'lost_term'   — emit the content once (assistant_event), then black-hole
+                      the terminator forever; interrupt() is SWALLOWED (produces
+                      nothing), reproducing the 07-24 incident (stream terminator
+                      lost AND interrupt black-holed).
+      'dead'        — the CLI subprocess has exited (returncode set) and the
+                      stream hangs; the watchdog's liveness probe must reap it.
+      'plain_exc'   — emit content, then a typed Pi worker transport failure.
+      'interrupt_raises' — the stream NEVER yields (a black hole) AND interrupt()
+                      RAISES, with a live subprocess (no returncode), so neither
+                      the liveness probe nor any result_event can ever fire.
+                      Pre-fix the watchdog just cleared the retry latch and
+                      re-interrupted forever; the reap is the only way out.
+    """
+
+    def __init__(self, mode, reply="batch reply", returncode=None):
+        self.mode = mode
+        self.reply = reply
+        self.interrupts = 0
+        self.disconnects = 0
+        self._gate = asyncio.Event()
+        self._closed = False
+        if returncode is not None:
+            self.returncode = returncode
+
+    async def connect(self, prompt=None):
+        pass
+
+    async def query(self, prompt, session_id="default"):
+        # 'dead' / 'interrupt_raises' never open the gate — the stream hangs until
+        # the watchdog reaps and disconnect() unblocks it.
+        if self.mode in ("ok", "lost_term", "plain_exc"):
+            self._gate.set()
+
+    async def interrupt(self):
+        self.interrupts += 1          # swallowed: nothing is ever produced
+        if self.mode == "interrupt_raises":
+            raise RuntimeError("interrupt swallowed by the black hole")
+
+    async def receive_messages(self):
+        while not self._closed:
+            await self._gate.wait()
+            self._gate.clear()
+            if self.mode == "ok":
+                yield assistant_event(self.reply)
+                yield result_event()
+                self._closed = True
+                return
+            if self.mode == "plain_exc":
+                yield assistant_event(self.reply)   # content lands…
+                # …then the SDK surfaces a dead subprocess as a plain Exception.
+                raise AgentTransportError("Pi worker exited during the turn")
+            if self.mode == "lost_term":
+                yield assistant_event(self.reply)   # content lands…
+                self.mode = "blackhole"              # …then the terminator never comes
+            # blackhole / dead → loop back and block on the (cleared) gate
+
+    async def disconnect(self):
+        self.disconnects += 1
+        self._closed = True
+        self._gate.set()              # let a blocked receive_messages() exit
+
+
+def _batch_client_factory(modes):
+    """Return a _compile_session_client stand-in that hands out one _BatchTurnFake
+    per connect, following `modes` in order (last mode repeats if drained). Records
+    the built clients so a test can assert interrupts/disconnects/rebuild count."""
+    built: list[_BatchTurnFake] = []
+
+    def factory(run, wd, system_prompt, session_id, **kwargs):
+        spec = modes[len(built)] if len(built) < len(modes) else modes[-1]
+        client = _BatchTurnFake(**spec) if isinstance(spec, dict) else _BatchTurnFake(spec)
+        built.append(client)
+        return client
+
+    return built, factory
+
+
+async def _drive_batch_with_watchdog(modes, *, label="batch 1/2", batch_active=True,
+                                     idle=0.05, poll=0.02, max_retries=1,
+                                     interrupt_deadline=0.2, rebuild_max=3):
+    """Run the REAL _drive_batch_session with the REAL _model_stall_watchdog over a
+    scripted sequence of fake clients, at test-tuned knobs (restored after). The
+    de-stream floor is 0 in tests (the shim never binds), so bounds are the raw
+    idle/deadline values. Returns (run, drained events, reply, raised, built)."""
+    saved = (
+        compile_box._MODEL_IDLE_TIMEOUT_S, compile_box._MODEL_WATCHDOG_POLL_S,
+        compile_box._MODEL_MAX_RETRIES, compile_box._STALL_INTERRUPT_DEADLINE_S,
+        compile_box._BATCH_REBUILD_MAX_RETRIES, compile_box._compile_session_client,
+        compile_box._compile_system_prompt, compile_box._engine_kind,
+    )
+    built, factory = _batch_client_factory(modes)
+    compile_box._MODEL_IDLE_TIMEOUT_S = idle
+    compile_box._MODEL_WATCHDOG_POLL_S = poll
+    compile_box._MODEL_MAX_RETRIES = max_retries
+    compile_box._STALL_INTERRUPT_DEADLINE_S = interrupt_deadline
+    compile_box._BATCH_REBUILD_MAX_RETRIES = rebuild_max
+    compile_box._compile_session_client = factory
+    compile_box._compile_system_prompt = lambda run: "sys"
+    compile_box._engine_kind = lambda: "pi_agent"
+    raised = None
+    reply = None
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            run = compile_box.CompileRun("bd", td, 1)
+            run._batch_active = batch_active
+            wdog = asyncio.create_task(compile_box._model_stall_watchdog(run))
+            try:
+                reply = await asyncio.wait_for(
+                    compile_box._drive_batch_session(run, "批 1/2 指令", label), timeout=5)
+            except compile_box.ModelStallError as e:
+                raised = e
+            finally:
+                run.done = True
+                wdog.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await wdog
+    finally:
+        (
+            compile_box._MODEL_IDLE_TIMEOUT_S, compile_box._MODEL_WATCHDOG_POLL_S,
+            compile_box._MODEL_MAX_RETRIES, compile_box._STALL_INTERRUPT_DEADLINE_S,
+            compile_box._BATCH_REBUILD_MAX_RETRIES, compile_box._compile_session_client,
+            compile_box._compile_system_prompt, compile_box._engine_kind,
+        ) = saved
+    return run, _drain(run), reply, raised, built
+
+
+async def test_batch_lost_terminator_reaps_and_rebuilds():
+    """(a) A batch turn whose content completed but whose stream terminator was
+    lost (and interrupt() swallowed) is reaped by the watchdog within bounds, then
+    _drive_batch_session rebuilds a fresh client and the batch completes — instead
+    of hanging for 40+ minutes on the wedged transport."""
+    run, evs, reply, raised, built = await _drive_batch_with_watchdog(
+        ["lost_term", "ok"])
+    types = [e["type"] for e in evs]
+    assert raised is None, raised
+    assert reply == "batch reply", reply
+    assert len(built) == 2, built                 # exactly one rebuild
+    assert built[0].interrupts >= 1, built[0].interrupts   # watchdog tried in place first
+    assert built[0].disconnects >= 1, built[0].disconnects  # dead client torn down
+    assert "turn_stalled" in types, types         # the watchdog fired (checkpoint within bounds)
+    print("✓ batch stall: lost terminator reaped within bounds → client rebuilt → batch completes")
+
+
+async def test_batch_subprocess_death_rebuilds_and_continues():
+    """(b) The CLI subprocess dies mid-batch (returncode set) and the stream
+    hangs. The watchdog's liveness probe detects the exit in one poll (not the
+    idle floor), _drive_batch_session rebuilds, and the batch continues."""
+    run, evs, reply, raised, built = await _drive_batch_with_watchdog(
+        [{"mode": "dead", "returncode": 0}, {"mode": "ok"}])
+    types = [e["type"] for e in evs]
+    assert raised is None, raised
+    assert reply == "batch reply", reply
+    assert len(built) == 2, built
+    assert built[0].interrupts == 0, built[0].interrupts   # a dead process is not interrupted
+    assert built[0].disconnects >= 1, built[0].disconnects
+    stalled = [e for e in evs if e["type"] == "turn_stalled"]
+    assert any(e.get("code") == "model_turn_unrecoverable" for e in stalled), stalled
+    print("✓ batch stall: dead subprocess detected by liveness probe → rebuilt → batch continues")
+
+
+async def test_batch_transport_failure_rebuilds_and_continues():
+    """A typed Pi transport fault destroys the old worker and resumes the batch."""
+    run, evs, reply, raised, built = await _drive_batch_with_watchdog(
+        ["plain_exc", "ok"])
+    assert raised is None, raised
+    assert reply == "batch reply", reply          # rebuilt turn's reply, not the dead attempt's
+    assert len(built) == 2, built                 # exactly one rebuild
+    assert built[0].interrupts == 0, built[0].interrupts   # not a stall — a raised transport fault
+    assert built[0].disconnects >= 1, built[0].disconnects  # dead client torn down
+    print("✓ batch stall: a plain SDK stream Exception is normalized → client rebuilt → batch completes")
+
+
+async def test_batch_interrupt_failure_reaps_instead_of_spinning():
+    """R3-1 (infinite wedge): a black-holed stream whose interrupt() RAISES.
+
+    Pre-fix the watchdog's except branch only cleared _stall_retrying and emitted
+    a summary. Nothing reaped: no result_event ever arrives, so the _stall_fatal
+    latch _consume_turn_stream would act on is never consumed, and the cleared
+    _stall_retrying also disables the interrupt-deadline reap — the watchdog just
+    re-interrupts on every idle bound, forever (in production: a full bound, up to
+    the 900s de-stream floor, per cycle). The 5s wait_for in the harness therefore
+    times out pre-fix. Post-fix the FIRST interrupt failure hands off to
+    _reap_unrecoverable_turn: the batch sub-session rebuilds and completes."""
+    run, evs, reply, raised, built = await _drive_batch_with_watchdog(
+        ["interrupt_raises", "ok"])
+    assert raised is None, raised
+    assert reply == "batch reply", reply
+    assert len(built) == 2, built                  # exactly one rebuild
+    # Bounded, not spinning: the doomed client is interrupted ONCE, then reaped.
+    assert built[0].interrupts == 1, built[0].interrupts
+    assert built[0].disconnects >= 1, built[0].disconnects
+    stalled = [e for e in evs if e["type"] == "turn_stalled"]
+    assert any(e.get("code") == "model_turn_unrecoverable" for e in stalled), stalled
+    print("✓ batch stall: interrupt() that RAISES is reaped at once → rebuilt → batch completes (no spin)")
+
+
+async def test_interrupt_failure_reap_is_bounded_and_resumable():
+    """R3-1, exhaustion arm: EVERY client black-holes with a raising interrupt().
+    The run must still terminate on the bounded rebuild budget with a resumable
+    ModelStallError — and must spend exactly ONE interrupt per client, proving the
+    watchdog never re-enters the re-interrupt loop the fix removed."""
+    run, evs, reply, raised, built = await _drive_batch_with_watchdog(
+        ["interrupt_raises"], rebuild_max=2)
+    assert isinstance(raised, compile_box.ModelStallError), raised
+    assert "exhausted" in str(raised), raised
+    assert len(built) == 3, built                  # initial + 2 rebuilds, then give up
+    assert [c.interrupts for c in built] == [1, 1, 1], [c.interrupts for c in built]
+    assert all(c.disconnects >= 1 for c in built), [c.disconnects for c in built]
+    print("✓ batch stall: a raising interrupt() burns exactly one attempt per client → resumable exhaustion")
+
+
+async def test_batch_rebuild_exhaustion_raises_resumable():
+    """(c) A batch whose every client dies exhausts the bounded rebuilds and
+    raises ModelStallError; _run_batch_compile turns that into the resumable
+    checkpoint (finished batches stay stamped, run ends closable)."""
+    run, evs, reply, raised, built = await _drive_batch_with_watchdog(
+        [{"mode": "dead", "returncode": 1}], rebuild_max=2)
+    assert isinstance(raised, compile_box.ModelStallError), raised
+    assert "exhausted" in str(raised), raised
+    assert len(built) == 3, built                 # initial + 2 rebuilds, then give up
+    assert all(c.disconnects >= 1 for c in built), [c.disconnects for c in built]
+
+    # The orchestrator converts that raise into the resumable-checkpoint turn_done.
+    real_drive = compile_box._drive_batch_session
+
+    async def always_stall(run_, directive, label, pdf_page_ranges=None,
+                           raw_scope=None):
+        raise compile_box.ModelStallError("batch session stalled; exhausted rebuilds")
+
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "raw" / "a").mkdir(parents=True)
+        (wd / "raw" / "a" / "one.md").write_bytes(b"x" * 300)
+        (wd / "raw" / "a" / "two.md").write_bytes(b"y" * 300)
+        run2 = compile_box.CompileRun("bx", str(wd), 1)
+        os.environ["KBC_BATCH_THRESHOLD_BYTES"] = "100"
+        os.environ["KBC_BATCH_BUDGET_BYTES"] = "400"
+        os.environ["KBC_BATCH_PLANNER"] = "code"
+        compile_box._drive_batch_session = always_stall
+        try:
+            await compile_box._run_batch_compile(run2, "直接开始编译")
+        finally:
+            compile_box._drive_batch_session = real_drive
+            del os.environ["KBC_BATCH_THRESHOLD_BYTES"]
+            del os.environ["KBC_BATCH_BUDGET_BYTES"]
+        evs2 = _drain(run2)
+        types2 = [e["type"] for e in evs2]
+        assert types2.count("turn_done") == 1, types2   # the single logical turn still CLOSES
+        done = next(e for e in evs2 if e["type"] == "turn_done")
+        assert "resume" in done["text"] or "断点" in done["text"], done
+        assert run2._batch_active is False, "batch flag must clear so the next trigger can resume"
+    print("✓ batch stall: rebuilds exhausted → ModelStallError → run ends resumable (checkpoint)")
+
+
+def test_batch_retry_preserves_first_attempt_page_baseline():
+    """A rebuilt transport is the same logical turn, not a new byte baseline."""
+    with tempfile.TemporaryDirectory() as td:
+        candidate = Path(td) / "candidate"
+        candidate.mkdir()
+        page = candidate / "topic.md"
+        page.write_text(
+            "---\ntype: Topic\nverified:\n  by: human:r\n"
+            "  at: '2026-08-04T00:00:00Z'\n---\nOld\n", "utf-8")
+        run = compile_box.CompileRun("baseline", td, 1)
+        run._begin_turn("attempt 1")
+        original = dict(run._turn_page_hashes)
+        page.write_text(page.read_text("utf-8").replace("Old", "New"), "utf-8")
+
+        # The idempotent retry performs no write. It must still compare against
+        # the bytes before attempt 1, otherwise verified survives changed bytes.
+        run._begin_turn("attempt 2", preserve_page_baseline=True)
+        assert run._turn_page_hashes == original
+        changes = compile_box.incremental.changed_pages(
+            run._turn_page_hashes, compile_box.incremental.page_hashes(td))
+        assert changes == {"topic.md": "modified"}, changes
+        stamped = compile_box.selfcheck.stamp_siclaw_generated_metadata(
+            td, set(changes), now=datetime(2026, 8, 4, 12, 0, tzinfo=timezone.utc))
+        assert stamped == ["topic.md"]
+        fm, _, error = compile_box.selfcheck.parse_okf_frontmatter(page.read_text("utf-8"))
+        assert not error and "verified" not in fm, fm
+    print("✓ batch retry keeps the first attempt baseline and invalidates old verification")
+
+
+async def test_workspace_sync_invalidates_verification_before_cross_process_resume():
+    """Durability cannot carry old trust onto bytes written by a failed turn."""
+    with tempfile.TemporaryDirectory() as td:
+        candidate = Path(td) / "candidate"
+        candidate.mkdir()
+        page = candidate / "topic.md"
+        page.write_text(
+            "---\ntype: Topic\nverified:\n  by: human:r\n"
+            "  at: '2026-08-04T00:00:00Z'\n---\nOld\n", "utf-8")
+        run = compile_box.CompileRun("durable-baseline", td, 1)
+        sent = compile_box._workspace_sync_cursor(td)
+        run._begin_turn("attempt 1")
+        page.write_text(page.read_text("utf-8").replace("Old", "New"), "utf-8")
+
+        changed = await compile_box._sync_workspace(run, sent)
+        assert changed == 1, changed
+        sync = next(event for event in _drain(run) if event["type"] == "syncArtifacts")
+        persisted = next(
+            item["content"] for item in sync["artifacts"]
+            if item["path"] == "candidate/topic.md"
+        )
+        fm, _, error = compile_box.selfcheck.parse_okf_frontmatter(persisted)
+        assert not error and "verified" not in fm, fm
+        assert (fm.get("generated") or {}).get("by") == "process:siclaw-kbc", fm
+        local_fm, _, error = compile_box.selfcheck.parse_okf_frontmatter(
+            page.read_text("utf-8"))
+        assert not error and "verified" in local_fm, local_fm  # sync never races the writer
+
+        # A second periodic tick neither rewrites nor re-emits identical bytes.
+        assert await compile_box._sync_workspace(run, sent) == 0
+        replay = compile_box._workspace_replay_artifacts(run, sent)
+        replayed = next(item["content"] for item in replay
+                        if item["path"] == "candidate/topic.md")
+        assert replayed == persisted
+
+        # Retrying in the same live box reconciles the previous failed turn
+        # before replacing its in-memory baseline.
+        run._begin_turn("same-process retry")
+        local_fm, _, error = compile_box.selfcheck.parse_okf_frontmatter(
+            page.read_text("utf-8"))
+        assert not error and "verified" not in local_fm, local_fm
+
+        # Emulate a new box rehydrating the persisted Candidate. Its idempotent
+        # retry has no byte delta, but stale verification is already impossible.
+        page.write_text(persisted, "utf-8")
+        resumed = compile_box.CompileRun("resumed", td, 1)
+        resumed._begin_turn("attempt 1 after restart")
+        changes = compile_box.incremental.changed_pages(
+            resumed._turn_page_hashes, compile_box.incremental.page_hashes(td))
+        assert changes == {}, changes
+        fm, _, error = compile_box.selfcheck.parse_okf_frontmatter(page.read_text("utf-8"))
+        assert not error and "verified" not in fm, fm
+    print("✓ workspace sync invalidates old verified before cross-process resume")
+
+
+async def test_durable_workspace_sync_waits_for_consumer_ack():
+    """A sealed batch is not complete until the control plane commits and ACKs it."""
+    compile_box.RUNS.clear()
+    with tempfile.TemporaryDirectory() as td:
+        candidate = Path(td) / "candidate"
+        authoring = Path(td) / "authoring"
+        candidate.mkdir()
+        authoring.mkdir()
+        (candidate / "index.md").write_text("# Index\n", "utf-8")
+        (candidate / "topic.md").write_text("# Topic\n", "utf-8")
+        (authoring / "BATCH_PLAN.json").write_text(
+            json.dumps({"phase": "map", "batches": [{"id": "b01", "status": "done"}]}),
+            "utf-8",
+        )
+        run = compile_box.CompileRun("ack-run", td, 1)
+        run._artifact_ack_required = True
+        compile_box.RUNS[run.run_id] = run
+        sent = {}
+
+        pending = asyncio.create_task(
+            compile_box._sync_workspace(run, sent, durable_barrier=True))
+        event = await asyncio.wait_for(run.events.get(), timeout=1)
+        run.events.task_done()
+        assert event["type"] == "syncArtifacts", event
+        sync_id = event.get("sync_id")
+        assert sync_id and not pending.done(), "batch advanced before durable ACK"
+        assert run._pending_sync_events[sync_id] == event
+
+        client = TestClient(TestServer(compile_box.build_app()))
+        await client.start_server()
+        try:
+            response = await client.post(
+                f"/artifacts/ack/{run.run_id}", json={"sync_id": sync_id})
+            assert response.status == 200, await response.text()
+            body = await response.json()
+            assert body["accepted"] is True, body
+            changed = await asyncio.wait_for(pending, timeout=1)
+            assert changed >= 3, changed
+            assert sent, "dedupe cursor advances only after ACK"
+
+            # Lost ACK responses are harmless: runtime retries idempotently.
+            response = await client.post(
+                f"/artifacts/ack/{run.run_id}", json={"sync_id": sync_id})
+            body = await response.json()
+            assert response.status == 200 and body["accepted"] is False, body
+        finally:
+            await client.close()
+            compile_box.RUNS.clear()
+    print("✓ durable workspace sync waits for atomic consumer ACK")
+
+
+async def test_batch_stamp_blocker_is_repairable_without_syncing_stale_trust():
+    """Unsafe YAML is a repair finding, not a retry poison or trust leak."""
+    with tempfile.TemporaryDirectory() as td:
+        candidate = Path(td) / "candidate"
+        candidate.mkdir()
+        page = candidate / "topic.md"
+        page.write_text(
+            "---\n{type: Topic, verified: {by: 'human:r', "
+            "at: '2026-08-04T00:00:00Z'}}\n---\nOld\n", "utf-8")
+        run = compile_box.CompileRun("blocked-stamp", td, 1)
+        sent = compile_box._workspace_sync_cursor(td)
+        run._suppress_turn_done = True
+        run._begin_turn("batch")
+        page.write_text(page.read_text("utf-8").replace("Old", "New"), "utf-8")
+
+        # result_event must finish normally instead of poisoning every batch
+        # rebuild. The changed page is withheld from durability sync.
+        await compile_box._emit_message(run, result_event())
+        assert "topic.md" in run._provenance_stamp_failures
+        assert await compile_box._sync_workspace(run, sent) == 0
+        assert not _drain(run), "blocked page must emit neither stale bytes nor a tombstone"
+
+        # A later repair normalizes the YAML. The same result_event seam stamps
+        # it, clears the blocker, and only then exposes the new bytes.
+        run._begin_turn("repair")
+        page.write_text(
+            "---\ntype: Topic\nverified:\n  by: human:r\n"
+            "  at: '2026-08-04T00:00:00Z'\n---\nNew\n", "utf-8")
+        await compile_box._emit_message(run, result_event())
+        assert run._provenance_stamp_failures == {}
+        assert await compile_box._sync_workspace(run, sent) == 1
+        sync = next(event for event in _drain(run) if event["type"] == "syncArtifacts")
+        persisted = next(item["content"] for item in sync["artifacts"]
+                         if item["path"] == "candidate/topic.md")
+        fm, _, error = compile_box.selfcheck.parse_okf_frontmatter(persisted)
+        assert not error and "verified" not in fm, fm
+    print("✓ batch provenance blocker repairs without retry poison or stale-trust sync")
+
+
+async def test_resumed_batch_phase_is_watchdog_armed():
+    """(d) The resumed-batching phase (the suspected coverage gap) runs each
+    pending batch through _drive_batch_session, which arms the watchdog via
+    _begin_turn exactly like a first-pass batch. Resume a plan with one pending
+    batch whose first client loses its terminator: the watchdog must reap it and
+    the rebuild must recover — proving the resumed phase is covered."""
+    import batching
+
+    real_drive = compile_box._drive_batch_session
+    real_accounted = compile_box._unaccounted_batch_sources
+    real_selfcheck = compile_box._post_turn_selfcheck
+    real_media = compile_box._media_verify_enabled
+    saved = (
+        compile_box._MODEL_IDLE_TIMEOUT_S, compile_box._MODEL_WATCHDOG_POLL_S,
+        compile_box._MODEL_MAX_RETRIES, compile_box._STALL_INTERRUPT_DEADLINE_S,
+        compile_box._compile_session_client, compile_box._compile_system_prompt,
+        compile_box._engine_kind,
+    )
+    built, factory = _batch_client_factory(["lost_term", "ok"])
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "raw" / "a").mkdir(parents=True)
+        (wd / "raw" / "a" / "one.md").write_bytes(b"x" * 300)
+        (wd / "raw" / "a" / "two.md").write_bytes(b"y" * 300)
+        run = compile_box.CompileRun("rz", str(wd), 1)
+        # A pinned plan already exists with batch 1 done, batch 2 pending → the
+        # resume branch of _run_batch_compile drives ONLY batch 2.
+        inventory = batching.scan_sources(wd / "raw")
+        os.environ["KBC_BATCH_BUDGET_BYTES"] = "400"
+        os.environ["KBC_BATCH_PLANNER"] = "code"
+        plan = batching.build_plan(inventory, batching.pack_batches(inventory), planner="code")
+        assert len(plan["batches"]) >= 2, plan
+        plan["batches"][0]["status"] = "done"
+        for b in plan["batches"][1:]:
+            b["status"] = "pending"
+        (wd / batching.BATCH_PLAN_PATH).parent.mkdir(parents=True, exist_ok=True)
+        (wd / batching.BATCH_PLAN_PATH).write_text(json.dumps(plan))
+        (wd / batching.SOURCES_INVENTORY_PATH).write_text(json.dumps(inventory))
+
+        compile_box._MODEL_IDLE_TIMEOUT_S = 0.05
+        compile_box._MODEL_WATCHDOG_POLL_S = 0.02
+        compile_box._MODEL_MAX_RETRIES = 1
+        compile_box._STALL_INTERRUPT_DEADLINE_S = 0.2
+        compile_box._compile_session_client = factory
+        compile_box._compile_system_prompt = lambda run_: "sys"
+        compile_box._engine_kind = lambda: "pi_agent"
+        compile_box._unaccounted_batch_sources = lambda run_, sources: []
+        compile_box._post_turn_selfcheck = lambda run_: _async_none()
+        compile_box._media_verify_enabled = lambda: False
+        # The watchdog normally lives in _run_wrapper; _run_batch_compile is
+        # driven directly here, so arm it alongside (exactly as production runs
+        # it concurrently with the orchestrator).
+        wdog = asyncio.create_task(compile_box._model_stall_watchdog(run))
+        try:
+            await asyncio.wait_for(
+                compile_box._run_batch_compile(run, "直接开始编译"), timeout=8)
+        finally:
+            run.done = True
+            wdog.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await wdog
+            (
+                compile_box._MODEL_IDLE_TIMEOUT_S, compile_box._MODEL_WATCHDOG_POLL_S,
+                compile_box._MODEL_MAX_RETRIES, compile_box._STALL_INTERRUPT_DEADLINE_S,
+                compile_box._compile_session_client, compile_box._compile_system_prompt,
+                compile_box._engine_kind,
+            ) = saved
+            compile_box._drive_batch_session = real_drive
+            compile_box._unaccounted_batch_sources = real_accounted
+            compile_box._post_turn_selfcheck = real_selfcheck
+            compile_box._media_verify_enabled = real_media
+            del os.environ["KBC_BATCH_BUDGET_BYTES"]
+        evs = _drain(run)
+        types = [e["type"] for e in evs]
+        # The resumed batch stalled and was reaped (armed watchdog), then rebuilt.
+        assert "turn_stalled" in types, types
+        assert built[0].disconnects >= 1, built[0].disconnects
+        assert len(built) >= 2, built                 # the resumed batch rebuilt at least once
+        assert types.count("turn_done") == 1, types   # the resumed run still closes exactly once
+        final_plan = json.loads((wd / batching.BATCH_PLAN_PATH).read_text())
+        assert all(b["status"] == "done" for b in final_plan["batches"]), final_plan
+    print("✓ resumed batch phase: watchdog armed on the pending batch → reaped → rebuilt → completes")
+
+
+async def _async_none():
+    return None
+
+
+# ── Rate-limit resilience (C2) ───────────────────────────────────────────────
+
+
+class _RateLimitedFakeClient:
+    """Ends each turn with a rate-limit error result until the Nth query, which
+    produces a normal completion. `is_error` + `api_error_status` mirror the CLI's
+    result_event on a 429/503/529 (CLI >= 2.1.110)."""
+
+    def __init__(self, succeed_on_query=2, status=429, **kwargs):
+        self.options = SimpleNamespace(**kwargs)
+        self.queries = []
+        self.interrupts = 0
+        self._succeed_on = succeed_on_query
+        self._status = status
+        self._gate = asyncio.Event()
+        self._closed = False
+
+    async def connect(self, prompt=None):
+        pass
+
+    async def query(self, prompt, session_id="default"):
+        self.queries.append(prompt)
+        self._gate.set()
+
+    async def interrupt(self):
+        self.interrupts += 1
+
+    async def receive_messages(self):
+        while not self._closed:
+            await self._gate.wait()
+            self._gate.clear()
+            if len(self.queries) >= self._succeed_on:
+                yield assistant_event("compiled ok")
+                yield result_event()
+                self._closed = True
+                return
+            r = result_event(is_error=True)
+            r.data["api_error_status"] = self._status
+            yield r
+            # loop back and wait for the retry query
+
+    async def disconnect(self):
+        self._closed = True
+
+
+async def test_model_rate_limit_backoff_then_completes():
+    """C2: a 429 error result backs off + re-issues; the retry completes."""
+    fake = _RateLimitedFakeClient(succeed_on_query=2, status=429)
+    run, evs, raised = await _run_stall_scenario(
+        fake, idle=90, poll=0.03, max_retries=3, rate_base=0.01, rate_cap=0.02, rate_max=5)
+    types = [e["type"] for e in evs]
+    assert raised is None, raised
+    assert fake.queries == ["批 1/10", "批 1/10"], fake.queries
+    assert "rate_limited" in types, types
+    assert next(e for e in evs if e["type"] == "rate_limited")["status"] == 429
+    assert run._last_turn_reply == "compiled ok", run._last_turn_reply
+    print("✓ rate limit: 429 backs off + re-issues, then completes (C2)")
+
+
+async def test_model_rate_limit_exhausts_gracefully():
+    """C2: persistent 529 → after the retry budget the turn ends with a clear note
+    (run idle), not a crash."""
+    fake = _RateLimitedFakeClient(succeed_on_query=999, status=529)
+    run, evs, raised = await _run_stall_scenario(
+        fake, idle=90, poll=0.03, max_retries=3, rate_base=0.01, rate_cap=0.02, rate_max=2)
+    types = [e["type"] for e in evs]
+    assert raised is None, raised                       # graceful, not a crash
+    assert types.count("rate_limited") == 2, types      # rate_max retries
+    assert any(e["type"] == "summary" and "rate-limited" in e.get("text", "") for e in evs), evs
+    print("✓ rate limit: exhausted budget ends gracefully with a note, no crash (C2)")
+
+
+# ── Graceful-shutdown flush (F3) ─────────────────────────────────────────────
+
+
+async def test_shutdown_flush_syncs_active_runs():
+    """F3: on_shutdown final-syncs each active run's unsynced workspace so a pod
+    kill (SIGTERM) doesn't lose the last window of on-disk work."""
+    saved = compile_box._SHUTDOWN_DRAIN_MAX_S
+    compile_box._SHUTDOWN_DRAIN_MAX_S = 0.2
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            wd = Path(td)
+            (wd / "candidate").mkdir(parents=True)
+            (wd / "candidate" / "01.md").write_text("# page one\n", "utf-8")
+            run = compile_box.CompileRun("shut1", td, 1)
+            run._sync_sent = {}
+            compile_box.RUNS["shut1"] = run
+            try:
+                await compile_box._flush_on_shutdown(None)
+            finally:
+                compile_box.RUNS.pop("shut1", None)
+            evs = _drain(run)
+            sync = [e for e in evs if e["type"] == "syncArtifacts"]
+            assert sync, evs
+            assert "candidate/01.md" in [a["path"] for a in sync[0]["artifacts"]], sync
+    finally:
+        compile_box._SHUTDOWN_DRAIN_MAX_S = saved
+    print("✓ shutdown flush: final-syncs active runs' unsynced workspace (F3)")
+
+
+def test_pr382_review_fixes():
+    """Review fixes: brief guard + capped/last-marker raw (A/C) and atomic writer (B)."""
+    good = ("开始生成知识库\n\n我的定调标签(请作为本次编译的 brief):\n"
+            "- 给谁看:内部工程师\n- 内容倾向:详尽百科\n请执行。")
+    b = compile_box.parse_brief_block(good)
+    assert b and b["audience"] == "内部工程师", b
+    # A(parse): marker present but no bullet field → None (a bare prose mention is not a brief)
+    assert compile_box.parse_brief_block("关于我的定调标签我想补充一句") is None
+    assert compile_box.parse_brief_block("我的定调标签") is None
+    # C: raw is taken from the LAST marker and capped
+    noise = ("我的定调标签 早前顺口提过\n我的定调标签(brief):\n- 给谁看:A\n" + "y" * 9000)
+    b2 = compile_box.parse_brief_block(noise)
+    assert b2 and b2["audience"] == "A", b2
+    assert len(b2["raw"]) == compile_box._BRIEF_RAW_MAX and "早前顺口提过" not in b2["raw"], len(b2["raw"])
+
+    # A(capture): first-wins — a later marker message never clobbers BRIEF.json
+    with tempfile.TemporaryDirectory() as td:
+        class _R:  # _capture_brief only reads .workdir
+            workdir = td
+        r = _R()
+        assert compile_box._capture_brief(r, good) is True
+        first = json.loads((Path(td) / "authoring" / "BRIEF.json").read_text())
+        assert compile_box._capture_brief(r, "我的定调标签(brief):\n- 给谁看:别人\n") is False
+        assert json.loads((Path(td) / "authoring" / "BRIEF.json").read_text()) == first
+
+    # B: atomic writer round-trips + overwrites + leaves no temp
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "sub" / "x.json"
+        compile_box._write_text_atomic(p, '{"a":1}\n')
+        assert p.read_text() == '{"a":1}\n'
+        compile_box._write_text_atomic(p, '{"a":2}\n')
+        assert p.read_text() == '{"a":2}\n' and not list(Path(td).rglob("*.tmp"))
+
+    print("✓ pr382 review fixes (brief guard/cap/first-wins, atomic write)")
+
+
+async def test_typed_authoring_commands():
+    """Machine action is stable across locales; text is renderer output only."""
+    class QueryClient:
+        def __init__(self):
+            self.queries = []
+
+        async def query(self, text):
+            self.queries.append(text)
+
+    compile_box.RUNS.clear()
+    client = TestClient(TestServer(compile_box.build_app()))
+    await client.start_server()
+    try:
+        for run_id, locale, expected in [
+            ("cmd-en", "en", "Start the initial full compilation now"),
+            ("cmd-zh", "zh", "立即开始首次全量编译"),
+        ]:
+            td = tempfile.TemporaryDirectory()
+            run = compile_box.CompileRun(run_id, td.name, 1)
+            run.locale = locale
+            run.client = QueryClient()
+            run.connected.set()
+            compile_box.RUNS[run_id] = run
+            body = {
+                "command_id": f"op-{locale}",
+                "command": {
+                    "version": 1,
+                    "action": "compile.generate",
+                    "operation_id": f"op-{locale}",
+                    "generation": 1,
+                    "parameters": {"brief": {
+                        "knowledge_type": "code",
+                        "intent": "troubleshoot",
+                        "audience": "internal-eng",
+                        "depth": "full",
+                        "redaction": "none",
+                        "content_locale": "auto",
+                        "note": "keep examples",
+                    }, "renew": {
+                        "strategy": "contract_migration",
+                        "objective": "converge the stable draft",
+                        "scope": "full candidate catalog",
+                        "current_okf_version": "0.1",
+                        "target_okf_version": "0.2",
+                    }},
+                },
+            }
+            r = await client.post(f"/command/{run_id}", json=body)
+            assert r.status == 200, await r.text()
+            payload = await r.json()
+            assert payload["action"] == "compile.generate" and len(run.client.queries) == 1, payload
+            assert expected in run.client.queries[0], run.client.queries[0]
+            assert "contract_migration" in run.client.queries[0]
+            assert "0.1 -> 0.2" in run.client.queries[0]
+            brief = json.loads((Path(td.name) / "authoring" / "BRIEF.json").read_text())
+            assert brief == {
+                "schema_version": 1,
+                "source": "authoring_command",
+                "knowledge_type": "code",
+                "intent": "troubleshoot",
+                "audience": "internal-eng",
+                "depth": "full",
+                "redaction": "none",
+                "content_locale": "auto",
+                "note": "keep examples",
+            }, brief
+            # Idempotent retry never launches another turn.
+            r = await client.post(f"/command/{run_id}", json=body)
+            assert r.status == 200 and (await r.json())["duplicate"] is True
+            assert len(run.client.queries) == 1
+            invalid_intent = json.loads(json.dumps(body))
+            invalid_intent["command_id"] = f"bad-intent-{locale}"
+            invalid_intent["command"]["parameters"]["brief"]["intent"] = "请帮我排障"
+            run._turn_active = False
+            r = await client.post(f"/command/{run_id}", json=invalid_intent)
+            assert r.status == 400 and len(run.client.queries) == 1, await r.text()
+            invalid_type = json.loads(json.dumps(body))
+            invalid_type["command_id"] = f"bad-type-{locale}"
+            invalid_type["command"]["parameters"]["brief"]["knowledge_type"] = "repository"
+            r = await client.post(f"/command/{run_id}", json=invalid_type)
+            assert r.status == 400 and len(run.client.queries) == 1, await r.text()
+            invalid_renew = json.loads(json.dumps(body))
+            invalid_renew["command_id"] = f"bad-renew-{locale}"
+            invalid_renew["command"]["parameters"]["renew"]["strategy"] = "client_selected_magic"
+            r = await client.post(f"/command/{run_id}", json=invalid_renew)
+            assert r.status == 400 and len(run.client.queries) == 1, await r.text()
+            unsupported_contract = json.loads(json.dumps(body))
+            unsupported_contract["command_id"] = f"bad-okf-target-{locale}"
+            unsupported_contract["command"]["parameters"]["renew"]["target_okf_version"] = "0.3"
+            r = await client.post(f"/command/{run_id}", json=unsupported_contract)
+            assert r.status == 400 and "compiler-supported OKF version 0.2" in (
+                await r.json())["error"]
+            assert len(run.client.queries) == 1
+            # An idempotency key binds one normalized payload; it cannot be
+            # reinterpreted as a different action or generation.
+            changed = json.loads(json.dumps(body))
+            changed["command"]["generation"] = 2
+            r = await client.post(f"/command/{run_id}", json=changed)
+            assert r.status == 409 and "different payload" in (await r.json())["error"]
+            assert len(run.client.queries) == 1
+            # A distinct command cannot be acknowledged and silently dropped
+            # while another turn is active.
+            run._turn_active = True
+            busy = json.loads(json.dumps(body))
+            busy["command_id"] = f"busy-{locale}"
+            r = await client.post(f"/command/{run_id}", json=busy)
+            assert r.status == 409 and len(run.client.queries) == 1, await r.text()
+            # A live run is pinned to one operation/generation context.
+            run._turn_active = False
+            other = json.loads(json.dumps(body))
+            other["command_id"] = "other-command"
+            other["command"]["operation_id"] = "other-operation"
+            r = await client.post(f"/command/{run_id}", json=other)
+            assert r.status == 409, await r.text()
+            td.cleanup()
+
+        # The renew target is bound to the deterministic artifact validator,
+        # not merely rendered into command prose. A legacy root stays red until
+        # the resulting artifact declares the supported target version.
+        concept = {"text": "---\ntype: Topic\ntitle: T\n---\nBody"}
+        legacy_artifact = {
+            "index.md": {"text": "---\nokf_version: \"0.1\"\n---\n# Index\n- [T](t.md)"},
+            "t.md": concept,
+        }
+        assert compile_box.selfcheck.SUPPORTED_OKF_VERSION == "0.2"
+        assert any(v["kind"] == "okf_index_frontmatter"
+                   for v in compile_box.selfcheck.format_policy_violations(legacy_artifact))
+        migrated_artifact = {
+            **legacy_artifact,
+            "index.md": {"text": "---\nokf_version: \"0.2\"\n---\n# Index\n- [T](t.md)"},
+        }
+        assert compile_box.selfcheck.format_policy_violations(migrated_artifact) == []
+
+        with tempfile.TemporaryDirectory() as td:
+            run = compile_box.CompileRun("cmd-bad-json", td, 1)
+            run.client = QueryClient()
+            run.connected.set()
+            compile_box.RUNS[run.run_id] = run
+            r = await client.post(
+                f"/command/{run.run_id}",
+                data="{oops",
+                headers={"Content-Type": "application/json"},
+            )
+            assert r.status == 400, await r.text()
+            assert (await r.json())["error"] == "request body must be valid JSON"
+
+        with tempfile.TemporaryDirectory() as td:
+            run = compile_box.CompileRun("cmd-guards", td, 1)
+            run.client = QueryClient()
+            run.connected.set()
+            compile_box.RUNS[run.run_id] = run
+            base = {
+                "command_id": "guard-op",
+                "command": {
+                    "version": 1,
+                    "operation_id": "guard-op",
+                    "generation": 3,
+                    "parameters": {},
+                },
+            }
+            # Explicit incremental never degrades into a full compile.
+            incremental_body = json.loads(json.dumps(base))
+            incremental_body["command"]["action"] = "compile.incremental"
+            r = await client.post("/command/cmd-guards", json=incremental_body)
+            assert r.status == 409 and run.client.queries == [], await r.text()
+
+            # Approval binds to the exact proposed-plan bytes.
+            plan = Path(td) / "authoring" / "PROPOSED_PLAN.json"
+            plan.parent.mkdir(parents=True, exist_ok=True)
+            plan.write_text('{"text":"plan A"}\n')
+            approval = json.loads(json.dumps(base))
+            approval["command_id"] = "approve-op"
+            approval["command"]["action"] = "compile.approve_plan"
+            approval["command"]["parameters"] = {"plan_id": "0" * 64}
+            r = await client.post("/command/cmd-guards", json=approval)
+            assert r.status == 409 and run.client.queries == [], await r.text()
+
+        bad = {"command_id": "x", "command": {"version": 1, "action": "编译一下", "operation_id": "x", "generation": 1}}
+        run = compile_box.CompileRun("cmd-bad", tempfile.mkdtemp(), 1)
+        run.client = QueryClient()
+        run.connected.set()
+        compile_box.RUNS[run.run_id] = run
+        r = await client.post("/command/cmd-bad", json=bad)
+        assert r.status == 400 and run.client.queries == [], await r.text()
+        print("✓ typed authoring commands (locale-independent action, brief, idempotency, fencing, stale-plan/incremental guards)")
+    finally:
+        compile_box.RUNS.clear()
+        await client.close()
+
+
+def test_a_spend_cap_is_not_a_rate_limit():
+    """402 and 429 look alike and want different handling. A rate limit clears
+    in seconds, so the backoff loop is right for it; a spend cap does not, so
+    burning five retries over thirty seconds achieves nothing.
+
+    Production hit `daily cost limit exceeded (504.29/500.00) … retry_after
+    84596` and the owner was told "batch compile interrupted; trigger a compile
+    again to resume", which is true of every other interruption and misleading
+    here. There was no 402 anywhere in the box before this test.
+
+    The correction must not overshoot into the mirror-image error. A spend cap
+    is lifted by a PERSON — raise the limit, top up, swap the key — so the box
+    may not claim the refusal is deterministic, and may not state a
+    time-to-clear it cannot stand behind. What it CAN state is where the work
+    stopped, so that is what the owner gets.
+    """
+    err = compile_box.ModelQuotaExhausted("refused on billing")
+    assert compile_box._batch_error_code(err) == "quota_exhausted"
+    # _error_event must surface the same code (not hard-coded batch_failed).
+    frame = compile_box._error_event(
+        f"batch compile failed: {err!r}",
+        code=compile_box._batch_error_code(err),
+        stage="batch_compile",
+        exception_class=type(err).__name__,
+        message=f"{compile_box._batch_error_code(err)}:{type(err).__name__}",
+    )
+    assert frame["code"] == "quota_exhausted", frame
+    assert frame["message"] == "quota_exhausted:ModelQuotaExhausted", frame
+    assert "refused on billing" not in frame["message"], frame
+
+    # Neither claim may come back. `deterministic` is what a consumer would read
+    # to stop retrying, and a stated deadline is what an owner would wait out —
+    # both take a decision that belongs to whoever can raise the limit.
+    assert not hasattr(err, "deterministic"), "a spend cap is lifted by a person"
+    assert not hasattr(err, "retry_after_s"), "the box does not forecast the window"
+    assert not hasattr(compile_box, "_quota_retry_after")
+
+    # 402 must not be mistaken for the rate-limit family it sits beside.
+    assert compile_box._MODEL_QUOTA_STATUS not in compile_box._MODEL_RATE_STATUSES
+
+    # What the owner is told instead: which batch the next compile starts at.
+    # Positional and 1-based; done batches are counted, not the ids.
+    plan = {"batches": [{"status": "done"}, {"status": "done"}, {"status": "pending"}]}
+    assert compile_box._batch_resume_point(plan) == (3, 3)
+    assert compile_box._batch_resume_point({"batches": [{"status": "pending"}]}) == (1, 1)
+    # Fully stamped, or no plan at all: nothing to point at, so say nothing.
+    assert compile_box._batch_resume_point({"batches": [{"status": "done"}]}) is None
+    assert compile_box._batch_resume_point(None) is None
+    assert compile_box._batch_resume_point({}) is None
+
+    print("OK  a spend cap is named, not forecast, and reports its resume point")
+
+
+async def test_a_spend_cap_does_not_kill_a_live_session():
+    """The typed refusal is scoped to the batch orchestrator (which cannot carry
+    on without model calls). A live session must be left exactly as it was.
+
+    Deciding that an owner should stop trying is not the box's decision to take:
+    the limit can be raised at any moment, and a session that killed itself has
+    removed the owner's ability to find out. This drives the live path — the
+    default fail_on_error_result=False — and asserts nothing propagates: the
+    turn ends, the run stays up, and no backoff retries are spent on a refusal
+    backing off cannot clear.
+    """
+    fake = _RateLimitedFakeClient(succeed_on_query=999, status=402)
+    run, evs, raised = await _run_stall_scenario(
+        fake, idle=90, poll=0.03, max_retries=3, rate_base=0.01, rate_cap=0.02, rate_max=2)
+    assert raised is None, raised                          # the session survives
+    assert [e for e in evs if e["type"] == "rate_limited"] == [], evs
+    assert run._turn_active is False                       # the turn ended cleanly
+    assert fake.queries == ["批 1/10"], fake.queries        # never re-issued
+    print("✓ spend cap: a live session ends the turn and stays up, no backoff")
+
+
+async def main():
+    # PK never fires in these wiring tests — a qualifying fixture must not spawn
+    # a real provider session in the background (test_selfcheck covers PK wiring).
+    os.environ["KBC_PK_MODE"] = "off"
+    test_install_wiki_snapshot_size_guard()
+    await test_workspace_sync()
+    await test_workspace_sync_loop_survives_a_failed_tick()
+    await test_run_wrapper_terminal_signals()
+    await test_session_driver_conversational()
+    await test_conversational_session()
+    await test_message_waits_for_connect()
+    await test_message_idempotency_key()
+    test_pack_candidates_to_wiki()
+    test_pack_candidates_symlink_confinement()
+    await test_test_path_escape_guard()
+    await test_batch_planner_uses_compile_path_guard()
+    await test_prompt_packs_locale()
+    test_default_allowlist_covers_every_compile_tool()
+    await test_source_inspector_is_engine_neutral_bounded_and_complete()
+    await test_a_session_records_what_it_actually_spent()
+    test_compile_session_denies_subagents()
+    test_compile_surface_excludes_auto_question_proposals()
+    test_ledger_instructions_agree_across_surfaces()
+    await test_test_session_driver_readonly()
+    await test_test_session_driver_uses_captured_contract()
+    await test_open_close_test_session_http()
+    test_resume_without_plan_routes_by_workspace()
+    await test_open_test_session_idempotency()
+    await test_open_test_session_idempotency_is_run_scoped()
+    await test_test_message_path()
+    await test_test_session_step_frames()
+    await test_test_session_stall_reaps_turn_keeps_session_live()
+    await test_test_session_late_reaped_frames_never_terminate_new_turn()
+    await test_test_session_rebuild_after_failed_interrupt()
+    await test_test_session_rebuild_after_lost_terminator()
+    await test_test_session_terminator_in_window_no_rebuild()
+    await test_test_session_rebuild_retry_after_failed_reconnect()
+    await test_test_session_immediate_retry_within_terminator_window()
+    await test_test_session_retry_during_interrupt_in_flight()
+    await test_test_session_idle_ttl_reaper()
+    await test_list_test_sessions_endpoint()
+    await test_explicit_test_recommendation_http()
+    await test_reference_assist_http_and_validation()
+    await test_reference_assist_driver_is_fast_isolated_and_structured()
+    await test_recommendation_driver_is_minimal_and_submits_through_registered_mcp_tool()
+    await test_recommendation_driver_reports_max_turn_exhaustion()
+    await test_propose_plan_never_bounces()
+    await test_delete_candidate_page_is_scoped()
+    test_apply_session_config()
+    test_parse_brief_block()
+    await test_message_captures_brief()
+    await test_incremental_route()
+    await test_incremental_integrity_guard()
+    await test_incremental_guard_rearms_on_ledger_repair()
+    await test_incremental_violation_auto_restored()
+    await test_incremental_rebinds_untouched_source_ids_without_widening_body_scope()
+    await test_unconverged_files_residual_ticket()
+    await test_exact_source_alias_is_repaired_before_l1_budget()
+    await test_incremental_grandfathers_untouched_format_debt()
+    await test_repair_turn_may_edit_ledger_target_pages()
+    await test_incremental_index_deletion_cannot_escape_guard()
+    await test_incremental_arm_cleared_when_dispatch_fails()
+    await test_noop_repair_turn_reaches_the_gate()
+    await test_unchanged_owner_turn_does_not_migrate_legacy_format()
+    await test_batch_final_ledger_check_requires_index()
+    await test_batch_orchestrator_routing_and_resume()
+    await test_exclude_source_tool_owns_the_ledger()
+    await test_exclusion_tools_cover_the_full_lifecycle()
+    await test_batch_standalone_media_is_retained()
+    await test_batch_unaccounted_gets_corrective_then_auto_excluded()
+    await test_batch_content_fault_skips_batch_but_stall_interrupts()
+    await test_batch_zero_progress_second_run_auto_excludes()
+    await test_batch_media_round_cap_marks_pending_exhausted()
+    await test_lifecycle_logs_never_leak_content_to_stdout()
+    await test_batch_auto_exclude_refused_interrupts_resumably()
+    await test_slice_failure_auto_exclude_refused_interrupts_resumably()
+    await test_lifecycle_line_drops_unsafe_batch_id()
+    await test_post_turn_normalizes_hand_edited_ledger()
+    test_small_kb_batch_gate_skips_poppler_metadata()
+    test_hierarchical_text_slice_materialization_and_directive()
+    test_batch_relay_brief_hands_off_progress_and_prior_pages()
+    test_batch_checkpoint_digest_is_verified_before_resume()
+    test_hierarchical_resume_state_contract()
+    test_hierarchical_pdf_page_directive()
+    await test_hierarchical_batch_plan_and_section_reduce()
+    test_hierarchical_media_verify_round_limit()
+    await test_hierarchical_media_rechecks_after_ledger_repair()
+    await test_batch_orchestrator_review_fixes()
+    await test_model_stall_retries_then_completes()
+    await test_model_stall_live_stream_not_reaped()
+    await test_model_stall_tool_gap_not_reaped()
+    await test_model_stall_exhausts_to_error()
+    await test_stall_interrupt_deadline_closes_turn()
+    await test_batch_lost_terminator_reaps_and_rebuilds()
+    await test_batch_subprocess_death_rebuilds_and_continues()
+    await test_batch_transport_failure_rebuilds_and_continues()
+    await test_batch_interrupt_failure_reaps_instead_of_spinning()
+    await test_interrupt_failure_reap_is_bounded_and_resumable()
+    await test_batch_rebuild_exhaustion_raises_resumable()
+    test_batch_retry_preserves_first_attempt_page_baseline()
+    await test_workspace_sync_invalidates_verification_before_cross_process_resume()
+    await test_durable_workspace_sync_waits_for_consumer_ack()
+    await test_batch_stamp_blocker_is_repairable_without_syncing_stale_trust()
+    await test_resumed_batch_phase_is_watchdog_armed()
+    await test_run_wrapper_closes_turn_on_driver_crash()
+    await test_run_wrapper_cancels_detached_verify_tasks()
+    await test_model_rate_limit_backoff_then_completes()
+    await test_model_rate_limit_exhausts_gracefully()
+    await test_shutdown_flush_syncs_active_runs()
+    test_pr382_review_fixes()
+    await test_report_domain_is_bounded_by_code_not_by_asking()
+    test_the_domain_is_asked_for_when_the_library_is_actually_finished()
+    test_domain_refresh_requires_full_catalog_before_report_domain()
+    await test_report_domain_disk_failure_is_not_need_args()
+    test_read_repo_meta_clamps_hand_written_over_cap_and_newlines()
+    test_a_spend_cap_is_not_a_rate_limit()
+    await test_a_spend_cap_does_not_kill_a_live_session()
+    await test_the_runtime_owns_the_dispatch_round_not_the_model()
+    await test_typed_authoring_commands()
+    await test_file_ticket_is_the_only_door_and_the_evidence_picks_the_kind()
+    await test_apply_proposal_command_renders_the_reviewed_brief()
+
+    compile_box._COMPILE_IMPL = fake_driver
+    compile_box.RUNS.clear()
+
+    client = TestClient(TestServer(compile_box.build_app()))
+    await client.start_server()
+    try:
+        assert (await (await client.get("/health")).json())["status"] == "ok"
+
+        with tempfile.TemporaryDirectory() as td:
+            workdir = Path(td)
+            (workdir / "raw").mkdir()
+            (workdir / "raw" / "old.md").write_text("old raw\n")
+            snapshot, part_bundles = make_source_snapshot([
+                {"docs/a.md": "alpha\n"},
+                {"docs/b.md": "beta\n"},
+            ])
+            identity = {"run_id": "snapshot-run", "input_revision": "manifest-v2", "workdir": td}
+            for route in ("/sources", "/sources/begin", "/sources/state", "/sources/part", "/sources/commit"):
+                for payload in (b"", b"{"):
+                    r = await client.post(route, data=payload, headers={"Content-Type": "application/json"})
+                    assert r.status == 400, (route, payload, r.status, await r.text())
+
+            r = await client.post("/sources/begin", json={**identity, "snapshot": snapshot})
+            begin = await r.json()
+            assert r.status == 200 and begin["missing_parts"] == ["part-000001", "part-000002"], begin
+
+            r = await client.post("/sources/part", json={
+                **identity,
+                "part_id": "part-000001",
+                "bundle_base64": base64.b64encode(part_bundles[0]).decode(),
+                "bundle_sha256": snapshot["parts"][0]["sha256"],
+            })
+            assert r.status == 200, await r.text()
+            r = await client.post("/sources/state", json=identity)
+            state = await r.json()
+            assert state["missing_parts"] == ["part-000002"], state
+            r = await client.post("/sources/commit", json=identity)
+            assert r.status == 409, await r.text()
+            assert (workdir / "raw" / "old.md").read_text() == "old raw\n"
+
+            r = await client.post("/sources/part", json={
+                **identity,
+                "part_id": "part-000002",
+                "bundle_base64": base64.b64encode(part_bundles[1]).decode(),
+                "bundle_sha256": snapshot["parts"][1]["sha256"],
+            })
+            assert r.status == 200, await r.text()
+            r = await client.post("/sources/commit", json={**identity, "locale": "zh"})
+            committed = await r.json()
+            assert r.status == 200 and committed["committed"], committed
+            assert (workdir / "raw" / "docs" / "a.md").read_text() == "alpha\n"
+            assert (workdir / "drop" / "docs" / "b.md").read_text() == "beta\n"
+            r = await client.post("/sources/begin", json={**identity, "snapshot": snapshot})
+            replay = await r.json()
+            assert r.status == 200 and replay["committed"] and replay["missing_parts"] == [], replay
+
+            print("✓ Source Snapshot v2 HTTP resume + atomic commit + idempotent replay")
+
+        with tempfile.TemporaryDirectory() as td:
+            workdir = Path(td)
+            (workdir / "raw").mkdir()
+            (workdir / "raw" / "old.md").write_text("old raw\n")
+            office_bundle = make_source_bundle({"manual.docx": b"new office source"})
+            original_convert_tree = compile_box.office_ingest.convert_tree
+            try:
+                def reject_office(_root):
+                    raise compile_box.office_ingest.OfficeIngestLimitExceeded("Office budget exceeded")
+
+                compile_box.office_ingest.convert_tree = reject_office
+                r = await client.post("/sources", json={
+                    "workdir": td,
+                    "bundle_base64": base64.b64encode(office_bundle).decode(),
+                })
+                assert r.status == 400 and "Office budget exceeded" in await r.text()
+                assert (workdir / "raw" / "old.md").read_text() == "old raw\n"
+                assert not (workdir / "raw" / "manual.docx").exists()
+            finally:
+                compile_box.office_ingest.convert_tree = original_convert_tree
+
+            print("✓ legacy source install keeps previous Raw on Office budget failure")
+
+        with tempfile.TemporaryDirectory() as td:
+            large_bundle = make_source_bundle({"large.bin": deterministic_bytes(2 * 1024 * 1024)})
+            assert len(base64.b64encode(large_bundle)) > 1024 * 1024
+            r = await client.post("/sources", json={
+                "workdir": td,
+                "bundle_base64": base64.b64encode(large_bundle).decode(),
+            })
+            assert r.status == 200, await r.text()
+            assert (Path(td) / "raw" / "large.bin").stat().st_size == 2 * 1024 * 1024
+
+        with tempfile.TemporaryDirectory() as td:
+            bundle = make_source_bundle({"ops/readme.md": "hello raw\n", "policy.md": "cap 300\n"})
+            sha = hashlib.sha256(bundle).hexdigest()
+            r = await client.post("/sources", json={
+                "run_id": "r1",
+                "workdir": td,
+                "bundle_base64": base64.b64encode(bundle).decode(),
+                "bundle_sha256": sha,
+            })
+            assert r.status == 200, await r.text()
+            source_resp = await r.json()
+            assert source_resp["files"] == 2 and source_resp["bundle_sha256"] == sha, source_resp
+            assert (Path(td) / "raw" / "ops" / "readme.md").read_text() == "hello raw\n"
+            assert (Path(td) / "drop" / "ops" / "readme.md").read_text() == "hello raw\n"
+            assert (Path(td) / "constitution.md").exists()
+
+            authoring_bundle = make_source_bundle({
+                "authoring/CLAUDE.md": "follow the workspace\n",
+                "authoring/PLAN.md": "- [ ] compile runbook\n",
+                "eval/TESTS.md": "# Tests\n",
+            })
+            authoring_sha = hashlib.sha256(authoring_bundle).hexdigest()
+            r = await client.post("/authoring", json={
+                "run_id": "r1",
+                "workdir": td,
+                "bundle_base64": base64.b64encode(authoring_bundle).decode(),
+                "bundle_sha256": authoring_sha,
+            })
+            assert r.status == 200, await r.text()
+            authoring_resp = await r.json()
+            assert authoring_resp["files"] == 3 and authoring_resp["bundle_sha256"] == authoring_sha, authoring_resp
+            assert (Path(td) / "authoring" / "CLAUDE.md").read_text() == "follow the workspace\n"
+            assert (Path(td) / "eval" / "TESTS.md").read_text() == "# Tests\n"
+
+            # Standard tar tools emit explicit root directory entries before files.
+            # Those safe roots must be accepted without permitting root-level files.
+            directory_bundle_buffer = io.BytesIO()
+            with tarfile.open(fileobj=directory_bundle_buffer, mode="w:gz") as tf:
+                root = tarfile.TarInfo("candidate/")
+                root.type = tarfile.DIRTYPE
+                root.mode = 0o755
+                tf.addfile(root)
+                payload = b"# Restored candidate\n"
+                page = tarfile.TarInfo("candidate/index.md")
+                page.size = len(payload)
+                tf.addfile(page, io.BytesIO(payload))
+            r = await client.post("/authoring", json={
+                "run_id": "r1",
+                "workdir": td,
+                "bundle_base64": base64.b64encode(directory_bundle_buffer.getvalue()).decode(),
+            })
+            assert r.status == 200, await r.text()
+            assert (Path(td) / "candidate" / "index.md").read_text() == "# Restored candidate\n"
+
+            bad_authoring_bundle = make_source_bundle({"raw/nope.md": "nope"})
+            r = await client.post("/authoring", json={
+                "workdir": td,
+                "bundle_base64": base64.b64encode(bad_authoring_bundle).decode(),
+            })
+            assert r.status == 400, await r.text()
+
+            bad_bundle = make_source_bundle({"../evil.md": "nope"})
+            r = await client.post("/sources", json={
+                "workdir": td,
+                "bundle_base64": base64.b64encode(bad_bundle).decode(),
+            })
+            assert r.status == 400, await r.text()
+
+            r = await client.post("/session/r1", json={
+                "workdir": td,
+                "instruction": "# KB Authoring Compile Task\n\n### authoring/CLAUDE.md\nfollow the workspace",
+            })
+            assert r.status == 200, await r.text()
+
+            r = await client.post("/sources", json={
+                "run_id": "r1",
+                "workdir": td,
+                "bundle_base64": base64.b64encode(bundle).decode(),
+            })
+            live_conflict = await r.json()
+            assert r.status == 409 and live_conflict["error"]["code"] == "KBC_RUN_ALREADY_LIVE", live_conflict
+            r = await client.post("/sources/begin", json={
+                "run_id": "r1",
+                "input_revision": "manifest-v2",
+                "workdir": td,
+                "snapshot": snapshot,
+            })
+            live_conflict = await r.json()
+            assert r.status == 409 and live_conflict["error"]["code"] == "KBC_RUN_ALREADY_LIVE", live_conflict
+            # /authoring IS allowed on a live run (200): the runtime rehydrates the
+            # durable workspace / pushes assets into an existing session through it.
+            r = await client.post("/authoring", json={
+                "run_id": "r1",
+                "workdir": td,
+                "bundle_base64": base64.b64encode(authoring_bundle).decode(),
+            })
+            assert r.status == 200, await r.text()
+
+            # /session is idempotent on a live run → no-op attach
+            r = await client.post("/session/r1", json={"workdir": td})
+            assert r.status == 200 and (await r.json()).get("already_live"), await r.text()
+
+            sse = await client.get("/events/r1")
+            events = await read_until(sse, "end")
+            types = [e["type"] for e in events]
+            # capability-era vocabulary: no parked, no done+bundle payload. A clean
+            # session EXIT closes done→end (explicit terminal, so the runtime never
+            # guesses from a bare end) — done carries no bundle and follows the turns.
+            assert "summary" in types and "turn_done" in types and types[-2:] == ["done", "end"], types
+            assert "parked" not in types, types
+            done_ev = next(e for e in events if e["type"] == "done")
+            assert "bundle" not in done_ev and "artifacts" not in done_ev, done_ev
+            turn = next(e for e in events if e["type"] == "turn_done")
+            assert turn["text"] == "compiled 1 page", turn
+            # the candidate page the driver wrote is synced back as an artifact
+            sync = next(e for e in events if e["type"] == "syncArtifacts")
+            assert any(a["path"] == "candidate/index.md" for a in sync["artifacts"]), sync
+
+        # unknown run events → 404
+        r = await client.get("/events/nope")
+        assert r.status == 404, r.status
+
+        print("OK  compile_box protocol smoke (sources / authoring / health / session idempotent / SSE summary+turn_done+syncArtifacts+end / 409 / 404)")
+    finally:
+        await client.close()
+
+
+async def test_report_domain_is_bounded_by_code_not_by_asking():
+    """The domain line is the one piece of library metadata disclosed PER
+    LIBRARY rather than per use — a console list, a binding picker and an MCP
+    tool listing all carry it — so its budget is multiplied by however many
+    libraries an agent can see. A length asked for in a tool description is a
+    wish; this one has to be a fact, so the cap is applied here.
+
+    Over-cap is refused without writing: silent truncation once stored
+    mid-token garbage into another agent's system prompt. The model rewrites a
+    complete shorter sentence instead.
+
+    The model also never writes the file. It supplies one natural-language
+    sentence and the format is generated, which is the same rule the exclusion
+    ledger runs under after a hand-authored trailing comma once blanked it.
+    """
+    import selfcheck
+
+    with tempfile.TemporaryDirectory() as td:
+        (Path(td) / "authoring").mkdir(parents=True)
+        run = compile_box.CompileRun("dom1", td, 1)
+        run._sync_sent = {}
+        tools = {t.name: t for t in compile_box._compile_engine_tools(run)}
+        if "report_domain" not in tools:
+            raise AssertionError(f"report_domain not registered: {sorted(tools)}")
+
+        # A domain the model kept short arrives intact.
+        short = "GPU 集群硬件健康检查与故障诊断"
+        await tools["report_domain"].handler({"domain": short})
+        assert selfcheck.read_repo_meta(td).get("domain") == short, selfcheck.read_repo_meta(td)
+
+        # Over-long: refuse, leave prior domain, tell the model to rewrite.
+        long = "领域" * 200
+        before = selfcheck.read_repo_meta(td)
+        result = await tools["report_domain"].handler({"domain": long})
+        assert selfcheck.read_repo_meta(td) == before, selfcheck.read_repo_meta(td)
+        assert str(compile_box.DOMAIN_MAX_CHARS) in str(result), result
+        assert str(compile_box.DOMAIN_TARGET_CHARS) in str(result), result
+        assert "未记录" in str(result) or "not recorded" in str(result).lower() or "超过" in str(result) or "exceeds" in str(result).lower(), result
+
+        # At the ceiling still admitted whole (no scissors).
+        at_cap = "领" * compile_box.DOMAIN_MAX_CHARS
+        await tools["report_domain"].handler({"domain": at_cap})
+        assert selfcheck.read_repo_meta(td).get("domain") == at_cap
+        assert len(selfcheck.read_repo_meta(td).get("domain", "")) == compile_box.DOMAIN_MAX_CHARS
+
+        # Whitespace the model may wrap across lines collapses: this text is
+        # rendered in one line in a picker.
+        await tools["report_domain"].handler({"domain": "  多行\n\n领域   描述  "})
+        assert selfcheck.read_repo_meta(td).get("domain") == "多行 领域 描述", selfcheck.read_repo_meta(td)
+
+        # Empty is refused rather than stored: an empty domain is worse than an
+        # absent one, because a picker renders it as a blank line that looks
+        # like a library nobody described AND like one described as nothing.
+        before = selfcheck.read_repo_meta(td)
+        await tools["report_domain"].handler({"domain": "   "})
+        assert selfcheck.read_repo_meta(td) == before
+
+    # A missing file is an ABSENT domain, never an exception: the library still
+    # compiles, publishes and answers questions without one.
+    with tempfile.TemporaryDirectory() as td2:
+        assert selfcheck.read_repo_meta(td2) == {}
+        (Path(td2) / "authoring").mkdir(parents=True)
+        (Path(td2) / selfcheck.REPO_META_PATH).write_text("{not json", encoding="utf-8")
+        assert selfcheck.read_repo_meta(td2) == {}
+
+    # Inventory-shaped over-cap text must not be stored (clipped or whole).
+    # The first production sample was ~98 cp (under today's 100 admission
+    # ceiling); extend it so this still exercises refuse-without-write.
+    with tempfile.TemporaryDirectory() as td3:
+        (Path(td3) / "authoring").mkdir(parents=True)
+        run3 = compile_box.CompileRun("dom3", td3, 1)
+        run3._sync_sent = {}
+        tools3 = {t.name: t for t in compile_box._compile_engine_tools(run3)}
+        real = ("领域平台接入智能诊断平台的工程最佳实践：如何设计 MCP 工具与结果契约、"
+                "编写 Skill 与 Knowledge、做交付验证与回滚，以及 MCP/Skill/Knowledge "
+                "的边界与协作方式、部署验收清单与回滚手册")
+        assert len(real) > compile_box.DOMAIN_MAX_CHARS, len(real)
+        result3 = await tools3["report_domain"].handler({"domain": real})
+        assert selfcheck.read_repo_meta(td3) == {}
+        assert str(compile_box.DOMAIN_MAX_CHARS) in str(result3), result3
+
+    # Comma-bearing one-liners under the cap are stored whole.
+    whole = "GPU 集群硬件健康检查、网络与存储的故障诊断"
+    assert len(whole) <= compile_box.DOMAIN_MAX_CHARS
+    with tempfile.TemporaryDirectory() as td4:
+        (Path(td4) / "authoring").mkdir(parents=True)
+        run4 = compile_box.CompileRun("dom4", td4, 1)
+        run4._sync_sent = {}
+        tools4 = {t.name: t for t in compile_box._compile_engine_tools(run4)}
+        await tools4["report_domain"].handler({"domain": whole})
+        assert selfcheck.read_repo_meta(td4).get("domain") == whole
+
+    print("✓ report_domain: bounded by code, refuse-over-cap, machine-serialised, absent-safe")
+
+
+def test_the_domain_is_asked_for_when_the_library_is_actually_finished():
+    """The domain is instructed once, in the persistent role prompt, as something
+    to do "when you finish". A batched compile has no such moment: every batch
+    ends, each batch directive says compile these sources and update the index,
+    and none of them is the finish. So the domain was reported from one batch's
+    worth of corpus — describing a fraction of the library, permanently — or it
+    was never reported and the library reaches every chooser as a bare name.
+    Neither failure is visible: nothing validates that a domain exists.
+
+    Final review is the one moment the whole library exists, and it already is
+    where machine-computed worklists make silence impossible. Asking there also
+    repairs the partial case, because report_domain overwrites.
+    """
+    import selfcheck
+
+    with tempfile.TemporaryDirectory() as td:
+        (Path(td) / "candidate").mkdir(parents=True)
+        (Path(td) / "candidate" / "index.md").write_text("# idx\n- [a](a.md)\n", encoding="utf-8")
+        (Path(td) / "candidate" / "a.md").write_text(
+            "---\ntype: concept\ntitle: A\n---\nbody\n", encoding="utf-8")
+
+        for locale in ("zh", "en"):
+            directive = compile_box._compose_final_directive(td, 3, "", locale=locale)
+            assert "report_domain" in directive, (locale, directive)
+
+        # Never reported: the directive says what the silence costs rather than
+        # just naming the tool.
+        zh = compile_box._compose_final_directive(td, 3, "", locale="zh")
+        assert "还没报过" in zh, zh
+
+        # Reported from an earlier batch: the current value is quoted back, so
+        # the model can judge whether the FINISHED corpus outgrew it instead of
+        # guessing what it once wrote.
+        (Path(td) / "authoring").mkdir(parents=True)
+        selfcheck.write_repo_meta(td, "第一批写的领域")
+        zh = compile_box._compose_final_directive(td, 3, "", locale="zh")
+        assert "第一批写的领域" in zh, zh
+        assert "还没报过" not in zh, zh
+        en = compile_box._compose_final_directive(td, 3, "", locale="en")
+        assert "第一批写的领域" in en, en
+
+        # Still the coarse question — an inventory here would go stale on every
+        # compile and a missing entry would make a router skip the library.
+        assert "不要罗列页面" in zh, zh
+        assert "Do not list pages" in en, en
+
+    # The ask has to be actionable in that round: final review runs as a compile
+    # session, and a tool missing from the allowlist would be a dead end created
+    # by permissions instead of instructions.
+    assert "mcp__compile__report_domain" in compile_box.DEFAULT_COMPILE_ALLOWED_TOOLS
+
+    print("✓ final review asks for the domain of the finished library, quoting what a batch already wrote")
+
+
+def test_domain_refresh_requires_full_catalog_before_report_domain():
+    """On-demand domain update is allowed only with a whole-library view.
+
+    Scoped incremental must not invent a first domain from a partial diff; this
+    dedicated turn is the unified path for empty or rewrite cases.
+    """
+    import selfcheck
+
+    with tempfile.TemporaryDirectory() as td:
+        (Path(td) / "candidate").mkdir(parents=True)
+        (Path(td) / "candidate" / "index.md").write_text(
+            "# idx\n- [a](a.md) — GPU health\n", encoding="utf-8")
+        for locale in ("zh", "en", None):
+            text = compile_box.build_domain_refresh_directive(td, locale=locale)
+            assert "report_domain" in text, (locale, text)
+            assert "index.md" in text, (locale, text)
+        zh = compile_box.build_domain_refresh_directive(td, locale="zh")
+        assert "完整阅读" in zh or "完整" in zh, zh
+        assert "不要" in zh and ("重编" in zh or "raw" in zh), zh
+        en = compile_box.build_domain_refresh_directive(td, locale="en")
+        assert "read candidate/index.md in full" in en.lower() or "index.md" in en
+        assert "Do not recompile" in en or "recompile" in en.lower()
+
+        (Path(td) / "authoring").mkdir(parents=True)
+        selfcheck.write_repo_meta(td, "旧领域")
+        zh2 = compile_box.build_domain_refresh_directive(td, locale="zh")
+        assert "旧领域" in zh2, zh2
+
+    R = type("R", (), {"_batch_active": False, "locale": "en", "workdir": td})
+    assert compile_box._should_route_to_domain_refresh(R(), "", "compile.refresh_domain")
+    assert compile_box._should_route_to_domain_refresh(R(), "请更新领域描述", None)
+    assert compile_box._should_route_to_domain_refresh(
+        R(), "please refresh the domain description", None)
+    # Prefix-style English must NOT steal ordinary chat about domain rulings.
+    assert not compile_box._should_route_to_domain_refresh(
+        R(), "Update domain rulings for the storage pages per constitution.md", None)
+    assert not compile_box._should_route_to_domain_refresh(
+        R(), "refresh domain", None)
+    assert not compile_box._should_route_to_domain_refresh(
+        R(), "请增量重编", None)
+    assert "compile.refresh_domain" in compile_box._COMMAND_ACTIONS
+
+    # Typed command must render without KeyError (settings UI / handle_command path).
+    run = compile_box.CompileRun("dom-refresh", td, 1)
+    run.locale = "en"
+    rendered = compile_box._render_command(run, {
+        "action": "compile.refresh_domain",
+        "parameters": {},
+    })
+    assert "report_domain" in rendered, rendered
+    run_zh = compile_box.CompileRun("dom-refresh-zh", td, 1)
+    run_zh.locale = "zh"
+    rendered_zh = compile_box._render_command(run_zh, {
+        "action": "compile.refresh_domain",
+        "parameters": {},
+    })
+    assert "report_domain" in rendered_zh, rendered_zh
+
+    # Missing catalog → 409 before the model is scheduled.
+    empty = tempfile.mkdtemp()
+    try:
+        run_empty = compile_box.CompileRun("dom-empty", empty, 1)
+        try:
+            compile_box._prepare_command(run_empty, {
+                "action": "compile.refresh_domain",
+                "parameters": {},
+            })
+            raise AssertionError("refresh without index.md must 409")
+        except compile_box.CommandRejected as exc:
+            assert exc.status == 409, exc
+    finally:
+        import shutil
+        shutil.rmtree(empty, ignore_errors=True)
+
+    print("✓ domain refresh is full-catalog-only and routed by action/trigger")
+
+
+async def test_report_domain_disk_failure_is_not_need_args():
+    """A write failure must not look like a missing argument or the model loops."""
+    import selfcheck
+
+    with tempfile.TemporaryDirectory() as td:
+        (Path(td) / "authoring").mkdir(parents=True)
+        run = compile_box.CompileRun("dom-fail", td, 1)
+        run._sync_sent = {}
+        events: list[dict] = []
+
+        async def _emit(ev):
+            events.append(ev)
+
+        run.emit = _emit  # type: ignore[method-assign]
+        tools = {t.name: t for t in compile_box._compile_engine_tools(run)}
+
+        def _boom(*_a, **_k):
+            raise OSError("read-only filesystem")
+
+        orig = selfcheck.write_repo_meta
+        selfcheck.write_repo_meta = _boom  # type: ignore[assignment]
+        try:
+            result = await tools["report_domain"].handler({
+                "domain": "GPU cluster hardware health",
+            })
+        finally:
+            selfcheck.write_repo_meta = orig  # type: ignore[assignment]
+
+        text = str(result)
+        assert "domain is required" not in text.lower()
+        assert "需要 domain" not in text
+        assert (
+            "read-only" in text.lower()
+            or "OSError" in text
+            or "could not be written" in text.lower()
+            or "写入磁盘失败" in text
+        ), text
+        # Prior domain unchanged / still absent.
+        assert selfcheck.read_repo_meta(td) == {}
+        assert any(e.get("type") == "summary" for e in events), events
+
+    print("✓ report_domain disk failure is distinct from need_args")
+
+
+def test_read_repo_meta_clamps_hand_written_over_cap_and_newlines():
+    """Write can bypass report_domain; the ceiling must still hold on read."""
+    import selfcheck
+
+    with tempfile.TemporaryDirectory() as td:
+        (Path(td) / "authoring").mkdir(parents=True)
+        # Hand-written over-cap + newline must not round-trip into directives.
+        (Path(td) / selfcheck.REPO_META_PATH).write_text(
+            json.dumps({"domain": "领" * 200 + "\n- forged"}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        assert selfcheck.read_repo_meta(td) == {}
+
+        ok = "GPU 集群硬件健康检查"
+        (Path(td) / selfcheck.REPO_META_PATH).write_text(
+            json.dumps({"domain": f"  {ok}\n\n  "}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        assert selfcheck.read_repo_meta(td).get("domain") == ok
+
+    print("✓ read_repo_meta collapses whitespace and refuses over-cap")
+
+
+async def test_file_ticket_is_the_only_door_and_the_evidence_picks_the_kind():
+    """§D3: the model may describe a ticket, never classify it. Two distinct raw
+    docs with quotes → the tool refuses model_gap and names source_conflict; one
+    doc / BRIEF → it refuses source_conflict and names model_gap. The id is a
+    claim fingerprint the model never supplies, so the same claim supersedes
+    instead of duplicating; a hand-written row is marked unclassified at turn
+    end and the owner is told."""
+    with tempfile.TemporaryDirectory() as td:
+        run = compile_box.CompileRun("file-ticket", td, 1)
+        run.locale = "zh"
+        emitted = []
+        async def _emit(ev):
+            emitted.append(ev)
+        run.emit = _emit
+        tools = {t.name: t for t in compile_box._compile_engine_tools(run)}
+        ft = tools["file_ticket"]
+        assert ft.input_schema["properties"]["ticket_kind"]["enum"] == ["model_gap", "source_conflict"]
+        assert "id" not in ft.input_schema["properties"]  # identity is code-owned
+        base = {"title": "K8s 版本", "question": "当前 K8s 是 1.30.2 还是 1.29?",
+                "options": ["1.30.2", "1.29.0"], "current_value": "1.30.2", "affected_pages": ["cluster.md"]}
+        two = [{"doc": "raw/a.md", "quote": "1.30.2"}, {"doc": "b.md", "quote": "1.29.0"}]
+        one = [{"doc": "raw/a.md", "quote": "1.30.2"}]
+        ledger = Path(td) / "authoring" / "CONTRADICTIONS.json"
+
+        # missing / bad kind
+        r = await ft.handler({**base, "sources": two})
+        assert "ticket_kind" in r and not ledger.exists(), r
+        r = await ft.handler({**base, "sources": two, "ticket_kind": "raw_bug"})
+        assert "ticket_kind" in r and not ledger.exists(), r
+        # missing evidence
+        r = await ft.handler({**base, "sources": [], "ticket_kind": "model_gap"})
+        assert "sources" in r and not ledger.exists(), r
+        # two docs self-filed as model_gap → refused, names source_conflict
+        r = await ft.handler({**base, "sources": two, "ticket_kind": "model_gap"})
+        assert "source_conflict" in r and "已拒" in r and not ledger.exists(), r
+        # one doc self-filed as source_conflict → refused, names model_gap
+        r = await ft.handler({**base, "sources": one, "ticket_kind": "source_conflict"})
+        assert "model_gap" in r and "已拒" in r and not ledger.exists(), r
+        # BRIEF-based tone call with a raw excerpt is still one raw doc → model_gap
+        tone = [{"doc": "authoring/BRIEF.json", "quote": "audience=external"}, {"doc": "a.md", "quote": "内部 IP"}]
+        r = await ft.handler({**base, "sources": tone, "ticket_kind": "source_conflict"})
+        assert "model_gap" in r and "已拒" in r, r
+
+        # accepted: one doc as model_gap
+        r = await ft.handler({**base, "sources": one, "ticket_kind": "model_gap"})
+        assert "已开" in r and "model_gap" in r, r
+        rows = json.loads(ledger.read_text("utf-8"))
+        assert len(rows) == 1
+        tk = rows[0]
+        assert tk["id"].startswith("tk-") and tk["ticket_kind"] == "model_gap" and tk["origin"] == "compile"
+        # legacy chat path: no accepted command → no round stamp (nothing auto-closes)
+        assert tk["filed_operation_id"] == "" and tk["filed_generation"] == 0
+        # a typed command round stamps the round the evidence was seen in, from the
+        # runtime's pinned context — the model has no argument for it
+        run._command_context = ("op-round-2", 3)
+        assert tk["status"] == "open" and tk["answer"] is None and tk["filed_at"]
+        assert tk["sources"] == [{"doc": "a.md", "quote": "1.30.2"}]  # raw/ stripped
+        # a later round finds the second document: same question, more evidence →
+        # the kind flips to source_conflict on a NEW claim id (doc set changed),
+        # while the same claim re-filed supersedes rather than duplicates.
+        r = await ft.handler({**base, "sources": one, "ticket_kind": "model_gap", "current_value": "1.30.2-cks"})
+        assert "已更新" in r, r
+        rows = json.loads(ledger.read_text("utf-8"))
+        assert len(rows) == 1 and rows[0]["current_value"] == "1.30.2-cks"
+        assert rows[0]["filed_operation_id"] == "op-round-2" and rows[0]["filed_generation"] == 3
+        assert rows[0]["filed_at"] == tk["filed_at"]  # first sighting kept; re-filing stamps superseded_at
+        assert rows[0]["superseded_at"]
+        # Finding the second document flips the SAME claim to source_conflict
+        # in place — one row, not a duplicate beside a stale model_gap.
+        r = await ft.handler({**base, "sources": two, "ticket_kind": "source_conflict"})
+        assert "已更新" in r, r
+        rows = json.loads(ledger.read_text("utf-8"))
+        assert [x["ticket_kind"] for x in rows] == ["source_conflict"] and rows[0]["id"] == tk["id"]
+        assert len(rows[0]["sources"]) == 2
+
+        # the model hand-writes a row anyway → turn-end backstop marks it unclassified and tells the owner
+        rows.append({"id": "hand-1", "title": "手写", "question": "?", "sources": two,
+                     "affected_pages": ["cluster.md"], "status": "open", "answer": None})
+        ledger.write_text(json.dumps(rows, ensure_ascii=False), "utf-8")
+        await compile_box._normalize_ticket_ledger_after_turn(run, td)
+        rows = {x["id"]: x for x in json.loads(ledger.read_text("utf-8"))}
+        assert rows["hand-1"]["ticket_kind"] == "unclassified"
+        assert any("未分类" in ev.get("text", "") and "file_ticket" in ev.get("text", "") for ev in emitted), emitted
+        # resolve_ticket still closes a file_ticket-opened row by its code-owned id
+        await tools["resolve_ticket"].handler({"ticket_id": tk["id"], "applied_value": "1.30.2",
+                                               "pages_edited": ["cluster.md"], "note": ""})
+        rows = {x["id"]: x for x in json.loads(ledger.read_text("utf-8"))}
+        # the kind stayed what the LAST evidence supported (flipped in place above)
+        assert rows[tk["id"]]["status"] == "applied" and rows[tk["id"]]["ticket_kind"] == "source_conflict"
+    # both prompt packs steer opening through the tool and forbid Write on the ledger
+    for loc in ("en", "zh"):
+        ts = compile_box._tool_strings(loc)
+        assert "source_conflict" in ts["file_ticket"]["desc"] and "model_gap" in ts["file_ticket"]["desc"]
+        for key in ("kind_needs_conflict", "kind_needs_gap"):
+            assert "{n}" in ts["file_ticket"][key] and "{docs}" in ts["file_ticket"][key]
+    print("✓ file_ticket: evidence picks the kind, code owns the id, hand-written rows land unclassified")
+
+
+async def test_apply_proposal_command_renders_the_reviewed_brief():
+    """compile.apply_proposal: the box accepts only the server-derived shape and
+    renders exactly the reviewed brief — title, change, rationale, page scope —
+    in the run's locale. Missing brief/title fail closed."""
+    with tempfile.TemporaryDirectory() as td:
+        for locale, needle in (("en", "owner-approved repair proposal"), ("zh", "已批准的一条修复提案")):
+            run = compile_box.CompileRun(f"prop-{locale}", td, 1)
+            run.locale = locale
+            command_id, command = compile_box._normalize_command({
+                "command_id": f"cmd-{locale}",
+                "command": {
+                    "version": 1, "action": "compile.apply_proposal", "operation_id": "op-1", "generation": 1,
+                    "parameters": {
+                        "proposal_id": "prop-1", "title": "Fix the K8s version", "instruction": "Set the version to 1.30.2-cks on cluster-baseline.md",
+                        "rationale": "the page copied the older acceptance sheet", "affected_pages": ["cluster-baseline.md"],
+                        "smuggled": "ignored by the renderer",
+                    },
+                },
+            })
+            assert command["action"] == "compile.apply_proposal"
+            assert command["parameters"]["affected_pages"] == ["cluster-baseline.md"]
+            # Unknown keys are dropped at the door, not merely ignored by the renderer.
+            assert set(command["parameters"]) == {"proposal_id", "title", "instruction", "rationale", "affected_pages"}
+            text = compile_box._render_command(run, command)
+            assert needle in text and "Fix the K8s version" in text and "1.30.2-cks" in text and "cluster-baseline.md" in text, text
+            assert "smuggled" not in text
+            # A smuggled brief would rewrite authoring/BRIEF.json; the box refuses it.
+            try:
+                compile_box._normalize_command({"command_id": "cmd-brief", "command": {
+                    "version": 1, "action": "compile.apply_proposal", "operation_id": "op-2", "generation": 1,
+                    "parameters": {"proposal_id": "p", "title": "t", "instruction": "i", "affected_pages": ["a.md"],
+                                   "brief": {"knowledge_type": "code", "audience": "external", "redaction": "external"}}}})
+            except compile_box.CommandRejected:
+                pass
+            else:
+                raise AssertionError("apply_proposal must refuse a brief")
+            compile_box._prepare_command(run, command)
+            assert not (Path(td) / "authoring" / "BRIEF.json").exists()
+            # The approved scope is a byte-integrity guard, not prompt text.
+            (Path(td) / "candidate").mkdir(exist_ok=True)
+            (Path(td) / "candidate" / "other.md").write_text("untouchable", encoding="utf-8")
+            compile_box._arm_proposal_scope_guard(run, command["parameters"]["affected_pages"])
+            incr = run._incr_pending
+            assert incr and incr["changeset"]["affected_pages"] == ["cluster-baseline.md"]
+            assert incr["before_bytes"]["other.md"] == b"untouchable"
+            import incremental
+            assert incremental.authorized_pages(td, incr["changeset"]) == {"cluster-baseline.md", "index.md"}
+        for broken in ({"proposal_id": "p", "title": "t"}, {"proposal_id": "p", "instruction": "b"}, {"proposal_id": "p", "title": "t", "instruction": "b", "affected_pages": "x"}):
+            try:
+                compile_box._normalize_command({"command_id": "c", "command": {
+                    "version": 1, "action": "compile.apply_proposal", "operation_id": "op", "generation": 1, "parameters": broken}})
+            except compile_box.CommandRejected:
+                pass
+            else:
+                raise AssertionError(f"should reject {broken}")
+    print("✓ compile.apply_proposal renders the reviewed brief and fails closed on a malformed shape")
+
+
+async def test_the_runtime_owns_the_dispatch_round_not_the_model():
+    """A resolve_ticket receipt is stamped with the round the RUNTIME accepted,
+    never with what the model typed.
+
+    The nonce exists so a consumer can match a receipt to the exact dispatch it
+    answers. The runtime validates it as REQUIRED on the way in, then used to
+    render it into prose for the model to hand back — and read it back with an
+    empty default. Production paid for that twice over: five tickets sat at
+    "已答·待重试" because the echo carried a superseded round, and they closed
+    only when a later retry omitted the nonce entirely, which fell through to
+    the weaker timestamp rule and let an unmatched receipt close a ticket.
+
+    Both halves are asserted here: the model cannot get the round WRONG, and the
+    model cannot get the round OMITTED.
+    """
+    class QueryClient:
+        def __init__(self):
+            self.queries = []
+
+        async def query(self, text):
+            self.queries.append(text)
+
+    compile_box.RUNS.clear()
+    client = TestClient(TestServer(compile_box.build_app()))
+    await client.start_server()
+    td = tempfile.TemporaryDirectory()
+    try:
+        run = compile_box.CompileRun("nonce-run", td.name, 1)
+        run.locale = "zh"
+        run.client = QueryClient()
+        run.connected.set()
+        compile_box.RUNS["nonce-run"] = run
+
+        tickets_path = Path(td.name) / "authoring" / "CONTRADICTIONS.json"
+        tickets_path.parent.mkdir(parents=True, exist_ok=True)
+        tickets_path.write_text(json.dumps([
+            {"id": "tk-1", "title": "H2O 还是 H200", "affected_pages": ["p1.md"]},
+            {"id": "tk-2", "title": "两个电话号", "affected_pages": ["p2.md"]},
+        ], ensure_ascii=False), "utf-8")
+
+        tools = {t.name: t for t in compile_box._compile_engine_tools(run)}
+        resolve = tools["resolve_ticket"]
+
+        # Before any dispatch the round is empty — a self-resolve the owner never
+        # asked for must not look like an answer to one.
+        await resolve.handler({
+            "ticket_id": "tk-1", "applied_value": "H200",
+            "pages_edited": ["p1.md"], "note": "", "dispatch_nonce": "invented-by-the-model",
+        })
+        rows = {tk["id"]: tk for tk in json.loads(tickets_path.read_text("utf-8"))}
+        assert rows["tk-1"]["agent_report"]["dispatch_nonce"] == "", rows["tk-1"]["agent_report"]
+
+        # Dispatch round "round-A".
+        r = await client.post("/command/nonce-run", json={
+            "command_id": "cmd-apply-A",
+            "command": {
+                "version": 1, "action": "compile.apply_rulings",
+                "operation_id": "op-apply-A", "generation": 1,
+                "parameters": {
+                    "dispatch_nonce": "round-A",
+                    "rulings": [{"ticket_id": "tk-1", "affected_pages": ["p1.md"],
+                                 "kind": "value", "value": "H200"}],
+                },
+            },
+        })
+        assert r.status == 200, await r.text()
+
+        # The model echoes a SUPERSEDED round — exactly what production did.
+        await resolve.handler({
+            "ticket_id": "tk-1", "applied_value": "H200",
+            "pages_edited": ["p1.md"], "note": "", "dispatch_nonce": "3a413abb-stale",
+        })
+        # ...and omits it entirely — the other half of the same production bug.
+        await resolve.handler({
+            "ticket_id": "tk-2", "applied_value": "保留双源",
+            "pages_edited": ["p2.md"], "note": "",
+        })
+        rows = {tk["id"]: tk for tk in json.loads(tickets_path.read_text("utf-8"))}
+        for tid in ("tk-1", "tk-2"):
+            got = rows[tid]["agent_report"]["dispatch_nonce"]
+            assert got == "round-A", f"{tid} stamped {got!r}, want the accepted round"
+            assert rows[tid]["status"] == "applied", rows[tid]
+
+        # The round ends with its result_event. The nonce must end with it: an
+        # ordinary owner turn may still call resolve_ticket, but that receipt
+        # must be visibly outside every apply round.
+        await compile_box._emit_message(run, result_event())
+        assert run.apply_dispatch_nonce == "", run.apply_dispatch_nonce
+        run._turn_active = False
+        r = await client.post("/message/nonce-run", json={"message": "继续检查剩余内容"})
+        assert r.status == 200, await r.text()
+        assert run.apply_dispatch_nonce == "", run.apply_dispatch_nonce
+        await resolve.handler({
+            "ticket_id": "tk-1", "applied_value": "ordinary-turn edit",
+            "pages_edited": ["p1.md"], "note": "",
+        })
+        rows = {tk["id"]: tk for tk in json.loads(tickets_path.read_text("utf-8"))}
+        assert rows["tk-1"]["agent_report"]["dispatch_nonce"] == "", rows["tk-1"]
+
+        # A second dispatch re-stamps: receipts follow the CURRENT round. The
+        # first round's turn has to end first — a live turn refuses a second
+        # command, which is the same reason a real re-dispatch waits for idle.
+        run._turn_active = False
+        r = await client.post("/command/nonce-run", json={
+            # A re-dispatch is a new COMMAND inside the same authoring
+            # operation: the run pins to (operation_id, generation) for life.
+            "command_id": "cmd-apply-B",
+            "command": {
+                "version": 1, "action": "compile.apply_rulings",
+                "operation_id": "op-apply-A", "generation": 1,
+                "parameters": {
+                    "dispatch_nonce": "round-B",
+                    "rulings": [{"ticket_id": "tk-1", "affected_pages": ["p1.md"],
+                                 "kind": "value", "value": "H200"}],
+                },
+            },
+        })
+        assert r.status == 200, await r.text()
+        await resolve.handler({
+            "ticket_id": "tk-1", "applied_value": "H200",
+            "pages_edited": ["p1.md"], "note": "", "dispatch_nonce": "round-A",
+        })
+        rows = {tk["id"]: tk for tk in json.loads(tickets_path.read_text("utf-8"))}
+        assert rows["tk-1"]["agent_report"]["dispatch_nonce"] == "round-B", rows["tk-1"]
+
+        # The directive no longer asks the model for bookkeeping it cannot own.
+        directive = run.client.queries[-1]
+        assert "nonce" not in directive.lower(), directive
+        assert "resolve_ticket" in directive, directive
+    finally:
+        compile_box.RUNS.clear()
+        await client.close()
+        td.cleanup()
+    print("✓ dispatch round is stamped by the runtime; a wrong or missing echo cannot mislead it")
+
+
+async def test_incremental_rebinds_untouched_source_ids_without_widening_body_scope():
+    """Recreated Raw identity is metadata repair, including across repair turns."""
+    import incremental
+    import selfcheck
+
+    for needs_repair in (False, True):
+        with tempfile.TemporaryDirectory() as td:
+            wd = Path(td)
+            for folder in ("raw", "candidate", "authoring"):
+                (wd / folder).mkdir()
+            (wd / "raw/changed.md").write_text("Changed source.")
+            (wd / "raw/stable.md").write_text("Unchanged source bytes.")
+            (wd / "authoring/manifest.yaml").write_text(
+                "sources:\n  - id: changed-source\n    path: changed.md\n"
+                "  - id: current-source\n    path: stable.md\n")
+            (wd / "candidate/index.md").write_text(
+                '---\nokf_version: "0.2"\n---\n# Index\n- [A](a.md)\n- [C](c.md)\n')
+            a = ('---\ntype: Guide\ntitle: Changed\nlabels:\n'
+                 '  - facet: topic\n    value: changed\nsources:\n'
+                 '  - resource: raw/changed.md\n    id: changed-source\n---\nA fact.\n')
+            # Inherited format debt must remain grandfathered: rekeying may
+            # not enlist this untouched page into a labels/format migration.
+            c = ('---\ntype: Guide\ntitle: Stable\nsources:\n'
+                 '  - resource: raw/stable.md\n    id: old-source\n---\n'
+                 '<!-- okf:evidence {"id":"stable.section","sources":["old-source"]} -->\n'
+                 '## Stable\nKeep this prose and its attribution exactly.\n')
+            expected = c.replace('id: old-source', 'id: "current-source"').replace(
+                '"sources":["old-source"]', '"sources":["current-source"]')
+            (wd / "candidate/a.md").write_text(a)
+            (wd / "candidate/c.md").write_text(c)
+            (wd / "authoring/RAW_CHANGES.json").write_text(json.dumps({
+                "modified": ["changed.md"], "added": [], "deleted": []}))
+            run = compile_box.CompileRun("source-rekey", td, 1)
+            run.client = _FakeAgentClient()
+            await compile_box._start_incremental(run, "Update changed source", strict=True)
+            assert run._incr_pending["changeset"]["affected_pages"] == ["a.md"]
+            if needs_repair:
+                (wd / "raw/orphan.md").write_text("Unaccounted input.")
+            # Even a simultaneous unauthorized body edit must be restored;
+            # the identity repair is never a blanket exemption for this page.
+            (wd / "candidate/c.md").write_text(c + "Unauthorized body edit.\n")
+            repair = await compile_box._post_turn_selfcheck(run)
+            assert (wd / "candidate/c.md").read_text() == expected
+            report = selfcheck.read_selfcheck(td)
+            assert not any(v["kind"] == "evidence_source_mapping" for v in report["lint"]["violations"])
+            assert report["incremental"]["restored_pages"] == ["c.md"]
+            if needs_repair:
+                assert repair and "orphan.md" in repair
+                assert "c.md" not in run._incr_pending["repair_pages"]
+                assert run._incr_pending["before_bytes"]["c.md"] == expected.encode()
+                (wd / "authoring/EXCLUSIONS.json").write_text(json.dumps([
+                    {"pattern": "orphan.md", "reason": "Live operational data"}]))
+                (wd / "candidate/c.md").write_text(expected + "Another unauthorized edit.\n")
+                repair = await compile_box._post_turn_selfcheck(run)
+                assert (wd / "candidate/c.md").read_text() == expected
+            assert repair is None
+            assert selfcheck.read_selfcheck(td)["state"] == "passed"
+            assert run._l1_repairs_used == 0
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

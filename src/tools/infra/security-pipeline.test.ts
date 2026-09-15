@@ -1,0 +1,377 @@
+import { describe, it, expect } from "vitest";
+import {
+  preExecSecurity,
+  postExecSecurity,
+  type ToolOutputData,
+} from "./security-pipeline.js";
+import { analyzeOutput } from "./output-sanitizer.js";
+
+// ── preExecSecurity ─────────────────────────────────────────────────
+
+describe("preExecSecurity", () => {
+  it("blocks disallowed commands", () => {
+    const result = preExecSecurity("rm -rf /", { context: "pod" });
+    expect(result.error).toBeTruthy();
+    expect(result.action).toBeNull();
+    expect(result.hasSensitiveKubectl).toBe(false);
+  });
+
+  it("allows valid commands and returns action", () => {
+    // kubectl needs extraAllowed for local context; use env which has a sanitizer
+    const result = preExecSecurity("env", { context: "pod" });
+    expect(result.error).toBeNull();
+    // env → has sanitization action (sanitize-env)
+    expect(result.action).not.toBeNull();
+  });
+
+  it("allows valid commands without sanitization action", () => {
+    const result = preExecSecurity("ls /tmp", { context: "pod" });
+    expect(result.error).toBeNull();
+    expect(result.action).toBeNull();
+    expect(result.hasSensitiveKubectl).toBe(false);
+  });
+
+  // ── analyzeTarget strategies ────────────────────────────────────
+
+  describe("analyzeTarget: single (default)", () => {
+    it("uses the command directly for output analysis", () => {
+      // env has a sanitizer rule in output-sanitizer
+      const result = preExecSecurity("env", {
+        context: "pod",
+        blockPipeline: true,
+      });
+      expect(result.error).toBeNull();
+      expect(result.action).not.toBeNull();
+      // single strategy → hasSensitiveKubectl is always false
+      expect(result.hasSensitiveKubectl).toBe(false);
+    });
+  });
+
+  describe("analyzeTarget: last-in-pipeline", () => {
+    it("uses last command in pipeline for output analysis", () => {
+      // The last stage decides the sanitizer, so a pipeline ending in a command that has none gets none.
+      // The fixture used to be `env | wc -l`, which is now REFUSED: losing env's redaction to a later
+      // stage is exactly the leak that refusal exists for, so it can no longer stand in for the general
+      // rule. `cat` carries no sanitizer either way.
+      const result = preExecSecurity("cat /var/log/messages | wc -l", {
+        context: "node",
+        analyzeTarget: "last-in-pipeline",
+      });
+      expect(result.error).toBeNull();
+      expect(result.action).toBeNull();
+    });
+
+    it("refuses the shape that would lose the FIRST stage's sanitizer", () => {
+      // The other half of the same fact: when the source is protected by its shape and the last stage is
+      // not, analysing the last stage alone silently drops the protection.
+      for (const cmd of ["env | wc -l", "printenv PASSWORD | cut -c1-",
+                         "crictl inspect abc | jq -r '.info.config.envs[0].value'"]) {
+        const result = preExecSecurity(cmd, { context: "node", analyzeTarget: "last-in-pipeline" });
+        expect(result.error, cmd).not.toBeNull();
+      }
+    });
+
+    it("picks up sanitizer from last command", () => {
+      // Pipeline: ls | env → last command env has sanitizer
+      const result = preExecSecurity("ls /tmp | env", {
+        context: "node",
+        analyzeTarget: "last-in-pipeline",
+      });
+      expect(result.error).toBeNull();
+      expect(result.action).not.toBeNull();
+    });
+  });
+
+  describe("analyzeTarget: auto", () => {
+    it("detects kubectl exec inner command", () => {
+      const result = preExecSecurity(
+        "kubectl exec my-pod -- env",
+        {
+          context: "local",
+          extraAllowed: new Set(["kubectl"]),
+          analyzeTarget: "auto",
+        },
+      );
+      expect(result.error).toBeNull();
+      // inner command is "env" → should have sanitization action
+      expect(result.action).not.toBeNull();
+    });
+
+    it("falls back to last-in-pipeline when no kubectl exec", () => {
+      // uptime (general category) and wc (text category) are both in local whitelist
+      const result = preExecSecurity("uptime | wc -l", {
+        context: "local",
+        analyzeTarget: "auto",
+      });
+      expect(result.error).toBeNull();
+      // last command is wc → no sanitizer
+      expect(result.action).toBeNull();
+    });
+  });
+
+  // ── hasSensitiveKubectl detection ─────────────────────────────
+
+  describe("hasSensitiveKubectl", () => {
+    it("detects sensitive kubectl in pipeline (auto)", () => {
+      const result = preExecSecurity(
+        "kubectl get secret my-secret -o json | jq '.data'",
+        {
+          context: "local",
+          extraAllowed: new Set(["kubectl"]),
+          analyzeTarget: "auto",
+        },
+      );
+      expect(result.error).toBeNull();
+      expect(result.hasSensitiveKubectl).toBe(true);
+    });
+
+    it("is false for single-command kubectl get secret (auto)", () => {
+      const result = preExecSecurity("kubectl get secret my-secret -o json", {
+        context: "local",
+        extraAllowed: new Set(["kubectl"]),
+        analyzeTarget: "auto",
+      });
+      expect(result.error).toBeNull();
+      // single command, not a pipeline → false
+      expect(result.hasSensitiveKubectl).toBe(false);
+    });
+
+    it("is always false for single strategy", () => {
+      const result = preExecSecurity("env", {
+        context: "pod",
+        analyzeTarget: "single",
+      });
+      expect(result.error).toBeNull();
+      expect(result.hasSensitiveKubectl).toBe(false);
+    });
+  });
+});
+
+// ── postExecSecurity ────────────────────────────────────────────────
+
+describe("postExecSecurity", () => {
+  it("returns output unchanged when action is null and output is short", () => {
+    expect(postExecSecurity("hello world", null)).toBe("hello world");
+  });
+
+  it("truncates long output", () => {
+    const output = "x".repeat(200_000);
+    const result = postExecSecurity(output, null);
+    expect(result.length).toBeLessThan(output.length);
+  });
+
+  it("applies sanitizer then truncates", () => {
+    const action = {
+      type: "sanitize" as const,
+      sanitize: (s: string) => s.replace(/TOKEN/g, "[REDACTED]"),
+    };
+    const result = postExecSecurity("my TOKEN here", action);
+    expect(result).toContain("[REDACTED]");
+    expect(result).not.toContain("TOKEN");
+  });
+
+  it("applies redactSensitiveContent when hasSensitiveKubectl", () => {
+    const jwt = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.payload.signature";
+    const result = postExecSecurity(jwt, null, {
+      hasSensitiveKubectl: true,
+    });
+    expect(result).not.toContain("eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9");
+  });
+});
+
+describe("postExecSecurity — a failed run survives a structural sanitizer", () => {
+  // What a `kubectl get pod ... -o json` resolves to: structural, not line-safe.
+  // Splicing "[exit code: N]" into the body made JSON.parse fail here, and the
+  // parse-failure branch suppresses everything — error, stdout and exit code.
+  const jsonAction = analyzeOutput("kubectl", ["get", "pod", "web-0", "-o", "json"])!;
+
+  it("resolves kubectl -o json on a pod to a structural sanitizer", () => {
+    expect(jsonAction).not.toBeNull();
+    expect(jsonAction.lineSafe).toBe(false);
+  });
+
+  it("keeps the exit code and stderr when a NotFound leaves the body empty", () => {
+    const result = postExecSecurity("", jsonAction, {
+      stderr: 'Error from server (NotFound): pods "web-0" not found',
+      exitCode: 1,
+    });
+    expect(result).toContain("(no output)");
+    expect(result).toContain("[exit code: 1]");
+    expect(result).toContain("NotFound");
+    expect(result).not.toContain("Failed to parse");
+  });
+
+  it("still redacts a JSON body that came back with a non-zero exit", () => {
+    const body = JSON.stringify({
+      kind: "Pod",
+      spec: { containers: [{ env: [{ name: "API_TOKEN", value: "s3cret" }] }] },
+    });
+    const result = postExecSecurity(body, jsonAction, { exitCode: 1 });
+    expect(result).not.toContain("s3cret");
+    expect(result).toContain("[exit code: 1]");
+    expect(result).not.toContain("Failed to parse");
+  });
+
+  it("never shows the sanitizer our own annotations", () => {
+    let seen: string | null = null;
+    const action = {
+      type: "sanitize" as const,
+      lineSafe: false,
+      sanitize: (s: string) => {
+        seen = s;
+        return s;
+      },
+    };
+    postExecSecurity("body", action, {
+      exitCode: 1,
+      signal: "SIGKILL",
+      notes: "\n...[truncated]",
+    });
+    expect(seen).toBe("body");
+  });
+
+  it("skips the sanitizer entirely on an empty body", () => {
+    let called = false;
+    const action = {
+      type: "sanitize" as const,
+      lineSafe: false,
+      sanitize: () => {
+        called = true;
+        return "should not run";
+      },
+    };
+    const result = postExecSecurity("   ", action, { exitCode: 2 });
+    expect(called).toBe(false);
+    expect(result).toContain("[exit code: 2]");
+  });
+
+  it("renders signal and notes alongside the exit code", () => {
+    const result = postExecSecurity("partial", null, {
+      exitCode: 137,
+      signal: "SIGKILL",
+      notes: "\n...[output truncated at 10 MB]",
+    });
+    expect(result).toContain("partial");
+    expect(result).toContain("...[output truncated at 10 MB]");
+    expect(result).toContain("[exit code: 137 (signal: SIGKILL)]");
+  });
+
+  it("leaves a successful run's body untouched by any annotation", () => {
+    const result = postExecSecurity('{"kind":"Pod"}', jsonAction);
+    expect(result).not.toContain("exit code");
+    expect(result).not.toContain("(no output)");
+  });
+});
+
+describe("stderr is redacted too", () => {
+  // stderr used to be appended verbatim, on the rationale that sanitizing it would break the JSON
+  // validity of a combined blob — which stopped applying once stdout is sanitized in isolation. A
+  // command that echoes a token in its error message was leaking it through the one channel nothing
+  // looked at.
+  it("redacts a secret a command echoed into its own error message", () => {
+    const out = postExecSecurity("", null, {
+      stderr: 'curl: failed with header "Authorization: Bearer ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"\npassword: hunter2',
+      exitCode: 22,
+    });
+    expect(out).not.toContain("hunter2");
+    expect(out).not.toContain("ghp_AAAA");
+    expect(out).toContain("STDERR:");
+    // What survives: which command failed, and the exit code. What does NOT: the rest of that line.
+    // Redaction is value-level, so a `key: value` line carrying a secret loses the whole value —
+    // there is no way to know where the secret ends inside free prose. The trade is deliberate; a
+    // narrower substring pass would have to change the redactor stdout shares, for a smaller gain.
+    expect(out).toContain("curl: **REDACTED**");
+    expect(out).toContain("[exit code: 22]");
+  });
+
+  it("redacts a MULTI-LINE secret's body, not just its marker line", () => {
+    // The first version used redactLines — the line-safe primitive built for the streaming sanitizer,
+    // which cannot see past the current line. Foreground stderr is the complete text, so a PEM body, a
+    // YAML block scalar and a nested mapping all had their marker redacted while the secret itself went
+    // through, and the notice then claimed the output was clean. That is worse than not claiming.
+    const stderr = [
+      "error: failed to load key",
+      "-----BEGIN RSA PRIVATE KEY-----",
+      "MIIEowIBAAKCAQEA1234567890LEAKED",
+      "-----END RSA PRIVATE KEY-----",
+      "api_token: |",
+      "  ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "password:",
+      "  inner: hunter2",
+      "Warning: v1beta1 is deprecated",
+    ].join("\n");
+
+    const out = postExecSecurity("", null, { stderr, exitCode: 1 });
+    expect(out).not.toContain("MIIEowIBAAKCAQEA");   // PEM body
+    expect(out).not.toContain("ghp_AAAA");           // block-scalar body
+    expect(out).not.toContain("hunter2");            // nested under `password:`
+    // What the reader still needs: which step failed, the exit code, and unrelated warnings.
+    expect(out).toContain("error: failed to load key");
+    expect(out).toContain("[exit code: 1]");
+    expect(out).toContain("Warning: v1beta1 is deprecated");
+  });
+
+  it("announces a stderr-only redaction exactly once", () => {
+    const once = postExecSecurity("plain body", null, { stderr: "password: hunter2" });
+    expect(once).not.toContain("hunter2");
+    expect(once.match(/have been redacted/g) ?? []).toHaveLength(1);
+  });
+
+  it("does not add a second notice when the stdout sanitizer already added one", () => {
+    const cm = JSON.stringify({ kind: "ConfigMap", data: { "app.json": '{"password":"hunter2"}' } });
+    const out = postExecSecurity(cm, analyzeOutput("kubectl", ["get", "cm", "-o", "json"]), {
+      stderr: "password: also-secret",
+    });
+    expect(out).not.toContain("hunter2");
+    expect(out).not.toContain("also-secret");
+    expect(out.match(/have been redacted/g) ?? []).toHaveLength(1);
+  });
+
+  it("leaves ordinary stderr untouched", () => {
+    const out = postExecSecurity("body", null, { stderr: "Warning: v1beta1 is deprecated" });
+    expect(out).toContain("Warning: v1beta1 is deprecated");
+  });
+});
+
+
+describe("trusted sandbox data output", () => {
+  it.each([
+    ["kubectl", ["get", "secret", "-o", "json"], { kind: "Secret", data: { password: "private-test-value" } }],
+    ["crictl", ["inspect", "id"], { info: { config: { envs: ["PASSWORD=private-test-value"] } } }],
+    ["cat", ["/tmp/config.json"], { password: "private-test-value", healthy: true }],
+  ] as const)("separates %s sanitizer notices from JSON and stderr", (binary, args, payload) => {
+    let captured: ToolOutputData | undefined;
+    const text = postExecSecurity(JSON.stringify(payload), analyzeOutput(binary, [...args]), {
+      outputMode: "data", onOutputData: data => { captured = data; },
+      stderr: "Warning: old API\npassword: private-stderr", notes: "\n[diagnostic note]", exitCode: 1,
+    });
+    expect(() => JSON.parse(text)).not.toThrow();
+    expect(captured?.text).toBe(text);
+    expect(captured?.stderr).toContain("Warning: old API");
+    expect(captured?.notices).toContain("[diagnostic note]");
+    expect(captured?.notices.filter(n => n.includes("redacted"))).toHaveLength(1);
+    expect(JSON.stringify(captured)).not.toMatch(/private-test-value|private-stderr|\[exit code/);
+  });
+
+  it("keeps JSON valid through the shared pipeline fallback sanitizer", () => {
+    const text = postExecSecurity('{"password":"private-value","healthy":true}', null, {
+      outputMode: "data", hasSensitiveKubectl: true,
+    });
+    expect(JSON.parse(text)).toEqual({ password: "**REDACTED**", healthy: true });
+  });
+
+  it("does not strip user data that contains the same words as a sanitizer notice", () => {
+    const payload = { message: "⚠️ Sensitive values have been redacted for security." };
+    const text = postExecSecurity(JSON.stringify(payload), null, { outputMode: "data", stderr: "warning" });
+    expect(JSON.parse(text)).toEqual(payload);
+  });
+
+  it("preserves complete data while sanitizing both channels and terminal controls", () => {
+    const rows = "healthy-node\n".repeat(30_000);
+    const result = postExecSecurity(rows + "TOKEN\x1b[31mlast-node\x1b[0m", {
+      type: "sanitize", sanitize: s => s.replace("TOKEN", "[REDACTED]"),
+    }, { outputMode: "data", stderr: "password: private-value" });
+    expect(result.startsWith(rows)).toBe(true); expect(result).toContain("last-node");
+    expect(result).not.toMatch(/TOKEN|private-value|siclaw-output|truncated|\x1b/);
+  });
+});

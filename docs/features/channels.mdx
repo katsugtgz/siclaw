@@ -1,0 +1,225 @@
+---
+title: "Channels & Integrations"
+sidebarTitle: "Channels"
+description: "Access Siclaw via Terminal, Web UI, Slack, Lark, webhooks, and scheduled patrols."
+---
+
+## Supported Channels
+
+All channels share the same investigation engine — the interface differs but the diagnostic capability is identical.
+
+| Channel | Mode | Status |
+|---------|------|--------|
+| **Web UI** | Gateway | Stable |
+| **Slack** | Gateway | Stable |
+| **Lark (Feishu)** | Gateway | Stable |
+| **Discord** | Gateway | Stable |
+| **Telegram** | Gateway | Stable |
+| **Webhooks** | Gateway | Stable |
+
+## Web UI
+
+Available in Local Server mode (`siclaw local`) and Kubernetes deployments:
+
+```bash
+siclaw local
+# Open http://localhost:3000
+```
+
+For development (running Runtime and Portal separately):
+
+```bash
+npm run dev:portal    # Portal + Web UI
+npm run dev:runtime   # Runtime control plane
+```
+
+The Web UI provides:
+- Real-time investigation with streaming updates
+- Session history and investigation reports
+- Skill management (create, review, publish)
+- Built-in metrics dashboard (token usage, cost, latency, sessions)
+- MCP server configuration
+- Cron job management
+
+## Slack Integration
+
+### Setup
+
+1. Create a Slack App at [api.slack.com/apps](https://api.slack.com/apps)
+2. Enable **Socket Mode** and **Event Subscriptions**
+3. Subscribe to events: `app_mention`, `message.im`
+4. Add bot scopes: `chat:write`, `app_mentions:read`, `im:history`
+5. In Siclaw Web UI, open **Channels** and save the bot credentials for Slack:
+
+   - `botToken`
+   - `appToken`
+
+### Usage
+
+Mention the bot in any channel:
+
+```
+@siclaw Pod payment-service is CrashLoopBackOff in prod
+```
+
+Or send a direct message for private investigations.
+
+## Lark (Feishu) Integration
+
+Create a Lark bot app, enable message event subscriptions, then configure it in **Channels** with:
+
+- `appId`
+- `appSecret`
+
+The existing group context selector determines Topic behavior directly; there
+is no separate Topic switch or deployment setting.
+
+The mention rule is intentionally narrow:
+
+- Only **Topic** mode may omit `@bot`, and only inside an already-claimed Topic
+  whose complete message history contains exactly one human and this Siclaw
+  app. The parent group's roster is irrelevant: a large group can still have a
+  two-party Topic.
+- The Runtime reads the Topic root separately and paginates every Topic reply,
+  up to 100 pages of 50 replies. A longer Topic fails closed and requires
+  `@bot`. A second human or another app also makes every Agent turn require
+  `@bot`, including turns from the original asker, so human-to-human discussion
+  cannot wake the Agent.
+- Personal and Team modes never run the Agent from an unmentioned message.
+  Missing/malformed root or Topic history, pagination anomalies, unknown sender
+  identities, and lookup failures all require `@bot`.
+
+- **Personal (per-user)**: each accepted root message opens a Feishu topic with
+  the streaming card inside it. Accepted follow-ups reuse that user's Agent
+  session, but this mode never gets the no-mention exception.
+- **Topic (thread-shared)**: an accepted root message claims that Feishu Topic.
+  Every authorized participant then reuses the same Agent session inside it.
+  The main group and every other unclaimed Topic remain context-isolated.
+- **Team (shared)**: accepted turns use the existing main-group reply path and
+  the whole group keeps one shared Agent session; Feishu topics do not split it
+  into separate sessions.
+
+No additional Topic switch is required in the UI. The one-human/one-bot Topic
+path without `@bot` requires the app's group-message event permission.
+
+### Feishu test-bot capability checklist
+
+Do not treat a successful long connection or an `im.message.receive_v1`
+subscription as proof that every message path is enabled. Feishu filters that
+single event by the app's scopes; for example, group messages can work while
+direct messages are silently not delivered.
+
+Use these application-identity scopes for a complete Siclaw Agent test bot:
+
+| Capability unit | Scope | Why Siclaw needs it |
+|---|---|---|
+| Send, reply, and read messages | `im:message` | Plain-text replies, CardKit card replies, topic replies, mode-switch announcements, reading the Topic root/history for the mention gate, and downloading images attached to received messages |
+| Receive direct messages | `im:message.p2p_msg:readonly` | Required separately even when `im:message` is enabled |
+| Receive group `@bot` messages | `im:message.group_at_msg:readonly` | Starts an investigation from a group root message |
+| Receive group messages without a mention | `im:message.group_msg` | Required for the one-human/one-bot Topic path and for passive shared-group discussion context; this is a sensitive permission, so restrict the app's availability for pilots |
+| Read group metadata | `im:chat:readonly` | Resolves the group title shown for the binding; group roster counts are not used by the Topic mention gate |
+| Create and stream cards | `cardkit:card:write` | Creates the thinking card, streams milestones, finalizes the answer, and updates feedback controls |
+| Upload reply images and files | `im:resource` | Uploads charts and other Agent-generated message resources; received-message downloads are covered by `im:message` |
+| Read bot metadata (recommended) | `application:bot.basic_info:read` | Keeps the bot name and identity lookup explicit in the app configuration |
+
+Do not add contacts, Drive, Docs, Calendar, or tenant-admin scopes for this
+channel. The optional ControlPlane identity-binding flow only calls
+`authen/v1/user_info`, which requires no additional API scope for `open_id`,
+display name, and avatar.
+
+The matching platform configuration is:
+
+1. Enable the **Bot** capability.
+2. Select **Long connection** for events and callbacks.
+3. Subscribe to the `im.message.receive_v1` event.
+4. Subscribe to the `card.action.trigger` callback.
+5. Add the ControlPlane callback URL
+   `/api/v1/siclaw/personal-bot/oauth/feishu/callback` as an exact redirect URL
+   when identity binding is tested.
+6. Publish the app version after changing capabilities, events, callbacks,
+   permissions, redirect URLs, or availability.
+7. Restrict a pilot app to the intended test users, especially when
+   `im:message.group_msg` is enabled.
+
+Acceptance should cover each permission unit independently:
+
+- Direct message: send a unique text and confirm the bot replies.
+- Topic mention gate: in **Topic** mode, send a unique root with `@bot`, then a
+  follow-up without `@bot`; confirm both reply even if the parent group has many
+  members. Add a second human to that Topic and confirm every unmentioned
+  follow-up stays silent; the same turns should work when `@bot` is explicit.
+- Personal-mode root: select **Personal**, send an accepted unique message, and
+  confirm the first reply opens a topic.
+- Personal-mode gate: even with one human and one bot, omit `@bot` and confirm
+  the Agent stays silent; then mention it and confirm the same user's session
+  is reused.
+- Topic-mode root: select **Topic**, send an accepted unique message, and
+  confirm the first reply opens a Topic.
+- Topic-mode continuity: have another authorized member explicitly `@bot` in
+  that Topic and confirm both turns reuse the same session.
+- Topic-mode isolation: reply without a mention in another Topic and confirm the
+  bot stays silent and creates no session there.
+- Team-mode root: select **Team**, send `@bot` with a unique text, and confirm
+  the bot replies in the main group without opening a topic.
+- Team-mode continuity: have another member `@bot` and confirm both turns reuse
+  the one shared group session.
+- Streaming card: confirm the thinking state, milestone updates, and final state.
+- Card callback: click feedback or a mode button and confirm the toast and state
+  update.
+- Media: send an image to the bot and request a chart/image response.
+
+## Discord Integration
+
+Configure a Discord bot in **Channels** with:
+
+- `token`
+
+## Telegram Integration
+
+Configure a Telegram bot in **Channels** with:
+
+- `botToken`
+
+## Alert Webhooks
+
+Create a Trigger in the **Triggers** page. Siclaw will generate:
+
+- a unique webhook URL
+- a bearer secret
+
+Requests should be sent to the generated endpoint:
+
+```bash
+curl -X POST https://siclaw.example.com/hooks/v1/<trigger-id> \
+  -H "Authorization: Bearer <trigger-secret>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "title": "High error rate on payment-service",
+    "severity": "critical",
+    "labels": {"namespace": "prod", "service": "payment"}
+  }'
+```
+
+Compatible with: **Prometheus Alertmanager**, **Grafana**, **PagerDuty**, and any custom webhook (JSON format).
+
+## Scheduled Patrols (Cron)
+
+Schedule recurring health checks using natural language:
+
+```
+"Check GPU utilization across all training nodes every 6 hours"
+"Verify pod health in the payments namespace every 30 minutes"
+"Run full cluster health check at 9am every Monday"
+```
+
+### Creating a Patrol
+
+**Via Web UI**: Go to **Cron** in the sidebar, click **New Patrol**, describe what to check and how often.
+
+Each patrol run produces a status (success / warning / failure), output summary, and timestamp — all visible in the Web UI.
+
+## MCP Servers
+
+Siclaw supports the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) for connecting external data sources — Prometheus metrics, GitHub issues, custom APIs — as investigation tools. The agent discovers and uses them automatically.
+
+See [MCP Servers](/configuration/mcp) for setup and examples.

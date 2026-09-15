@@ -1,0 +1,376 @@
+/**
+ * Runtime phone-home connection registry.
+ *
+ * Runtimes open a persistent WS to Portal on `/ws/runtime`.
+ * Portal keeps a connection map (agentId → Set<WebSocket>) so it can
+ * send RPC commands and receive events from each Runtime without polling.
+ *
+ * Two exports:
+ *   - `createConnectionMap()` — pure in-memory registry (unit-testable)
+ *   - `registerRuntimeWs()`   — HTTP upgrade handler wiring
+ */
+
+import crypto from "node:crypto";
+import http from "node:http";
+import type WebSocket from "ws";
+import { WebSocketServer } from "ws";
+import { isErrorDetail, type ErrorDetail } from "../lib/error-envelope.js";
+
+// ── Public types ─────────────────────────────────────────────
+
+export interface RpcResult {
+  ok: boolean;
+  transport?: "NOT_DISPATCHED" | "REPLIED" | "UNKNOWN";
+  payload?: unknown;
+  /** Backward-compatible human message for existing Portal callers. */
+  error?: string;
+  /** Structured Runtime error when the peer supports the ErrorDetail wire. */
+  errorDetail?: ErrorDetail;
+}
+
+interface PendingRpc {
+  ws: WebSocket;
+  resolve: (result: RpcResult) => void;
+  timer: ReturnType<typeof setTimeout>;
+  trackTransport?: boolean;
+}
+
+type EventHandler = (data: unknown) => void;
+
+export interface RuntimeConnectionMap {
+  register(agentId: string, ws: WebSocket): void;
+  unregister(agentId: string, ws: WebSocket): void;
+  isConnected(agentId: string): boolean;
+  sendCommand(
+    agentId: string,
+    method: string,
+    params: unknown,
+    timeoutMs?: number,
+  ): Promise<RpcResult>;
+  /** Exact Runtime routing; credential-bearing callbacks must never use fallback. */
+  sendCommandToRuntime?(runtimeId: string, method: string, params: unknown, timeoutMs?: number): Promise<RpcResult>;
+  notify(agentId: string, method: string, params: unknown): void;
+  notifyMany(agentIds: string[], method: string, params: unknown): void;
+  /**
+   * Fire-and-forget a notification to EVERY connected Runtime, once per
+   * connection (not per agentId). Used for global, agent-agnostic reloads such
+   * as tracing config — `notify(agentId, …)` would only reach one Runtime.
+   * Optional so existing literal mocks of this interface stay valid.
+   */
+  notifyAll?(method: string, params: unknown): void;
+  subscribe(
+    agentId: string,
+    channel: string,
+    handler: EventHandler,
+  ): () => void;
+  connectedAgentIds(): string[];
+}
+
+// ── Factory ──────────────────────────────────────────────────
+
+const DEFAULT_TIMEOUT_MS = 30_000;
+
+/**
+ * Best-effort: ask every connected runtime to re-pull the channel list.
+ * Call after ANY write that changes what channel.list returns (shared-app
+ * CRUD, personal-bot upsert/disable) — without it the gateway keeps serving
+ * deleted channels on stale WS connections until a restart.
+ */
+export function broadcastChannelReload(map: RuntimeConnectionMap): void {
+  for (const runtimeId of map.connectedAgentIds()) {
+    void map.sendCommand(runtimeId, "channel.reload", {})
+      .then((r) => { if (!r.ok) console.warn(`[channels] channel.reload rejected by runtime=${runtimeId}: ${r.error}`); })
+      .catch((err) => console.warn(`[channels] channel.reload push failed runtime=${runtimeId}:`, err));
+  }
+}
+
+export function createConnectionMap(): RuntimeConnectionMap {
+  const connections = new Map<string, Set<WebSocket>>();
+  const pending = new Map<string, PendingRpc>();
+  // Event subscribers: agentId → channel → handlers.
+  // A single Runtime serves all agents, so events arriving on any
+  // connection are dispatched to ALL matching channel subscribers
+  // regardless of agentId key. Subscribers already filter by sessionId.
+  const subscribers = new Map<string, Map<string, Set<EventHandler>>>();
+
+  function handleMessage(source: WebSocket, raw: WebSocket.Data): void {
+    let msg: any;
+    try {
+      msg = JSON.parse(String(raw));
+    } catch {
+      return;
+    }
+
+    if (msg.type === "res" && typeof msg.id === "string") {
+      const entry = pending.get(msg.id);
+      if (entry && entry.ws === source) {
+        clearTimeout(entry.timer);
+        pending.delete(msg.id);
+        const errorDetail = isErrorDetail(msg.error) ? msg.error : undefined;
+        entry.resolve({
+          ok: !!msg.ok,
+          ...(entry.trackTransport ? { transport: "REPLIED" as const } : {}),
+          payload: msg.payload,
+          error: typeof msg.error === "string" ? msg.error : errorDetail?.message,
+          ...(errorDetail ? { errorDetail } : {}),
+        });
+      }
+      return;
+    }
+
+    if (msg.type === "event" && typeof msg.channel === "string") {
+      // Broadcast to all subscribers for this channel across all agentIds.
+      // Each subscriber filters by sessionId internally.
+      for (const channels of subscribers.values()) {
+        const handlers = channels.get(msg.channel);
+        if (!handlers) continue;
+        for (const h of handlers) {
+          try {
+            h(msg.data);
+          } catch { /* subscriber errors must not crash the loop */ }
+        }
+      }
+    }
+  }
+
+  /** Check if an exact agentId has connections. */
+  function hasWs(agentId: string): boolean {
+    const set = connections.get(agentId);
+    return !!set && set.size > 0;
+  }
+
+  /**
+   * Get a WS for the given agentId. Falls back to any connected Runtime because a single
+   * Runtime process serves all agents.
+   *
+   * 🔴 That fallback is only correct while there is exactly ONE Runtime. With two, an RPC
+   * for agent A can land on a Runtime that does not own A's box, and the failure is silent
+   * — the wrong Runtime answers plausibly. `warnOnMultipleRuntimes` makes the condition
+   * loud rather than leaving it to be discovered from confusing behaviour. The Runtime
+   * Deployment is pinned to one replica with `strategy: Recreate` for this reason; anything
+   * that lifts that pin has to replace this fallback with real ownership routing.
+   */
+  function getWs(agentId: string, exactOnly = false): WebSocket | null {
+    const exact = connections.get(agentId);
+    if (exact && exact.size > 0) return exact.values().next().value!;
+    if (exactOnly) return null;
+    warnOnMultipleRuntimes();
+    // Fallback: pick any connected Runtime
+    for (const set of connections.values()) {
+      if (set.size > 0) return set.values().next().value!;
+    }
+    return null;
+  }
+
+  /**
+   * Say so, once, when the single-Runtime assumption stops holding.
+   *
+   * Distinct sockets, not distinct agentId keys: one Runtime registers under several
+   * agentIds while sharing a socket, which is normal and must not warn.
+   */
+  let multiRuntimeWarned = false;
+  function warnOnMultipleRuntimes(): void {
+    if (multiRuntimeWarned) return;
+    const sockets = new Set<WebSocket>();
+    for (const set of connections.values()) for (const ws of set) sockets.add(ws);
+    if (sockets.size <= 1) return;
+    multiRuntimeWarned = true;
+    console.error(
+      `[runtime-ws] ${sockets.size} Runtimes are connected, but agent-to-Runtime routing ` +
+      `assumes exactly one: an RPC for an agent this Runtime does not own will be answered ` +
+      `anyway. Scale the Runtime Deployment back to 1 replica.`,
+    );
+  }
+
+  async function dispatch(agentId: string, method: string, params: unknown, timeoutMs: number, exact: boolean): Promise<RpcResult> {
+    const ws = getWs(agentId, exact);
+    const trackTransport = method === "sandbox.tool";
+    if (!ws) return { ok: false, error: `Agent ${agentId} is not connected`, ...(trackTransport ? { transport: "NOT_DISPATCHED" as const } : {}) };
+    const id = crypto.randomUUID();
+    const frame = JSON.stringify({ type: "req", id, method, params });
+    return new Promise<RpcResult>((resolve) => {
+      const timer = setTimeout(() => {
+        pending.delete(id);
+        resolve({ ok: false, error: `RPC ${method} timed out after ${timeoutMs}ms`, ...(trackTransport ? { transport: "UNKNOWN" as const } : {}) });
+      }, timeoutMs);
+      timer.unref?.();
+      pending.set(id, { ws, resolve, timer, trackTransport });
+      try { ws.send(frame); } catch {
+        clearTimeout(timer); pending.delete(id);
+        resolve({ ok: false, error: "Runtime connection unavailable", ...(trackTransport ? { transport: "UNKNOWN" as const } : {}) });
+      }
+    });
+  }
+
+  const map: RuntimeConnectionMap = {
+    register(agentId, ws) {
+      let set = connections.get(agentId);
+      if (!set) {
+        set = new Set();
+        connections.set(agentId, set);
+      }
+      set.add(ws);
+
+      const onMessage = (data: WebSocket.Data) => handleMessage(ws, data);
+      ws.on("message", onMessage);
+
+      const cleanup = () => {
+        map.unregister(agentId, ws);
+        ws.removeListener("message", onMessage);
+      };
+      ws.on("close", cleanup);
+      ws.on("error", cleanup);
+    },
+
+    unregister(agentId, ws) {
+      const set = connections.get(agentId);
+      if (!set) return;
+      set.delete(ws);
+      if (set.size === 0) connections.delete(agentId);
+    },
+
+    isConnected(agentId) {
+      // Exact match first, then fallback to any connected Runtime.
+      // A single Runtime process serves all agents; the connection is
+      // registered under its runtimeId (e.g. "runtime"), not per-agent.
+      if (hasWs(agentId)) return true;
+      return connections.size > 0;
+    },
+
+    async sendCommand(agentId, method, params, timeoutMs = DEFAULT_TIMEOUT_MS) {
+      return dispatch(agentId, method, params, timeoutMs, false);
+    },
+
+    async sendCommandToRuntime(runtimeId, method, params, timeoutMs = DEFAULT_TIMEOUT_MS) {
+      return dispatch(runtimeId, method, params, timeoutMs, true);
+    },
+
+    notify(agentId, method, params) {
+      const frame = JSON.stringify({ type: "req", id: crypto.randomUUID().slice(0, 8), method, params });
+      // Exact match: broadcast to all connections for this agentId
+      const exact = connections.get(agentId);
+      if (exact && exact.size > 0) {
+        for (const ws of exact) ws.send(frame);
+        return;
+      }
+      // Fallback: send to any connected Runtime
+      const ws = getWs(agentId);
+      if (ws) ws.send(frame);
+    },
+
+    notifyMany(agentIds, method, params) {
+      for (const id of agentIds) {
+        map.notify(id, method, params);
+      }
+    },
+
+    notifyAll(method, params) {
+      // One frame per distinct WebSocket across all agentId buckets. A single
+      // Runtime process may be registered under several agentIds but shares one
+      // socket; dedupe so a global reload isn't sent to it twice.
+      const frame = JSON.stringify({ type: "req", id: crypto.randomUUID().slice(0, 8), method, params });
+      const seen = new Set<WebSocket>();
+      for (const set of connections.values()) {
+        for (const ws of set) {
+          if (seen.has(ws)) continue;
+          seen.add(ws);
+          ws.send(frame);
+        }
+      }
+    },
+
+    subscribe(agentId, channel, handler) {
+      let channels = subscribers.get(agentId);
+      if (!channels) {
+        channels = new Map();
+        subscribers.set(agentId, channels);
+      }
+      let handlers = channels.get(channel);
+      if (!handlers) {
+        handlers = new Set();
+        channels.set(channel, handlers);
+      }
+      handlers.add(handler);
+
+      return () => {
+        handlers!.delete(handler);
+        if (handlers!.size === 0) channels!.delete(channel);
+        if (channels!.size === 0) subscribers.delete(agentId);
+      };
+    },
+
+    connectedAgentIds() {
+      return [...connections.keys()];
+    },
+  };
+
+  return map;
+}
+
+// ── HTTP upgrade handler ─────────────────────────────────────
+
+export function registerRuntimeWs(
+  httpServer: http.Server,
+  portalSecret: string,
+  rpcHandlers: Map<string, (params: any, agentId: string) => Promise<any>>,
+): RuntimeConnectionMap {
+  const map = createConnectionMap();
+  const wss = new WebSocketServer({ noServer: true });
+
+  httpServer.on("upgrade", (req, socket, head) => {
+    const url = req.url ?? "";
+    if (!url.startsWith("/ws/runtime")) return;
+
+    const authToken = req.headers["x-auth-token"] as string | undefined;
+    if (!authToken || authToken !== portalSecret) {
+      socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+
+    const agentId = req.headers["x-agent-id"] as string | undefined;
+    if (!agentId) {
+      socket.write("HTTP/1.1 400 Bad Request\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      console.log(`[runtime-ws] connected agentId=${agentId}`);
+      map.register(agentId, ws);
+
+      ws.on("close", () => {
+        console.log(`[runtime-ws] disconnected agentId=${agentId}`);
+      });
+
+      // Handle incoming RPC requests from Runtime → Portal.
+      ws.on("message", async (raw) => {
+        let msg: any;
+        try {
+          msg = JSON.parse(String(raw));
+        } catch {
+          return;
+        }
+
+        if (msg.type !== "req" || typeof msg.id !== "string" || typeof msg.method !== "string") {
+          return;
+        }
+
+        const handler = rpcHandlers.get(msg.method);
+        if (!handler) {
+          ws.send(JSON.stringify({ type: "res", id: msg.id, ok: false, error: `Unknown method: ${msg.method}` }));
+          return;
+        }
+
+        try {
+          const payload = await handler(msg.params, agentId);
+          ws.send(JSON.stringify({ type: "res", id: msg.id, ok: true, payload }));
+        } catch (err: any) {
+          ws.send(JSON.stringify({ type: "res", id: msg.id, ok: false, error: err.message ?? String(err) }));
+        }
+      });
+    });
+  });
+
+  return map;
+}

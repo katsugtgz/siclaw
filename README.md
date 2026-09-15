@@ -1,93 +1,215 @@
-# siclaw
+<div align="center">
 
+<img src="docs/assets/logo.png" alt="Siclaw Logo" width="400" />
 
+# Siclaw
 
-## Getting started
+**Read-only investigation copilot for DevOps and SRE teams**
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+[![npm](https://img.shields.io/npm/v/siclaw?logo=npm)](https://www.npmjs.com/package/siclaw)
+[![CI](https://github.com/scitix/siclaw/actions/workflows/ci.yml/badge.svg)](https://github.com/scitix/siclaw/actions/workflows/ci.yml)
+[![Node.js](https://img.shields.io/badge/Node.js-%3E%3D22-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5.9-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![Slack](https://img.shields.io/badge/Slack-Join%20Community-4A154B?logo=slack&logoColor=white)](https://join.slack.com/t/siclaw-scitix/shared_invite/zt-3rrsoc2ic-JIfbfvT1_04sqgQorSRfmw)
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+[Website](https://www.siclaw.ai) | [Live Preview](https://www.siclaw.ai/demo/) | [Documentation](https://docs.siclaw.ai) | [Slack](https://join.slack.com/t/siclaw-scitix/shared_invite/zt-3rrsoc2ic-JIfbfvT1_04sqgQorSRfmw)
 
-## Add your files
+</div>
 
-- [ ] [Create](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#create-a-file) or [upload](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#upload-a-file) files
-- [ ] [Add files using the command line](https://docs.gitlab.com/ee/gitlab-basics/add-file.html#add-a-file-using-the-command-line) or push an existing Git repository with the following command:
+---
 
+Siclaw is an open-source AI agent for DevOps and SRE teams. It is built for **read-only infrastructure diagnostics**: gather evidence, form hypotheses, validate them, and return a clear root-cause analysis without changing your environment directly. Describe a problem in plain language and Siclaw investigates it from the web UI, your team's chat channels, or a non-interactive CLI invocation.
+
+A hosted preview of the Portal UI — 4 specialist agents, recorded investigation sessions, and the built-in diagnostic skill set — is available at **[siclaw.ai/demo](https://www.siclaw.ai/demo/)**.
+
+## Features
+
+- **Deep Investigation** — A 4-phase workflow for evidence gathering, hypothesis testing, and root-cause analysis
+- **Investigation Memory** — Learns from past incidents to improve future investigations
+- **Read-Only by Default** — Investigates and recommends next steps without changing your environment directly
+- **Team Workflows** — Shared web UI, credentials, channels, triggers, and scheduled patrols
+- **Reusable Skills** — Turn repeated diagnostic playbooks into reviewable runbooks
+- **Extensible** — Connect external tools and data sources through [MCP](https://modelcontextprotocol.io)
+- **Multi-Channel Access** — Use Siclaw from the web UI, chat channels, or non-interactive CLI
+- **Agent Tracing** — Export agent behavior (LLM calls, tools, tokens) to [Langfuse](https://langfuse.com), [Phoenix](https://phoenix.arize.com), or any OTLP backend; configured in the web UI and hot-reloaded live
+
+## Architecture
+
+![Siclaw System Architecture](docs/assets/architecture.svg)
+
+> **Control plane** (Portal + Gateway + shared DB) stores the curated agents and their
+> bound resources — Skills, a versioned Knowledge wiki, MCP servers, and Credentials.
+> Sessions use an **AgentBox** (one Pod per user in Kubernetes, or in-process in local dev).
+> The headless CLI embeds the same core directly. The
+> Agent Brain runs a Deep Investigation Engine against its bound capabilities —
+> read-only across every target it touches.
+
+## Prerequisites
+
+- **Node.js >= 22.19.0** — [Download](https://nodejs.org/)
+- **npm** — Comes with Node.js
+- **kubectl** — Optional, only needed if you want Siclaw to investigate Kubernetes clusters
+
+## Quick Start
+
+Start with the local Web UI, or deploy to Kubernetes for a team. The CLI also supports non-interactive diagnostic runs. For local usage, start from a dedicated working directory because Siclaw stores most runtime data in `.siclaw/` relative to where you launch it.
+
+```bash
+mkdir -p ~/siclaw-work
+cd ~/siclaw-work
 ```
-cd existing_repo
-git remote add origin http://gitlab.scitix-inner.ai/aiops/siclaw.git
-git branch -M main
-git push -uf origin main
+
+### 1. Local Server — VM or laptop, recommended for daily use
+
+A lightweight web UI backed by SQLite. No MySQL, no Docker required.
+
+```bash
+npm install -g siclaw
+
+# Start the server
+siclaw local
+
+# Open http://localhost:3000
+# On a fresh local workspace: sign in with admin / admin
+# Configure providers in Models
+# Import kubeconfigs in Clusters
 ```
 
-## Integrate with your tools
+<details>
+<summary><b>Build from source</b></summary>
 
-- [ ] [Set up project integrations](http://gitlab.scitix-inner.ai/aiops/siclaw/-/settings/integrations)
+```bash
+git clone https://github.com/scitix/siclaw.git && cd siclaw
+npm ci && make build-portal-web && npm run build
+npm link                 # register `siclaw` command globally
 
-## Collaborate with your team
+siclaw local             # start local server
 
-- [ ] [Invite team members and collaborators](https://docs.gitlab.com/ee/user/project/members/)
-- [ ] [Create a new merge request](https://docs.gitlab.com/ee/user/project/merge_requests/creating_merge_requests.html)
-- [ ] [Automatically close issues from merge requests](https://docs.gitlab.com/ee/user/project/issues/managing_issues.html#closing-issues-automatically)
-- [ ] [Enable merge request approvals](https://docs.gitlab.com/ee/user/project/merge_requests/approvals/)
-- [ ] [Set auto-merge](https://docs.gitlab.com/ee/user/project/merge_requests/merge_when_pipeline_succeeds.html)
+# Uninstall: npm unlink siclaw -g
+```
 
-## Test and Deploy
+</details>
 
-Use the built-in continuous integration in GitLab.
+A fresh local workspace creates the bootstrap account **admin / admin**. Open the Web UI and change its password in **Account**. Configure a model and select an agent to begin an investigation.
 
-- [ ] [Get started with GitLab CI/CD](https://docs.gitlab.com/ee/ci/quick_start/index.html)
-- [ ] [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/ee/user/application_security/sast/)
-- [ ] [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/ee/topics/autodevops/requirements.html)
-- [ ] [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/ee/user/clusters/agent/)
-- [ ] [Set up protected environments](https://docs.gitlab.com/ee/ci/environments/protected_environments.html)
+**Data locations (defaults, override with env vars):**
+- Database: `.siclaw/data/portal.db` — override with `DATABASE_URL=sqlite:///custom/path.db` or `DATABASE_URL=mysql://...`
+- Secrets: `.siclaw/local-secrets.json` — auto-generated JWT / Runtime / Portal secrets, 0600 perms
 
-***
+#### Non-interactive CLI
 
-# Editing this README
+In another terminal, use the same working directory to run a single investigation with the local Portal's configuration:
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+```bash
+siclaw agents
+siclaw --agent sre-oncall --prompt "Why is pod nginx-abc in CrashLoopBackOff?"
+siclaw --agent sre-oncall --continue --prompt "Check recent events"
+```
 
-## Suggestions for a good README
+Use a name returned by `siclaw agents`. A single configured agent is selected automatically; with multiple agents, `--agent` is required. The invocation prints the final answer and exits. Missing input or model configuration produces an error instead of a setup prompt.
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+The CLI reads Portal configuration through a local authenticated snapshot API. Each invocation materializes skills, knowledge, and credentials under a private `.siclaw/.portal-snapshot/run-<random>/` root and removes only that root on exit. Web UI changes apply to the next invocation. For custom ports, set `PORTAL_PORT` on the server and `SICLAW_PORTAL_PORT` on the CLI to the same value.
 
-## Name
-Choose a self-explaining name for your project.
+When Portal is unavailable and no agent was selected, the CLI uses `.siclaw/config/settings.json` and local resources. A selected agent must load successfully; snapshot failures stop execution. See [CLI configuration](#headless-cli) below and the [Portal integration guide](https://docs.siclaw.ai/features/portal-cli-integration).
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+> **Terminal interface migration:** Bare `siclaw` now shows help. Use `siclaw local` for interactive investigations. Terminal slash commands and the setup wizard have been removed; `--continue` requires a new `--prompt`. Existing `--print --prompt "..."` scripts remain supported.
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+### 2. Kubernetes — Team / enterprise
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+Production deployment uses Helm plus three container images: `runtime`, `portal`, and `agentbox`.
 
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+Build and push images if you are using your own registry:
 
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
+```bash
+make docker REGISTRY=registry.example.com/myteam TAG=latest
+make push  REGISTRY=registry.example.com/myteam TAG=latest
+```
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+Then deploy the chart with a MySQL URL:
 
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
+```bash
+helm upgrade --install siclaw ./helm/siclaw \
+  --namespace siclaw \
+  --create-namespace \
+  --set image.registry=registry.example.com/myteam \
+  --set image.tag=latest \
+  --set database.url="mysql://user:pass@host:3306/siclaw"
+```
+
+The default chart exposes the **Portal** Service on service port `3003` and NodePort `31003`. Runtime and AgentBox run as ClusterIP-only services (internal traffic).
+
+## Configuration
+
+### Headless CLI
+
+- A reachable local Portal supplies providers and agent-bound resources. Configure these in its Web UI.
+- Without Portal, prepare `.siclaw/config/settings.json` before running `siclaw --prompt "..."`.
+- For cluster and host access, import credentials in the local Web UI and run the CLI from that workspace.
+- Investigation traces are written to `.siclaw/traces/` relative to the working directory.
+
+Minimal example:
+
+```json
+{
+  "providers": {
+    "default": {
+      "baseUrl": "https://api.openai.com/v1",
+      "apiKey": "sk-YOUR-KEY",
+      "api": "openai-completions",
+      "models": [{ "id": "gpt-4o", "name": "GPT-4o" }]
+    }
+  }
+}
+```
+
+### Local Server / Kubernetes
+
+All configuration happens through the web UI:
+
+- Configure LLM providers in **Models**
+- Import kubeconfigs in **Clusters**
+- Import SSH hosts and credentials in **Hosts**
+- Configure Slack, Lark, Discord, and Telegram in **Channels**
+- Configure MCP servers in **MCP**
+- Manage users and roles in **Users**
+- Schedule recurring investigations in **My Tasks**
+
+## Documentation
+
+- [Getting Started](https://docs.siclaw.ai/start/getting-started)
+- [CLI & Local Server](https://docs.siclaw.ai/install/cli)
+- [Kubernetes Deployment](https://docs.siclaw.ai/install/kubernetes)
+- [LLM Providers](https://docs.siclaw.ai/configuration/providers)
+- [MCP Servers](https://docs.siclaw.ai/configuration/mcp)
+- [Agent Tracing](https://docs.siclaw.ai/features/tracing)
+
+## Tech Stack
+
+| Layer | Technology |
+|-------|-----------|
+| Runtime | Node.js 22+ (ESM-only) |
+| Language | TypeScript 5.9 |
+| Agent | [pi-coding-agent](https://github.com/badlogic/pi-mono) |
+| Database (portal) | MySQL (prod) or SQLite (local, via [node:sqlite](https://nodejs.org/api/sqlite.html)) — single DDL, driver chosen by `DATABASE_URL` scheme |
+| Database (memory) | node:sqlite + FTS5 + bge-m3 embeddings |
+| Frontend | React + Vite + Tailwind CSS |
+| K8s Client | @kubernetes/client-node |
+| MCP | @modelcontextprotocol/sdk |
+| Realtime | WebSocket (ws) |
+
+## Community
+
+- [Slack](https://join.slack.com/t/siclaw-scitix/shared_invite/zt-3rrsoc2ic-JIfbfvT1_04sqgQorSRfmw) — Chat with the team and other users
+- [GitHub Issues](https://github.com/scitix/siclaw/issues) — Bug reports and feature requests
+- [GitHub Discussions](https://github.com/scitix/siclaw/discussions) — Questions, ideas, and general discussion
 
 ## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
 
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, architecture overview, and pull request guidelines.
 
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
-
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
+Looking for a place to start? Check out issues labeled [`good first issue`](https://github.com/scitix/siclaw/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22).
 
 ## License
-For open source projects, say how it is licensed.
 
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+[Apache License 2.0](LICENSE)

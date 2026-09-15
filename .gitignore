@@ -1,0 +1,42 @@
+# Dependencies
+node_modules/
+node_modules
+portal-web/node_modules/
+
+# Build output
+dist/
+portal-web/dist/
+
+# Stray TypeScript compile outputs in source tree (ts → js residue)
+portal-web/src/**/*.js
+portal-web/src/**/*.js.map
+
+# Runtime data
+.siclaw/
+.siclaw
+*.sqlite
+*.db
+
+# Environment & secrets
+.env
+.env.*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+.worktrees
+.omx/
+.codex/*
+!.codex/agents/
+!.codex/agents/**
+!.codex/skills/
+!.codex/skills/**
+.codex/skills/.system/**
+!.codex/prompts/
+!.codex/prompts/**

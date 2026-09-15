@@ -1,0 +1,816 @@
+/**
+ * Database migrations — Portal owns ALL tables.
+ *
+ * Writes one DDL definition that is accepted by both MySQL and SQLite:
+ *   - No ENGINE=... / COLLATE=... / CHARSET=... (MySQL uses server defaults)
+ *   - No TIMESTAMP(3) millisecond precision (second precision only)
+ *   - No ON UPDATE CURRENT_TIMESTAMP (application layer manages `updated_at`)
+ *   - JSON values stored in text columns (application layer JSON.stringify/parse)
+ *   - Inline INDEX declarations moved to separate `ensureIndex()` calls
+ *
+ * `CREATE TABLE IF NOT EXISTS` preserves legacy MySQL table definitions.
+ * Explicit, idempotent upgrades below handle columns that require changes.
+ * Indexes use names that match the historical MySQL DDL so `ensureIndex`
+ * is idempotent on old deployments.
+ */
+
+import { getDb } from "../gateway/db.js";
+import { ensureIndex, safeAlterTable, dropIndexIfExists, ensureUniqueIndex, widenColumn, tightenColumnNotNull, setColumnDefault } from "./migrate-compat.js";
+import { DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_TOKENS } from "../core/model-compat.js";
+import type { Db } from "../gateway/db.js";
+import { removeRetiredCapabilityKeys } from "../core/tool-capabilities.js";
+
+const PORTAL_SCHEMA_SQLS: string[] = [
+  // Users (simple auth, no org/RBAC)
+  `CREATE TABLE IF NOT EXISTS siclaw_users (
+    id CHAR(36) PRIMARY KEY,
+    username VARCHAR(100) NOT NULL UNIQUE,
+    password_hash VARCHAR(255) NOT NULL,
+    role VARCHAR(20) NOT NULL DEFAULT 'admin',
+    can_review_skills TINYINT(1) NOT NULL DEFAULT 0,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+  )`,
+
+  // Agents (simplified, no org_id)
+  `CREATE TABLE IF NOT EXISTS agents (
+    id CHAR(36) PRIMARY KEY,
+    name VARCHAR(255) NOT NULL UNIQUE,
+    description TEXT,
+    status VARCHAR(20) NOT NULL DEFAULT 'active',
+    model_provider VARCHAR(100),
+    model_id VARCHAR(255),
+    model_routing TEXT,
+    tool_capabilities TEXT,
+    agent_type VARCHAR(32) NOT NULL DEFAULT 'custom',
+    system_prompt TEXT,
+    is_production TINYINT(1) NOT NULL DEFAULT 1,
+    idle_timeout_sec INT NOT NULL DEFAULT 300,
+    replicas INT NOT NULL DEFAULT 1,
+    icon VARCHAR(50),
+    color VARCHAR(50),
+    created_by CHAR(36),
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+  )`,
+
+  // Clusters (plaintext kubeconfig)
+  `CREATE TABLE IF NOT EXISTS clusters (
+    id CHAR(36) PRIMARY KEY,
+    name VARCHAR(255) NOT NULL UNIQUE,
+    description TEXT,
+    kubeconfig TEXT,
+    api_server VARCHAR(500),
+    debug_image VARCHAR(500) DEFAULT NULL,
+    is_production TINYINT(1) NOT NULL DEFAULT 1,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+  )`,
+
+  // Hosts (plaintext SSH)
+  `CREATE TABLE IF NOT EXISTS hosts (
+    id CHAR(36) PRIMARY KEY,
+    name VARCHAR(255) NOT NULL UNIQUE,
+    ip VARCHAR(45) NOT NULL,
+    port INT NOT NULL DEFAULT 22,
+    username VARCHAR(100) NOT NULL DEFAULT 'root',
+    auth_type VARCHAR(20) NOT NULL DEFAULT 'password',
+    password VARCHAR(500),
+    private_key TEXT,
+    passphrase VARCHAR(500),
+    description TEXT,
+    is_production TINYINT(1) NOT NULL DEFAULT 1,
+    jump_host_id CHAR(36) DEFAULT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+  )`,
+
+  // Junction tables
+  `CREATE TABLE IF NOT EXISTS agent_clusters (
+    agent_id CHAR(36) NOT NULL,
+    cluster_id CHAR(36) NOT NULL,
+    PRIMARY KEY (agent_id, cluster_id),
+    CONSTRAINT fk_ac_agent FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE,
+    CONSTRAINT fk_ac_cluster FOREIGN KEY (cluster_id) REFERENCES clusters(id) ON DELETE CASCADE
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS agent_hosts (
+    agent_id CHAR(36) NOT NULL,
+    host_id CHAR(36) NOT NULL,
+    PRIMARY KEY (agent_id, host_id),
+    CONSTRAINT fk_ah_agent FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE,
+    CONSTRAINT fk_ah_host FOREIGN KEY (host_id) REFERENCES hosts(id) ON DELETE CASCADE
+  )`,
+
+
+  // Skills + MCP servers must be created BEFORE their junction tables below,
+  // otherwise CREATE TABLE agent_skills / agent_mcp_servers fails on MySQL with
+  // ER_FK_CANNOT_OPEN_PARENT (1824). SQLite tolerates forward FK refs, which is
+  // why the SQLite-only migrate test never caught this.
+  `CREATE TABLE IF NOT EXISTS skills (
+    id CHAR(36) PRIMARY KEY,
+    org_id CHAR(36) NOT NULL,
+    name VARCHAR(255) NOT NULL,
+    description TEXT,
+    labels TEXT,
+    author_id CHAR(36) NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'draft',
+    version INT NOT NULL DEFAULT 1,
+    specs MEDIUMTEXT,
+    scripts TEXT,
+    files MEDIUMTEXT,
+    created_by CHAR(36) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS skill_versions (
+    id CHAR(36) PRIMARY KEY,
+    skill_id CHAR(36) NOT NULL,
+    version INT NOT NULL,
+    specs MEDIUMTEXT,
+    scripts TEXT,
+    files MEDIUMTEXT,
+    diff TEXT,
+    commit_message VARCHAR(500),
+    author_id CHAR(36) NOT NULL,
+    is_approved TINYINT(1) NOT NULL DEFAULT 0,
+    labels TEXT DEFAULT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (skill_id, version),
+    CONSTRAINT fk_skill_versions_skill FOREIGN KEY (skill_id) REFERENCES skills(id) ON DELETE CASCADE
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS skill_reviews (
+    id CHAR(36) PRIMARY KEY,
+    skill_id CHAR(36) NOT NULL,
+    version INT NOT NULL,
+    diff TEXT,
+    security_assessment TEXT,
+    submitted_by CHAR(36) NOT NULL,
+    reviewed_by CHAR(36),
+    decision VARCHAR(20),
+    reject_reason TEXT,
+    submitted_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    reviewed_at TIMESTAMP,
+    CONSTRAINT fk_review_skill FOREIGN KEY (skill_id) REFERENCES skills(id) ON DELETE CASCADE
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS mcp_servers (
+    id CHAR(36) PRIMARY KEY,
+    org_id CHAR(36) NOT NULL,
+    name VARCHAR(255) NOT NULL,
+    transport VARCHAR(30) NOT NULL,
+    url VARCHAR(500),
+    command VARCHAR(500),
+    args TEXT,
+    env TEXT,
+    headers TEXT,
+    enabled TINYINT(1) NOT NULL DEFAULT 1,
+    description TEXT,
+    created_by CHAR(36) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (org_id, name)
+  )`,
+
+  // Tracing exporters (admin-managed third-party analysis platforms).
+  // Global — NO org_id (tracing is one fan-out set shared by every agent),
+  // so there is also no UNIQUE(org_id, name). `auth` holds type-specific
+  // credential material as a TEXT JSON blob (langfuse {publicKey,secretKey},
+  // phoenix {apiKey,projectName}, otlp {headers}); the OTLP headers are
+  // assembled at read time in buildTracingConfig(). Mirrors mcp_servers'
+  // double-driver-safe style: no JSON column / TIMESTAMP(3) / ON UPDATE.
+  `CREATE TABLE IF NOT EXISTS tracing_exporters (
+    id CHAR(36) PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    platform_type VARCHAR(30) NOT NULL,
+    url VARCHAR(500) NOT NULL,
+    auth TEXT,
+    enabled TINYINT(1) NOT NULL DEFAULT 1,
+    sort_order INT NOT NULL DEFAULT 0,
+    created_by CHAR(36),
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+  )`,
+
+  // Agent <-> Skill junction
+  `CREATE TABLE IF NOT EXISTS agent_skills (
+    agent_id CHAR(36) NOT NULL,
+    skill_id CHAR(36) NOT NULL,
+    PRIMARY KEY (agent_id, skill_id),
+    CONSTRAINT fk_as_agent FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE,
+    CONSTRAINT fk_as_skill FOREIGN KEY (skill_id) REFERENCES skills(id) ON DELETE CASCADE
+  )`,
+
+  // Agent <-> MCP Server junction
+  `CREATE TABLE IF NOT EXISTS agent_mcp_servers (
+    agent_id CHAR(36) NOT NULL,
+    mcp_server_id CHAR(36) NOT NULL,
+    PRIMARY KEY (agent_id, mcp_server_id),
+    CONSTRAINT fk_ams_agent FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE,
+    CONSTRAINT fk_ams_mcp FOREIGN KEY (mcp_server_id) REFERENCES mcp_servers(id) ON DELETE CASCADE
+  )`,
+
+  // Agent Tasks (scheduled jobs scoped to agents)
+  `CREATE TABLE IF NOT EXISTS agent_tasks (
+    id CHAR(36) PRIMARY KEY,
+    agent_id CHAR(36) NOT NULL,
+    name VARCHAR(255) NOT NULL,
+    description TEXT,
+    schedule VARCHAR(100) NOT NULL,
+    prompt TEXT NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'active',
+    last_run_at TIMESTAMP NULL,
+    last_result VARCHAR(50) NULL,
+    last_manual_run_at TIMESTAMP NULL DEFAULT NULL,
+    created_by CHAR(36),
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_at_agent FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE
+  )`,
+
+  // Notifications (per-user inbox for task completions etc.)
+  `CREATE TABLE IF NOT EXISTS notifications (
+    id CHAR(36) PRIMARY KEY,
+    user_id CHAR(36) NOT NULL,
+    type VARCHAR(50) NOT NULL,
+    title VARCHAR(255) NOT NULL,
+    message TEXT,
+    related_agent_id CHAR(36),
+    related_task_id CHAR(36),
+    related_run_id CHAR(36),
+    read_at TIMESTAMP NULL DEFAULT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+  )`,
+
+  // Agent Task Runs (execution history)
+  `CREATE TABLE IF NOT EXISTS agent_task_runs (
+    id CHAR(36) PRIMARY KEY,
+    task_id CHAR(36) NOT NULL,
+    status VARCHAR(20) NOT NULL,
+    result_text TEXT,
+    error TEXT,
+    duration_ms INT,
+    session_id CHAR(36),
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_atr_task FOREIGN KEY (task_id) REFERENCES agent_tasks(id) ON DELETE CASCADE
+  )`,
+
+  // Channels (global — shared across agents)
+  `CREATE TABLE IF NOT EXISTS channels (
+    id CHAR(36) PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    type VARCHAR(50) NOT NULL,
+    config TEXT NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'active',
+    created_by CHAR(36) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+  )`,
+
+  // Agent <-> Channel junction (admin binds which channels an agent can use)
+  `CREATE TABLE IF NOT EXISTS agent_channel_auth (
+    agent_id CHAR(36) NOT NULL,
+    channel_id CHAR(36) NOT NULL,
+    PRIMARY KEY (agent_id, channel_id),
+    CONSTRAINT fk_ach_agent FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE,
+    CONSTRAINT fk_ach_channel FOREIGN KEY (channel_id) REFERENCES channels(id) ON DELETE CASCADE
+  )`,
+
+  // API Keys (Portal-owned — validation + CRUD here, Runtime never touches)
+  `CREATE TABLE IF NOT EXISTS agent_api_keys (
+    id CHAR(36) PRIMARY KEY,
+    agent_id CHAR(36) NOT NULL,
+    name VARCHAR(255) NOT NULL,
+    key_hash VARCHAR(255) NOT NULL,
+    key_plain VARCHAR(255) NOT NULL,
+    key_prefix VARCHAR(10) NOT NULL,
+    last_used_at TIMESTAMP NULL DEFAULT NULL,
+    expires_at TIMESTAMP NULL DEFAULT NULL,
+    created_by CHAR(36) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_ak_agent FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS api_key_service_accounts (
+    api_key_id CHAR(36) NOT NULL,
+    service_account_id CHAR(36) NOT NULL,
+    PRIMARY KEY (api_key_id, service_account_id),
+    CONSTRAINT fk_aksa_api_key FOREIGN KEY (api_key_id) REFERENCES agent_api_keys(id) ON DELETE CASCADE
+  )`,
+
+  // ================================================================
+  // Siclaw core tables (chat, tasks, models, etc.)
+  // skills + mcp_servers are defined above, before their junction tables.
+  // ================================================================
+
+  // Chat
+  `CREATE TABLE IF NOT EXISTS chat_sessions (
+    id CHAR(36) PRIMARY KEY,
+    agent_id CHAR(36) NOT NULL,
+    user_id CHAR(36) NOT NULL,
+    title VARCHAR(255),
+    preview VARCHAR(500),
+    message_count INT NOT NULL DEFAULT 0,
+    origin VARCHAR(20) DEFAULT NULL,
+    parent_session_id CHAR(36) DEFAULT NULL,
+    parent_agent_id CHAR(36) DEFAULT NULL,
+    delegation_id VARCHAR(64) DEFAULT NULL,
+    target_agent_id CHAR(36) DEFAULT NULL,
+    sender_external_id VARCHAR(128) DEFAULT NULL,
+    channel_id CHAR(36) DEFAULT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_active_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    deleted_at TIMESTAMP NULL DEFAULT NULL
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS chat_messages (
+    id CHAR(36) PRIMARY KEY,
+    session_id CHAR(36) NOT NULL,
+    role VARCHAR(20) NOT NULL,
+    content MEDIUMTEXT,
+    tool_name VARCHAR(100),
+    toolset VARCHAR(255) DEFAULT NULL,
+    tool_input MEDIUMTEXT,
+    outcome VARCHAR(16),
+    duration_ms INT,
+    metadata LONGTEXT,
+    from_agent_id CHAR(36) DEFAULT NULL,
+    parent_session_id CHAR(36) DEFAULT NULL,
+    delegation_id VARCHAR(64) DEFAULT NULL,
+    target_agent_id CHAR(36) DEFAULT NULL,
+    trace_id CHAR(32) DEFAULT NULL,
+    seq BIGINT DEFAULT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_chat_messages_session FOREIGN KEY (session_id) REFERENCES chat_sessions(id) ON DELETE CASCADE
+  )`,
+
+  // End-user feedback on channel replies (Feishu card 👍/👎). One row per
+  // (reply, person); a re-vote upserts rating. message_ref is a channel-level
+  // reply reference (Feishu CardKit card_id today) rather than a chat_messages
+  // FK — the card is finalized concurrently with message persistence, so the
+  // DB row id may not exist yet when the button payload is built.
+  `CREATE TABLE IF NOT EXISTS message_feedback (
+    id CHAR(36) PRIMARY KEY,
+    session_id CHAR(36) NOT NULL,
+    message_ref VARCHAR(64) NOT NULL,
+    rating VARCHAR(10) NOT NULL,
+    sender_external_id VARCHAR(128) NOT NULL,
+    channel_id VARCHAR(128) DEFAULT NULL,
+    source VARCHAR(20) NOT NULL DEFAULT 'lark',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (message_ref, sender_external_id),
+    CONSTRAINT fk_message_feedback_session FOREIGN KEY (session_id) REFERENCES chat_sessions(id) ON DELETE CASCADE
+  )`,
+
+  // A2A task projection. This is protocol state for external agent clients,
+  // not an AgentBox/pi-agent checkpoint.
+  `CREATE TABLE IF NOT EXISTS a2a_tasks (
+    id CHAR(36) PRIMARY KEY,
+    agent_id CHAR(36) NOT NULL,
+    user_id CHAR(36) NOT NULL,
+    api_key_id CHAR(36) DEFAULT NULL,
+    context_id VARCHAR(255) NOT NULL,
+    session_id CHAR(36) NOT NULL,
+    state VARCHAR(40) NOT NULL,
+    status_message TEXT,
+    artifact_text TEXT,
+    error TEXT,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_event_at TIMESTAMP NULL DEFAULT NULL,
+    completed_at TIMESTAMP NULL DEFAULT NULL,
+    CONSTRAINT fk_a2a_tasks_agent FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE
+  )`,
+
+  // Model Providers
+  `CREATE TABLE IF NOT EXISTS model_providers (
+    id CHAR(36) PRIMARY KEY,
+    org_id CHAR(36),
+    name VARCHAR(100) NOT NULL,
+    base_url VARCHAR(500) NOT NULL,
+    api_key VARCHAR(500),
+    api_type VARCHAR(50) NOT NULL DEFAULT 'openai-completions',
+    sort_order INT NOT NULL DEFAULT 0,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+  )`,
+
+  // context_window / max_tokens: the column defaults are INTERPOLATED from
+  // DEFAULT_CONTEXT_WINDOW / DEFAULT_MAX_TOKENS (core/model-compat.ts), which
+  // mirror what pi applies to a model definition of its own. Interpolated rather
+  // than written out, because a hand-copied number here is a second answer to the
+  // same question and the one it gave (65536) was above the ceiling of the Claude
+  // models in use. Fresh installs get it from this DDL; existing databases are
+  // corrected by the setColumnDefault call below (MySQL).
+  //
+  // A default only governs an INSERT that omits the column; rows already storing
+  // 65536 keep it, so an affected model needs its max_tokens corrected rather
+  // than a redeploy. No migration is attempted here: a stored value can be a
+  // deliberate operator choice, and this cannot tell the two apart.
+  `CREATE TABLE IF NOT EXISTS model_entries (
+    id CHAR(36) PRIMARY KEY,
+    provider_id CHAR(36) NOT NULL,
+    model_id VARCHAR(255) NOT NULL,
+    name VARCHAR(255),
+    reasoning TINYINT(1) NOT NULL DEFAULT 0,
+    vision TINYINT(1) NOT NULL DEFAULT 0,
+    context_window INT NOT NULL DEFAULT ${DEFAULT_CONTEXT_WINDOW},
+    max_tokens INT NOT NULL DEFAULT ${DEFAULT_MAX_TOKENS},
+    api_type VARCHAR(50) NOT NULL DEFAULT 'openai-completions',
+    max_tokens_field VARCHAR(32) DEFAULT NULL,
+    compat_overrides TEXT DEFAULT NULL,
+    is_default TINYINT(1) NOT NULL DEFAULT 0,
+    sort_order INT NOT NULL DEFAULT 0,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (provider_id, model_id),
+    CONSTRAINT fk_model_entries_provider FOREIGN KEY (provider_id) REFERENCES model_providers(id) ON DELETE CASCADE
+  )`,
+
+  // Diagnostics
+  `CREATE TABLE IF NOT EXISTS agent_diagnostics (
+    id CHAR(36) PRIMARY KEY,
+    agent_id CHAR(36) NOT NULL,
+    name VARCHAR(255) NOT NULL,
+    description TEXT,
+    prompt_template TEXT NOT NULL,
+    params TEXT,
+    sort_order INT NOT NULL DEFAULT 0,
+    created_by CHAR(36) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (agent_id, name)
+  )`,
+
+  // Channel Bindings (maps channel + route_key → agent)
+  `CREATE TABLE IF NOT EXISTS channel_bindings (
+    id CHAR(36) PRIMARY KEY,
+    channel_id CHAR(36) NOT NULL,
+    agent_id CHAR(36) NOT NULL,
+    session_id CHAR(36) DEFAULT NULL,
+    route_key VARCHAR(255) NOT NULL,
+    route_type VARCHAR(20) NOT NULL DEFAULT 'group',
+    display_name VARCHAR(255) DEFAULT NULL,
+    context_mode VARCHAR(20) DEFAULT NULL,
+    created_by CHAR(36),
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (channel_id, route_key)
+  )`,
+
+  // Channel Binding Sessions (maps one channel binding + participant key → session)
+  `CREATE TABLE IF NOT EXISTS channel_binding_sessions (
+    id CHAR(36) PRIMARY KEY,
+    binding_id CHAR(36) NOT NULL,
+    session_key VARCHAR(255) NOT NULL,
+    session_id CHAR(36) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (binding_id, session_key)
+  )`,
+
+  // Channel Pairing Codes (ephemeral, 5-min TTL)
+  `CREATE TABLE IF NOT EXISTS channel_pairing_codes (
+    code VARCHAR(10) PRIMARY KEY,
+    channel_id CHAR(36) NOT NULL,
+    agent_id CHAR(36) NOT NULL,
+    created_by CHAR(36) NOT NULL,
+    expires_at TIMESTAMP NOT NULL
+  )`,
+
+  // System config (admin-managed kv)
+  `CREATE TABLE IF NOT EXISTS system_config (
+    config_key VARCHAR(100) PRIMARY KEY,
+    config_value TEXT,
+    updated_by CHAR(36),
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+  )`,
+
+  // Skill import history (audit log for bulk skill imports)
+  `CREATE TABLE IF NOT EXISTS skill_import_history (
+    id CHAR(36) PRIMARY KEY,
+    version INT NOT NULL,
+    comment VARCHAR(500),
+    snapshot LONGTEXT NOT NULL,
+    skill_count INT NOT NULL DEFAULT 0,
+    added TEXT,
+    updated TEXT,
+    deleted TEXT,
+    imported_by CHAR(36) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+  )`,
+
+  // Knowledge Repos & Versions (admin-managed wiki packages)
+  `CREATE TABLE IF NOT EXISTS knowledge_repos (
+    id CHAR(36) PRIMARY KEY,
+    name VARCHAR(255) NOT NULL UNIQUE,
+    description VARCHAR(500),
+    max_versions INT NOT NULL DEFAULT 10,
+    created_by CHAR(36),
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS knowledge_versions (
+    id CHAR(36) PRIMARY KEY,
+    repo_id CHAR(36) NOT NULL,
+    version INT NOT NULL,
+    message VARCHAR(500),
+    data LONGBLOB NOT NULL,
+    size_bytes INT NOT NULL,
+    sha256 VARCHAR(64),
+    file_count INT,
+    is_active TINYINT(1) NOT NULL DEFAULT 0,
+    status VARCHAR(20) NOT NULL DEFAULT 'inactive',
+    activated_by CHAR(36),
+    activated_at TIMESTAMP,
+    error_message TEXT,
+    uploaded_by CHAR(36),
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (repo_id, version),
+    CONSTRAINT fk_kv_repo FOREIGN KEY (repo_id) REFERENCES knowledge_repos(id) ON DELETE CASCADE
+  )`,
+
+  // Agent <-> Knowledge Repo binding (like agent_skills)
+  `CREATE TABLE IF NOT EXISTS agent_knowledge_repos (
+    agent_id CHAR(36) NOT NULL,
+    repo_id CHAR(36) NOT NULL,
+    PRIMARY KEY (agent_id, repo_id),
+    CONSTRAINT fk_akr_agent FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE,
+    CONSTRAINT fk_akr_repo FOREIGN KEY (repo_id) REFERENCES knowledge_repos(id) ON DELETE CASCADE
+  )`,
+
+  // Knowledge publish audit log
+  `CREATE TABLE IF NOT EXISTS knowledge_publish_events (
+    id CHAR(36) PRIMARY KEY,
+    action VARCHAR(20) NOT NULL,
+    repo_id CHAR(36) NOT NULL,
+    version_id CHAR(36) NOT NULL,
+    version INT NOT NULL,
+    previous_version_id CHAR(36),
+    previous_version INT,
+    snapshot_before TEXT,
+    snapshot_after TEXT,
+    status VARCHAR(20) NOT NULL,
+    requested_by CHAR(36),
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_kpe_repo FOREIGN KEY (repo_id) REFERENCES knowledge_repos(id) ON DELETE CASCADE
+  )`,
+];
+
+/** Secondary indexes — kept separate so both drivers can handle them idempotently. */
+async function createIndexes(): Promise<void> {
+  const db = getDb();
+  // chat_sessions
+  await ensureIndex(db, "chat_sessions", "idx_chat_sessions_user", "user_id, last_active_at");
+  await ensureIndex(db, "chat_sessions", "idx_chat_sessions_agent", "agent_id");
+  await ensureIndex(db, "chat_sessions", "idx_chat_sessions_origin", "origin");
+  await ensureIndex(db, "chat_sessions", "idx_chat_sessions_parent", "parent_session_id, created_at");
+  await ensureIndex(db, "chat_sessions", "idx_chat_sessions_delegation", "delegation_id");
+  // chat_messages
+  await ensureIndex(db, "chat_messages", "idx_chat_messages_session", "session_id, created_at");
+  await ensureIndex(db, "chat_messages", "idx_chat_messages_audit", "role, created_at");
+  await ensureIndex(db, "chat_messages", "idx_chat_messages_parent", "parent_session_id, created_at");
+  await ensureIndex(db, "chat_messages", "idx_chat_messages_delegation", "delegation_id");
+  // message_feedback — Metrics aggregates by session.
+  await ensureIndex(db, "message_feedback", "idx_message_feedback_session", "session_id, created_at");
+  await ensureIndex(db, "chat_messages", "idx_chat_messages_trace", "trace_id");
+  // a2a_tasks — every A2A query is scoped by (agent_id, api_key_id), so lead the composite
+  // indexes with that prefix. #340 already created idx_a2a_tasks_agent/_context (older column
+  // lists) on every deployed DB, and ensureIndex is name-only — so we must drop those and
+  // recreate under NEW names, or the new prefixes never apply on existing DBs (mirrors the
+  // skills uq_skills_org_name → idx_skills_org_name precedent below). Drop+rename is one-time
+  // idempotent: once the old names are gone dropIndexIfExists is a no-op.
+  //
+  // ORDER MATTERS on MySQL: idx_a2a_tasks_agent (single agent_id column) backs the FK
+  // fk_a2a_tasks_agent, and InnoDB refuses to DROP an index still needed by a foreign key
+  // (ER_DROP_INDEX_FK 1553). So create the (agent_id, …)-leading composites FIRST — once
+  // idx_a2a_tasks_agent_key exists InnoDB uses it as the FK's backing index — THEN drop the
+  // old single-column index. (SQLite has no such restriction; the order is harmless there.)
+  await ensureIndex(db, "a2a_tasks", "idx_a2a_tasks_agent_key", "agent_id, api_key_id, created_at");
+  await ensureIndex(db, "a2a_tasks", "idx_a2a_tasks_session", "session_id");
+  await ensureIndex(db, "a2a_tasks", "idx_a2a_tasks_context_key", "agent_id, api_key_id, context_id, created_at");
+  await dropIndexIfExists(db, "a2a_tasks", "idx_a2a_tasks_agent");
+  await dropIndexIfExists(db, "a2a_tasks", "idx_a2a_tasks_context");
+  // notifications
+  await ensureIndex(db, "notifications", "idx_notifications_user", "user_id, read_at, created_at");
+  // agent_api_keys
+  await ensureIndex(db, "agent_api_keys", "idx_api_keys_hash", "key_hash");
+  // agent_task_runs
+  await ensureIndex(db, "agent_task_runs", "idx_agent_task_runs_task", "task_id, created_at");
+  await ensureIndex(db, "agent_task_runs", "idx_agent_task_runs_session", "session_id");
+  // channel_bindings
+  await ensureIndex(db, "channel_bindings", "idx_channel_bindings_agent", "agent_id");
+  // channel_binding_sessions
+  await ensureIndex(db, "channel_binding_sessions", "idx_channel_binding_sessions_session", "session_id");
+  // knowledge_publish_events
+  await ensureIndex(db, "knowledge_publish_events", "idx_kpe_created", "created_at");
+  await ensureIndex(db, "knowledge_publish_events", "idx_kpe_repo", "repo_id, created_at");
+  // hosts jump chain reverse lookup
+  await ensureIndex(db, "hosts", "idx_hosts_jump", "jump_host_id");
+}
+
+export async function runPortalMigrations(): Promise<void> {
+  const db = getDb();
+
+  // DDL — MySQL auto-commits each, SQLite handles each in its own implicit tx.
+  for (const sql of PORTAL_SCHEMA_SQLS) {
+    await db.query(sql);
+  }
+
+  // Additive column migrations MUST run BEFORE createIndexes() — some indexes
+  // reference columns that only exist after these ALTERs on legacy MySQL
+  // databases (e.g. idx_agent_task_runs_session on agent_task_runs.session_id,
+  // which was added in a later migration than the CREATE TABLE).
+  await safeAlterTable(db, "clusters", "debug_image", "VARCHAR(500) DEFAULT NULL");
+  await safeAlterTable(db, "agents", "model_routing", "TEXT DEFAULT NULL");
+  await safeAlterTable(db, "agents", "idle_timeout_sec", "INT NOT NULL DEFAULT 300");
+  // How many AgentBox pods this agent runs. DEFAULT 1 is the identity value: an existing
+  // row picks it up on upgrade and behaves exactly as it did before replicas existed.
+  await safeAlterTable(db, "agents", "replicas", "INT NOT NULL DEFAULT 1");
+  // Per-agent tool capability groups (JSON array of group keys). TEXT (not a
+  // JSON column type) for MySQL+SQLite dual-compat. NULL = no selection = all
+  // tools (backward-compatible with agents predating this feature).
+  await safeAlterTable(db, "agents", "tool_capabilities", "TEXT DEFAULT NULL");
+  // Sub-agent model tiers: JSON array of {tier, provider, modelId, whenToUse}.
+  // TEXT (not a JSON column type) for MySQL+SQLite dual-compat, like
+  // model_routing and tool_capabilities. NULL = no tiers = children inherit the
+  // parent's model, which is the pre-feature behaviour.
+  //
+  // Standalone only: under Upstream mode the tier config lives in the management
+  // plane's own storage and this column stays NULL.
+  await safeAlterTable(db, "agents", "subagent_models", "TEXT DEFAULT NULL");
+  await safeAlterTable(db, "agents", "agent_type", "VARCHAR(32) NOT NULL DEFAULT 'custom'");
+  await safeAlterTable(db, "agent_task_runs", "session_id", "CHAR(36) DEFAULT NULL");
+  await safeAlterTable(db, "agent_tasks", "last_manual_run_at", "TIMESTAMP NULL DEFAULT NULL");
+  await safeAlterTable(db, "model_entries", "vision", "TINYINT(1) NOT NULL DEFAULT 0");
+  // The wire protocol a model speaks. A PER-MODEL attribute, not a provider one:
+  // one endpoint can serve OpenAI-protocol and Claude-protocol models side by
+  // side (a model gateway can do exactly that), so there is no meaningful
+  // provider-wide answer. model_providers.api_type survives only as the value
+  // pre-filled when adding a model.
+  //
+  // Added nullable so existing rows survive the ALTER, then backfilled from the
+  // provider (semantically identical to the inherit behaviour they had) and
+  // tightened to NOT NULL. Order matters: MySQL rejects the MODIFY while NULLs
+  // remain.
+  await safeAlterTable(db, "model_entries", "api_type", "VARCHAR(50) DEFAULT NULL");
+  await db.query(
+    `UPDATE model_entries SET api_type = COALESCE(
+       (SELECT mp.api_type FROM model_providers mp WHERE mp.id = model_entries.provider_id),
+       'openai-completions')
+     WHERE api_type IS NULL OR api_type = ''`,
+  );
+  // NOT widenColumn: that compares COLUMN_TYPE, and varchar(50) → varchar(50)
+  // reads as "no change" however the nullability differs, so it silently skips.
+  // Any deployment that already had this column — including one whose table was
+  // created by an earlier build of this same branch — would stay nullable.
+  // SQLite has no cheap MODIFY COLUMN, so there the constraint only reaches
+  // fresh files via CREATE TABLE; the app layer never writes NULL either way.
+  await tightenColumnNotNull(db, "model_entries", "api_type", "VARCHAR(50) NOT NULL DEFAULT 'openai-completions'");
+  // Which request field carries the output-token cap for THIS model. NULL =
+  // let resolveMaxTokensField() infer it; an explicit value overrides. Nullable
+  // on purpose: unlike the wire protocol, there is a sane automatic answer, so
+  // "unanswered" is a meaningful state rather than a hole to backfill.
+  await safeAlterTable(db, "model_entries", "max_tokens_field", "VARCHAR(32) DEFAULT NULL");
+  // Per-model wire-compat overrides (JSON text, whitelisted keys). Nullable and
+  // normally NULL: the resolver answers from pi's own table or a generation rule,
+  // and this exists for the id neither reads correctly. TEXT rather than a column
+  // per key — this boundary has already grown `api_type`, `max_tokens_field` and
+  // now two thinking keys, each time as a separate schema change.
+  await safeAlterTable(db, "model_entries", "compat_overrides", "TEXT DEFAULT NULL");
+  // An upgraded database still carries the old 65536 column default — CREATE TABLE
+  // IF NOT EXISTS skips an existing table, and the value was above the ceiling of
+  // Claude models in use. Unlike the stored ROWS (left alone: 65536 can be a
+  // deliberate choice for a model whose ceiling really is that high, and nothing
+  // here can tell that from an unlucky default), the column default is
+  // unambiguous — nobody chose it per model — so it is corrected on its own.
+  // The same helper covers context_window if that constant ever moves.
+  await setColumnDefault(
+    db,
+    "model_entries",
+    "max_tokens",
+    `INT NOT NULL DEFAULT ${DEFAULT_MAX_TOKENS}`,
+    String(DEFAULT_MAX_TOKENS),
+  );
+  await safeAlterTable(db, "skills", "is_builtin", "TINYINT(1) NOT NULL DEFAULT 0");
+  await safeAlterTable(db, "skills", "overlay_of", "CHAR(36) DEFAULT NULL");
+  await safeAlterTable(db, "skills", "files", "MEDIUMTEXT DEFAULT NULL");
+  // Hosts: self-referencing jump host chain (ProxyJump) + private-key passphrase.
+  // No FK on jump_host_id — mirrors chat_sessions.parent_session_id; integrity is
+  // enforced in app code (validateJumpChain) and acquire-time tolerates dangling refs.
+  await safeAlterTable(db, "hosts", "jump_host_id", "CHAR(36) DEFAULT NULL");
+  await safeAlterTable(db, "hosts", "passphrase", "VARCHAR(500) DEFAULT NULL");
+  // Channel (Lark/DingTalk) audit attribution: the actual end-user actor and the
+  // channel, distinct from the binding-owner user_id. Read by the Metrics
+  // "by user" axis (actorUserColumn). Nullable; only set for channel sessions.
+  await safeAlterTable(db, "chat_sessions", "sender_external_id", "VARCHAR(128) DEFAULT NULL");
+  await safeAlterTable(db, "chat_sessions", "channel_id", "CHAR(36) DEFAULT NULL");
+  await safeAlterTable(db, "channel_bindings", "context_mode", "VARCHAR(20) DEFAULT NULL");
+  await safeAlterTable(db, "skill_versions", "labels", "TEXT DEFAULT NULL");
+  await safeAlterTable(db, "skill_versions", "files", "MEDIUMTEXT DEFAULT NULL");
+  await safeAlterTable(db, "chat_sessions", "parent_session_id", "CHAR(36) DEFAULT NULL");
+  await safeAlterTable(db, "chat_sessions", "parent_agent_id", "CHAR(36) DEFAULT NULL");
+  await safeAlterTable(db, "chat_sessions", "delegation_id", "VARCHAR(64) DEFAULT NULL");
+  await safeAlterTable(db, "chat_sessions", "target_agent_id", "CHAR(36) DEFAULT NULL");
+  await safeAlterTable(db, "channel_bindings", "session_id", "CHAR(36) DEFAULT NULL");
+  // Binding owner (the user who PAIRed this chat). Present in the CREATE TABLE above, but older
+  // installs predate it — adapter.ts / siclaw-api.ts SELECT cb.created_by, so existing DBs need
+  // this backfill ALTER or every channel message errors ("Unknown column 'cb.created_by'").
+  await safeAlterTable(db, "channel_bindings", "created_by", "CHAR(36) DEFAULT NULL");
+  // Human-readable name of the bound chat (group title / user name), fetched
+  // from the channel platform at PAIR time and lazily refreshed by the gateway.
+  // Display-only cache — identity is always route_key, never this name.
+  await safeAlterTable(db, "channel_bindings", "display_name", "VARCHAR(255) DEFAULT NULL");
+  await safeAlterTable(db, "chat_messages", "from_agent_id", "CHAR(36) DEFAULT NULL");
+  await safeAlterTable(db, "chat_messages", "parent_session_id", "CHAR(36) DEFAULT NULL");
+  await safeAlterTable(db, "chat_messages", "delegation_id", "VARCHAR(64) DEFAULT NULL");
+  await safeAlterTable(db, "chat_messages", "target_agent_id", "CHAR(36) DEFAULT NULL");
+  await safeAlterTable(db, "chat_messages", "trace_id", "CHAR(32) DEFAULT NULL");
+  // Runtime-resolved invocation source. Historical rows intentionally remain NULL: deriving
+  // this from a tool name would invent lineage that was never recorded at call time.
+  await safeAlterTable(db, "chat_messages", "toolset", "VARCHAR(255) DEFAULT NULL");
+  // Conversation order. `created_at` cannot carry it: the column is second-granular (a
+  // fractional type would break the SQLite half of this DDL), and the tiebreaker `id` is a
+  // UUID — so two messages written in the same second came back in an order decided by
+  // random hex. A backfill is needed exactly once, on the upgrade that adds the column.
+  if (await safeAlterTable(db, "chat_messages", "seq", "BIGINT DEFAULT NULL")) {
+    await backfillChatMessageSeq(db);
+  }
+  // The transcript reads a session ordered by seq; without this it is a filesort whose
+  // cost grows with the length of the conversation rather than the size of the page.
+  await ensureIndex(db, "chat_messages", "idx_chat_messages_session_seq", "session_id, seq");
+
+  // Widen delegation_id CHAR(36)→VARCHAR(64) on EXISTING deployments. A group reduce child's id
+  // `${toolCallId}#reduce` reaches 36 chars for a 29-char provider id and would overflow CHAR(36)
+  // under MySQL strict mode (dropping the reduce child's session + delegation rows). safeAlterTable
+  // above only ADDs missing columns; widenColumn MODIFYs the existing type (idempotent, MySQL-only).
+  await widenColumn(db, "chat_sessions", "delegation_id", "VARCHAR(64) DEFAULT NULL");
+  await widenColumn(db, "chat_messages", "delegation_id", "VARCHAR(64) DEFAULT NULL");
+  // Bounded script output can exceed MySQL TEXT's 64 KiB, both in the displayed
+  // tool content and the structured result used to rebuild history. SQLite has
+  // no corresponding width limit; widenColumn is a no-op there.
+  await widenColumn(db, "chat_messages", "content", "MEDIUMTEXT DEFAULT NULL");
+
+  // Complete skill preview packages exceed TEXT's 64 KiB capacity. Preserve
+  // legacy JSON columns; SQLite TEXT already has no equivalent width limit.
+  await widenColumn(db, "chat_messages", "metadata", "LONGTEXT DEFAULT NULL", ["tinytext", "text", "mediumtext"]);
+
+  // Indexes that used to be inlined inside CREATE TABLE (+ overlay/org_name
+  // indexes added later). Safe to run now that all referenced columns exist.
+  await createIndexes();
+  await ensureIndex(db, "skills", "idx_skills_overlay", "overlay_of");
+
+  // Relax the unique (org_id, name) constraint so a builtin skill and its
+  // overlay can share the same name. Drop the legacy unique index (MySQL only —
+  // SQLite fresh installs never create it) and replace with a regular index.
+  await dropIndexIfExists(db, "skills", "uq_skills_org_name");
+  await ensureIndex(db, "skills", "idx_skills_org_name", "org_id, name");
+
+  // Data backfill (safe to run repeatedly).
+  await db.query("UPDATE chat_sessions SET origin = 'task' WHERE origin = 'cron'");
+  await db.query("UPDATE skills SET is_builtin = 1 WHERE created_by = 'system' AND is_builtin = 0");
+
+  await db.query("UPDATE agents SET status = 'disabled' WHERE agent_type = ? AND status <> 'disabled'", ["coordinator"]);
+  await db.query("DROP TABLE IF EXISTS agent_delegates");
+
+  // Repeatable data cleanup also repairs installs that already ran retirement.
+  // Parse in JS so malformed legacy TEXT and both SQL dialects remain safe.
+  const [capabilityRows] = await db.query<Array<{ id: string; tool_capabilities: string }>>(
+    "SELECT id, tool_capabilities FROM agents WHERE tool_capabilities LIKE ?", ["%delegate_agents%"],
+  );
+  for (const row of capabilityRows) {
+    let keys: unknown;
+    try { keys = JSON.parse(row.tool_capabilities); } catch { continue; }
+    if (!Array.isArray(keys) || !keys.every((key) => typeof key === "string") || !keys.includes("delegate_agents")) continue;
+    // Both [] and null group selections are unrestricted. If nothing remains,
+    // use ["no_tools"] so resolution still grants no built-in capabilities.
+    const cleaned = JSON.stringify(removeRetiredCapabilityKeys(keys));
+    await db.query("UPDATE agents SET tool_capabilities = ? WHERE id = ? AND tool_capabilities = ?",
+      [cleaned, row.id, row.tool_capabilities]);
+  }
+
+  console.log("[portal-migrate] All tables ready");
+}
+
+/** Exposed for tests that need to inspect the DDL statements. */
+export { PORTAL_SCHEMA_SQLS };
+// Re-export ensureUniqueIndex so tests / callers can create uniques; only
+// currently used by tests.
+export { ensureUniqueIndex };
+
+/**
+ * Give existing messages an order, once, when the `seq` column is first added.
+ *
+ * Uses the ordering the reader used until now (`created_at`, then `id`), so an upgrade
+ * does not reshuffle history — it freezes whatever order was already being shown. Rows
+ * written after this run get their order at write time instead.
+ */
+async function backfillChatMessageSeq(db: Db): Promise<void> {
+  const numbered = `SELECT id, ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY created_at, id) AS rn FROM chat_messages`;
+  if (db.driver === "mysql") {
+    await db.query(`UPDATE chat_messages m JOIN (${numbered}) t ON t.id = m.id SET m.seq = t.rn`);
+  } else {
+    await db.query(`UPDATE chat_messages SET seq = (SELECT rn FROM (${numbered}) t WHERE t.id = chat_messages.id)`);
+  }
+  console.log("[portal-migrate] backfilled chat_messages.seq");
+}

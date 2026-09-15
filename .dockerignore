@@ -1,0 +1,15 @@
+.git
+.DS_Store
+
+node_modules
+portal-web/node_modules
+
+dist
+portal-web/dist
+coverage
+
+*.log
+__pycache__
+*.pyc
+
+kbc/platform/pod/test_*.py

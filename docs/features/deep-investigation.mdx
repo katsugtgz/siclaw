@@ -1,0 +1,71 @@
+---
+title: "Deep Investigation"
+sidebarTitle: "Deep Investigation"
+description: "How Siclaw's interactive investigation mode works — a focus mode for complex root-cause analysis."
+---
+
+## Overview
+
+Deep Investigation (DP) is a **mode** you toggle on when you want Siclaw to slow
+down and reason through a complex problem instead of jumping to a fix. In DP
+mode the agent is coached by an enhanced system prompt to:
+
+1. Gather evidence with tools before forming hypotheses.
+2. Consider 2–5 candidate causes and weigh them against the evidence.
+3. Cross-verify from multiple data sources before drawing conclusions.
+4. Present findings with explicit confidence and a causal chain.
+
+DP mode stays on until you explicitly turn it off. It does not activate by
+itself.
+
+## Triggering Deep Investigation
+
+### Web UI
+
+Click the magnifying-glass toggle next to the message input. A banner appears
+while DP mode is active. Click again to turn it off.
+
+### Dig Deeper
+
+Any regular answer can be escalated into DP by clicking the **Dig deeper**
+action chip that appears below the agent's reply. This sends a follow-up prompt
+asking for a deeper investigation into the same question.
+
+### External API
+
+Automations can drive an agent from outside Siclaw using the `/api/v1/run`
+endpoint with an API-key-scoped agent. Issue an API key in the Portal UI
+(agent detail page → API keys), then:
+
+```bash
+curl -X POST https://siclaw.example.com/api/v1/run \
+  -H "Authorization: Bearer sk-xxxxxxxx" \
+  -H "Content-Type: application/json" \
+  -d '{"text": "Intermittent 5xx errors on API gateway every 30 minutes"}'
+```
+
+The agent resolved from the API key runs synchronously and returns the
+assistant reply. DP-style reasoning can be requested in the prompt text.
+
+## What DP Changes
+
+DP mode changes how the agent *thinks* and, in supported runtimes, exposes a
+same-agent delegation primitive for bounded parallel evidence collection. Normal
+chat sessions do not see the delegation tool.
+
+- **Slower triage**: the agent spends more effort cross-verifying evidence
+  before proposing a cause.
+- **Hypothesis framing**: conclusions are presented with confidence
+  and the counter-evidence considered.
+- **Parallel evidence collection**: for complex DP investigations, the agent can
+  start one to three same-agent sub-investigations and then synthesize their
+  returned evidence capsules.
+- **Conversation continuity**: DP state persists across messages in the same
+  session until explicitly exited.
+
+## Investigation Memory
+
+When [Investigation Memory](/features/memory) is enabled, DP-mode sessions
+write their conclusions (root cause, causal chain, evidence refs) to the
+memory index. Future investigations with similar symptoms retrieve past
+matches automatically to speed up triage.

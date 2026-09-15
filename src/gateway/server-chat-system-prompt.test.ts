@@ -1,0 +1,303 @@
+/**
+ * Regression test for the custom-system-prompt fallback in chat.send.
+ *
+ * Bug: control-plane's web-chat proxy sends chat.send WITHOUT a systemPrompt param, so
+ * the runtime's handler (which only read params.systemPrompt) handed the box
+ * `undefined` and a custom-prompt agent silently got AgentBox's built-in default
+ * SRE persona. Channel paths (dingtalk/lark) already resolved the agent's own
+ * template via config.getAgent and worked — only the web path was unwired.
+ *
+ * The fix: when the caller does not forward systemPrompt, chat.send falls back to
+ * resolveAgentSystemPrompt(agentId, frontendClient). An explicitly forwarded
+ * prompt (portal-standalone) still wins as-is; a resolve failure / no custom
+ * prompt falls back to undefined = built-in default.
+ *
+ * This test drives the real chat.send handler from startRuntime (data-layer +
+ * agentbox mocked) and asserts what systemPromptTemplate the box prompt receives.
+ */
+import { describe, it, expect, afterEach, vi } from "vitest";
+
+vi.mock("./chat-repo.js", () => ({
+  validTraceId: (v: unknown) => (typeof v === "string" && /^[0-9a-f]{32}$/.test(v) ? v : undefined),
+  warnTraceBindFailure: vi.fn(),
+  ensureChatSession: vi.fn(async () => {}),
+  appendMessage: vi.fn(async () => "msg-id"),
+  bindMessageTraceId: vi.fn(async () => {}),
+  updateMessage: vi.fn(async () => {}),
+  incrementMessageCount: vi.fn(async () => {}),
+}));
+
+vi.mock("./output-redactor.js", () => ({
+  buildRedactionConfigForModelConfig: vi.fn(() => ({})),
+}));
+
+const chatRepo = await import("./chat-repo.js");
+
+// The mocked consumer hangs (the IIFE never settles) — we only need it to reach
+// prompt(), whose opts we capture below.
+vi.mock("./sse-consumer.js", () => ({
+  consumeAgentSse: vi.fn((opts: { signal?: AbortSignal }) => {
+    return new Promise((resolve) => {
+      const done = () =>
+        resolve({ resultText: "", taskReportText: "", errorMessage: "", eventCount: 0, durationMs: 0 });
+      if (opts.signal?.aborted) return done();
+      opts.signal?.addEventListener("abort", done, { once: true });
+    });
+  }),
+}));
+
+const promptCalls: Array<{
+  systemPromptTemplate?: string;
+  sessionId: string;
+  requiredResultToolName?: string;
+}> = [];
+vi.mock("./agentbox/client.js", () => ({
+  AgentBoxClient: class {
+    endpoint: string;
+    constructor(endpoint: string) {
+      this.endpoint = endpoint;
+    }
+    prompt = vi.fn(async (opts: { sessionId: string; systemPromptTemplate?: string }) => {
+      promptCalls.push(opts);
+      return { sessionId: opts.sessionId, traceId: "0123456789abcdef0123456789abcdef" };
+    });
+    abortSession = vi.fn(async () => {});
+    steerSession = vi.fn(async () => ({ ok: true, traceId: "fedcba9876543210fedcba9876543210" }));
+    streamEvents = async function* () {};
+  },
+}));
+
+const { startRuntime } = await import("./server.js");
+const { sessionRegistry } = await import("./session-registry.js");
+
+// getAgentResult drives what config.getAgent resolves to (or throws when set to
+// an Error), letting each test model "custom prompt present / absent / lookup
+// failed". Other RPC methods resolve empty so unrelated wiring stays inert.
+let getAgentResult: unknown = undefined;
+let getAgentError: Error | undefined;
+const getAgentCalls: unknown[] = [];
+function fakeFrontendClient() {
+  return {
+    request: vi.fn(async (method: string, params: unknown) => {
+      if (method === "config.getAgent") {
+        getAgentCalls.push(params);
+        if (getAgentError) throw getAgentError;
+        return getAgentResult;
+      }
+      return { found: false };
+    }),
+    onCommand: vi.fn(),
+    emitEvent: vi.fn(),
+    close: vi.fn(),
+  } as any;
+}
+
+function fakeAgentBoxManager() {
+  return {
+    setCertManager: vi.fn(),
+    setSpawnEnvResolver: vi.fn(),
+    setPersistenceResolver: vi.fn(),
+    getOrCreate: vi.fn(async () => ({ endpoint: "https://fake.internal" })),
+    list: vi.fn(() => []),
+    cleanup: vi.fn(async () => {}),
+  } as any;
+}
+
+async function bootRuntime() {
+  return startRuntime({
+    config: { port: 0, internalPort: 0, host: "127.0.0.1", serverUrl: "", portalSecret: "" } as any,
+    agentBoxManager: fakeAgentBoxManager(),
+    frontendClient: fakeFrontendClient(),
+    credentialService: {} as any,
+  });
+}
+
+async function waitFor(predicate: () => boolean, timeoutMs = 2000): Promise<void> {
+  const start = Date.now();
+  while (!predicate()) {
+    if (Date.now() - start > timeoutMs) throw new Error("waitFor timed out");
+    await new Promise((r) => setTimeout(r, 5));
+  }
+}
+
+let server: Awaited<ReturnType<typeof startRuntime>> | undefined;
+afterEach(async () => {
+  if (server) await server.close();
+  server = undefined;
+  promptCalls.length = 0;
+  getAgentCalls.length = 0;
+  getAgentResult = undefined;
+  getAgentError = undefined;
+  vi.clearAllMocks();
+});
+
+describe("startRuntime — chat.send custom system prompt", () => {
+  it("rejects retired delegation before creating or prompting a session", async () => {
+    server = await bootRuntime();
+    const send = server.rpcMethods.get("chat.send")!;
+    for (const legacy of [{ delegation: { delegationId: "d1" } }, { origin: "delegation" }]) {
+      await expect(send({ agentId: "peer", userId: "u", text: "old request", sessionId: "retired", ...legacy },
+        { sendEvent: vi.fn() })).rejects.toMatchObject({ code: "AGENT_RETIRED", status: 410, retriable: false });
+    }
+    expect(promptCalls).toHaveLength(0);
+    expect(chatRepo.ensureChatSession).not.toHaveBeenCalled();
+    expect(chatRepo.appendMessage).not.toHaveBeenCalled();
+  });
+
+  it("uses an explicitly forwarded systemPrompt as-is (portal-standalone) and skips the lookup", async () => {
+    // config.getAgent would resolve a DIFFERENT prompt; the explicit param must win
+    // and the fallback lookup must not even run.
+    getAgentResult = { system_prompt: "should-not-be-used" };
+    server = await bootRuntime();
+    const send = server.rpcMethods.get("chat.send")!;
+
+    await send(
+      { agentId: "a", userId: "u", text: "hi", sessionId: "S1", systemPrompt: "explicit-portal-prompt" },
+      { sendEvent: vi.fn() },
+    );
+    await waitFor(() => promptCalls.length > 0);
+
+    expect(promptCalls[0].systemPromptTemplate).toBe("explicit-portal-prompt");
+    expect(getAgentCalls).toEqual([]);
+  });
+
+  it("forwards a strict result-tool requirement to AgentBox", async () => {
+    server = await bootRuntime();
+    const send = server.rpcMethods.get("chat.send")!;
+
+    const ack = await send({
+      agentId: "a",
+      userId: "u",
+      text: "hi",
+      sessionId: "strict-result",
+      requiredResultToolName: "mcp__result__submit",
+      requireSessionPersistence: true,
+    }, { sendEvent: vi.fn() }) as { strictResultProtocolVersion?: number };
+    await waitFor(() => promptCalls.length > 0);
+
+    expect(promptCalls[0].requiredResultToolName).toBe("mcp__result__submit");
+    expect(ack.strictResultProtocolVersion).toBe(1);
+  });
+
+  it("does not advertise strict protocol support for a partial opt-in", async () => {
+    server = await bootRuntime();
+    const send = server.rpcMethods.get("chat.send")!;
+
+    const ack = await send({
+      agentId: "a",
+      userId: "u",
+      text: "hi",
+      sessionId: "result-without-durable-ack",
+      requiredResultToolName: "mcp__result__submit",
+    }, { sendEvent: vi.fn() }) as { strictResultProtocolVersion?: number };
+
+    expect(ack.strictResultProtocolVersion).toBeUndefined();
+  });
+
+  it("falls back to the agent's custom prompt when the caller omits systemPrompt (control-plane web path)", async () => {
+    getAgentResult = { system_prompt: "custom agent persona" };
+    server = await bootRuntime();
+    const send = server.rpcMethods.get("chat.send")!;
+
+    await send({ agentId: "a", userId: "u", text: "hi", sessionId: "S2" }, { sendEvent: vi.fn() });
+    await waitFor(() => promptCalls.length > 0);
+
+    expect(getAgentCalls).toEqual([{ agentId: "a" }]);
+    expect(promptCalls[0].systemPromptTemplate).toBe("custom agent persona");
+  });
+
+  it("falls back to undefined (built-in default) when the agent has no custom prompt", async () => {
+    getAgentResult = { system_prompt: null };
+    server = await bootRuntime();
+    const send = server.rpcMethods.get("chat.send")!;
+
+    await send({ agentId: "a", userId: "u", text: "hi", sessionId: "S3" }, { sendEvent: vi.fn() });
+    await waitFor(() => promptCalls.length > 0);
+
+    expect(promptCalls[0].systemPromptTemplate).toBeUndefined();
+  });
+
+  it("falls back to undefined (built-in default) when the prompt lookup fails — never a chat failure", async () => {
+    getAgentError = new Error("config.getAgent RPC exploded");
+    server = await bootRuntime();
+    const send = server.rpcMethods.get("chat.send")!;
+
+    const ack = await send({ agentId: "a", userId: "u", text: "hi", sessionId: "S4" }, { sendEvent: vi.fn() });
+    // The ack still returns ok — a resolve failure must not fail the send.
+    expect(ack).toMatchObject({ ok: true, sessionId: "S4" });
+    await waitFor(() => promptCalls.length > 0);
+
+    expect(promptCalls[0].systemPromptTemplate).toBeUndefined();
+  });
+
+  it("rejects a strict persistence ACK before any AgentBox prompt starts", async () => {
+    vi.mocked(chatRepo.ensureChatSession).mockRejectedValueOnce(new Error("database unavailable"));
+    server = await bootRuntime();
+    const send = server.rpcMethods.get("chat.send")!;
+
+    await expect(send({
+      agentId: "a",
+      userId: "u",
+      text: "hi",
+      sessionId: "strict-session",
+      requireSessionPersistence: true,
+    }, { sendEvent: vi.fn() })).rejects.toMatchObject({ name: "SessionPersistenceError" });
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(promptCalls).toEqual([]);
+    expect(sessionRegistry.peek("strict-session")).toBeUndefined();
+  });
+
+  it("keeps best-effort persistence for ordinary interactive chat", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.mocked(chatRepo.ensureChatSession).mockRejectedValueOnce(new Error("database unavailable"));
+    server = await bootRuntime();
+    const send = server.rpcMethods.get("chat.send")!;
+
+    await expect(send({ agentId: "a", userId: "u", text: "hi", sessionId: "web-session" }, {
+      sendEvent: vi.fn(),
+    })).resolves.toMatchObject({ ok: true, sessionId: "web-session" });
+    await waitFor(() => promptCalls.length > 0);
+    warn.mockRestore();
+  });
+});
+
+describe("authorized handoff trace propagation", () => {
+  it("forwards the source Runtime context to the receiving AgentBox", async () => {
+    server = await bootRuntime();
+    const traceContext = { traceId: "0123456789abcdef0123456789abcdef", parentSpanId: "1234567890abcdef", traceFlags: 1 };
+    await server.rpcMethods.get("chat.send")!({
+      agentId: "receiver", userId: "u", sessionId: "handoff-trace", text: "continue", skipInitialPersistence: true,
+      handoff: { fromAgentId: "sender", brief: "continue", traceContext },
+    }, { sendEvent: vi.fn() });
+    await waitFor(() => promptCalls.length > 0);
+    expect(promptCalls[0]).toMatchObject({ handoffTrace: traceContext });
+  });
+  it("does not accept a trace override on an ordinary new user turn", async () => {
+    server = await bootRuntime();
+    await server.rpcMethods.get("chat.send")!({
+      agentId: "a", userId: "u", sessionId: "plain-trace", text: "question",
+      handoffTrace: { traceId: "0123456789abcdef0123456789abcdef" },
+    }, { sendEvent: vi.fn() });
+    await waitFor(() => promptCalls.length > 0);
+    expect(promptCalls[0]).not.toHaveProperty("handoffTrace", { traceId: "0123456789abcdef0123456789abcdef" });
+  });
+});
+
+
+describe("handoff continuation policy transport", () => {
+  it("resumes the same owner with policy and trace without persisting a fake user message", async () => {
+    server = await bootRuntime();
+    const send = server.rpcMethods.get("chat.send")!;
+    const policy = { remaining: 0, visitedAgentIds: ["a", "b"], history: [{ from: "a", to: "b", brief: "inspect" }] };
+    const traceContext = { traceId: "0123456789abcdef0123456789abcdef", parentSpanId: "1234567890abcdef", traceFlags: 1 };
+    await send({ agentId: "b", userId: "u", sessionId: "closure", text: "Explain what remains unresolved", skipInitialPersistence: true,
+      handoffSupported: false, handoffPolicy: policy, handoff: { fromAgentId: "b", brief: "closure", recovery: true, traceContext } }, { sendEvent: vi.fn() });
+    await waitFor(() => promptCalls.length > 0);
+    expect(promptCalls[0]).toMatchObject({ handoffSupported: false, handoffPolicy: policy, handoffTrace: traceContext, requireExistingSession: true });
+    expect((promptCalls[0] as any).text).toContain("continuation of the same request");
+    expect((promptCalls[0] as any).text).toContain("Explain what remains unresolved");
+    expect(chatRepo.ensureChatSession).not.toHaveBeenCalled();
+    expect(chatRepo.appendMessage).not.toHaveBeenCalled();
+  });
+});

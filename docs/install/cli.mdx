@@ -1,0 +1,143 @@
+---
+title: "CLI & Local Server"
+sidebarTitle: "CLI / Local"
+description: "Install Siclaw globally and run as CLI or local server."
+---
+
+## Recommended Working Directory
+
+Siclaw stores most runtime data in a `.siclaw/` folder **relative to the directory where you start it**. Create a dedicated working directory and reuse it:
+
+```bash
+mkdir -p ~/siclaw-work
+cd ~/siclaw-work
+```
+
+## Install
+
+```bash
+npm install -g siclaw
+```
+
+## Local Server (recommended)
+
+```bash
+siclaw local
+```
+
+Launches the Web UI at `http://localhost:3000`.
+
+A fresh local workspace seeds **admin / admin**. Sign in and change its password in **Account**, then configure a provider in **Models**.
+
+## Non-interactive CLI
+
+```bash
+siclaw --prompt "Why is pod nginx-abc in CrashLoopBackOff?"
+siclaw --continue --prompt "Check recent events"
+```
+
+Each invocation prints an answer and exits. `--prompt` is required; bare `siclaw` displays help. Missing configuration produces an error instead of an interactive setup wizard. `--print` remains accepted for existing scripts.
+
+### Pairing with a Local Server
+
+When `siclaw local` runs in the same working directory, the CLI reads an authenticated Portal snapshot containing providers, agents, and their bound resources. Configure them in the Web UI before running:
+
+```bash
+siclaw agents
+siclaw --agent sre-oncall --prompt "Check cluster health"
+```
+
+Use a name listed by `siclaw agents`. A single agent is selected automatically; multiple agents require `--agent`. Configuration changes apply to the next invocation. See [CLI + Local Portal Integration](/features/portal-cli-integration) for snapshot lifecycle and custom ports.
+
+## From Source
+
+```bash
+git clone https://github.com/scitix/siclaw.git
+cd siclaw
+npm ci
+make build-portal-web
+npm run build
+
+# Local server
+node siclaw.mjs local
+```
+
+## Configuration
+
+By default, Siclaw reads and writes these paths relative to your current working directory:
+
+```
+.siclaw/
+├── config/
+│   └── settings.json     ← LLM provider, model, API key
+├── credentials/           ← Imported kubeconfigs, SSH keys, API tokens
+├── skills/
+└── user-data/
+    ├── memory/
+    │   └── .memory.db
+    └── ...
+```
+
+### LLM Configuration
+
+When Portal is unavailable and no agent was selected, the headless CLI reads `.siclaw/config/settings.json`. A selected agent must load successfully or execution stops. Prepare it before running a diagnostic. When paired with Portal, configure providers in the Web UI's **Models** page.
+
+Minimal example:
+
+```json
+{
+  "providers": {
+    "openai": {
+      "baseUrl": "https://api.openai.com/v1",
+      "apiKey": "sk-...",
+      "api": "openai-completions",
+      "models": [{ "id": "gpt-4o", "name": "GPT-4o" }]
+    },
+    "anthropic": {
+      "baseUrl": "https://api.anthropic.com/v1",
+      "apiKey": "sk-ant-...",
+      "api": "anthropic-messages",
+      "models": [{ "id": "claude-sonnet-4-20250514", "name": "Claude Sonnet 4" }]
+    }
+  }
+}
+```
+
+In Local Server mode, configure providers and models in the **Models** page of the Web UI.
+
+See [LLM Providers](/configuration/providers) for provider examples.
+
+### Kubernetes Credentials
+
+Siclaw tools resolve kubeconfig from its own credential store, not from your shell's `KUBECONFIG`.
+
+Import kubeconfigs in **Clusters** in the local Web UI. The paired CLI receives them on its next invocation. Import SSH access in **Hosts**.
+
+After import, Siclaw can route `kubectl` calls through that stored credential.
+
+## Embedding (Optional)
+
+To enable Investigation Memory with semantic search, add an embedding config:
+
+```json
+{
+  "embedding": {
+    "baseUrl": "https://api.example.com/v1",
+    "apiKey": "sk-...",
+    "model": "bge-m3",
+    "dimensions": 1024
+  }
+}
+```
+
+If `embedding.apiKey` is omitted, Siclaw falls back to the default LLM provider key.
+
+## Traces
+
+Deep investigation traces are written to:
+
+```text
+.siclaw/traces/
+```
+
+The path is resolved relative to the working directory where Siclaw was launched.

@@ -1,0 +1,657 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { EventEmitter } from "node:events";
+import type { FrontendWsClientOptions } from "./frontend-ws-client.js";
+import { RpcResponseError } from "../lib/error-envelope.js";
+
+// ── Mock WebSocket ──────────────────────────────────────────
+
+/**
+ * Fake WebSocket class that mimics the `ws` library interface.
+ * Backed by EventEmitter so we can simulate open/close/message/error.
+ */
+class FakeWebSocket extends EventEmitter {
+  static readonly OPEN = 1;
+  static readonly CLOSED = 3;
+
+  readyState = FakeWebSocket.OPEN;
+  _sent: string[] = [];
+
+  constructor(
+    public _url: string,
+    public _options: any,
+  ) {
+    super();
+    // Simulate async open — caller triggers it explicitly in tests.
+  }
+
+  send(data: string): void {
+    this._sent.push(data);
+  }
+
+  close(): void {
+    this.readyState = FakeWebSocket.CLOSED;
+  }
+
+  removeAllListeners(): this {
+    super.removeAllListeners();
+    return this;
+  }
+}
+
+/** Track all FakeWebSocket instances created during a test. */
+let wsInstances: FakeWebSocket[] = [];
+
+// ── Module mocking ──────────────────────────────────────────
+
+vi.mock("ws", () => {
+  return {
+    default: class MockWS extends FakeWebSocket {
+      constructor(url: string, options: any) {
+        super(url, options);
+        wsInstances.push(this);
+      }
+    },
+    __esModule: true,
+  };
+});
+
+// ── Helpers ─────────────────────────────────────────────────
+
+const defaultOpts: FrontendWsClientOptions = {
+  serverUrl: "http://portal:3003",
+  portalSecret: "test-secret",
+  agentId: "agent-42",
+  timeoutMs: 500,
+};
+
+/** Import the client after mocking ws */
+async function createClient(opts?: Partial<FrontendWsClientOptions>) {
+  const { FrontendWsClient } = await import("./frontend-ws-client.js");
+  return new FrontendWsClient({ ...defaultOpts, ...opts });
+}
+
+/** Simulate the WS connection opening. */
+function openLatestWs(): FakeWebSocket {
+  const ws = wsInstances[wsInstances.length - 1];
+  ws.emit("open");
+  return ws;
+}
+
+// ── Tests ───────────────────────────────────────────────────
+
+describe("FrontendWsClient", () => {
+  beforeEach(() => {
+    wsInstances = [];
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  // ── 1. connected is false before connect ──────────────────
+
+  it("connected is false before connect", async () => {
+    const client = await createClient();
+    expect(client.connected).toBe(false);
+    client.close();
+  });
+
+  // ── 2. request() throws when not connected ────────────────
+
+  it("request() throws when not connected", async () => {
+    const client = await createClient();
+    await expect(client.request("test.method")).rejects.toThrow("not connected");
+    client.close();
+  });
+
+  // ── 3. request() resolves when response received ──────────
+
+  it("request() resolves when response received", async () => {
+    const client = await createClient();
+
+    const connectPromise = client.connect();
+    const ws = openLatestWs();
+    await connectPromise;
+
+    expect(client.connected).toBe(true);
+
+    const requestPromise = client.request("config.getSettings", { agentId: "a" });
+
+    // Extract the sent frame to get the RPC id
+    expect(ws._sent).toHaveLength(1);
+    const frame = JSON.parse(ws._sent[0]);
+    expect(frame.type).toBe("req");
+    expect(frame.method).toBe("config.getSettings");
+    expect(frame.params).toEqual({ agentId: "a" });
+
+    // Simulate Portal responding
+    ws.emit("message", JSON.stringify({
+      type: "res",
+      id: frame.id,
+      ok: true,
+      payload: { model: "gpt-4" },
+    }));
+
+    const result = await requestPromise;
+    expect(result).toEqual({ model: "gpt-4" });
+
+    client.close();
+  });
+
+  // ── 4. request() rejects on timeout ───────────────────────
+
+  it("request() rejects on timeout", async () => {
+    const client = await createClient({ timeoutMs: 200 });
+
+    const connectPromise = client.connect();
+    openLatestWs();
+    await connectPromise;
+
+    const requestPromise = client.request("slow.method");
+
+    // Advance time past the timeout
+    vi.advanceTimersByTime(300);
+
+    await expect(requestPromise).rejects.toThrow("timed out");
+
+    client.close();
+  });
+
+  it("request() supports a longer per-call timeout without changing the client default", async () => {
+    const client = await createClient({ timeoutMs: 200 });
+
+    const connectPromise = client.connect();
+    openLatestWs();
+    await connectPromise;
+
+    const requestPromise = client.request("source.part", undefined, 500);
+    const rejection = expect(requestPromise).rejects.toThrow("timed out after 500ms");
+    vi.advanceTimersByTime(300);
+    expect(vi.getTimerCount()).toBeGreaterThan(0);
+    vi.advanceTimersByTime(201);
+
+    await rejection;
+    client.close();
+  });
+
+  // ── 5. onCommand() dispatches and sends response ──────────
+
+  it("onCommand() dispatches inbound command and sends response", async () => {
+    const client = await createClient();
+
+    client.onCommand(async (method, params) => {
+      if (method === "chat.send") {
+        return { received: true, echo: params.msg };
+      }
+      throw new Error("Unknown command");
+    });
+
+    const connectPromise = client.connect();
+    const ws = openLatestWs();
+    await connectPromise;
+
+    // Simulate Portal sending a command to Runtime
+    ws.emit("message", JSON.stringify({
+      type: "req",
+      id: "cmd-1",
+      method: "chat.send",
+      params: { msg: "hello" },
+    }));
+
+    // Give the async handler time to run
+    await vi.advanceTimersByTimeAsync(0);
+
+    // Check the response was sent back
+    // ws._sent[0] might be from other calls; find the response
+    const responses = ws._sent.map((s) => JSON.parse(s));
+    const cmdResponse = responses.find((r) => r.type === "res" && r.id === "cmd-1");
+    expect(cmdResponse).toBeDefined();
+    expect(cmdResponse.ok).toBe(true);
+    expect(cmdResponse.payload).toEqual({ received: true, echo: "hello" });
+
+    client.close();
+  });
+
+  it("onCommand() sends error response when handler throws", async () => {
+    const client = await createClient();
+
+    client.onCommand(async () => {
+      throw new Error("handler boom");
+    });
+
+    const connectPromise = client.connect();
+    const ws = openLatestWs();
+    await connectPromise;
+
+    ws.emit("message", JSON.stringify({
+      type: "req",
+      id: "cmd-err",
+      method: "fail.method",
+      params: {},
+    }));
+
+    await vi.advanceTimersByTimeAsync(0);
+
+    const responses = ws._sent.map((s) => JSON.parse(s));
+    const cmdResponse = responses.find((r) => r.type === "res" && r.id === "cmd-err");
+    expect(cmdResponse).toBeDefined();
+    expect(cmdResponse.ok).toBe(false);
+    expect(cmdResponse.error).toEqual({
+      code: "INTERNAL_ERROR",
+      message: "handler boom",
+      retriable: true,
+    });
+
+    client.close();
+  });
+
+  it("onCommand() preserves structured status/code/retriable in negative responses", async () => {
+    const client = await createClient();
+
+    client.onCommand(async () => {
+      throw new RpcResponseError({
+        code: "SERVICE_UNAVAILABLE",
+        message: "box is starting",
+        retriable: true,
+        status: 503,
+      });
+    });
+
+    const connectPromise = client.connect();
+    const ws = openLatestWs();
+    await connectPromise;
+
+    ws.emit("message", JSON.stringify({
+      type: "req",
+      id: "cmd-structured-error",
+      method: "capability.command",
+      params: {},
+    }));
+
+    await vi.advanceTimersByTimeAsync(0);
+
+    const responses = ws._sent.map((s) => JSON.parse(s));
+    const cmdResponse = responses.find((r) => r.type === "res" && r.id === "cmd-structured-error");
+    expect(cmdResponse).toEqual({
+      type: "res",
+      id: "cmd-structured-error",
+      ok: false,
+      error: {
+        code: "SERVICE_UNAVAILABLE",
+        message: "box is starting",
+        retriable: true,
+        status: 503,
+      },
+    });
+
+    client.close();
+  });
+
+  // ── 6. emitEvent() sends event frame ──────────────────────
+
+  it("emitEvent() sends event frame", async () => {
+    const client = await createClient();
+
+    const connectPromise = client.connect();
+    const ws = openLatestWs();
+    await connectPromise;
+
+    client.emitEvent("chat.stream", { chunk: "hello" });
+
+    expect(ws._sent).toHaveLength(1);
+    const frame = JSON.parse(ws._sent[0]);
+    expect(frame.type).toBe("event");
+    expect(frame.channel).toBe("chat.stream");
+    expect(frame.data).toEqual({ chunk: "hello" });
+
+    client.close();
+  });
+
+  it("emitEvent() does nothing when not connected", async () => {
+    const client = await createClient();
+    // Should not throw
+    client.emitEvent("chat.stream", { chunk: "hello" });
+    client.close();
+  });
+
+  it("subscribe() receives Portal-to-Runtime events and can unsubscribe", async () => {
+    const client = await createClient();
+    const received: unknown[] = [];
+    const unsubscribe = client.subscribe("delegation.event", (data) => received.push(data));
+    const connectPromise = client.connect();
+    const ws = openLatestWs();
+    await connectPromise;
+
+    ws.emit("message", JSON.stringify({
+      type: "event",
+      channel: "delegation.event",
+      data: { delegationId: "d1", event: { type: "message_end" } },
+    }));
+    expect(received).toEqual([{ delegationId: "d1", event: { type: "message_end" } }]);
+
+    unsubscribe();
+    ws.emit("message", JSON.stringify({
+      type: "event",
+      channel: "delegation.event",
+      data: { delegationId: "d2" },
+    }));
+    expect(received).toHaveLength(1);
+    client.close();
+  });
+
+  it("acknowledges a reliable event only when a matching subscriber accepts it", async () => {
+    const client = await createClient();
+    const unsubscribeOther = client.subscribe("delegation.event", () => false);
+    expect(client.dispatchReliableEvent("delegation.event", { delegationId: "d1" })).toBe(false);
+
+    const received: unknown[] = [];
+    const unsubscribeMatching = client.subscribe("delegation.event", (data) => {
+      const envelope = data as { delegationId?: string };
+      if (envelope.delegationId !== "d1") return false;
+      received.push(data);
+      return true;
+    });
+
+    expect(client.dispatchReliableEvent("delegation.event", { delegationId: "other" })).toBe(false);
+    expect(client.dispatchReliableEvent("delegation.event", { delegationId: "d1" })).toBe(true);
+    expect(received).toEqual([{ delegationId: "d1" }]);
+
+    unsubscribeMatching();
+    unsubscribeOther();
+    client.close();
+  });
+
+  // ── 7. Auto-reconnect on disconnect ───────────────────────
+
+  it("rejects all pending RPCs on WS close (so callers don't wait the full timeout)", async () => {
+    const client = await createClient();
+    const connectPromise = client.connect();
+    const ws = openLatestWs();
+    await connectPromise;
+
+    // Send an RPC — it stays pending until either response or close.
+    const rpcPromise = client.request("slow.method", {});
+    // Now the WS drops before the response arrives.
+    ws.emit("close");
+
+    await expect(rpcPromise).rejects.toThrow(/disconnected/);
+
+    client.close();
+  });
+
+  it("schedules reconnect on close", async () => {
+    const client = await createClient();
+
+    const connectPromise = client.connect();
+    const ws = openLatestWs();
+    await connectPromise;
+
+    expect(client.connected).toBe(true);
+
+    // Simulate disconnect
+    ws.emit("close");
+    expect(client.connected).toBe(false);
+
+    // Advance past reconnect delay (base 1s + up to 2s jitter)
+    vi.advanceTimersByTime(4_000);
+
+    // A new WS instance should have been created for the reconnect attempt
+    expect(wsInstances.length).toBeGreaterThanOrEqual(2);
+
+    client.close();
+  });
+
+  it("does not reconnect after close()", async () => {
+    const client = await createClient();
+
+    const connectPromise = client.connect();
+    const ws = openLatestWs();
+    await connectPromise;
+
+    const instanceCount = wsInstances.length;
+
+    client.close();
+
+    // Simulate disconnect (after close was called)
+    ws.emit("close");
+
+    vi.advanceTimersByTime(60_000);
+
+    // No new WS instances should have been created
+    expect(wsInstances.length).toBe(instanceCount);
+  });
+
+  // ── URL conversion ────────────────────────────────────────
+
+  it("converts http:// to ws:// in URL", async () => {
+    const client = await createClient({ serverUrl: "http://portal:3003" });
+    const connectPromise = client.connect();
+    const ws = wsInstances[wsInstances.length - 1];
+    expect(ws._url).toBe("ws://portal:3003/ws/runtime");
+    ws.emit("open");
+    await connectPromise;
+    client.close();
+  });
+
+  it("converts https:// to wss:// in URL", async () => {
+    const client = await createClient({ serverUrl: "https://portal:3003" });
+    const connectPromise = client.connect();
+    const ws = wsInstances[wsInstances.length - 1];
+    expect(ws._url).toBe("wss://portal:3003/ws/runtime");
+    ws.emit("open");
+    await connectPromise;
+    client.close();
+  });
+
+  it("passes auth headers to WebSocket constructor", async () => {
+    const client = await createClient({
+      portalSecret: "my-secret",
+      agentId: "agent-99",
+    });
+    const connectPromise = client.connect();
+    const ws = wsInstances[wsInstances.length - 1];
+    expect(ws._options.headers["X-Auth-Token"]).toBe("my-secret");
+    expect(ws._options.headers["X-Agent-Id"]).toBe("agent-99");
+    ws.emit("open");
+    await connectPromise;
+    client.close();
+  });
+
+  // ── RPC error response ────────────────────────────────────
+
+  it("request() rejects when response has ok=false", async () => {
+    const client = await createClient();
+
+    const connectPromise = client.connect();
+    const ws = openLatestWs();
+    await connectPromise;
+
+    const requestPromise = client.request("bad.method");
+
+    const frame = JSON.parse(ws._sent[0]);
+    ws.emit("message", JSON.stringify({
+      type: "res",
+      id: frame.id,
+      ok: false,
+      error: "not found",
+    }));
+
+    await expect(requestPromise).rejects.toThrow("not found");
+
+    client.close();
+  });
+
+  // ── close() rejects pending RPCs ─────────────────────────────
+
+  it("close() rejects all pending RPCs", async () => {
+    const client = await createClient();
+
+    const connectPromise = client.connect();
+    openLatestWs();
+    await connectPromise;
+
+    // Send two requests but don't simulate any response
+    const p1 = client.request("method.one");
+    const p2 = client.request("method.two");
+
+    // Close before any response arrives
+    client.close();
+
+    await expect(p1).rejects.toThrow("closed");
+    await expect(p2).rejects.toThrow("closed");
+  });
+
+  // ── capability advertisement (runtime.register on open) ──────
+
+  it("advertises capabilities via runtime.register on open", async () => {
+    const client = await createClient({ capabilities: { compile: true } });
+    const connectPromise = client.connect();
+    const ws = openLatestWs();
+    await connectPromise;
+
+    expect(ws._sent).toHaveLength(1);
+    const frame = JSON.parse(ws._sent[0]);
+    expect(frame.type).toBe("req");
+    expect(frame.method).toBe("runtime.register");
+    expect(frame.params).toEqual({ capabilities: { compile: true } });
+
+    client.close();
+  });
+
+  it("does not advertise when capabilities are empty", async () => {
+    const client = await createClient(); // defaultOpts has no capabilities
+    const connectPromise = client.connect();
+    const ws = openLatestWs();
+    await connectPromise;
+
+    expect(ws._sent).toHaveLength(0);
+    client.close();
+  });
+
+  it("reports the sessions it is streaming, read fresh on every connect", async () => {
+    // The list has to be true when the frame goes out: a consumer settles every in-flight
+    // turn NOT named here, so a stale list either strands a live turn or keeps a dead one.
+    let live: string[] = ["s1", "s2"];
+    const client = await createClient({ capabilities: { compile: true } });
+    client.setActiveSessionsProvider(() => live);
+
+    const connectPromise = client.connect();
+    const ws1 = openLatestWs();
+    await connectPromise;
+    expect(JSON.parse(ws1._sent[0]).params).toEqual({ capabilities: { compile: true }, activeSessions: ["s1", "s2"] });
+
+    live = [];
+    ws1.emit("close");
+    await vi.advanceTimersByTimeAsync(3100);
+    const ws2 = openLatestWs();
+    // Empty is a real answer, not a missing one: it tells the consumer to settle everything.
+    expect(JSON.parse(ws2._sent[0]).params).toEqual({ capabilities: { compile: true }, activeSessions: [] });
+
+    client.close();
+  });
+
+  it("stays silent when there is nothing to advertise", async () => {
+    // No capabilities and nothing streaming: the frame would carry no information, and
+    // against a consumer that predates `runtime.register` it costs a rejected RPC and a
+    // warning line on every reconnect.
+    const client = await createClient(); // no capabilities
+    client.setActiveSessionsProvider(() => []);
+    const connectPromise = client.connect();
+    const ws = openLatestWs();
+    await connectPromise;
+
+    expect(ws._sent).toHaveLength(0);
+    client.close();
+  });
+
+  it("advertises live sessions even with no capabilities", async () => {
+    const client = await createClient(); // no capabilities
+    client.setActiveSessionsProvider(() => ["s1"]);
+    const connectPromise = client.connect();
+    const ws = openLatestWs();
+    await connectPromise;
+
+    expect(JSON.parse(ws._sent[0]).params).toEqual({ capabilities: {}, activeSessions: ["s1"] });
+    client.close();
+  });
+
+  it("still connects when the session provider throws", async () => {
+    // advertiseCapabilities runs inside the socket "open" listener, where a throw is an
+    // uncaughtException — and the value it is fetching is advisory.
+    const client = await createClient({ capabilities: { compile: true } });
+    client.setActiveSessionsProvider(() => { throw new Error("registry unavailable"); });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const connectPromise = client.connect();
+    const ws = openLatestWs();
+    await expect(connectPromise).resolves.toBeUndefined();
+
+    expect(JSON.parse(ws._sent[0]).params).toEqual({ capabilities: { compile: true } });
+    client.close();
+    warn.mockRestore();
+  });
+
+  it("re-advertises on every reconnect", async () => {
+    const client = await createClient({ capabilities: { compile: true } });
+    const connectPromise = client.connect();
+    const ws1 = openLatestWs();
+    await connectPromise;
+    expect(JSON.parse(ws1._sent[0]).method).toBe("runtime.register");
+
+    // Drop the connection and let the backoff timer fire a reconnect.
+    // First reconnect delay = base(1000) * 2^0 + jitter(0..2000) ≤ 3000ms.
+    ws1.emit("close");
+    await vi.advanceTimersByTimeAsync(3100);
+    const ws2 = openLatestWs();
+    expect(ws2).not.toBe(ws1);
+    expect(ws2._sent).toHaveLength(1);
+    expect(JSON.parse(ws2._sent[0]).method).toBe("runtime.register");
+
+    client.close();
+  });
+
+  it("notifies lifecycle observers after both initial connect and reconnect", async () => {
+    const client = await createClient();
+    const connected = vi.fn();
+    const unsubscribe = client.onConnected(connected);
+
+    const connectPromise = client.connect();
+    const ws1 = openLatestWs();
+    await connectPromise;
+    expect(connected).toHaveBeenCalledTimes(1);
+
+    ws1.emit("close");
+    await vi.advanceTimersByTimeAsync(3100);
+    openLatestWs();
+    expect(connected).toHaveBeenCalledTimes(2);
+
+    unsubscribe();
+    client.close();
+  });
+
+  it("survives an 'unknown method' ack from an older consumer (best-effort)", async () => {
+    const client = await createClient({ capabilities: { compile: true } });
+    const connectPromise = client.connect();
+    const ws = openLatestWs();
+    await connectPromise;
+
+    // Older consumer replies with an error for the unknown method.
+    const frame = JSON.parse(ws._sent[0]);
+    ws.emit("message", JSON.stringify({
+      type: "res",
+      id: frame.id,
+      ok: false,
+      error: "unknown method: runtime.register",
+    }));
+
+    // Connection stays up; a normal RPC still works afterwards.
+    expect(client.connected).toBe(true);
+    const p = client.request("config.getSettings");
+    const req = JSON.parse(ws._sent[ws._sent.length - 1]);
+    ws.emit("message", JSON.stringify({ type: "res", id: req.id, ok: true, payload: { ok: 1 } }));
+    await expect(p).resolves.toEqual({ ok: 1 });
+
+    client.close();
+  });
+});

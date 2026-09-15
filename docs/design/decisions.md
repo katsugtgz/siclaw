@@ -1,0 +1,878 @@
+---
+
+title: "Architecture Decision Records"
+sidebarTitle: "ADRs"
+description: "Key architectural decisions with context, rationale, and consequences."
+---
+
+# Architecture Decision Records (ADR)
+
+> Runtime update (2026-09-10): Siclaw has removed its interactive terminal interface. References to TUI in earlier decisions describe the historical implementation. The retained non-interactive CLI and the migration contract are documented in ADR-020 below.
+
+> **Format**: Context → Decision → Consequences
+>
+> These are decisions with non-obvious rationale. Future contributors should read the relevant ADR
+> before proposing changes to these areas. If a decision needs revisiting, update this file.
+
+---
+
+## ADR-001: sql.js (WASM SQLite) for Default Local Database
+
+**Status**: Active
+
+**Context**:
+The local/TUI deployment needs persistent storage with zero installation requirements. Options considered:
+- Native `better-sqlite3`: Requires native compilation, breaks on Node version mismatches
+- `node:sqlite` (built-in): Only available in Node.js 22.5+, not available in older LTS
+- `sql.js` (WASM): Pure JavaScript, zero native deps, runs anywhere Node.js runs
+- MySQL: Requires separate server process, too heavy for single-user local dev
+
+**Decision**:
+Use `sql.js` for local/default SQLite deployment. `node:sqlite` (built-in) is used only for the memory database (chunked embeddings) where WAL mode and performance matter more.
+
+**Consequences**:
+- ✅ Zero installation friction for local dev and TUI mode
+- ✅ Works on any platform without native compilation
+- ⚠️ Loads entire database into memory (fine for local scale, not for large deployments)
+- ⚠️ Single-process only (lockfile enforcement required)
+- ⚠️ Must call `flushSqliteDb()` before exit; 30s auto-flush for crash safety
+- ❌ Not suitable for multi-instance Gateway (use MySQL for production)
+
+**Revisit when**: Database size consistently exceeds ~100MB on local installs.
+
+---
+
+## ADR-002: LocalSpawner Runs AgentBox In-Process (Not Child Process)
+
+**Status**: Active
+
+**Context**:
+For local development, AgentBox instances need to be spawned per-user. Options:
+- **Child process** (ProcessSpawner): Fork a new Node.js process per user, communicate via HTTP. True process isolation but adds startup latency, IPC complexity, and debugging friction.
+- **In-process** (LocalSpawner): Create a new HTTP server (on a new port) within the Gateway process. Shares memory, faster startup, easier debugging.
+- **K8s Pod** (K8sSpawner): Full isolation but requires a K8s cluster.
+
+**Decision**:
+LocalSpawner runs AgentBox HTTP servers in-process, one per user, on ports 4000+. This is explicitly a **development convenience mode**, not a production isolation model.
+
+**Consequences**:
+- ✅ Fast spin-up (no process fork overhead)
+- ✅ Easy to debug (single process, single debugger session)
+- ✅ Per-Agent SessionManager state allows isolated MCP bindings without writing process-global settings
+- ⚠️ All Agents share the same filesystem — LocalSpawner uses Agent-scoped Knowledge/Skill targets and factory-bound handlers; process-global `skillsHandler.materialize()` remains forbidden
+- ⚠️ A crash in one user's session affects all users
+- ❌ Not a multi-tenant production model — use K8sSpawner for that
+
+**ProcessSpawner** exists as a middle ground (true process isolation, local machine) but is not the default. It may be promoted if local dev isolation needs increase.
+
+---
+
+## ADR-003: Skill Bundles Exclude Core Skills
+
+**Status**: Active
+
+**Context**:
+The skill bundle API (`/api/internal/skills/bundle`) delivers skills to AgentBox instances. Should it include core (built-in) skills?
+
+Options:
+- **Include all**: Bundle contains core + global + personal. Simple for AgentBox (one source of truth). Expensive: Gateway must serialize all core skill files on every request.
+- **Exclude core**: Bundle contains only global + personal. Core skills are baked into the Docker image / repo checkout. AgentBox reads them from disk directly.
+
+**Decision**:
+Bundles contain **only global + skillset (dev only) + personal skills**. Core skills are baked into the AgentBox Docker image at build time and read from `skills/core/` at runtime. Skillset skills (from Skill Spaces) are included only in dev bundles — they must be promoted to global scope before reaching production.
+
+**Consequences**:
+- ✅ Bundle requests are small and fast (no large static skill content)
+- ✅ Core skills are versioned with the code, not the database
+- ⚠️ `skillsHandler.materialize()` does NOT restore core skills — it only writes what's in the bundle
+- ⚠️ In local mode, only the scoped `createSkillsHandler()` may materialize a bundle, under `.siclaw/skills/agents/<agentId>/`; the process-global handler remains unsafe
+- ⚠️ The control plane resolves Agent Type inheritance, masks, and personal overlays before returning the effective bundle; materialized entries therefore remain available independently of the image-Built-in switch
+- ⚠️ A personal Preview can set `inheritBuiltins=false` to skip every image Built-in, or use `disabledBuiltins` to skip individual image-Built-in names; AgentBox applies that policy to both model-visible Skills and Skill scripts
+- ⚠️ LocalSpawner must inject the Agent-scoped Skill root into script tools; process-global script lookup would cross Agent boundaries even if model-visible Skills were filtered correctly
+- ⚠️ Skillset skills are dev-only — untested collaborative work cannot reach production without promotion to global
+
+---
+
+## ADR-004: Shell Security via Whitelist (Not Blacklist)
+
+**Status**: Active
+
+**Context**:
+The agent needs to run shell commands for K8s diagnostics. How do we bound the blast radius?
+
+Options:
+- **Blacklist dangerous commands**: Maintain a list of blocked patterns. Simpler but constantly needs updating as new attack vectors emerge.
+- **Whitelist allowed commands**: Only explicitly approved binaries can run. Safer by default but requires conscious additions.
+- **Full sandbox** (seccomp, gVisor): Maximum safety but high operational complexity and latency.
+
+**Decision**:
+Whitelist-only model with 4-pass validation: binary allowlist → per-command validators → kubectl subcommands → per-flag restrictions. Approximately 80+ allowed binaries, each with documented reasoning.
+
+**Consequences**:
+- ✅ New binaries cannot be used until consciously reviewed and added
+- ✅ Defense-in-depth: even if an attacker controls the command string, unknown binaries are blocked
+- ✅ Per-command flag restrictions prevent specific attack vectors (e.g., `curl` restricted to GET/HEAD/OPTIONS only — POST and data flags blocked)
+- ⚠️ Legitimate diagnostic tools may need to be explicitly added (file an issue explaining the use case)
+- ❌ `sed`, `awk` are intentionally excluded — use `grep`/`jq`/`yq` instead
+- ❌ Skill scripts are exempt from the allowlist — this is intentional (skill review gate is the safety mechanism)
+
+**Revisit when**: A legitimate diagnostic binary is frequently blocked and the use case is well-scoped.
+
+---
+
+## ADR-005: Hybrid Memory Search (Vector + FTS5)
+
+**Status**: Active
+
+**Context**:
+Memory search needs to handle both semantic similarity ("find memories about OOMKilled pods") and exact keyword matching ("find memories mentioning node-23"). Pure vector search misses exact terms; pure BM25 misses semantic similarity.
+
+**Decision**:
+Hybrid scoring: `score = vectorWeight × cosineSimilarity + ftsWeight × BM25`
+
+Default: `vectorWeight = 0.70`, `ftsWeight = 0.30` (source: `src/memory/indexer.ts:14-15`). Configurable via `MemorySearchConfig`.
+
+**Consequences**:
+- ✅ Handles both "find semantically similar incidents" and "find the exact error message I saw"
+- ✅ CJK-aware: Chinese queries use bigram OR matching; Latin queries use AND
+- ⚠️ Requires embedding API to be configured — memory search is unavailable without it
+- ⚠️ In-memory cosine similarity over all chunks: acceptable for personal-scale (~1000 chunks), not for team-scale (use sqlite-vec extension for that)
+
+**Future**: When chunk count consistently exceeds ~10k, evaluate sqlite-vec GPU-accelerated vector search.
+
+---
+
+## ADR-006: mTLS Only for K8s Mode
+
+**Status**: Active
+
+**Context**:
+Gateway needs to authenticate AgentBox requests. Options:
+- **Shared secret / API key**: Simple but static, hard to rotate, provides no identity beyond "valid key"
+- **JWT from Gateway**: Gateway signs a JWT for each AgentBox. Simpler than mTLS but asymmetric — Gateway authenticates AgentBox but not vice versa.
+- **mTLS (mutual TLS)**: Both sides present certificates. Identity is cryptographically bound to the certificate (no secrets in env vars). Industry standard for service mesh.
+
+**Decision**:
+mTLS for K8s mode only. LocalSpawner mode uses plain HTTP (same machine, in-process — mTLS would add latency for zero security benefit on loopback).
+
+- CA: 10-year, stored in DB, auto-renewed at 30-day threshold
+- Client certs: issued per-pod at spawn time, identity in CN/OU
+- Protected: `/api/internal/*` endpoints on Gateway HTTPS port 3002
+
+**Consequences**:
+- ✅ Zero-secret identity: no API keys in pod environment variables
+- ✅ Certificate rotation is automatic (new cert on each pod spawn)
+- ✅ Certificate encodes userId + workspaceId — Gateway can authorize without DB lookup
+- ⚠️ Certificate generation adds ~100ms to pod spawn time
+- ⚠️ CA must be backed up — losing it requires re-issuing certs for all active pods
+- ❌ Local dev (LocalSpawner) has no mTLS — internal APIs on 127.0.0.1 only
+
+---
+
+## ADR-007: Single Brain (pi-agent) Behind BrainSession Interface
+
+**Status**: Active
+
+**Context**:
+The agent runtime needs to support different LLM providers (OpenAI, Anthropic, Ollama, vLLM, ...). Should the project maintain multiple SDK-specific brain implementations, or one pluggable brain that talks to any OpenAI-compatible endpoint?
+
+**Decision**:
+Use a single brain implementation — `@mariozechner/pi-coding-agent` (the "pi-agent" brain) — exposed through the `BrainSession` interface. The brain talks to any OpenAI-compatible provider, so Anthropic / DeepSeek / Qwen / Kimi / Ollama / vLLM all work without dedicated SDK bindings. Tool exposure uses the TypeBox `ToolDefinition` protocol wired through `src/core/tool-registry.ts`.
+
+**Consequences**:
+- ✅ One tool protocol, one compaction strategy, one guard pipeline — no feature-parity gap to maintain
+- ✅ Provider switching is configuration, not code
+- ✅ Memory tools, context tracking, and `steer()` mid-run injection all work because there's no secondary backend to lag behind
+- ⚠️ Provider-specific features (e.g. Anthropic prompt caching) require going through pi-agent's provider layer; they are not accessed via a parallel SDK brain
+
+---
+
+## ADR-008: Cron HA via Database Coordination (Not Leader Election)
+
+**Status**: Active
+
+**Context**:
+Multiple Gateway instances can run in K8s. Cron jobs must fire exactly once. Options:
+- **Single cron pod**: Designate one pod as cron leader. Simple but a SPOF.
+- **External scheduler** (k8s CronJob): Offload to K8s. Requires separate Job management complexity.
+- **DB-based coordination**: Each instance registers, claims jobs via `assignedTo` field, detects dead instances via heartbeat.
+
+**Decision**:
+DB-based coordination with heartbeat. Each cron instance:
+1. Registers in `cron_instances` table with heartbeat every 30s
+2. Reconciles every 60s: claims unassigned or orphaned jobs (from instances dead > 90s)
+3. Runs job, updates `lastRunAt` + `lastResult`
+4. Releases jobs on graceful shutdown
+
+**Consequences**:
+- ✅ No single point of failure
+- ✅ No external dependencies (reuses existing DB)
+- ✅ Job ownership is explicit and auditable
+- ⚠️ Up to 90s delay in job reassignment after a crash (dead threshold)
+- ⚠️ Duplicate firing possible in edge case: instance A marks job "executing" but crashes before updating `lastRunAt`; instance B reclaims and fires again. Acceptable for SRE automation use cases; add idempotency guards in critical skill scripts.
+
+---
+
+## ADR-009: AgentBox Config via Settings File, Not Environment Variables
+
+**Status**: Active
+
+**Context**:
+AgentBox needs LLM provider config (API keys, base URLs, models) and embedding config from Gateway. Previously, Gateway delivered this through two redundant channels:
+
+1. **settings.json** — `GET /api/internal/settings` (mTLS-protected) returns full provider/embedding config; AgentBox writes it to `.siclaw/config/settings.json`
+2. **Environment variables** — Gateway's `envResolver` injected `SICLAW_LLM_API_KEY`, `SICLAW_LLM_BASE_URL`, `SICLAW_LLM_MODEL`, `SICLAW_EMBEDDING_*` into spawned pods/processes
+
+The env var channel has a larger attack surface:
+- `kubectl describe pod` shows all env vars in plain text
+- `/proc/self/environ` is readable from within the container
+- `ProcessSpawner` inherited Gateway's entire `process.env` (including secrets) into child processes
+
+Meanwhile, `.siclaw/config/settings.json` is protected: `restricted-bash.ts` blocks agent shell commands from reading it.
+
+Additionally, K8s DIR env vars (`SICLAW_SKILLS_DIR`, `SICLAW_USER_DATA_DIR`) were injected with values identical to `config.ts` defaults — redundant since each pod is isolated.
+
+**Decision**:
+Remove the env var delivery channel for LLM/embedding config. Settings.json (via mTLS `GET /api/internal/settings`) is the sole channel for delivering sensitive config to AgentBox in K8s mode.
+
+Removed:
+- `envResolver` in `server.ts` (injected `SICLAW_LLM_*`, `SICLAW_EMBEDDING_*`)
+- `EnvResolver` type and `setEnvResolver()` in `AgentBoxManager`
+- `resolveApiKey()` function (no longer needed — DB stores plain API keys)
+- `SICLAW_SKILLS_DIR` and `SICLAW_USER_DATA_DIR` from K8s pod env (match defaults)
+- `SICLAW_AGENTBOX_PORT` — K8s always uses default 3000
+- `SICLAW_CERT_PATH` — code default is already `/etc/siclaw/certs`
+- `SICLAW_CREDENTIALS_DIR` — switched to default `.siclaw/credentials` (Dockerfile already creates it; `restricted-bash.ts` blocks agent access)
+- `USER_ID` — was injected but never read by AgentBox code
+- `SICLAW_WORKSPACE_ALLOWED_TOOLS` — was injected but never read by AgentBox code
+
+Kept as env vars (bootstrap or third-party library):
+- `SICLAW_GATEWAY_URL` — needed before settings can be fetched (bootstrap dependency)
+- `PI_CODING_AGENT_DIR` — pi-coding-agent library reads this env var to determine its config/session storage directory; no config file alternative available
+
+Unchanged:
+- TUI mode: `applyEnvOverrides()` in `config.ts` still reads `SICLAW_API_KEY` etc. for users who set env vars directly
+- ProcessSpawner: still injects `SICLAW_USER_DATA_DIR` per-user for dev isolation
+
+**Consequences**:
+- ✅ API keys no longer visible via `kubectl describe pod`
+- ✅ Single delivery channel eliminates redundancy and reduces confusion
+- ✅ Settings file is protected from agent access by `restricted-bash.ts`
+- ✅ K8s pod spec is simpler (fewer env vars)
+- ⚠️ AgentBox must successfully fetch settings from Gateway before creating sessions — if Gateway is unreachable, AgentBox has no LLM config (this was already the case)
+
+**Revisit when**: A legitimate use case requires env-var-based config delivery to AgentBox (e.g., sidecar injection patterns that cannot use HTTP).
+
+---
+
+## ADR-010: Dual-User OS Isolation for AgentBox Child Processes
+
+**Status**: Accepted
+
+**Context**:
+The LLM agent executes shell commands inside the AgentBox container via `restricted-bash.ts`. Previously, child processes ran as the same `agentbox` user as the main Node.js process, meaning they could read kubeconfig files, mTLS certificates, and config files.
+
+A real incident demonstrated the vulnerability: the agent used `kubectl get pods | cut -c1-2000 ~/.siclaw/credentials/kubeconfig` to read credentials via a text-processing command after a pipe. Application-level fixes (pipeOnly rules, noFilePaths checks, blockedFlags) were implemented but cannot enumerate all bypass techniques — the attack surface is fundamentally too large for application-level-only defense.
+
+Options considered:
+- **Application-level only**: COMMAND_RULES with pipeOnly, noFilePaths, blockedFlags. Implemented but insufficient as primary defense (whack-a-mole against creative command combinations).
+- **kubectl proxy**: Main process runs `kubectl proxy`, child processes use HTTP. But `kubectl exec` requires direct API connection (not proxy-able), so this is incomplete.
+- **Separate kubectl tool**: Move kubectl out of bash into a dedicated tool. Breaks natural pipeline syntax (`kubectl get pods | grep Error`).
+- **Dual-user + setgid kubectl**: Run child processes as `sandbox` user; kubectl binary gets setgid `kubecred` group for kubeconfig access. Preserves pipeline syntax, provides OS-level isolation.
+
+**Decision**:
+Adopt dual-user model with setgid kubectl:
+- Main process runs as `agentbox` (UID 1000, groups: agentbox + kubecred)
+- Child processes run as `sandbox` (UID 1001, group: sandbox) via `sudo -E -u sandbox`
+- kubectl binary has setgid bit for `kubecred` group (`chmod 2755`, `chgrp kubecred`)
+- Kubeconfig files: `agentbox:kubecred 0640` (readable by agentbox and kubectl, not by sandbox)
+- Other credentials: `agentbox:agentbox 0600` (readable only by agentbox)
+
+Container requires `CAP_SETUID` + `CAP_SETGID` capabilities (all others dropped).
+
+Application-level command validation (COMMAND_RULES, whitelist, shell operator blocking) is retained as defense-in-depth, not as primary credential protection.
+
+> **Regressed 2026-04 to 2026-08, restored since.** `sandbox` was granted `kubecred` and `hostcred`
+> alongside the host-credential pipeline, for a setgid `ssh` reader that was never built (and turned out
+> unnecessary — `host_exec` dials from the node process). Combined with an entrypoint line that chowned
+> the whole credential tree to `kubecred`, this made every credential file readable by any child
+> process, leaving the command validation this ADR demotes to defense-in-depth as the only barrier.
+> Neither change was wrong in isolation, and the baked image looked correct — only the running container
+> was exposed, which is why it went unnoticed for four months. The build now fails and the container
+> refuses to start if `sandbox` holds either group.
+
+**Consequences**:
+- ✅ Credential files are OS-protected — no application-level bypass possible for file reads
+- ✅ Pipeline syntax preserved: `kubectl get pods | grep Error` works naturally
+- ✅ Application-level rules become secondary defense, not sole defense
+- ✅ `sanitizeEnv()` still needed (env vars are in-memory, not file-based)
+- ⚠️ Container needs `CAP_SETUID` + `CAP_SETGID` — all other capabilities dropped
+- ⚠️ `allowPrivilegeEscalation` must be true for sudo's SUID and kubectl's setgid to work
+- ⚠️ Node.js process compromise (agentbox user) still grants kubeconfig access — mitigate with K8s RBAC scope
+- ❌ Adds ~2ms overhead per command execution (sudo fork)
+
+**Full design**: `docs/design/security.md`
+
+**Revisit when**: Container runtime supports rootless user namespace mapping natively (e.g., Kubernetes UserNamespacesSupport GA), which would eliminate the need for CAP_SETUID.
+
+---
+
+## ADR-011: Production/Test Environment Isolation via Workspace-Level AgentBox Credential Scoping
+
+**Status**: Accepted
+
+**Context**:
+Siclaw manages multiple K8s clusters (environments) for SRE diagnosis. Some are production, some are test/staging. Without isolation, a single AgentBox receives all credentials — an agent operating on test data could accidentally (or be tricked into) accessing production clusters, and test-only users have no enforcement boundary.
+
+Three isolation strategies were evaluated:
+
+- **Prompt-based**: Inject environment awareness into the LLM system prompt. Rejected — models forget instructions, no hard guarantee.
+- **Per-tool guard**: Check environment permissions in each tool (`restricted-bash.ts`, `ssh_exec`, `metrics_query`, etc.) before execution. Rejected — too many tools to guard, high maintenance cost, easy to miss a path.
+- **AgentBox-level credential scoping**: Filter credentials at injection time so the AgentBox only sees what its workspace type allows. The agent physically cannot access credentials it was never given.
+
+**Decision**:
+Environment isolation is enforced at the **workspace level** via credential scoping. Each workspace has an `envType` ("prod" or "test") that determines which credentials are injected into its AgentBox.
+
+### Data Model Changes
+
+**1. `workspaces` table — add `envType`**
+```sql
+ALTER TABLE workspaces ADD COLUMN env_type TEXT NOT NULL DEFAULT 'prod';
+-- Values: 'prod' | 'test'
+```
+
+**2. `environments` table — add `apiServer` (required)**
+```sql
+ALTER TABLE environments ADD COLUMN api_server TEXT NOT NULL;
+```
+Admin must provide the K8s API server address when creating an environment. This anchors the environment to a specific cluster and enables kubeconfig upload validation.
+
+### Credential Scoping Rules
+
+**Kubeconfig credentials** (managed via `userEnvConfigs`):
+- Bound to an `environment` record. The environment's `isTest` flag determines whether it is a prod or test credential.
+- On upload, the kubeconfig's `clusters[].cluster.server` is validated against `environment.apiServer`. Mismatch → rejected.
+
+**Non-kubeconfig credentials** (SSH keys, API tokens — in `credentials` table):
+- Phase 1: only injected into prod workspaces. Test workspaces get kubeconfig access only.
+- Phase 2 (future): add `envScope` field to `credentials` table when SSH/API template governance is designed.
+
+### Visibility Matrix
+
+| Credential source | Prod workspace | Test workspace |
+|---|---|---|
+| Kubeconfig for `isTest=false` environment | ✅ | ❌ |
+| Kubeconfig for `isTest=true` environment | ✅ | ✅ |
+| Non-kubeconfig credential (Phase 1) | ✅ | ❌ |
+
+Production workspaces see everything (may need to compare prod vs test). Test workspaces see only test kubeconfigs (cannot touch production).
+
+### Environment ↔ Workspace Binding Constraint
+
+```
+workspace.envType === "test" → can only bind environments where isTest=true
+workspace.envType === "prod" → can bind any environment (prod or test)
+```
+
+### Kubeconfig Upload Validation
+
+```
+User uploads kubeconfig for environment E:
+  1. E.apiServer must be non-null (enforced at environment creation)
+  2. Parse kubeconfig YAML → extract clusters[].cluster.server
+  3. E.apiServer must appear in the extracted server list
+  4. Mismatch → reject with error showing expected vs actual
+```
+
+This prevents a user from uploading a kubeconfig for cluster D while claiming it is for cluster A.
+
+### testOnly User Enforcement
+
+```
+user.testOnly === true → can only create workspaces with envType="test"
+```
+
+Checked at workspace creation time in the Gateway API layer. No enforcement needed inside AgentBox — the credential set is already filtered.
+
+### Investigation Memory Isolation
+
+Each workspace has its own memory database. Investigations in a prod workspace do not appear in a test workspace's context, and vice versa. Memory DB path: `<userDataDir>/<workspaceId>/.memory.db`.
+
+### Credential Payload Building (Gateway)
+
+```typescript
+function buildCredentialPayload(userId, workspace) {
+  const { envType } = workspace;
+  const envs = getWorkspaceEnvironments(workspace.id);
+
+  // Kubeconfigs: filter by workspace envType
+  const kubeconfigs = [];
+  for (const env of envs) {
+    const config = getUserEnvConfig(userId, env.id);
+    if (config) kubeconfigs.push({ name: env.name, content: config.kubeconfig });
+  }
+  // Binding constraint already ensures test workspace has no prod envs
+
+  // Non-kubeconfig credentials: prod only (Phase 1)
+  const otherCreds = envType === "prod"
+    ? getWorkspaceCredentials(workspace.id)
+    : [];
+
+  return [...kubeconfigs, ...otherCreds];
+}
+```
+
+### Cron Job Isolation
+
+Cron jobs are bound to a workspace (`cronJobs.workspaceId`). The workspace's `envType` determines which AgentBox (and therefore which credentials) the cron job runs with. No additional cron-specific isolation logic needed.
+
+**Consequences**:
+- ✅ Zero changes to spawner layer — boxKey, podName, AgentBox lifecycle all unchanged
+- ✅ Zero changes to tool layer — no per-tool environment guards needed
+- ✅ Hard isolation — AgentBox physically cannot access credentials it was not given
+- ✅ Admin governance — users cannot create environments, cannot change isTest/apiServer
+- ✅ Kubeconfig validation — prevents credential spoofing via apiServer anchoring
+- ⚠️ Users who need both prod and test access must maintain two workspaces
+- ⚠️ Non-kubeconfig credentials are prod-only in Phase 1 (SSH/API governance deferred)
+- ⚠️ Memory isolation means investigation insights do not transfer across workspace types — acceptable tradeoff for security
+
+**Revisit when**: Non-kubeconfig credential types (SSH, API) need environment-aware governance. At that point, add `envScope` to `credentials` table or extend the environment template model with endpoint validation anchors (similar to apiServer for K8s).
+
+---
+
+## ADR-012: Unified Command Security Model (COMMANDS + CONTEXT_POLICIES)
+
+**Status**: Active (PR #189, 2026-03-30)
+
+**Context**:
+The command security model was spread across 4 separate data structures (`ALLOWED_COMMANDS`, `COMMAND_CATEGORIES`, `COMMAND_RULES`, `CUSTOM_VALIDATORS`). Adding a single command required changes to 2-4 places. Per-command constraints were inconsistent — some used `allowedFlags`, others `blockedFlags`, others custom validators, with no clear principle for when to use which.
+
+**Decision**:
+Unify into two structures:
+- `COMMANDS: Record<string, CommandDef>` — one definition per command carrying category, declarative constraints, and optional custom validator
+- `CONTEXT_POLICIES: Record<string, ContextPolicy>` — which command categories are available per execution context (local, node, pod), plus context-level constraints (e.g., text commands are pipe-only in local context)
+
+Key design choices:
+- `pipeOnly` / `noFilePaths` became context-level policies, not per-command attributes
+- Complex validators (curl, kubectl) remain as `validate` escape hatches — their logic is too intricate for declarative rules
+- Safety constraints apply everywhere; context filtering is a separate layer
+
+**Consequences**:
+- ✅ Adding a command is now a single `CommandDef` entry
+- ✅ Context availability is orthogonal to command safety — no more duplicated constraints
+- ✅ Easier to audit — one place to see everything about a command
+- ⚠️ Complex validators (12 commands) still need per-command escape hatches
+
+**Files**: `src/tools/infra/command-sets.ts`, `src/tools/infra/command-validator.ts`
+
+---
+
+## ADR-013: Multi-Level SSH Jump Hosts via Self-Referencing `jump_host_id`
+
+**Status**: Active (2026-06, feat/ssh-jump-host)
+
+**Context**:
+`host_exec` / `host_script` could only reach directly-routable hosts. Production
+bare-metal / storage / GPU nodes typically sit behind a bastion. ADR-011 left
+non-kubeconfig credential governance for later ("Revisit when: SSH/API need
+environment-aware governance") — this is the first step.
+
+**Decision**:
+Model bastions with standard OpenSSH ProxyJump semantics, not a platform-specific
+scheme:
+- `hosts.jump_host_id` is a self-reference naming the next hop; each bastion is
+  its own managed host row with its own credentials (≡ ssh_config `ProxyJump
+  <named-host>`). Chains cap at depth 3.
+- The execution layer (`ssh-dial.ts`, broker-free) dials hop-by-hop via ssh2
+  `forwardOut` + `sock`; every hop does its own end-to-end handshake, so bastions
+  relay only ciphertext.
+- Credential boundaries carry the bastion's NAME (neutral wire reference); the
+  management server resolves `jump_host_id` → name so no internal id leaks into
+  the standard-SSH layer.
+- Binding an agent to a target transitively authorizes its jump chain. The
+  agentbox authenticates every hop, so an **explicit-credential** bastion's
+  key/password is materialized onto it (0600) like any bound host — only a
+  **managed** target's key stays solely on the bastion.
+**Consequences**:
+- ✅ Standard, portable model — the same inventory works standalone or driven by
+  an external management server
+- ✅ Reuses the existing CredentialBroker + security pipeline; no new credential store
+- ⚠️ Transitive authorization materializes onto the agentbox the credentials of
+  every **explicit** bastion in a bound target's chain (managed bastions excepted)
+- ⚠️ `is_production` is enforced only on the directly-bound entry host; a test
+  target whose chain includes a prod bastion materializes that prod bastion's key
+  onto a test agentbox — keep chains within one trust tier
+- ⚠️ The WS-RPC `credential.get` path does not enforce `is_production` matching on
+  the binding (pre-existing; shared with the cluster branch); the transitive jump
+  check mirrors each path's existing policy. Tracked as a separate follow-up.
+
+**Files**: `src/tools/infra/ssh-dial.ts`, `src/tools/infra/ssh-client.ts`, `src/portal/adapter.ts`, `src/portal/host-api.ts`, `src/portal/migrate.ts`; full contract in `docs/design/ssh-jump-host.md`
+
+**Update (2026-06, feat/ssh-managed-jump): managed auth now supported.**
+The original decision excluded "managed" target auth (last-hop key read off the
+bastion) as a community anti-pattern. Reversed by product decision to support a credential-on-bastion form. siclaw now supports
+`auth_type="managed"`: the target stores no credential; `ssh-dial` reads the first
+readable `~/.ssh/id_*` off the bastion at dial time and uses it for the final hop
+(target username + optional passphrase from the host record). Constraints: a managed
+host **requires a jump host**; the key is **not** broker-materialized (it lives on
+the bastion and transits agentbox memory) — an explicit, documented tradeoff vs.
+explicit per-hop credentials. Mechanism: read the first readable `~/.ssh/id_*` off the bastion for the final hop.
+
+---
+
+## ADR-014: Metrics — Prometheus Federation Only (Removed In-Memory Live-Counter Path)
+
+**Status**: Active
+
+**Context**:
+The metrics surface had two parallel paths. Path ①: an in-memory live-counter / top-N
+pipeline (per-process `LocalCollector` → gateway `MetricsAggregator` counter maps → the
+`metrics.live` RPC → the Portal "live" and "timing" dashboard widgets). Path ②: Prometheus
+federation (each agentbox's prom-client snapshot → gateway federation aggregator →
+`GET /metrics` → external Grafana). The path-① widgets (`RankedTable`, `TimingStatsCard`,
+`useLive`, `useTimingStats`) and their endpoints (`/metrics/live`, `/metrics/timing`) had
+no remaining frontend consumer — the dashboard never mounted them.
+
+**Decision**:
+Remove path ① entirely across all layers — frontend widgets, the Portal `/metrics/live`
+and `/metrics/timing` endpoints, the gateway `metrics.live` RPC, the aggregator's counter
+maps, and the whole `LocalCollector`. `MetricsAggregator` is now a federation-only pull
+loop. The agentbox `/api/internal/metrics-snapshot` pull and the SIGTERM
+`/api/internal/metrics-flush` push share one `MetricsFlushPayload { incarnation, prom }`.
+At the time of ADR-014, per-message `ttft_ms` was kept for the chat badge.
+ADR-018 supersedes that field: timing now comes only from `metadata.llm_call.ms`.
+
+**Scope — which boxes are pulled**:
+Only boxes running the default `agent` profile serve `/api/internal/metrics-snapshot`.
+The pod list the loop reads is selected by the `app=agentbox` label, which every spawned
+box carries including the KB compile boxes (Python, a different HTTP contract), so
+pull-eligibility is judged by profile, not by the label. Liveness — what
+`retainInstances` grace-evicts against — deliberately stays the FULL box list: a box that
+reaches federation by some other route (the SIGTERM flush, keyed on cert identity rather
+than profile) must not be evicted while it is still running.
+
+**Consequences**:
+- ✅ One metrics path instead of two; no in-memory counter state on the gateway
+- ✅ External Grafana unaffected — every federated `siclaw_*` series is unchanged
+  (`sessions_active` / `tool_calls_total` / `skill_calls_total` come from prom-client, not LocalCollector)
+- ⚠️ Lost the per-user/per-agent top-N tool/skill breakdown — but it only ever fed the
+  now-removed in-app dashboard, never external Prometheus
+- ⚠️ **Rolling-upgrade ordering**: the agentbox snapshot payload slimmed from
+  `{activeSessions, toolCallDeltas, skillCallDeltas, incarnation, prom}` to `{incarnation, prom}`.
+  An OLD gateway pulling a NEW agentbox throws a caught, transient `TypeError` in its pull
+  loop (skips that 30s federation cycle, self-heals on the next pull, no data loss). **Roll
+  the gateway Deployment before agentboxes** to avoid it entirely; a new gateway tolerates
+  the old (richer) payload by ignoring the extra fields.
+
+**Files**: `src/gateway/metrics-aggregator.ts`, `src/shared/metrics-types.ts`, `src/agentbox/http-server.ts`, `src/gateway/server.ts`, `src/portal/siclaw-api.ts`, `portal-web/src/hooks/useMetrics.ts`
+
+---
+
+## ADR-015: Agent Type Releases Apply at Turn Boundaries
+
+**Status**: Active
+
+**Context**:
+An external management server can move an Agent Type's production Release while
+existing AgentBoxes and sessions are warm. Skills, MCP, knowledge, prompt, and
+model configuration belong to one immutable Release, but replacing a model in
+the middle of an in-flight turn would make one turn span two configurations.
+Treating a generic reload ACK as proof that a particular model was prepared also
+allows stale or unrelated Release notifications to report success.
+
+**Decision**:
+Release application is identity-bound and happens at a turn boundary:
+
+- Identity-bound callers send the expected `releaseId` and `modelFingerprint`.
+  Runtime resolves the current binding from the management server and rejects a
+  notification whose prepared identity does not match either supplied value.
+  Legacy callers may omit the expected identity; that compatibility path reports
+  what was prepared but cannot reject a stale notification.
+- `model` is a reload type whose AgentBox action invalidates warm sessions. The
+  existing invalidation fence lets an in-flight turn finish and rebuilds the
+  session before its next prompt.
+- The next prompt remains the only carrier of provider credentials and model
+  configuration. Reload notifications carry identity, never secrets.
+- The reload response reports the prepared Release identity and number of
+  reached boxes as `preparedReleaseId` and `preparedModelFingerprint`.
+  Zero boxes means cold-start convergence, not runtime model verification.
+- A reload ACK proves preparation only. AgentBox records an observed release
+  and model fingerprint after a real turn completes successfully; only that
+  observed inventory can satisfy management-server runtime verification.
+
+**Consequences**:
+
+- ✅ Existing Agents switch models without a Pod restart on their next turn.
+- ✅ A turn never mixes model configurations.
+- ✅ Reload events are safe to retry and stale Release ACKs are detectable.
+- ✅ Provider credentials stay on the established prompt/config channel.
+- ⚠️ "Published" and "applied to an online box" are distinct states.
+- ⚠️ "Prepared for next turn" and "successfully ran a turn" are distinct
+  states; promotion gates consume only the latter.
+- ⚠️ Management servers predating this contract must keep model deliveries
+  pending while an older Runtime is deployed. Roll out Runtime support first,
+  then publish an AgentBox image containing observed-model reporting, update
+  `SICLAW_AGENTBOX_IMAGE`, and recycle existing AgentBox Pods before enabling
+  verified model delivery. Subsequent Release model changes use the turn-boundary
+  session fence and do not require another Pod restart.
+
+**Files**: `src/shared/gateway-sync.ts`, `src/gateway/server.ts`,
+`src/gateway/agent-model-binding.ts`, `src/agentbox/sync-handlers.ts`,
+`src/agentbox/http-server.ts`
+
+---
+
+## ADR-016: Compile Prompt and Runtime Harness from One Agent Context
+
+**Status**: Active
+
+**Context**:
+Siclaw assembled every session on top of an SRE-oriented default prompt and
+then appended an Agent type prompt. A Knowledge QA Agent therefore still saw
+cluster-binding, shell, workflow, memory, and ambient skill instructions even
+when its built-in tool whitelist was read-only. This made routing depend on
+conflicting prompt recency and made it difficult to prove the exact context a
+provider received. Initial capability lookup failures also shared the same null
+value as the legacy unrestricted Custom configuration.
+
+**Decision**:
+Introduce one Agent Context compiler at the session-factory boundary. Its input
+is Agent type, resolved tool policy, mode, memory configuration, and delegation
+constraint. Its outputs are:
+
+- a role-neutral system prompt with capability-derived infrastructure,
+  workflow, memory, skill-authoring, and operational-safety sections;
+- an immutable built-in Agent Type contract plus an optional Agent-owned
+  Addendum, rather than a persisted prompt that replaces the type contract;
+- an enforceable harness for built-in tools, configured MCP exposure, memory,
+  and allowed skill roots.
+
+All AgentBox and Portal-backed TUI entry points pass the locked Agent type and
+resolution state through this compiler. Unresolved startup is fail-closed.
+Custom plus a successfully resolved null selection remains the sole legacy
+unrestricted case. Session and final provider-envelope manifests record only
+hashes, lengths, layer provenance, and model-visible resource names, never
+prompt or user content. Exact effective prompt/tool inspection is available
+only through an explicit administrator request for a resident session.
+
+**Consequences**:
+
+- ✅ QA cold starts without SRE cluster-binding or shell guidance.
+- ✅ Prompt claims and model-visible tools/skills derive from one policy.
+- ✅ Capability-sync failure cannot silently become an unrestricted session.
+- ✅ Knowledge QA has a complete Wiki catalog → labels-only resolver → full
+  Read → citation retrieval stack without content-index hydration.
+- ✅ LocalSpawner materializes explicitly bound Skills and MCP per Agent before
+  the first prompt, without leaking process-global SRE resources into QA.
+- ✅ Domain-neutral state-change confirmation rules apply even when a QA or
+  Coordinator is explicitly bound to an effectful MCP.
+- ✅ Wire-level prompt/tool identity is auditable without sensitive logging.
+- ✅ A deterministic prompt-design check covers layer ownership, completion,
+  capability/tool alignment, retrieval behavior, duplication, and size.
+- ⚠️ QA/Coordinator no longer inherit host-global or repo-bundled operational
+  skills; required skills must be explicitly bound.
+- ⚠️ Explicitly configured MCP remains orthogonal to built-in capability
+  groups. The current MCP wire payload has no effect classification or binding
+  provenance, so Agent-type-safe selection is enforced by the control plane,
+  not guessed from dynamic tool names in Siclaw.
+- ⚠️ Persisted full-template overrides remain compatible and therefore do not
+  receive bundled role sections; the hardcoded Safety/Language suffix remains.
+
+**Files**: `src/core/agent-context.ts`, `src/core/prompt.ts`,
+`src/core/agent-factory.ts`, `src/core/model-envelope.ts`,
+`src/core/prompt-inspection.ts`,
+`src/agentbox-main.ts`, `src/gateway/agentbox/local-spawner.ts`
+
+---
+
+## ADR-017: Knowledge Labels Are Page Metadata and an Independent Retrieval Signal
+
+**Status**: Active
+
+**Context**:
+The runtime previously injected only the first 8,000 characters of `index.md`.
+That prefix looked complete while silently hiding valid pages, so an Agent could
+wrongly conclude that the Wiki did not cover a question. Content indexes that
+require FTS/vector construction or embedding hydration add another cold-start
+dependency and can take minutes or fail under provider rate limits. A
+package-specific hardcoded route would solve only the observed question.
+Labels also need to survive compiler → control plane → AgentBox without Sicore
+and Siclaw independently inferring different taxonomies.
+
+**Decision**:
+Store typed Knowledge Labels in each OKF v0.2 concept page's frontmatter. A
+label has one facet (`entity`, `topic`, `task`, `component`, `environment`, or
+`version`), a canonical human-readable value, and optional aliases. Siclaw KBC
+generates labels; Sicore validates their shape and transports them unchanged.
+
+The complete root `index.md` is injected into the model prompt as the common
+navigation baseline. AgentBox also derives an in-memory, paginated Label Catalog
+from page frontmatter before the first turn. `knowledge_search` resolves typed
+labels and aliases only; it never searches page bodies, creates a database, or
+opens an embedding provider. It returns page metadata, matched labels, alias
+reasons, and one deterministic shortest route from the root catalog to each
+leaf, never snippets. A labeled page outside the root catalog graph is excluded
+and reported as unreachable. The route proves publication and reachability; it
+does not claim that the Agent read every intermediate catalog. Labels and
+catalog entries never count as answer evidence; the Agent reads and cites only
+the supporting leaf pages.
+
+**Consequences**:
+
+- ✅ Every root-index route remains visible; no valid tail page is silently lost.
+- ✅ Known entities, tasks, versions, and aliases route without FTS, vectors, a database, or an embedding call.
+- ✅ The first QA turn has no content-index hydration dependency.
+- ✅ One page-level contract flows unchanged through compilation and delivery.
+- ✅ Every label result proves its canonical root-to-leaf catalog route; orphan labels cannot bypass publication.
+- ✅ Existing and third-party OKF v0.2 packages without labels navigate through the complete root index.
+- ⚠️ Label quality is a compiler-quality concern and needs later retrieval evaluation.
+- ⚠️ The full root index consumes fixed prompt tokens; KBC must keep entries concise, and any future oversized representation must remain complete rather than head-truncated.
+- ❌ A label match is not a citation or permission to answer without reading the page.
+
+**Files**: `kbc/platform/pod/selfcheck.py`, `src/knowledge/labels.ts`,
+`src/knowledge/resolver.ts`, `src/tools/query/knowledge-search.ts`
+
+---
+
+## ADR-018: Model Timing Is Measured at the Provider Boundary, One Row per Model Call
+
+**Status**: Active
+
+**Context**:
+Model timing used to be inferred in the gateway from the arrival times of SSE
+events: `pre_thinking_ms` on tool rows (previous boundary → tool start),
+`timing.{ttft_ms, thinking_ms, output_ms, turn_total_ms}` on assistant rows, a
+`NOISE_FLOOR` heuristic to stop `ttft` and `thinking` double-counting, and a
+portal-supplied `turnStartMs` anchor on another pod's clock. A model call that
+returned only tool calls had no row at all, so its time was parked on the tool
+rows; reasoning text was dropped; the provider's `usage` (including reasoning
+tokens) never reached the database. Downstream time accounting had to
+carry a page of caveats about which field to add when.
+
+**Decision**:
+Measure every provider request where it happens. `src/core/llm-call-recorder.ts`
+wraps `agent.streamFn` as the innermost layer (before the guard pipeline) and
+records, on the agentbox's own clock: request sent, HTTP headers (`start`), first
+content token, every thinking/text/tool-call block edge, response end, the
+provider's `usage`, and the stop reason. The result is stamped onto the assistant
+message as `llmCall` and travels with `message_end`; the gateway persists a
+redacted copy as `chat_messages.metadata.llm_call`.
+
+Persistence contract (web/api/a2a `sse-consumer.ts` and Lark
+`collectChannelResponse` alike):
+
+- **One agent-loop model call ⇒ one assistant row** carrying `metadata.llm_call`,
+  even when `content` is empty (tool-only call). Rounds are numbered from 1 per
+  prompt; a routing rollback rewinds the counter, and the discarded attempt's
+  envelopes ride the `model_route_notice` row as `discarded_llm_calls`. For
+  in-turn provider retries, recovered failures remain as empty model-call rows;
+  if the turn ultimately fails, earlier failures remain empty model-call rows
+  and the final failure's envelope rides the single `error_response` row.
+- **Reasoning text is its own row** (`kind: "thinking"`, `metadata.llm_round`),
+  written immediately before the model-call row and linked back via
+  `llm_call.thinking_row_id`. Redacted like any other content, then clipped at
+  a UTF-8 boundary to MySQL TEXT's 65,535-byte limit, including the truncation
+  marker (`metadata.truncated: true`). A failed reasoning insert is logged and
+  does not prevent the answer row from being written.
+- **Tool rows carry `metadata.llm_round` and `metadata.tool_call_id`**; their
+  `duration_ms` and `started_at` come from `startedAt`/`endedAt` stamped by
+  `PiAgentBrain.enrichToolEvent` on the same clock. Two consecutive model calls
+  bound a *tool group*; its span is the next call's `since_prev_ms`.
+- Compaction / summarisation calls share `streamFn` but consume no round; they
+  are folded into the next agent call's `aux_calls`.
+- The prompt boundary is explicit (`brain.llmCalls.beginPrompt` at HTTP receipt,
+  `endPrompt` in `actuallyFinish`) so round 1's `since_prev_ms` is the setup time;
+  synthetic notification turns also explicitly bracket the entire routing run
+  and apply attempt/rollback events. Other paths open it implicitly on the first call.
+- Buffered failed attempts carry only their envelopes on the routing switch's
+  `discardedLlmCalls`; consumers attach those to the same notice as live-attempt
+  envelopes. Discarded answer/reasoning text is never replayed. The synthetic
+  notification path still uses its existing conditional report persistence,
+  rather than the full SSE timeline persistence described above.
+
+The old fields are **not written any more and readers must not fall back to
+them**. `turnStartMs` is accepted on the wire and ignored.
+
+**Consequences**:
+
+- ✅ `net_ttft + thinking + output == total` per call, and `setup + Σ call + Σ tool group ≈ wall` per prompt — a partition that can be audited instead of a set of overlapping badges.
+- ✅ Reasoning tokens (`usage.reasoning`) and reasoning text are retained; output tok/s is computable.
+- ✅ Tool-only calls, failed calls and rolled-back attempts all appear on the timeline.
+- ✅ No schema change: envelope in `metadata`, thinking in `content`, grouping keys in `metadata`.
+- Empty model-call carriers deliberately have no separate row kind: they are
+  identified by assistant role, empty content, `llm_call`, and no `kind`.
+  Error/route notice kinds take precedence, even when content is empty.
+  Portal chat list/count and task traces share `transcriptVisiblePredicate`,
+  using dialect-aware JSON extraction before pagination rather than serialized
+  substring matching. NULL-metadata legacy rows remain visible.
+- ⚠️ One extra row per model call, plus one per call with reasoning text. Thinking rows and empty model-call carriers are hidden in transcripts, but `chat_sessions.message_count` and the Portal's generic `message_count` metric remain physical-row counts by the existing persistence contract. Any reader of `chat_messages` must treat `kind: "thinking"` as a hidden assistant kind before this runtime ships, or a call's own reasoning counts as a reply.
+- ⚠️ Providers that hide reasoning (`reasoning_tokens` without `reasoning_content`) report `thinking_visible: false`; their reasoning time is inside `net_ttft` and is not guessed at.
+- ❌ Historical rows without `llm_call` have no time accounting — only the wall clock.
+
+**Files**: `src/core/llm-call-recorder.ts`, `src/core/agent-factory.ts`,
+`src/core/brains/pi-agent-brain.ts`, `src/agentbox/http-server.ts`,
+`src/gateway/sse-consumer.ts`, `src/gateway/llm-call-rows.ts`,
+`src/gateway/channels/lark.ts`, `src/portal/metrics-timing.ts`,
+`src/shared/message-kinds.ts`
+
+## ADR-019: Coordinate Sandbox Tool Traffic Outside the Runner
+
+**Status**: Accepted (2026-09-11).
+
+**Context**: Serial SDK calls make fleet diagnostics slow. Increasing both script
+and tool concurrency without a shared target budget multiplies load across
+Runtime replicas and resource aliases.
+
+**Decision**: Permit ten scripts per Runtime and ten SDK lanes per script. The
+trusted Runtime derives target digests from freshly authorized credentials and
+requests atomic admission from the control plane. Cluster/MCP origins share ten
+active invocations and a 10/s, burst-20 token bucket. Host/node/Pod targets admit
+one at a time; all Pod containers share the leaf slot, including default selection.
+Queueing is bounded and credentials are resolved again after waiting. Confirmed
+completion releases a lease; uncertain completion retains its bounded expiry.
+Standalone Portal coordinates its Runtime instances in its single process;
+distributed control planes must use shared storage without a local fallback.
+
+**Consequences**: Python threads and Shell processes gain parallel orchestration
+without credentials or new command policies in the runner. Readiness protocol v3
+requires matching Runtime/AgentBox/runner images and a control plane supporting
+the private traffic RPCs. The gate counts SDK tool invocations, not all upstream
+HTTP traffic; ordinary Agent tools retain their existing limits. Endpoint aliases
+with different origins and upstream work surviving disconnection require
+operator/service-level controls. See `script-sandbox.md` for budgets and rollout.
+
+
+## ADR-020: Use Web UI for Interactive Work; Retain Headless CLI Execution
+
+**Date**: 2026-09-10
+
+**Decision**: Remove the interactive terminal runtime, setup wizard, terminal
+extensions, and custom terminal tool rendering. Use the Web UI for interactive
+investigations and configuration. Keep the shared agent engine available through
+`siclaw --prompt "..."` for a single diagnostic invocation.
+
+**Reason**: Maintaining a second interactive surface duplicates configuration,
+resource discovery, session controls, and tool presentation. Concentrating those
+workflows in Portal reduces maintenance while preserving scriptable diagnostics.
+
+**Consequences**:
+
+- Bare `siclaw` prints help. `siclaw local` starts the local Web UI.
+- `--continue` requires a new `--prompt`. `--print` remains accepted for scripts.
+- Missing providers or ambiguous agent selection produce a nonzero exit instead
+  of asking for input. Select Portal agents with `--agent <name>`.
+- Portal snapshots, standalone file configuration, credential materialization,
+  output sanitization, and background-command cleanup remain available to CLI runs.
+- A selected Portal agent must load successfully. Each invocation owns a private
+  snapshot root, including empty resource sets; cleanup never removes another
+  invocation's files. Background completions may join the active turn but cannot
+  wake an idle print session.
+- Prompt assembly discards obsolete terminal-only blocks in persisted templates.
+  Built-in skill preview guidance applies to Web/IM; CLI/task prompts omit
+  unavailable preview and sub-agent workflows.
+- DP activation and restoration remain available through Web/IM message markers;
+  terminal commands, shortcuts, and renderers are gone.
+- Direct terminal UI dependencies are removed. The upstream agent SDK may still
+  carry its own terminal packages transitively; Siclaw does not expose that UI.
+- Builds clear `dist/` before compiling, so removed terminal modules cannot leak
+  into packages built in an existing checkout.

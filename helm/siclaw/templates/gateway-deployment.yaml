@@ -1,0 +1,307 @@
+{{- if eq (include "siclaw.runtime.enabled" .) "true" }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "siclaw.fullname" . }}-runtime
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "siclaw.labels" (dict "ctx" . "component" "runtime") | nindent 4 }}
+spec:
+  # Singleton — see comment in values.yaml. Recreate (not RollingUpdate) so
+  # the old pod is torn down before the new one starts, avoiding the brief
+  # two-pod overlap that would evict each other on the upstream WS map.
+  #
+  # ⚠️ CORRECTNESS-BEARING since capability relay re-attach (onAdopt): two
+  # runtime pods sharing one adapter secret share one runtime_id, so BOTH
+  # would adopt the same capability runs and attach relays to the same box —
+  # and a box's /events queue is single-consumer, so the two relays would
+  # SPLIT the event stream (artifacts/turns silently lost). Do not flip this
+  # to RollingUpdate or replicas>1 without first giving each pod its own
+  # identity + partitioning runs.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "siclaw.selectorLabels" (dict "ctx" . "component" "runtime") | nindent 6 }}
+  template:
+    metadata:
+      {{- if .Values.scriptSandbox.enabled }}
+      annotations:
+        checksum/script-policy: {{ include (print $.Template.BasePath "/script-sandbox.yaml") . | sha256sum }}
+      {{- end }}
+      labels:
+        {{- include "siclaw.selectorLabels" (dict "ctx" . "component" "runtime") | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "siclaw.fullname" . }}-gateway
+      containers:
+        - name: runtime
+          image: {{ include "siclaw.image" (dict "component" "runtime" "ctx" .) }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 3001
+              protocol: TCP
+            - name: https-internal
+              containerPort: 3002
+              protocol: TCP
+          env:
+            {{- if .Values.scriptSandbox.enabled }}
+            - name: SICLAW_SCRIPT_SANDBOX_ENABLED
+              value: "true"
+            - name: SICLAW_SCRIPT_SANDBOX_PROVIDER
+              value: {{ .Values.scriptSandbox.provider | quote }}
+            - name: SICLAW_SCRIPT_SANDBOX_IMAGE
+              value: {{ if eq .Values.scriptSandbox.provider "e2b" }}""{{ else }}{{ required "scriptSandbox.image is required when enabled" .Values.scriptSandbox.image | quote }}{{ end }}
+            {{- if eq .Values.scriptSandbox.provider "e2b" }}
+            - name: SICLAW_SCRIPT_SANDBOX_E2B_TEMPLATE
+              value: {{ required "scriptSandbox.e2b.template is required" .Values.scriptSandbox.e2b.template | quote }}
+            - name: SICLAW_SCRIPT_SANDBOX_E2B_API_URL
+              value: {{ .Values.scriptSandbox.e2b.apiUrl | quote }}
+            - name: SICLAW_SCRIPT_SANDBOX_E2B_DOMAIN
+              value: {{ .Values.scriptSandbox.e2b.domain | quote }}
+            - name: E2B_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "scriptSandbox.e2b.apiKeySecret is required" .Values.scriptSandbox.e2b.apiKeySecret | quote }}
+                  key: {{ .Values.scriptSandbox.e2b.apiKeySecretKey | quote }}
+            {{- end }}
+            - name: SICLAW_SCRIPT_SANDBOX_NAMESPACE
+              value: {{ .Values.scriptSandbox.namespace | default (printf "%s-execution" (include "siclaw.fullname" .)) | quote }}
+            - name: SICLAW_SCRIPT_SANDBOX_SERVICE_ACCOUNT
+              value: {{ .Values.scriptSandbox.serviceAccount | quote }}
+            - name: SICLAW_SCRIPT_SANDBOX_RUNTIME_CLASS
+              value: {{ .Values.scriptSandbox.runtimeClass | quote }}
+            - name: SICLAW_SCRIPT_SANDBOX_NETWORK_ISOLATION
+              value: {{ .Values.scriptSandbox.networkIsolation | quote }}
+            - name: SICLAW_SCRIPT_SANDBOX_REQUIRE_NETWORK_ISOLATION
+              value: {{ .Values.scriptSandbox.requireNetworkIsolation | quote }}
+            - name: SICLAW_SCRIPT_SANDBOX_WARM_POOL_SIZE
+              value: {{ .Values.scriptSandbox.warmPoolSize | quote }}
+            - name: SICLAW_SCRIPT_SANDBOX_WARM_IDLE_SECONDS
+              value: {{ .Values.scriptSandbox.warmIdleSeconds | quote }}
+            - name: SICLAW_SCRIPT_SANDBOX_MAX_CONCURRENT_RUNS
+              value: {{ .Values.scriptSandbox.maxConcurrentRuns | quote }}
+            - name: SICLAW_SCRIPT_SANDBOX_MAX_TIMEOUT_SECONDS
+              value: {{ .Values.scriptSandbox.maxTimeoutSeconds | quote }}
+            - name: SICLAW_SCRIPT_SANDBOX_MAX_OUTPUT_BYTES
+              value: {{ .Values.scriptSandbox.maxOutputBytes | quote }}
+            - name: SICLAW_SCRIPT_SANDBOX_MAX_TOOL_CALLS
+              value: {{ .Values.scriptSandbox.maxToolCalls | quote }}
+            - name: SICLAW_SCRIPT_SANDBOX_MCP_POLICY_FILE
+              value: /etc/siclaw-script-policy/mcp.json
+            - name: SICLAW_SCRIPT_SANDBOX_HOST_KEYS_FILE
+              value: /etc/siclaw-script-policy/hosts.json
+            {{- end }}
+            - name: NODE_ENV
+              value: "production"
+            - name: SICLAW_PORT
+              value: "3001"
+            - name: SICLAW_INTERNAL_PORT
+              value: "3002"
+            - name: SICLAW_HOST
+              value: "0.0.0.0"
+            - name: SICLAW_K8S_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: SICLAW_AGENTBOX_IMAGE
+              value: {{ include "siclaw.agentboxImage" . }}
+            {{- /* Resources for the pods the Runtime SPAWNS, not for this pod —
+                   passed as env because the PodSpec is built at spawn time. */}}
+            {{- with .Values.agentbox.resources }}
+            {{- with .requests }}
+            {{- if .cpu }}
+            - name: SICLAW_AGENTBOX_CPU_REQUEST
+              value: {{ .cpu | quote }}
+            {{- end }}
+            {{- if .memory }}
+            - name: SICLAW_AGENTBOX_MEMORY_REQUEST
+              value: {{ .memory | quote }}
+            {{- end }}
+            {{- end }}
+            {{- with .limits }}
+            {{- if .cpu }}
+            - name: SICLAW_AGENTBOX_CPU_LIMIT
+              value: {{ .cpu | quote }}
+            {{- end }}
+            {{- if .memory }}
+            - name: SICLAW_AGENTBOX_MEMORY_LIMIT
+              value: {{ .memory | quote }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            - name: SICLAW_GATEWAY_HOSTNAME
+              value: "{{ include "siclaw.fullname" . }}-runtime.{{ .Release.Namespace }}.svc.cluster.local"
+            - name: SICLAW_MEMORY_ENABLED
+              value: {{ ternary "true" "false" .Values.runtime.memory.enabled | quote }}
+            {{- with .Values.runtime.embedding }}
+            {{- if .baseUrl }}
+            # Embedding endpoint for memory's vector search. Forwarded by the
+            # runtime spawner into each AgentBox pod (SICLAW_EMBEDDING_*).
+            - name: SICLAW_EMBEDDING_BASE_URL
+              value: {{ .baseUrl | quote }}
+            {{- if .model }}
+            - name: SICLAW_EMBEDDING_MODEL
+              value: {{ .model | quote }}
+            {{- end }}
+            {{- if .dimensions }}
+            - name: SICLAW_EMBEDDING_DIMENSIONS
+              value: {{ .dimensions | quote }}
+            {{- end }}
+            {{- if .apiKey }}
+            - name: SICLAW_EMBEDDING_API_KEY
+              value: {{ .apiKey | quote }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.runtime.subagentConcurrency }}
+            # Both are read inside the AgentBox; the spawner forwards them into the
+            # PodSpec. Unset ⇒ the agentbox falls back to its own defaults (10 / 50).
+            - name: SICLAW_SUBAGENT_CONCURRENCY
+              value: {{ .Values.runtime.subagentConcurrency | quote }}
+            {{- end }}
+            {{- if .Values.runtime.subagentPodConcurrency }}
+            - name: SICLAW_SUBAGENT_POD_CONCURRENCY
+              value: {{ .Values.runtime.subagentPodConcurrency | quote }}
+            {{- end }}
+            {{- if .Values.agentbox.persistence.enabled }}
+            # Global default policy: callers that omit per-agent persistence use the PVC.
+            - name: SICLAW_PERSISTENCE_ENABLED
+              value: "true"
+            {{- end }}
+            {{- if eq (include "siclaw.persistence.pvcAvailable" .) "true" }}
+            # PVC availability (infra): present whenever the chart provisions a PVC
+            # OR a pre-existing claim is referenced — independent of the global
+            # default above, so a per-agent persistence:true can mount it.
+            - name: SICLAW_PERSISTENCE_CLAIM_NAME
+              value: {{ include "siclaw.dataPvcName" . | quote }}
+            {{- end }}
+            {{- if .Values.agentbox.debugImage }}
+            - name: SICLAW_DEBUG_IMAGE
+              value: {{ .Values.agentbox.debugImage | quote }}
+            {{- end }}
+            {{- $compileBoxImage := include "siclaw.compileBoxImage" . }}
+            {{- if $compileBoxImage }}
+            # KB-compile box image (kbc/ in this repo) — consumed by the
+            # BoxProfile registry for kb-compile / kb-test capability boxes.
+            # Derived from image.registry/tag via compileBoxEnabled, or pinned
+            # explicitly via compileBoxImage. Absent ⇒ KB dark (fail-closed).
+            - name: SICLAW_COMPILE_BOX_IMAGE
+              value: {{ $compileBoxImage | quote }}
+            {{- end }}
+            {{- if .Values.agentbox.nodeSelector }}
+            # Node scheduling constraint forwarded by the runtime spawner onto
+            # every spawned AgentBox pod (parsed as a JSON label map).
+            - name: SICLAW_AGENTBOX_NODE_SELECTOR
+              value: {{ toJson .Values.agentbox.nodeSelector | quote }}
+            {{- end }}
+            - name: SICLAW_SKILLS_DIR
+              value: ".siclaw/skills"
+            # Phone-home upstream — auto-discover Portal if enabled, else use configured URL
+            - name: SICLAW_SERVER_URL
+              {{- if .Values.portal.enabled }}
+              value: "http://{{ include "siclaw.fullname" . }}-portal:{{ .Values.portal.service.port }}"
+              {{- else }}
+              value: {{ .Values.runtime.serverUrl | quote }}
+              {{- end }}
+            - name: SICLAW_PORTAL_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "siclaw.fullname" . }}-runtime
+                  key: portal-secret
+            {{- $caSecret := include "siclaw.runtimeCaSecretRef" . }}
+            {{- if $caSecret }}
+            # mTLS CA — persisted so existing AgentBox client certs survive
+            # Runtime restarts. See runtime-ca-secret.yaml.
+            - name: SICLAW_CA_CERT
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $caSecret }}
+                  key: tls.crt
+            - name: SICLAW_CA_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $caSecret }}
+                  key: tls.key
+            {{- end }}
+            {{- with .Values.runtime.llm }}
+            # LLM fallback for lean capability boxes (kb-compile / kb-test).
+            # Runtime sends it through the mTLS /session payload only when the
+            # consumer omitted its own LLM block; the chat path does not read it.
+            {{- if .baseUrl }}
+            - name: ANTHROPIC_BASE_URL
+              value: {{ .baseUrl | quote }}
+            {{- end }}
+            {{- if .model }}
+            - name: ANTHROPIC_MODEL
+              value: {{ .model | quote }}
+            {{- end }}
+            {{- if and .tokenSecret .tokenSecret.name }}
+            - name: ANTHROPIC_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .tokenSecret.name }}
+                  key: {{ .tokenSecret.key | default "ANTHROPIC_AUTH_TOKEN" }}
+            {{- end }}
+            {{- end }}
+            {{- with .Values.runtime.visualExport }}
+            {{- if .url }}
+            # Visual rendering happens inside AgentBox pods. The Runtime-level
+            # values are forwarded by K8sSpawner when each box is created.
+            - name: SICLAW_VISUAL_EXPORT_URL
+              value: {{ .url | quote }}
+            - name: SICLAW_VISUAL_EXPORT_TIMEOUT_MS
+              value: {{ .timeoutMs | default 60000 | quote }}
+            - name: SICLAW_VISUAL_EXPORT_THEME
+              value: {{ .theme | default "light" | quote }}
+            {{- end }}
+            {{- end }}
+            - name: NODE_OPTIONS
+              value: {{ printf "--max-old-space-size=%v" (.Values.runtime.nodeMaxOldSpaceMB | default 1024) | quote }}
+            # User-supplied env entries come last so callers can override any
+            # of the values above (e.g. swap in SICLAW_CA_CERT_FILE).
+            {{- range $key, $value := .Values.runtime.env }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
+          resources:
+            {{- toYaml .Values.runtime.resources | nindent 12 }}
+          volumeMounts:
+            {{- if .Values.scriptSandbox.enabled }}
+            - name: script-policy
+              mountPath: /etc/siclaw-script-policy
+              readOnly: true
+            {{- end }}
+            - name: skills
+              mountPath: /app/.siclaw/skills
+            {{- if eq (include "siclaw.persistence.pvcAvailable" .) "true" }}
+            - name: user-data
+              mountPath: /app/.siclaw/user-data
+            {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      volumes:
+        {{- if .Values.scriptSandbox.enabled }}
+        - name: script-policy
+          configMap:
+            name: {{ include "siclaw.fullname" . }}-script-policy
+        {{- end }}
+        - name: skills
+          emptyDir: {}
+        {{- if eq (include "siclaw.persistence.pvcAvailable" .) "true" }}
+        - name: user-data
+          persistentVolumeClaim:
+            claimName: {{ include "siclaw.dataPvcName" . }}
+        {{- end }}
+{{- end }}

@@ -1,0 +1,61 @@
+/**
+ * BoxSpawner interface
+ *
+ * Defines the abstract interface for AgentBox creation and destruction, supporting multiple implementations:
+ * - K8sSpawner: Kubernetes Pod
+ * - ProcessSpawner: Local child process (for development)
+ * - E2BSpawner: E2B cloud sandbox (future)
+ */
+
+import type { AgentBoxConfig, AgentBoxHandle, AgentBoxInfo } from "./types.js";
+import type { ContainerObservation } from "../capability/container-evidence.js";
+
+export interface BoxSpawner {
+  /** Spawner name */
+  readonly name: string;
+
+  /**
+   * Create an AgentBox
+   */
+  spawn(config: AgentBoxConfig): Promise<AgentBoxHandle>;
+
+  /**
+   * Stop an AgentBox
+   */
+  stop(boxId: string): Promise<void>;
+
+  /**
+   * Get AgentBox information
+   */
+  get(boxId: string): Promise<AgentBoxInfo | null>;
+
+  /**
+   * List all AgentBoxes
+   */
+  list(): Promise<AgentBoxInfo[]>;
+
+  /**
+   * Clean up resources
+   */
+  cleanup(): Promise<void>;
+
+  /** K8s-only, read-only lifecycle evidence. Stop the observer before transport shutdown. */
+  observeContainers?(send: (observation: ContainerObservation) => Promise<unknown>): { retry(): void; stop(): Promise<void> };
+
+  /**
+   * Fingerprint of the CA the spawner currently issues mTLS certs from, if the
+   * spawner uses mTLS (K8s). Lets the manager detect AgentBox pods signed by a
+   * rotated CA and recycle them. Spawners without mTLS (local/process) omit it.
+   */
+  caFingerprint?(): string | undefined;
+
+  /**
+   * Whether boxes of this agent share one volume for session transcripts.
+   *
+   * A pool only works because any box can pick up a session the pool has written down.
+   * Without shared storage each box keeps its own copy, and a session that moves loses its
+   * history — silently, mid-conversation. The manager warns rather than refusing: a
+   * deployment may want a pool purely for one-shot traffic that never continues.
+   */
+  hasSharedSessionStorage?(agentId: string): boolean;
+}

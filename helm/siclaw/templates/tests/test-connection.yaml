@@ -1,0 +1,18 @@
+{{- if eq (include "siclaw.runtime.enabled" .) "true" }}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: "{{ include "siclaw.fullname" . }}-test-connection"
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "siclaw.labels" (dict "ctx" . "component" "test") | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+spec:
+  restartPolicy: Never
+  containers:
+    - name: wget
+      image: busybox
+      command: ["wget"]
+      args: ["--spider", "--timeout=5", "http://{{ include "siclaw.fullname" . }}-runtime.{{ .Release.Namespace }}.svc.cluster.local:3001/api/health"]
+{{- end }}

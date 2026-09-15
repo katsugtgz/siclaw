@@ -1,0 +1,180 @@
+---
+title: "Kubernetes Deployment"
+sidebarTitle: "Kubernetes"
+description: "Deploy Siclaw on Kubernetes with full tenant isolation using Helm."
+---
+
+## Architecture
+
+Kubernetes is the production deployment model for Siclaw:
+
+```
+Portal Deployment
+  ├── Web UI (React) + REST API
+  ├── Auth + user management
+  └── MySQL connection
+
+Runtime Deployment
+  ├── Channels (Slack / Lark / Discord / Telegram)
+  ├── Cron / scheduled tasks
+  └── K8s AgentBox spawner
+
+AgentBox Pod  (spawned per user / workspace)
+  ├── Isolated agent runtime
+  ├── Synced skills and credentials
+  └── Internal mTLS back to Runtime
+```
+
+## Prerequisites
+
+- A Kubernetes cluster
+- A MySQL database reachable from the cluster
+- Published Siclaw images for `runtime`, `portal`, and `agentbox`
+
+Build and push images first if you are using your own registry:
+
+```bash
+make docker REGISTRY=registry.example.com/myteam TAG=latest
+make push REGISTRY=registry.example.com/myteam TAG=latest
+```
+
+## Quick Start
+
+Install from the chart in this repository:
+
+```bash
+helm upgrade --install siclaw ./helm/siclaw \
+  --namespace siclaw \
+  --create-namespace \
+  --set image.registry=registry.example.com/myteam \
+  --set image.tag=latest \
+  --set database.url="mysql://user:pass@mysql.svc.cluster.local:3306/siclaw"
+```
+
+All three images share `image.registry` and `image.tag` by default.
+
+## Important Values
+
+Current top-level values look like this:
+
+```yaml
+image:
+  registry: registry.example.com/myteam
+  tag: latest
+
+runtime:
+  replicas: 1
+
+portal:
+  enabled: true
+  replicas: 1
+  service:
+    type: NodePort
+    port: 3003
+    nodePort: 31003
+
+database:
+  url: mysql://user:pass@mysql.svc.cluster.local:3306/siclaw
+```
+
+Use `database.existingSecret.name` if you do not want to pass the connection string on the command line.
+
+## Accessing the UI
+
+The Portal Service is the front door. With default values it listens on port `3003` inside the cluster and on NodePort `31003` on any node.
+
+- Keep `portal.service.type: NodePort` for quick access via `http://<any-node-ip>:31003`
+- Or point an Ingress at the Portal Service on service port `3003`
+
+Example Ingress backend:
+
+```yaml
+backend:
+  service:
+    name: siclaw-portal
+    port:
+      number: 3003
+```
+
+<Note>
+WebSocket support is required for live investigation updates. Keep proxy read/send timeouts high enough for multi-minute investigations.
+</Note>
+
+## Authentication
+
+On first launch, open the Portal UI and register the first user — that account becomes the admin. Registration is open only for the very first account; every subsequent registration requires admin authentication.
+
+## Metrics
+
+Runtime and Portal both expose Prometheus metrics at `/metrics`. The chart can create ServiceMonitor, PodMonitor, Grafana dashboard, and PrometheusRule resources under the `metrics.*` values block.
+
+The Runtime endpoint also exposes bounded KB capability lifecycle series such as
+`siclaw_gateway_capability_starts_total`,
+`siclaw_gateway_capability_start_duration_ms`,
+`siclaw_gateway_capability_active_runs`,
+`siclaw_gateway_capability_materialization_failures_total`, and
+`siclaw_gateway_capability_relay_failures_total`. They intentionally carry no
+run, repository, user, or operation identifiers; use logs/traces for drill-down.
+
+Common settings:
+
+```yaml
+metrics:
+  enabled: true
+  serviceMonitor:
+    enabled: true
+  podMonitor:
+    enabled: true
+  grafanaDashboard:
+    enabled: true
+  prometheusRule:
+    enabled: false
+```
+
+If you want bearer-token protection for `/metrics`, add:
+
+```yaml
+runtime:
+  env:
+    SICLAW_METRICS_TOKEN: "your-secret-token"
+```
+
+To remove the `user_id` label from token and cost metrics:
+
+```yaml
+runtime:
+  env:
+    SICLAW_METRICS_USER_ID: "false"
+```
+
+## Operational Notes
+
+- Kubernetes mode requires MySQL. SQLite is only for single-process local use.
+- AgentBox pods are created on demand by the Runtime.
+- Runtime ↔ AgentBox traffic is secured with mTLS automatically.
+- KB compile/test boxes additionally receive a default-on ingress NetworkPolicy;
+  the chart's Runtime pod is the only default caller on port 3000. Extend
+  `agentbox.networkPolicy.ingressFrom` only for an intentional extra caller.
+- A Runtime rolling restart preserves K8s AgentBox pods so the replacement can
+  re-adopt live capability runs. Cluster-wide box deletion remains an explicit
+  cleanup operation, not a process-shutdown side effect.
+- If you deploy monitoring resources from the chart, do not also apply duplicate monitor manifests manually.
+
+## Post-rollout Chat Acceptance
+
+After a production Runtime or AgentBox rollout reports Ready, verify cold-session
+dispatch before declaring the release complete:
+
+1. Create at least five new chat sessions. Do not reuse an existing session or
+   retry a failed first message.
+2. Send one first-turn prompt in each session, sequentially. All five must reach
+   assistant output and `prompt_done` without a `stream_error` or manual retry.
+3. For every turn, correlate `sessionId` and `turnId` across the control-plane,
+   Runtime, and AgentBox logs. Confirm the selected Runtime and AgentBox, and a
+   `/api/prompt` result with `status=200` and `outcome=accepted`.
+4. Treat any first-turn failure, missing terminal event, or unexplained
+   Runtime/AgentBox selection as a failed release acceptance. Preserve the
+   correlated log lines before retrying or rolling again.
+
+This check validates observed post-rollout behavior. Pod readiness and a
+successful image rollout alone do not satisfy chat acceptance.

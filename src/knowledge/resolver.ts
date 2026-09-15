@@ -1,0 +1,54 @@
+import {
+  KnowledgeLabelIndex,
+  type KnowledgeLabelCatalogResult,
+  type KnowledgeLibrarySummary,
+  type KnowledgeResolutionResult,
+} from "./labels.js";
+
+/**
+ * Resolves mounted knowledge pages exclusively from typed page labels.
+ *
+ * The complete root index is injected separately as the compatibility route
+ * for unlabeled packages. This resolver never reads page bodies, opens an
+ * embedding provider, or builds an FTS/vector database; callers must Read the
+ * selected page before treating it as evidence.
+ */
+export class KnowledgeResolver {
+  private closed = false;
+
+  constructor(private readonly labels: KnowledgeLabelIndex) {}
+
+  async sync(): Promise<void> {
+    if (this.closed) return;
+    await this.labels.sync();
+  }
+
+  search(query: string, topK = 10, opts: { library?: string } = {}): KnowledgeResolutionResult {
+    if (this.closed) return {
+      pages: [], matchedPages: 0, totalPages: 0, totalLabels: 0,
+      libraries: [], routing: { multiLibrary: false, selected: [], fallback: false, margin: null }, staleCandidates: 0,
+      unknownLibrary: false, invalidLabeledPages: 0, unlabeledPages: 0, unreachableLabeledPages: 0,
+    };
+    return this.labels.search(query, topK, opts);
+  }
+
+  /** Libraries of the mount with their dominant labels; one root "" entry for a single library. */
+  libraries(): KnowledgeLibrarySummary[] {
+    if (this.closed) return [];
+    return this.labels.listLibraries();
+  }
+
+  catalog(opts: { query?: string; facet?: string; offset?: number; limit?: number } = {}): KnowledgeLabelCatalogResult {
+    if (this.closed) {
+      return {
+        labels: [], totalLabels: 0, totalPages: 0, offset: 0, hasMore: false,
+        invalidLabeledPages: 0, unlabeledPages: 0, unreachableLabeledPages: 0,
+      };
+    }
+    return this.labels.catalog(opts);
+  }
+
+  close(): void {
+    this.closed = true;
+  }
+}

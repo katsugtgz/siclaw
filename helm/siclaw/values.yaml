@@ -1,0 +1,350 @@
+# -- Container images
+image:
+  registry: ""          # e.g. "siclaw" -> siclaw/siclaw-runtime:latest
+  pullPolicy: Always
+  tag: "latest"
+
+# -- Demo MySQL (testing only, not for production)
+mysql:
+  enabled: false
+  image: mysql:8.0
+  database: siclaw
+  username: siclaw
+  password: ""
+
+# -- Database (MySQL, Portal only — Runtime uses adapter API)
+database:
+  url: ""               # mysql://user:pass@host:3306/siclaw
+
+# -- Agent Runtime
+# NOTE: Runtime is a singleton — exactly one replica per Helm release.
+# Phone-home WS registration on the upstream (Portal or an external management server) is keyed by
+# runtime identity and a second connection with the same identity evicts the
+# first, so multiple replicas of the same release would continuously fight.
+# Scale horizontally by deploying multiple releases with distinct identities.
+runtime:
+  enabled: true
+  portalSecret: ""      # Runtime → Portal/Upstream API auth (X-Auth-Token on phone-home WS)
+  # Where Runtime gets Agent/Credential info from:
+  #   Standalone mode: http://siclaw-portal:3003
+  #   Upstream mode:     http://upstream-apiserver:8080
+  serverUrl: "http://siclaw-portal:3003"
+  # Runtime ↔ AgentBox mTLS CA. Without persistence, every Runtime restart
+  # generates a fresh CA and existing AgentBox pods (which hold client certs
+  # signed by the previous CA) immediately fail mTLS — sessions hang until
+  # those pods are reaped.
+  #
+  # Pick exactly one:
+  #   generateCa: true  — chart genCAs once and stores it in a Secret with
+  #                       helm.sh/resource-policy=keep so upgrades reuse it.
+  #                       NOTE: relies on `helm lookup` to detect the existing
+  #                       Secret. `helm template` / `helm install --dry-run`
+  #                       cannot lookup the cluster and will emit a FRESH CA
+  #                       every render — never pipe their output to
+  #                       `kubectl apply -f -`, you will overwrite the live
+  #                       Secret and break mTLS for all running AgentBoxes.
+  #                       For GitOps / render-then-apply use caSecret instead.
+  #   caSecret: "name"  — bring-your-own kubernetes.io/tls Secret (keys
+  #                       tls.crt / tls.key). Useful with cert-manager,
+  #                       Vault PKI, or any pipeline that pre-renders manifests.
+  tls:
+    generateCa: true
+    caSecret: ""
+  resources:
+    requests:
+      cpu: "100m"
+      # Source Snapshot v2 transports one part at a time, but a maximum-size
+      # part can transiently retain its RPC JSON and outbound box request.
+      memory: "512Mi"
+    limits:
+      cpu: "2"
+      memory: "2Gi"
+  # Keep room outside V8 for the binary/base64 buffers used by large source
+  # parts. runtime.env.NODE_OPTIONS may override this complete setting.
+  nodeMaxOldSpaceMB: 1024
+  memory:
+    # Disabled by default for integrated production deployments. Enabling
+    # this re-exposes memory_search/memory_get and session memory auto-save.
+    enabled: false
+  # Embedding endpoint for memory's hybrid vector search. Only used when
+  # memory.enabled=true. When baseUrl is empty, memory falls back to FTS
+  # (keyword) search only — no semantic vector recall. The endpoint must be
+  # OpenAI-compatible (POST {baseUrl}/embeddings); e.g. a self-hosted TEI /
+  # vLLM / Ollama service. Forwarded to each AgentBox pod via the runtime
+  # spawner (SICLAW_EMBEDDING_* env). dimensions MUST match the model's output.
+  embedding:
+    baseUrl: ""           # e.g. http://tei-embedding.<ns>.svc.cluster.local/v1
+    model: ""             # e.g. Qwen/Qwen3-Embedding-4B (empty → BAAI/bge-m3)
+    dimensions: 0         # e.g. 2560 (0/empty → 1024). Must match the model.
+    apiKey: ""            # optional. Empty ⇒ unauthenticated for a self-hosted
+                          # endpoint on a DIFFERENT origin than the LLM provider.
+                          # If the embedding baseUrl is the SAME origin as the
+                          # default LLM provider, that provider's key is reused.
+  # Browser-rendered charts and diagrams. The URL must point to a reachable
+  # ControlPlane Web /siclaw-visual-export page; this chart does not install an
+  # external renderer or assume its Kubernetes Service name.
+  visualExport:
+    url: ""                # e.g. https://console.example.com/siclaw-visual-export
+    timeoutMs: 60000       # total browser launch + render budget; MCP adds 5s grace
+    theme: light           # light or dark
+  # Max sub-agent child sessions ONE CONVERSATION runs concurrently. A wide
+  # spawn_subagent fan-out queues past this instead of starting one child agent +
+  # one LLM stream per target at once (avoids provider 429s / pod pressure).
+  # Forwarded to each AgentBox pod as SICLAW_SUBAGENT_CONCURRENCY.
+  #
+  # NOTE: this used to mean per-BOX, so it decided how much one user's fan-out
+  # slowed everyone else sharing the agent. It is now per-conversation, and
+  # subagentPodConcurrency below took over protecting the process. If you had
+  # lowered this as a memory guard, that number belongs there instead.
+  subagentConcurrency: 10
+  # Ceiling on sub-agent child sessions across the WHOLE AgentBox process, every
+  # conversation included. The per-conversation cap above answers fairness; this
+  # one answers survival — queueing costs one user latency, an OOMKill costs every
+  # session in the box its work. Watch siclaw_box_subagent_active against
+  # siclaw_box_rss_bytes (both labelled by box_id) before raising it: per-child
+  # memory is unmeasured and 50 is provisional.
+  subagentPodConcurrency: 50
+  # LLM endpoint for LEAN CAPABILITY BOXES (kb-compile / kb-test) ONLY. The chat
+  # path does not read these — agent models come from the Portal/Upstream model
+  # descriptors. On a fresh KB session Runtime sends these through the mTLS
+  # /session payload only when the consumer did not provide its own LLM block;
+  # credentials are never copied into the KB PodSpec. Token rotation: update the
+  # Secret, rollout-restart Runtime (env Secrets resolve at pod start), then keep
+  # the old token valid through a grace window or delete KB agentbox pods. A live
+  # box's already-connected SDK client keeps its session-start token until respawn.
+  llm:
+    baseUrl: ""            # e.g. https://model-gateway.example.com/model-api (Anthropic-compatible proxy)
+    model: ""              # optional model default (below KBC_COMPILE_MODEL)
+    tokenSecret:
+      name: ""             # existing Secret holding the model-proxy token
+      key: "ANTHROPIC_AUTH_TOKEN"
+  # Extra runtime env, spread into the gateway container (overrides values above).
+  # Trace environment (Langfuse deployment.environment.name) is auto-injected per
+  # agent by Portal, so you normally leave this unset. SICLAW_TRACING_ENVIRONMENT set
+  # here is only a fallback for deployments where Portal does not supply one (Portal's
+  # per-agent value wins when present).
+  env: {}
+
+# -- Portal (standalone web UI, replaces Upstream)
+portal:
+  enabled: true
+  # Keep at 1. Live chat/A2A SSE streaming and the in-process A2A task trackers
+  # (src/portal/a2a-gateway.ts) are process-local, and a Runtime phone-homes to a
+  # single Portal instance — so >1 replica would scatter streams across pods that
+  # don't hold the Runtime connection. Horizontal scale needs a shared pub/sub first.
+  replicas: 1
+  jwtSecret: ""         # Portal's JWT signing key (Portal is the auth boundary)
+  portalSecret: ""      # shared with Runtime; verifies Runtime phone-home X-Auth-Token
+  service:
+    type: NodePort
+    port: 3003
+    nodePort: 31003
+  resources:
+    requests:
+      cpu: "50m"
+      memory: "64Mi"
+    limits:
+      cpu: "500m"
+      memory: "512Mi"
+  env: {}
+
+# -- OCR backend for Portal image/PDF attachment preprocessing
+ocr:
+  enabled: true
+  replicas: 1
+  # Set when OCR is provided by another service. If enabled=false and this is
+  # empty, Portal treats OCR as unavailable and keeps chat sends recoverable.
+  externalUrl: ""
+  timeoutMs: 120000
+  image:
+    # Empty repository uses image.registry + image.tag as siclaw-ocr:<tag>.
+    repository: ""
+    tag: ""
+    pullPolicy: ""
+  service:
+    port: 8088
+  device: "cpu"
+  preload: true
+  enableStructure: false
+  # Per-Pod admitted in-flight OCR requests. PaddleOCR inference is serialized
+  # inside each backend process; requests above this limit receive HTTP 503.
+  maxConcurrency: 1
+  # Per-attachment OCR text characters that Portal may inject into the prompt.
+  maxEvidenceTextChars: 32768
+  # Total OCR evidence characters that Portal may inject for one chat turn.
+  maxTotalEvidenceTextChars: 65536
+  # Hard process-level watchdog for a single OCR request. If PaddleOCR hangs past
+  # this window, the backend exits and Kubernetes restarts the container.
+  hardTimeoutMs: 150000
+  # PDF inputs are capped before PaddleOCR runs so a long paper does not occupy
+  # OCR workers and delay screenshot/table requests. Set 0 to disable.
+  maxPdfPages: 10
+  # Decoded image pixel cap before OCR runs. Set 0 to disable.
+  maxImagePixels: 50000000
+  textDetectionModelName: "PP-OCRv5_mobile_det"
+  textRecognitionModelName: "PP-OCRv5_mobile_rec"
+  textDetLimitSideLen: ""
+  maxRequestBytes: "10485760"
+  cache:
+    # Cache PaddleOCR/PaddleX model downloads across container restarts in the
+    # same Pod. This does not store user uploads or OCR text.
+    enabled: true
+  resources:
+    requests:
+      cpu: "2"
+      memory: "4Gi"
+    limits:
+      cpu: "4"
+      memory: "8Gi"
+  env: {}
+  networkPolicy:
+    enabled: false
+    # Extra Kubernetes NetworkPolicy from entries for OCR-only/shared-service
+    # deployments. Example:
+    # ingressFrom:
+    #   - namespaceSelector:
+    #       matchLabels:
+    #         kubernetes.io/metadata.name: management-server
+    #     podSelector:
+    #       matchLabels:
+    #         app.kubernetes.io/name: management-apiserver
+    ingressFrom: []
+
+# -- AgentBox (spawned at runtime by K8s spawner)
+agentbox:
+  debugImage: ""
+  # Resources for every AgentBox pod the Runtime spawns — one per agent, NOT the
+  # Runtime's own pod (that is runtime.resources above). A BoxProfile that declares
+  # its own still wins over these.
+  #
+  # The memory REQUEST is what the scheduler packs nodes on. A box sits near
+  # 200-280Mi while completely idle, so a request below that both overcommits the
+  # node and — since request < limit makes the pod Burstable — puts it first in
+  # line for eviction under node pressure. Raise it as sub-agent concurrency goes
+  # up; siclaw_box_rss_bytes (labelled by box_id on gateway:3001/metrics) is the
+  # measurement to tune from. Limits reserve no capacity, so headroom is cheap.
+  #
+  # These values are the deployed defaults. src/gateway/agentbox/k8s-spawner.ts
+  # carries the same numbers as its fallback for the no-env case (LocalSpawner,
+  # a hand-rolled manifest); keep the two in step when changing either.
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "1Gi"
+    limits:
+      cpu: "2000m"
+      memory: "8Gi"
+  # KB compile capability (kb-compile / kb-test boxes; built from this repo's
+  # kbc/, ships with every release via `make docker`). The RELEASE-COUPLED
+  # switch: true ⇒ the runtime spawns {image.registry}/siclaw-kbc-box:{image.tag}
+  # — same registry/tag convention as every other component. false + no
+  # override ⇒ KB stays dark (fail-closed; compile attempts error, chat
+  # unaffected).
+  compileBoxEnabled: false
+  # Full-image override (implies enabled): hot-fix the compile brain
+  # independently of a release, e.g. "registry/.../siclaw-kbc-box:main-<sha>".
+  compileBoxImage: ""
+  # Node selector applied to every spawned AgentBox pod. Constrains pods to
+  # nodes carrying all of these labels (e.g. { disktype: ssd, pool: agents }).
+  # Empty ⇒ no constraint; the scheduler picks any eligible node.
+  nodeSelector: {}
+  # Ingress isolation for dynamically spawned KB compile/test boxes. The
+  # Runtime is the only built-in caller; mTLS remains the identity boundary.
+  # KB pods use exec health probes, so kubelet/node CIDRs do not need a broad
+  # NetworkPolicy exception (behavior differs across CNIs for HTTP probes).
+  networkPolicy:
+    enabled: true
+    # Extra trusted callers, e.g. a separately deployed Gateway in the same or
+    # another namespace. Entries are appended to the Runtime podSelector.
+    ingressFrom: []
+  persistence:
+    # PVC persistence has two independent concepts:
+    #   1. PVC availability (infrastructure) — is a shared RWX PVC present that
+    #      agents can mount? Controlled by `enabled` (chart provisions one) OR
+    #      `claimName` (reference one you created out-of-band).
+    #   2. Global default policy — should callers that DON'T set a per-agent
+    #      persistence value use the PVC? Controlled by `enabled` only.
+    # A per-agent opt-in (chat.send persistence:true, e.g. from a product portal)
+    # mounts the PVC whenever it is *available*, regardless of the global default.
+
+    # Global default policy. true ⇒ also chart-provision + mount the PVC below.
+    enabled: false
+    # Reference a PRE-EXISTING RWX PVC by name. Set this (with enabled:false) to
+    # make the PVC available for per-agent opt-in while keeping the global default
+    # OFF. REQUIRED and has NO default on this path — the name differs per
+    # deployment and must match a PVC you already created; empty ⇒ no PVC to
+    # mount, all agents fall back to emptyDir.
+    # When enabled:true this just overrides the chart-managed PVC name
+    # (empty → "<release-fullname>-data").
+    claimName: ""
+    # REQUIRED when enabled: true (chart-provisioned PVC). Must support ReadWriteMany.
+    # Examples: nfs, efs-sc, csi-cephfs, longhorn (with RWX).
+    # Leaving this empty while enabled keeps the PVC in Pending state.
+    # Ignored when referencing an existing PVC via claimName (enabled:false).
+    storageClassName: ""
+    size: "10Gi"
+
+# -- Metrics & Observability
+metrics:
+  enabled: true
+  serviceMonitor:
+    enabled: true
+    interval: 15s
+    namespace: ""
+    namespaceSelector: {}
+    additionalLabels: {}
+    # gateway:3001/metrics is the ONLY scrape target (agentbox federation re-exports
+    # here). The gateway's checkMetricsAuth fails OPEN when SICLAW_METRICS_TOKEN is
+    # unset (the default — rely on NetworkPolicy), so leave this empty in that case.
+    # If you DO set SICLAW_METRICS_TOKEN, you MUST point bearerTokenSecret at a Secret
+    # holding the same token, otherwise every scrape 401s and all metrics go dark.
+    # Example: { name: siclaw-metrics-token, key: token }
+    bearerTokenSecret: {}
+  # NOTE: the agentbox PodMonitor was removed — agentbox metrics are now federated
+  # through the Gateway and exported from gateway:3001 (ServiceMonitor above), the
+  # single stable scrape target. See metrics-federation-DESIGN.md.
+  grafanaDashboard:
+    enabled: true
+    namespace: ""
+    additionalLabels: {}
+  prometheusRule:
+    enabled: false
+    namespace: ""
+    additionalLabels: {}
+    costThresholdPerHour: 10
+
+# Optional, disposable Python/Bash execution. No AgentBox or production secrets.
+scriptSandbox:
+  enabled: false
+  provider: k8s # k8s or e2b; both use the same controlled tools.
+  publicUrl: "" # Canonical HTTPS origin of the standalone Portal callback ingress.
+  e2b:
+    template: "" # Operator-built Dockerfile.script-sandbox-e2b template.
+    apiUrl: https://api.e2b.app
+    domain: e2b.app
+    apiKeySecret: "" # Existing Secret in Runtime namespace; never mounted in a runner.
+    apiKeySecretKey: api-key
+  image: "" # Set to the built Dockerfile.script-sandbox image, preferably a digest.
+  namespace: "" # Default: <release-fullname>-execution; dedicated to runners.
+  createNamespace: true
+  serviceAccount: siclaw-script-runner
+  runtimeClass: "" # Optional gVisor/Kata class already installed on the cluster.
+  networkIsolation: false
+  requireNetworkIsolation: false
+  warmPoolSize: 1 # One-use idle instances for the deployment default profile, per Runtime.
+  warmIdleSeconds: 300
+  maxConcurrentRuns: 10
+  maxTimeoutSeconds: 300
+  maxOutputBytes: 131072
+  maxToolCalls: 512
+  # Shared admission owned by standalone Portal (external control planes configure their own limits).
+  traffic:
+    targetConcurrency: 10
+    targetRps: 10
+    targetBurst: 20
+  # Operator-reviewed HTTP MCP tools. No automatic readOnlyHint trust.
+  mcpPolicy: {}
+  # Registered host name -> SHA256 host key fingerprint.
+  hostKeyPins: {}
+  # Global execution namespace quota (include all Runtime replicas and both warm profiles).
+  podQuota: 24

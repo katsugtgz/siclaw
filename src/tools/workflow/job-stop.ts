@@ -1,0 +1,49 @@
+/**
+ * job_stop — cancel a running background job (sub-agent OR bash) (design §7).
+ *
+ * The job id comes from a prior spawn_subagent({ run_in_background: true }) launch or a
+ * bash({ run_in_background: true }) launch. Hidden until the runtime injects the stop executor.
+ */
+
+import { Type } from "@sinclair/typebox";
+import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+
+import type { ToolEntry, ToolRefs } from "../../core/tool-registry.js";
+import { BACKGROUND_BASH_ENABLED, RUN_IN_BACKGROUND_ENABLED } from "../../core/subagent-registry.js";
+
+export function createJobStopTool(
+  refs: ToolRefs,
+  executor = refs.jobStopExecutor,
+): ToolDefinition {
+  return {
+    name: "job_stop",
+    label: "Stop Job",
+    description: "Cancel a running background job (sub-agent or bash command) by its job_id, returned when it was launched with run_in_background.",
+    parameters: Type.Object({
+      job_id: Type.String({ description: "The job_id returned by a background spawn_subagent or background bash launch." }),
+    }),
+    async execute(_toolCallId, rawParams) {
+      if (!executor) {
+        return { content: [{ type: "text" as const, text: JSON.stringify({ error: true, message: "job_stop is not available." }) }], details: { error: true } };
+      }
+      const jobId = (rawParams as { job_id?: string }).job_id?.trim();
+      if (!jobId) {
+        return { content: [{ type: "text" as const, text: JSON.stringify({ error: true, message: "job_stop requires a job_id." }) }], details: { error: true } };
+      }
+      const result = await executor(jobId);
+      return {
+        content: [{ type: "text" as const, text: JSON.stringify(result) }],
+        details: { ...result, job_id: jobId },
+      };
+    },
+  };
+}
+
+export const registration: ToolEntry = {
+  category: "workflow",
+  create: (refs) => createJobStopTool(refs),
+  // Available once either background mode is on AND the runtime injected a stop executor
+  // (so a job_id can actually exist). Hidden otherwise.
+  available: (refs) =>
+    (RUN_IN_BACKGROUND_ENABLED || BACKGROUND_BASH_ENABLED) && Boolean(refs.jobStopExecutor),
+};

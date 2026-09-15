@@ -1,0 +1,683 @@
+import { describe, it, expect, vi } from "vitest";
+import { driveCapabilitySession } from "./session-driver.js";
+import { CapabilityRunManager } from "./run-manager.js";
+import { CAPABILITY_EVENT, CAPABILITY_PERSIST_ARTIFACTS, CAPABILITY_PERSIST_EXECUTION_OBSERVATION, CAPABILITY_PERSIST_RUN_STATE } from "./contract.js";
+
+// Fake box client that yields a fixed sequence of box events over streamPath.
+function fakeClient(events: any[]) {
+  return {
+    async *streamPath(_path: string) {
+      for (const e of events) yield e;
+    },
+  } as any;
+}
+
+function fakeFrontend() {
+  return {
+    emitEvent: vi.fn(),
+    request: vi.fn().mockResolvedValue({ ok: true }),
+  } as any;
+}
+
+function fakeManager() {
+  const manager = {
+    touch: vi.fn(),
+    touchHeartbeat: vi.fn(),
+    setStatus: vi.fn().mockResolvedValue(undefined),
+    endRun: vi.fn().mockResolvedValue(undefined),
+    // Default undefined = no tracked record (e.g. already dropped at a terminal).
+    get: vi.fn(),
+    commitRelayEvent: vi.fn().mockImplementation(async (runId, _eventId, status, failure) => {
+      if (status === "done" || status === "failed") {
+        if (failure) await manager.endRun(runId, status, failure);
+        else await manager.endRun(runId, status);
+      } else if (status) await manager.setStatus(runId, status);
+    }),
+  } as any;
+  return manager;
+}
+
+function reliableClient(client: any) {
+  let sequence = 0;
+  return {
+    ...client,
+    postJson: client.postJson ?? vi.fn().mockResolvedValue({ ok: true }),
+    async *streamPath(path: string, opts: any) {
+      yield { type: "relay_ready", event_ack: 1 };
+      for await (const event of client.streamPath(path, opts)) {
+        if (["syncArtifacts", "turn_done", "error", "done", "end"].includes(event.type)) {
+          yield { ...event, event_id: `${"a".repeat(32)}:${++sequence}` };
+        } else yield event;
+      }
+    },
+  };
+}
+
+const emits = (fe: any) => fe.emitEvent.mock.calls.filter((c: any[]) => c[0] === CAPABILITY_EVENT).map((c: any[]) => c[1]);
+
+describe("driveCapabilitySession — box event → capability wire mapping", () => {
+  it("a recoverable provider failure retains the real run for the owner's next turn", async () => {
+    const fe = fakeFrontend();
+    const manager = new CapabilityRunManager(fe);
+    const { runId } = await manager.startRun({ profile: "kb-compile", orgId: "org", correlationId: "attempt" });
+    await driveCapabilitySession({ client: fakeClient([
+      { type: "error", recoverable: true, code: "model_request_failed", message: "Retry this turn" },
+      { type: "turn_done", text: "Retry this turn" },
+    ]), runId, frontendClient: fe, manager });
+    expect(manager.get(runId)?.status).toBe("idle");
+    expect(manager.get(runId)?.correlationId).toBe("attempt");
+    expect(emits(fe).some((event: any) => event.type === "lifecycle")).toBe(false);
+    await manager.setStatus(runId, "running");
+    expect(manager.get(runId)?.status).toBe("running");
+    expect(fe.request.mock.calls.some(([, p]: any[]) => p?.status === "failed")).toBe(false);
+  });
+
+  it("requests workspace replay only when re-attaching to a live box", async () => {
+    const paths: string[] = [];
+    const client = {
+      async *streamPath(path: string) {
+        paths.push(path);
+        yield { type: "relay_ready", event_ack: 1 };
+      },
+    } as any;
+    await driveCapabilitySession({
+      client,
+      runId: "r1",
+      frontendClient: fakeFrontend(),
+      manager: fakeManager(),
+      replayWorkspace: true,
+    });
+    expect(paths).toEqual(["/events/r1?ack=1&replay=1"]);
+  });
+
+  it("log/summary/turn_done map to capability.event and drive manager state", async () => {
+    const fe = fakeFrontend();
+    const mgr = fakeManager();
+    await driveCapabilitySession({
+      client: fakeClient([
+        { type: "log", text: "thinking" },
+        { type: "summary", summary: "wrote 3 pages" },
+        { type: "turn_done", text: "done for now" },
+        { type: "end" },
+      ]),
+      runId: "r1", frontendClient: fe, manager: mgr,
+    });
+
+    const ev = emits(fe);
+    expect(ev).toEqual([
+      { run_id: "r1", type: "log", payload: { text: "thinking" } },
+      { run_id: "r1", type: "summary", payload: { text: "wrote 3 pages" } },
+      { run_id: "r1", type: "turn", payload: { text: "done for now" } },
+    ]);
+    // EVERY box event bumps activity (watchdog must not reap an active run that
+    // only emits `log`): log + summary + turn_done + end = 4 touches.
+    expect(mgr.touch).toHaveBeenCalledTimes(4);
+    expect(mgr.touch).toHaveBeenCalledWith("r1");
+    expect(mgr.setStatus).toHaveBeenCalledWith("r1", "idle"); // turn ended → idle
+  });
+
+  it("syncArtifacts persists one atomic batch with the run input revision", async () => {
+    const fe = fakeFrontend();
+    const mgr = fakeManager();
+    mgr.get.mockReturnValue({ inputRevision: "manifest-1", status: "running" });
+    await driveCapabilitySession({
+      client: fakeClient([
+        { type: "syncArtifacts", artifacts: [{ path: "candidate/a.md", content: "# A" }] },
+        { type: "end" },
+      ]),
+      runId: "r1", frontendClient: fe, manager: mgr,
+    });
+    expect(fe.request).toHaveBeenCalledWith(CAPABILITY_PERSIST_ARTIFACTS, {
+      run_id: "r1",
+      input_revision: "manifest-1",
+      artifacts: [{
+        path: "candidate/a.md",
+        content: { inline_base64: Buffer.from("# A", "utf8").toString("base64") },
+      }],
+    });
+  });
+
+  it("ACKs a sealed checkpoint only after the consumer transaction commits", async () => {
+    const order: string[] = [];
+    const fe = fakeFrontend();
+    fe.request = vi.fn().mockImplementation(async (method: string) => {
+      if (method === CAPABILITY_PERSIST_ARTIFACTS) order.push("persist");
+      return { ok: true };
+    });
+    const client = {
+      async *streamPath() {
+        yield {
+          type: "syncArtifacts",
+          sync_id: "sync-1",
+          artifacts: [{ path: "candidate/a.md", content: "# A" }],
+        };
+      },
+      postJson: vi.fn().mockImplementation(async () => {
+        order.push("ack");
+        return { ok: true };
+      }),
+    } as any;
+    const mgr = fakeManager();
+    mgr.get.mockReturnValue({ runId: "r1", status: "running", inputRevision: "manifest-1" });
+
+    await driveCapabilitySession({ client, runId: "r1", frontendClient: fe, manager: mgr });
+
+    expect(order).toEqual(["persist", "ack"]);
+    expect(client.postJson).toHaveBeenCalledWith(
+      "/artifacts/ack/r1",
+      { sync_id: "sync-1" },
+      10_000,
+    );
+  });
+
+  it("persists an explicit input commit even when no files changed", async () => {
+    const fe = fakeFrontend();
+    const mgr = fakeManager();
+    mgr.get.mockReturnValue({ inputRevision: "manifest-1", status: "running" });
+    await driveCapabilitySession({
+      client: fakeClient([
+        { type: "syncArtifacts", artifacts: [], commit_input: true },
+        { type: "end" },
+      ]),
+      runId: "r1", frontendClient: fe, manager: mgr,
+    });
+    expect(fe.request).toHaveBeenCalledWith(CAPABILITY_PERSIST_ARTIFACTS, {
+      run_id: "r1",
+      input_revision: "manifest-1",
+      commit_input: true,
+      artifacts: [],
+    });
+  });
+
+  it("downgrades a commit without an input revision while preserving artifact content", async () => {
+    const fe = fakeFrontend();
+    const mgr = fakeManager();
+    mgr.get.mockReturnValue({ status: "running" });
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await driveCapabilitySession({
+        client: fakeClient([
+          {
+            type: "syncArtifacts",
+            artifacts: [{ path: "candidate/index.md", content: "# Index" }],
+            commit_input: true,
+          },
+          { type: "end" },
+        ]),
+        runId: "r1", frontendClient: fe, manager: mgr,
+      });
+    } finally {
+      errSpy.mockRestore();
+    }
+    expect(fe.request).toHaveBeenCalledWith(CAPABILITY_PERSIST_ARTIFACTS, {
+      run_id: "r1",
+      artifacts: [{
+        path: "candidate/index.md",
+        content: { inline_base64: Buffer.from("# Index", "utf8").toString("base64") },
+      }],
+    });
+    expect(emits(fe)).toContainEqual({
+      run_id: "r1",
+      type: "summary",
+      payload: { text: expect.stringContaining("provenance was not advanced") },
+    });
+  });
+
+  it("does not send an empty commit when the run has no input revision", async () => {
+    const fe = fakeFrontend();
+    const mgr = fakeManager();
+    mgr.get.mockReturnValue({ status: "running" });
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await driveCapabilitySession({
+        client: fakeClient([
+          { type: "syncArtifacts", artifacts: [], commit_input: true },
+          { type: "end" },
+        ]),
+        runId: "r1", frontendClient: fe, manager: mgr,
+      });
+    } finally {
+      errSpy.mockRestore();
+    }
+    expect(fe.request).not.toHaveBeenCalledWith(CAPABILITY_PERSIST_ARTIFACTS, expect.anything());
+    expect(emits(fe)).toContainEqual({
+      run_id: "r1",
+      type: "summary",
+      payload: { text: expect.stringContaining("provenance was not advanced") },
+    });
+  });
+
+  it("done → lifecycle done + endRun(done)", async () => {
+    const fe = fakeFrontend();
+    const mgr = fakeManager();
+    await driveCapabilitySession({
+      client: fakeClient([{ type: "done", message: "ok" }, { type: "end" }]),
+      runId: "r1", frontendClient: fe, manager: mgr,
+    });
+    expect(emits(fe)).toContainEqual({ run_id: "r1", type: "lifecycle", payload: { status: "done" } });
+    expect(mgr.endRun).toHaveBeenCalledWith("r1", "done");
+  });
+
+  it("error → lifecycle failed + endRun(failed) with structured failure even when bare", async () => {
+    const fe = fakeFrontend();
+    const mgr = fakeManager();
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await driveCapabilitySession({
+        client: fakeClient([{ type: "error", error: "boom" }, { type: "end" }]),
+        runId: "r1", frontendClient: fe, manager: mgr,
+      });
+    } finally {
+      errSpy.mockRestore();
+    }
+    expect(emits(fe)).toContainEqual({ run_id: "r1", type: "lifecycle", payload: { status: "failed", error: "boom" } });
+    // Bare box errors used to call endRun("failed") with no failure object.
+    // Owner-facing `error` ("boom") must NOT enter checkpoint.message.
+    expect(mgr.endRun).toHaveBeenCalledWith("r1", "failed", {
+      code: "box_error",
+      stage: "unknown",
+      message: "box_error",
+    });
+  });
+
+  it("persists a structured model-stall failure including free-text message", async () => {
+    const fe = fakeFrontend();
+    const mgr = fakeManager();
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await driveCapabilitySession({
+        client: fakeClient([{
+          type: "error",
+          error: "ModelStallError('model request stalled')",
+          code: "model_turn_stalled",
+          stage: "model_turn",
+          attempts: 4,
+          idle_s: 90.2,
+          bound_s: 90,
+          tool_pending: false,
+          last_sdk_message: "query",
+        }]),
+        runId: "r1", frontendClient: fe, manager: mgr,
+      });
+    } finally {
+      errSpy.mockRestore();
+    }
+    expect(mgr.endRun).toHaveBeenCalledWith("r1", "failed", {
+      code: "model_turn_stalled",
+      stage: "model_turn",
+      attempts: 4,
+      idle_s: 90.2,
+      bound_s: 90,
+      tool_pending: false,
+      last_sdk_message: "query",
+      // Safe short reason only — not the owner-facing error/repr string.
+      message: "model_turn_stalled",
+    });
+  });
+
+  it("a persistArtifacts outage retries until acknowledged before later events flow", async () => {
+    const fe = fakeFrontend();
+    let attempts = 0;
+    fe.request = vi.fn().mockImplementation(async (method: string) => {
+      if (method === CAPABILITY_PERSIST_ARTIFACTS && ++attempts < 3) throw new Error("ws blip");
+      return { ok: true };
+    });
+    const mgr = fakeManager();
+    mgr.get.mockReturnValue({ runId: "r1", status: "running" });
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await driveCapabilitySession({
+        client: fakeClient([
+          { type: "syncArtifacts", artifacts: [{ path: "candidate/a.md", content: "# A" }] },
+          { type: "turn_done", text: "still here" },
+          { type: "end" },
+        ]),
+        runId: "r1", frontendClient: fe, manager: mgr,
+      });
+    } finally {
+      errSpy.mockRestore();
+    }
+    // Relay survived the artifact failure: the turn after it was still delivered,
+    // and the run was never FAILED because of it (the trailing `end` terminalizes
+    // it as done — the normal close, not a casualty of the outage).
+    expect(emits(fe)).toContainEqual({ run_id: "r1", type: "turn", payload: { text: "still here" } });
+    expect(mgr.setStatus).toHaveBeenCalledWith("r1", "idle");
+    expect(mgr.endRun).not.toHaveBeenCalledWith("r1", "failed");
+    const artifactCalls = fe.request.mock.calls.filter((c: any[]) => c[0] === CAPABILITY_PERSIST_ARTIFACTS);
+    expect(artifactCalls).toHaveLength(3);
+    expect(artifactCalls[0][1]).toEqual(artifactCalls[2][1]);
+    // A consumer persistence retry is not evidence that the Box is alive. If it
+    // refreshes the Box heartbeat, a dead Box can stay "running" for the full
+    // data-stale window while only this local retry loop is making progress.
+    expect(mgr.touchHeartbeat).not.toHaveBeenCalled();
+  }, 10_000);
+
+  it("stops retrying when the run is cancelled or reaped", async () => {
+    const fe = fakeFrontend();
+    let attempts = 0;
+    fe.request = vi.fn().mockImplementation(async (method: string) => {
+      if (method === CAPABILITY_PERSIST_ARTIFACTS) {
+        attempts += 1;
+        throw new Error("consumer unavailable");
+      }
+      return { ok: true };
+    });
+    const mgr = fakeManager();
+    mgr.get.mockImplementation(() => attempts < 2 ? { runId: "r1", status: "running" } : undefined);
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await expect(driveCapabilitySession({
+        client: fakeClient([
+          { type: "syncArtifacts", artifacts: [{ path: "candidate/a.md", content: "# A" }] },
+        ]),
+        runId: "r1", frontendClient: fe, manager: mgr,
+      })).rejects.toThrow("no longer active");
+    } finally {
+      errSpy.mockRestore();
+    }
+    expect(attempts).toBe(2);
+  });
+
+  it("a malformed artifact entry is skipped loudly — the relay and later artifacts survive", async () => {
+    // Live 07-09: a runtime predating the tombstone branch threw in artifact
+    // construction (Buffer.from(undefined)) and the WHOLE relay died right after
+    // turn_done — the final SELFCHECK sync, settled, and end were lost, every
+    // incremental round wedged DIRTY, and the box pod leaked. Construction is
+    // still throwable today (a box bug sending a non-string content), so the
+    // guard is a boundary rule, not a legacy patch: skip the bad entry, keep
+    // the stream.
+    const fe = fakeFrontend();
+    const mgr = fakeManager();
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await driveCapabilitySession({
+        client: fakeClient([
+          {
+            type: "syncArtifacts",
+            artifacts: [
+              { path: "authoring/BAD.json", content: 42 as any }, // non-string → Buffer.from throws
+              { path: "authoring/SELFCHECK.json", content: '{"state":"passed"}' },
+            ],
+          },
+          { type: "end" },
+        ]),
+        runId: "r1", frontendClient: fe, manager: mgr,
+      });
+    } finally {
+      errSpy.mockRestore();
+    }
+    const artifactCalls = fe.request.mock.calls.filter((c: any[]) => c[0] === CAPABILITY_PERSIST_ARTIFACTS);
+    expect(artifactCalls).toHaveLength(1); // the good one after the bad one still landed
+    expect(artifactCalls[0][1]).toMatchObject({
+      run_id: "r1",
+      artifacts: [{ path: "authoring/SELFCHECK.json" }],
+    });
+    expect(mgr.endRun).not.toHaveBeenCalledWith("r1", "failed");
+  });
+
+  it("a deletion tombstone persists as {deleted:true} with no content", async () => {
+    const fe = fakeFrontend();
+    const mgr = fakeManager();
+    await driveCapabilitySession({
+      client: fakeClient([
+        { type: "syncArtifacts", artifacts: [{ path: "candidate/gone.md", deleted: true }] },
+        { type: "end" },
+      ]),
+      runId: "r1", frontendClient: fe, manager: mgr,
+    });
+    expect(fe.request).toHaveBeenCalledWith(CAPABILITY_PERSIST_ARTIFACTS, {
+      run_id: "r1",
+      input_revision: undefined,
+      artifacts: [{ path: "candidate/gone.md", deleted: true }],
+    });
+  });
+
+  it("an unhandled box event (e.g. the retired 'parked') is ignored, not fatal", async () => {
+    // The box never emits 'parked' (the handler was removed as dead code); a stray
+    // one must fall through harmlessly — no turn, no status change, no crash.
+    // (No trailing `end` here: this test isolates the unknown event itself.)
+    const fe = fakeFrontend();
+    const mgr = fakeManager();
+    await driveCapabilitySession({
+      client: fakeClient([{ type: "parked", message: "conflict noted" }]),
+      runId: "r1", frontendClient: fe, manager: mgr,
+    });
+    expect(emits(fe)).not.toContainEqual(expect.objectContaining({ type: "turn" }));
+    expect(mgr.setStatus).not.toHaveBeenCalled();
+    expect(mgr.endRun).not.toHaveBeenCalled();
+  });
+
+  it("a bare clean end (no done/error) terminalizes the run as done", async () => {
+    // Clean stream close = the box session can never take another turn (its RUNS
+    // entry keeps a dead client; every /message 409s). Left non-terminal, the run
+    // wedged the consumer for the idle TTL and the watchdog then blessed a dead
+    // session as a 2h-idle "done". A bare end must terminalize immediately.
+    const fe = fakeFrontend();
+    const mgr = fakeManager();
+    mgr.get.mockReturnValue({ runId: "r1", status: "idle" }); // tracked, non-terminal
+    await driveCapabilitySession({
+      client: fakeClient([{ type: "turn_done", text: "bye" }, { type: "end" }]),
+      runId: "r1", frontendClient: fe, manager: mgr,
+    });
+    expect(mgr.endRun).toHaveBeenCalledWith("r1", "done");
+    expect(emits(fe)).toContainEqual({ run_id: "r1", type: "lifecycle", payload: { status: "done" } });
+  });
+
+  it("end after an explicit done emits no duplicate lifecycle frame", async () => {
+    // get() → undefined: the record was dropped when the done persisted. endRun
+    // is sticky/no-op in the real manager; the frame must not be emitted twice.
+    const fe = fakeFrontend();
+    const mgr = fakeManager();
+    await driveCapabilitySession({
+      client: fakeClient([{ type: "done", message: "ok" }, { type: "end" }]),
+      runId: "r1", frontendClient: fe, manager: mgr,
+    });
+    const lifecycle = emits(fe).filter((f: any) => f.type === "lifecycle");
+    expect(lifecycle).toEqual([{ run_id: "r1", type: "lifecycle", payload: { status: "done" } }]);
+  });
+
+  it("a tombstone artifact relays deleted:true without content", async () => {
+    const fe = fakeFrontend();
+    const mgr = fakeManager();
+    await driveCapabilitySession({
+      client: fakeClient([
+        { type: "syncArtifacts", artifacts: [{ path: "candidate/dup.md", deleted: true }] },
+      ]),
+      runId: "r1", frontendClient: fe, manager: mgr,
+    });
+    expect(fe.request).toHaveBeenCalledWith(CAPABILITY_PERSIST_ARTIFACTS, {
+      run_id: "r1",
+      input_revision: undefined,
+      artifacts: [{ path: "candidate/dup.md", deleted: true }],
+    });
+  });
+});
+
+describe("driveCapabilitySession — bounded stream reconnect", () => {
+  it("replays artifact ACKs without waiting for execution observations across reconnect", async () => {
+    const order: string[] = [];
+    let releaseObservation!: () => void;
+    const pendingObservation = new Promise<void>((resolve) => { releaseObservation = resolve; });
+    const fe = fakeFrontend();
+    fe.request.mockImplementation(async (method: string) => {
+      if (method === CAPABILITY_PERSIST_EXECUTION_OBSERVATION) await pendingObservation;
+      if (method === CAPABILITY_PERSIST_ARTIFACTS) order.push("persist");
+      return { ok: true };
+    });
+    const manager = new CapabilityRunManager(fe);
+    const { runId } = await manager.startRun({ profile: "kb-compile", orgId: "org", correlationId: "attempt" });
+    const paths: string[] = [];
+    const client = {
+      async *streamPath(path: string) {
+        paths.push(path);
+        yield {
+          type: "execution_observation",
+          observation: {
+            version: 1, id: `observation-${paths.length}`, session_id: "session", turn_id: "turn",
+            kind: "model_request", observed_at: "2026-09-11T00:00:00Z", role: "compiler",
+            model_id: "model", provider: "provider", data: {},
+          },
+        };
+        yield {
+          type: "syncArtifacts", sync_id: "sync-1",
+          artifacts: [{ path: "candidate/a.md", content: "# A" }],
+        };
+        if (paths.length === 1) throw new Error("socket reset");
+        yield { type: "done" };
+        yield { type: "end" };
+      },
+      postJson: vi.fn().mockImplementation(async (path: string) => { if (path.startsWith("/artifacts/")) order.push("ack"); return { ok: true }; }),
+    } as any;
+    try {
+      await driveCapabilitySession({
+        client: reliableClient(client), runId, frontendClient: fe, manager,
+        reconnect: { maxAttempts: 1, baseDelayMs: 0, maxDelayMs: 0, isBoxAlive: async () => true },
+      });
+      expect(paths).toEqual([`/events/${runId}?ack=1`, `/events/${runId}?ack=1&replay=1`]);
+      expect(order).toEqual(["persist", "ack", "persist", "ack"]);
+      expect(client.postJson.mock.calls.filter(([path]: string[]) => path.startsWith("/artifacts/"))).toHaveLength(2);
+      expect(manager.get(runId)).toBeUndefined();
+      expect(fe.request.mock.calls.filter(([method]: any[]) => method === CAPABILITY_PERSIST_EXECUTION_OBSERVATION)).toHaveLength(1);
+    } finally {
+      releaseObservation();
+    }
+    await vi.waitFor(() => {
+      expect(fe.request.mock.calls.filter(([method]: any[]) => method === CAPABILITY_PERSIST_EXECUTION_OBSERVATION)).toHaveLength(2);
+    });
+  });
+
+  const alive = { baseDelayMs: 0, maxDelayMs: 0, isBoxAlive: async () => true };
+
+  it("re-opens the stream with replay when it breaks while the box is alive", async () => {
+    const paths: string[] = [];
+    let call = 0;
+    const client = {
+      async *streamPath(path: string) {
+        paths.push(path);
+        if (call++ === 0) {
+          yield { type: "log", text: "before the drop" };
+          throw new Error("socket hang up");
+        }
+        yield { type: "log", text: "after reconnect" };
+        yield { type: "end" };
+      },
+    } as any;
+    const fe = fakeFrontend();
+    const mgr = fakeManager();
+    mgr.get.mockReturnValue({ status: "running" });
+    await driveCapabilitySession({ client: reliableClient(client), runId: "r1", frontendClient: fe, manager: mgr, reconnect: alive });
+    expect(paths).toEqual(["/events/r1?ack=1", "/events/r1?ack=1&replay=1"]);
+    expect(emits(fe).filter((e: any) => e.type === "log").map((e: any) => e.payload.text)).toEqual(["before the drop", "after reconnect"]);
+    expect(mgr.endRun).toHaveBeenCalledWith("r1", "done");
+  });
+
+  it("gives up immediately when the box no longer answers", async () => {
+    const paths: string[] = [];
+    const client = {
+      async *streamPath(path: string) {
+        paths.push(path);
+        throw new Error("ECONNRESET");
+      },
+    } as any;
+    const mgr = fakeManager();
+    mgr.get.mockReturnValue({ status: "running" });
+    await expect(driveCapabilitySession({
+      client: reliableClient(client), runId: "r1", frontendClient: fakeFrontend(), manager: mgr,
+      reconnect: { ...alive, isBoxAlive: async () => false },
+    })).rejects.toThrow("ECONNRESET");
+    expect(paths).toEqual(["/events/r1?ack=1"]);
+    expect(mgr.endRun).not.toHaveBeenCalled(); // the caller fails the run (relay_failed)
+  });
+
+  it("fails the relay once the attempt budget is spent", async () => {
+    const paths: string[] = [];
+    const client = {
+      async *streamPath(path: string) {
+        paths.push(path);
+        throw new Error("still broken");
+      },
+    } as any;
+    const mgr = fakeManager();
+    mgr.get.mockReturnValue({ status: "running" });
+    await expect(driveCapabilitySession({
+      client: reliableClient(client), runId: "r1", frontendClient: fakeFrontend(), manager: mgr,
+      reconnect: { ...alive, maxAttempts: 2 },
+    })).rejects.toThrow("still broken");
+    expect(paths).toEqual(["/events/r1?ack=1", "/events/r1?ack=1&replay=1", "/events/r1?ack=1&replay=1"]);
+  });
+
+  it("ignores a stream error after the run already settled", async () => {
+    const mgr = fakeManager();
+    const client = {
+      async *streamPath(_path: string) {
+        yield { type: "done" };
+        throw new Error("connection closed by peer");
+      },
+    } as any;
+    // The real manager DROPS the record after persisting the terminal state.
+    mgr.endRun.mockImplementation(async () => { mgr.get.mockReturnValue(undefined); });
+    await driveCapabilitySession({ client: reliableClient(client), runId: "r1", frontendClient: fakeFrontend(), manager: mgr, reconnect: alive });
+    expect(mgr.endRun).toHaveBeenCalledTimes(1);
+    expect(mgr.endRun).toHaveBeenCalledWith("r1", "done");
+  });
+});
+
+describe("driveCapabilitySession — reconnect against the real run manager", () => {
+  const noDelay = { baseDelayMs: 0, maxDelayMs: 0, isBoxAlive: async () => true };
+  const frontend = () => ({ emitEvent: vi.fn(), request: vi.fn().mockResolvedValue({ ok: true }) }) as any;
+
+  it.each(["done", "error"])("does not replay after %s was persisted and the live record dropped", async (eventType) => {
+    const fe = frontend();
+    const manager = new CapabilityRunManager(fe);
+    const id = `settled-${eventType}`;
+    await manager.startRun({ runId: id, profile: "kb-compile", orgId: "t" });
+    const paths: string[] = [];
+    const health = vi.fn().mockResolvedValue(true);
+    const client = {
+      async *streamPath(path: string) {
+        paths.push(path);
+        if (paths.length === 1) {
+          yield { type: eventType };
+          expect(manager.get(id)).toBeUndefined(); // endRun dropped the record
+          throw new Error("socket reset after terminal, before end");
+        }
+        yield { type: "end" };
+      },
+    } as any;
+    await driveCapabilitySession({ client: reliableClient(client), runId: id, frontendClient: fe, manager, reconnect: { ...noDelay, isBoxAlive: health } });
+    const persisted = fe.request.mock.calls.filter((c: any[]) => c[0] === CAPABILITY_PERSIST_RUN_STATE).map((c: any[]) => c[1].status);
+    expect(persisted).toEqual(["running", eventType === "done" ? "done" : "failed"]);
+    expect(paths).toEqual([`/events/${id}?ack=1`]);
+    expect(health).not.toHaveBeenCalled();
+  });
+
+  it.each(["probe", "backoff"])("does not reopen after the run settles during the %s", async (stage) => {
+    const fe = frontend();
+    const manager = new CapabilityRunManager(fe);
+    const id = `settle-during-${stage}`;
+    await manager.startRun({ runId: id, profile: "kb-compile", orgId: "t" });
+    const paths: string[] = [];
+    let settling: Promise<void> | undefined;
+    const client = {
+      async *streamPath(path: string) {
+        paths.push(path);
+        if (paths.length === 1) throw new Error("temporary stream reset");
+        yield { type: "end" };
+      },
+    } as any;
+    await driveCapabilitySession({
+      client: reliableClient(client), runId: id, frontendClient: fe, manager,
+      reconnect: {
+        ...noDelay, baseDelayMs: 20, maxDelayMs: 20,
+        isBoxAlive: async () => {
+          if (stage === "probe") await manager.endRun(id, "done");
+          else setTimeout(() => { settling = manager.endRun(id, "done"); }, 0);
+          return true;
+        },
+      },
+    });
+    await settling;
+    expect(paths).toEqual([`/events/${id}?ack=1`]);
+    expect(manager.get(id)).toBeUndefined();
+  });
+});

@@ -1,0 +1,4327 @@
+import { UsageOutbox } from "./usage-outbox.js";
+/**
+ * AgentBox session manager
+ *
+ * Manages multiple sessions within a single AgentBox (a user may have multiple conversations).
+ * Reuses createSiclawSession() to create Agents.
+ * Supports session persistence via User PV.
+ *
+ * The memory indexer is shared at the AgentBox level and reused across sessions.
+ * MCP connections are created per-session by createSiclawSession and shut down on release.
+ * Sessions are released after each prompt completes (request-level lifecycle)
+ * and restored from JSONL on the next prompt.
+ */
+
+import type { BackgroundWorkTurn } from "./background-work-turn.js";
+import { persistableToolDetails } from "../shared/tool-result-metadata.js";
+import fs from "node:fs";
+import path from "node:path";
+import { randomUUID } from "node:crypto";
+import type { AgentSession } from "@earendil-works/pi-coding-agent";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { writeRehydratedSession } from "./session-rehydrate-store.js";
+import { createSiclawSession } from "../core/agent-factory.js";
+import type {
+  SpawnSubagentExecutor,
+  SpawnSubagentProgress,
+  SubagentStep,
+  SpawnSubagentRequest,
+  SpawnSubagentResult,
+  SpawnSubagentStatus,
+  SpawnSubagentGroupRequest,
+  SubagentGroupProgress,
+  SubagentGroupReport,
+  SubagentGroupResult,
+  SubagentGroupItemResult,
+  SubagentTargetCoverage,
+  JobStopExecutor,
+  BackgroundExecExecutor,
+  TaskOutputReader,
+  ChannelMessageExecutor,
+  AgentMode,
+} from "../core/tool-registry.js";
+import { getSubagentType, DEFAULT_SUBAGENT_TYPE, getSubagentConcurrency, getSubagentPodConcurrency, getSubagentMaxRuntimeMs, getBackgroundBashConcurrency, getGroupWorkerShare, getGroupPodShare, getSubagentGroupMaxRuntimeMs } from "../core/subagent-registry.js";
+import { GroupCircuitBreaker, type GroupItemOutcome, type GroupItemStatus } from "./subagent-group.js";
+import { JobRegistry, type JobStatus } from "../core/job-registry.js";
+import { hasAcceptedTurn, recordAcceptedTurn } from "./turn-ledger.js";
+import { buildNotificationBatch, buildGroupNotificationSummary, summarizeItemStatuses, type TaskNotification } from "../core/task-notification.js";
+import { spawnBackgroundBash } from "../core/background-bash-runner.js";
+import { DiskTaskOutput, getTaskOutputPath } from "../tools/cmd-exec/disk-output.js";
+import { ConcurrencyLimiter } from "../core/concurrency-limiter.js";
+import { buildDelegateSummaryBundle } from "./delegation-summary.js";
+import type { KubeconfigRef, SessionMode, DpStateRef } from "../core/types.js";
+import { normalizeAgentType } from "../core/agent-types.js";
+import type { HandoffTarget } from "../shared/agent-handoff.js";
+import type { BrainModelParams, BrainSession } from "../core/brain-session.js";
+import type { PromptInspection } from "../core/prompt-inspection.js";
+import type { McpClientManager } from "../core/mcp-client.js";
+import { createMemoryIndexer, type MemoryIndexer } from "../memory/index.js";
+import { createKnowledgeResolver, type KnowledgeResolver } from "../knowledge/indexer.js";
+import { saveSessionKnowledge } from "../memory/session-summarizer.js";
+import { loadConfig, getEmbeddingConfig, isMemoryEnabled } from "../core/config.js";
+import { emitDiagnostic } from "../shared/diagnostic-events.js";
+import { tracingRecorder } from "../shared/tracing/agent-trace-recorder.js";
+import { isTracingEnabled } from "../shared/tracing/otel-provider.js";
+import type { SpanContext } from "@opentelemetry/api";
+import { buildRedactionConfigForModelConfig, redactText, type RedactionConfig } from "../shared/output-redactor.js";
+import { detectLanguage } from "../shared/detect-language.js";
+import { stripLanguageDirective } from "../shared/strip-language-directive.js";
+import type {
+  DelegationAppendMessagePayload,
+  DelegationEventPayload,
+  DelegationLineagePayload,
+  DelegationPersistenceEvent,
+  DelegationPersistenceResponse,
+  DelegationToolUpdatePayload,
+  DelegationUpdateMessagePayload,
+} from "../shared/delegation-persistence.js";
+import { assistantTextBlocks } from "../shared/assistant-items.js";
+import { scheduleToolOutputCleanup } from "../core/tool-output-cleanup.js";
+import { ToolResultArtifactStore, toolResultArtifactRoot, formatToolResultArtifactReference, getToolResultArtifactDetails } from "../core/tool-result-artifact.js";
+import { prepareReduceEvidence } from "./subagent-evidence.js";
+import { finishTargetCoverage } from "./subagent-targets.js";
+import { createSubagentTickets, readSubagentTicket, SubagentMailbox } from "./subagent-lifecycle.js";
+import { openSubagentTranscript } from "./subagent-transcript.js";
+import { runSubagentToAcceptance } from "./subagent-completion.js";
+import { captureSubagentContext, materializeSubagentContext, validateSubagentContextSelection } from "./subagent-context.js";
+import { restoreTaskLedgerFromHistory } from "./task-ledger-recovery.js";
+import { isTaskEvent, buildTaskEventChatMessage, type TaskEvent } from "../shared/task-events.js";
+import { getOrCreateLedger, peekLedger, deleteLedger, type LedgerTask } from "../core/task-ledger.js";
+import { createCoalescedWriter, createSerialQueue } from "./keyed-writes.js";
+import {
+  createModelRouteState,
+  normalizeModelRouteState,
+  runPromptWithModelRouting,
+  resolveEffectivePolicy,
+  withResolvedCandidateConfig,
+  applyModelParamsForCandidate,
+  type ModelRouteCandidate,
+  type ModelRouteEvent,
+  type ModelRoutePolicy,
+  type ModelRouteState,
+} from "../core/model-routing.js";
+import { resolveRequestedTier } from "../core/subagent-registry.js";
+import {
+  persistableTierOutcome,
+  resolveTierSelection,
+  type ChildModelOutcome,
+  type PersistedTierOutcome,
+  type SubagentTierCandidates,
+  type SubagentTierMenu,
+  type SubagentTierPlan,
+  type TierFallbackReason,
+  type TierSelectionSource,
+} from "../core/subagent-models.js";
+import type { GatewayClient } from "./gateway-client.js";
+import { extractToolResultId } from "../core/message-utils.js";
+// topic-consolidator import removed — consolidation disabled
+
+/**
+ * Parent trace context captured once at spawn dispatch and threaded to every child run.
+ * `mainTraceId` stamps chat_messages.trace_id (DB audit); `spawnSpanContext` nests the child
+ * ROOT under the parent's spawn_subagent tool span (Langfuse). Both undefined when tracing is off.
+ */
+type SubagentTraceContext = { mainTraceId?: string; spawnSpanContext?: SpanContext };
+
+export interface ManagedSession {
+  agentPrompt?: string;
+  id: string;
+  /** User identity bound to this conversation's tools and child-session persistence. */
+  userId?: string;
+  brain: BrainSession;
+  session: AgentSession;  // backward compat — only guaranteed for pi-agent brain
+  /** Exact function-schema names exposed when this in-memory brain was built. */
+  toolNames: string[];
+  /** Exact Skill names exposed after personal overlay and Built-in masks. */
+  skillNames: string[];
+  /** SHA-256 of the actual SKILL.md loaded for each visible Skill. */
+  skillDigests: Record<string, string>;
+  /** Re-read loaded Skills before recording evidence. */
+  getSkillSnapshot?: () => { skillNames: string[]; skillDigests: Record<string, string> };
+  /** Exact on-demand prompt/tool inspection; never emitted through routine status or logs. */
+  getPromptInspection: () => PromptInspection;
+  createdAt: Date;
+  lastActiveAt: Date;
+  /** Callbacks fired when the current prompt completes */
+  _promptDoneCallbacks: Set<() => void>;
+  /** Whether auto-compaction is currently in progress */
+  isCompacting: boolean;
+  /** Whether the agent is currently active (between agent_start and agent_end) */
+  isAgentActive: boolean;
+  /** Whether an auto-retry is in progress (between auto_retry_start and auto_retry_end) */
+  isRetrying: boolean;
+  /** Whether the current prompt has finished (for race condition prevention) */
+  _promptDone: boolean;
+  /** Required background work owned by the current user prompt. */
+  _backgroundWorkTurn?: BackgroundWorkTurn;
+  /** Events buffered during prompt execution (replayed when SSE connects) */
+  _eventBuffer: unknown[];
+  /** Unsubscribe function for the event buffer subscription */
+  _bufferUnsub: (() => void) | null;
+  /** Serializes synthetic parent prompts triggered by delegation notifications */
+  _syntheticPromptQueue: Promise<void> | null;
+  /**
+   * Mutex around brain.prompt() — resolves when the current prompt path
+   * (HTTP /prompt OR synth notify) lets go. Prevents the TOCTOU race
+   * where waitForParentIdle() observed _promptDone === true and the synth
+   * path is mid-await when an HTTP /prompt sneaks in: both paths would
+   * end up calling brain.prompt() concurrently. Acquired before
+   * brain.prompt(), released in finally.
+   *
+   * TODO(post-247): consolidate _promptDone / _syntheticPromptQueue /
+   * _promptInflight into one mutex queue. Three overlapping primitives is
+   * harder to reason about than necessary; this lock patches the
+   * immediate jacoblee #2/#3 race but the long-term answer is unification
+   * (every brain.prompt() callsite chains through a single Promise queue,
+   * _promptDone becomes a status flag derived from the queue).
+   */
+  _promptInflight: Promise<void> | null;
+  /** Mutable reference to the active kubeconfig path — tools read .current at execution time */
+  kubeconfigRef: KubeconfigRef;
+  /**
+   * The tier MENU this session advertised when its tool schema was built.
+   *
+   * Snapshotted from box state at creation and never updated: the tool
+   * description is baked in at creation, so honouring a newer menu would let the
+   * lead pick a name it was shown while resolving it against a list it was not.
+   */
+  subagentTierMenu: SubagentTierMenu | null;
+  /**
+   * Tier CANDIDATES for the CURRENT turn — carries credentials.
+   *
+   * Session-scoped and overwritten by every prompt, INCLUDING being overwritten
+   * with null: a turn whose binding carries no tiers must leave none behind, or a
+   * withdrawn model stays reachable and outlives a credential rotation. Never
+   * box-level (that would share credentials across sessions and let one session
+   * resolve against another's binding), never persisted, never logged.
+   */
+  subagentTierCandidates: SubagentTierCandidates | null;
+  /**
+   * The candidate this turn is ACTUALLY running on, published by the routing
+   * runner's `onAttemptReady` once setup and preflight have passed.
+   *
+   * This is the fallback target for every tier miss. It cannot be read from
+   * `activeCandidateKey` (only written after an attempt succeeds, so mid-prompt it
+   * holds the previous turn's value) nor from `brain.getModel()` (no credentials,
+   * no params) — and it must not be the configured primary, since the parent may
+   * already have failed over away from it.
+   */
+  effectiveModelCandidate: ModelRouteCandidate | null;
+  /**
+   * The runtime tunables actually in effect on the PARENT after its attempt was
+   * set up — captured by the same `onAttemptReady` hook, which fires after the
+   * params have been applied.
+   *
+   * This is the only correct restore target for a child that tried a tier and had
+   * to fall back. A child's own pre-tier value is NOT usable for it: pi clamps the
+   * thinking level to the current model's capabilities, so a child that started on
+   * a non-reasoning model reads back `off` regardless of what the deployment's
+   * default is — and pi's own `setModel` would have given that default rather than
+   * the clamped value (`_getThinkingLevelForModelSwitch` consults
+   * `supportsThinking()` on the model being switched AWAY from).
+   */
+  effectiveModelParams: BrainModelParams | null;
+  /** Whether the current prompt was aborted (prevents empty response retry) */
+  _aborted: boolean;
+  /**
+   * Caller-supplied identity of the turn currently running, when it supplied one.
+   *
+   * A session id names a CONVERSATION, which a multi-turn session deliberately
+   * reuses across turns, so an abort addressed by session alone cannot distinguish
+   * "stop what is running" from "stop the turn I dispatched" — a late abort for a
+   * finished turn lands on its successor. Callers that know which turn they mean
+   * pass its id and the abort endpoint ignores a mismatch.
+   */
+  _currentTurnId?: string;
+  /** Mutable skill dirs array passed to DefaultResourceLoader — update + reload to switch */
+  skillsDirs: string[];
+  /** Session mode — determines which system skills are loaded */
+  mode: SessionMode;
+  /** Active operating mode (normal/dp/…) this agent was built for — drives rebuild on change. */
+  activeMode: AgentMode;
+  /** Whether this session was built with top-level `request_input` available. */
+  allowInputRequest: boolean;
+  handoffSupported?: boolean;
+  handoffPolicy?: import("../shared/agent-handoff.js").HandoffPolicy;
+  /** MCP client manager — per-session, shut down on release/close */
+  mcpManager?: McpClientManager;
+  /** Memory indexer — shared at AgentBox level, NOT per-session */
+  memoryIndexer?: MemoryIndexer;
+  /** Knowledge label resolver — shared at AgentBox level and scoped to this Agent's mount. */
+  knowledgeIndexer?: KnowledgeResolver;
+  /** Read-only DP state ref — pi-agent extension writes to this, agentbox exposes it for recovery */
+  dpStateRef?: DpStateRef;
+  /**
+   * Per-turn counter handed to the tool layer (see ToolRefs.turnRef). Bumped where
+   * the prompt mutex is acquired — the one funnel both /prompt and the synthetic
+   * delegation prompt pass through — so tools can scope state to one routing
+   * attempt instead of the whole session.
+   */
+  turnRef?: { current: number };
+  /** Number of JSONL message entries at the time of last memory auto-save (dedup) */
+  _lastSavedMessageCount: number;
+  /** Pending release timer (cleared when a new prompt arrives before TTL expires) */
+  _releaseTimer: ReturnType<typeof setTimeout> | null;
+  /** A config reload requires this in-memory brain to rebuild before its next idle prompt. */
+  _invalidated: boolean;
+  /** Background work currently owned by this parent session (e.g. detached sub-agent jobs). */
+  _backgroundWorkCount: number;
+  /**
+   * This conversation's share of the box's sub-agent capacity. Held per session so one
+   * conversation's fan-out queues its own children rather than everyone else's; the box-wide
+   * ceiling is the manager's `podSubagentLimiter`.
+   */
+  _subagentLimiter: ConcurrencyLimiter;
+  /** Per-session model routing state, persisted as a sidecar under the session directory. */
+  modelRouteState: ModelRouteState;
+  /** Last normalized model routing policy supplied by Runtime/Portal for this session. */
+  modelRoutePolicy?: ModelRoutePolicy;
+  /** When true, brain events are emitted by the route runner after attempt filtering. */
+  _routeBrainEventsThroughExtra: boolean;
+  /**
+   * Extra event subscribers — tools (via sessionEventEmitter in ToolRefs) can
+   * push custom events here, and the SSE handler forwards them to clients.
+   * Used by spawn_subagent to surface child-agent events in the parent
+   * session's stream.
+   */
+  _extraEventSubs: Set<(event: Record<string, unknown>) => void>;
+  /** Buffer of extra events fired before an SSE client connects (replayed on connect, like _eventBuffer for brain events). */
+  _extraEventBuffer: Record<string, unknown>[];
+  /**
+   * Completion notifications claimed but not yet delivered, plus a short coalescing timer.
+   * A burst of background jobs finishing close together (e.g. an RDMA server + client) is
+   * delivered as ONE synthetic turn instead of N — so the model reacts once rather than
+   * re-summarizing per completion. See notifyParent / flushPendingNotifications.
+   */
+  _pendingNotifications: TaskNotification[];
+  _coalesceTimer: ReturnType<typeof setTimeout> | null;
+  /** Unsubscribe for the gated tracing brain.subscribe; called + nulled on detach. */
+  _tracingUnsub: (() => void) | null;
+}
+
+export interface PersistedDpStateSnapshot {
+  active: boolean;
+}
+
+/** Delay before releasing an idle session (seconds). Gives frontend time to query context/model. */
+const SESSION_RELEASE_TTL_MS = 30_000;
+/**
+ * Window for coalescing background-job completion notifications when the parent is idle.
+ * A burst finishing within this window becomes ONE synthetic turn. Short enough to be
+ * imperceptible for background work, well under SESSION_RELEASE_TTL_MS so the synthetic
+ * turn (which clears the release timer) always wins the race.
+ */
+const NOTIFICATION_COALESCE_MS = 600;
+/**
+ * Min interval between live `group_progress` chat events for a background group. The
+ * orchestrator fires a progress callback on every item start/finish; this coalesces a burst
+ * (e.g. a wave of children finishing together) into one event, with a trailing flush so the
+ * final frame always lands. Live-only immediacy knob — correctness comes from persisted events.
+ */
+const GROUP_PROGRESS_THROTTLE_MS = 700;
+
+/**
+ * Minimal trailing throttle: at most one call per `ms`, always coalescing to the latest args via a
+ * trailing timer. `cancel()` drops any pending trailing call — used by the FOREGROUND group path so
+ * a late frame never lands after the tool has already returned its (authoritative) inline result.
+ * Standalone on purpose: the BACKGROUND emitter keeps its own flush-then-stop `settle()` (it MUST
+ * emit the terminal frame because it has no inline return value); a foreground group does not.
+ */
+function throttleTrailing<A extends unknown[]>(
+  fn: (...args: A) => void,
+  ms: number,
+): { call: (...args: A) => void; cancel: () => void } {
+  let last = 0;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let pending: A | null = null;
+  const flush = (): void => {
+    timer = null;
+    if (!pending) return;
+    last = Date.now();
+    const args = pending;
+    pending = null;
+    fn(...args);
+  };
+  return {
+    call: (...args: A): void => {
+      pending = args;
+      const elapsed = Date.now() - last;
+      if (elapsed >= ms) flush();
+      else if (!timer) {
+        timer = setTimeout(flush, ms - elapsed);
+        timer.unref?.();
+      }
+    },
+    cancel: (): void => {
+      if (timer) { clearTimeout(timer); timer = null; }
+      pending = null;
+    },
+  };
+}
+
+/** One-time guard for the "synthetic turn can't persist" diagnostic (see runSyntheticPrompt). */
+let warnedNoPersist = false;
+/** Delay before auto-clearing a fully-completed plan (CC V2 parity: HIDE_DELAY_MS). */
+const LEDGER_AUTOCLEAR_MS = 5_000;
+const DELEGATED_AGENT_MAX_RUNTIME_MS = getSubagentMaxRuntimeMs();
+const DELEGATED_AGENT_ABORT_TIMEOUT_MS = 2_000;
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function abortBrainBestEffort(
+  brain: Pick<BrainSession, "abort">,
+  label: string,
+  timeoutMs = DELEGATED_AGENT_ABORT_TIMEOUT_MS,
+): Promise<void> {
+  const abortPromise = Promise.resolve()
+    .then(() => brain.abort())
+    .catch((err) => {
+      console.warn(`[agentbox-session] ${label}: abort failed:`, err);
+    });
+  const outcome = await Promise.race([
+    abortPromise.then(() => "done" as const),
+    delay(timeoutMs).then(() => "timeout" as const),
+  ]);
+  if (outcome === "timeout") {
+    console.warn(`[agentbox-session] ${label}: abort did not settle within ${timeoutMs}ms; continuing with timeout result`);
+  }
+}
+
+export class AgentBoxSessionManager {
+  private sessions = new Map<string, ManagedSession>();
+  private subagentRuns = new Map<string, { mailbox: SubagentMailbox; jobId: string; restoredSession?: SessionManager }>();
+  // Retain the launching request owner until notification, even if Stop/handoff
+  // replaces the session's current request before a late child/process exit.
+  private backgroundWorkOwners = new Map<string, BackgroundWorkTurn>();
+
+  private registerBackgroundWork(sessionId: string, jobId: string): BackgroundWorkTurn | undefined {
+    const owner = this.sessions.get(sessionId)?._backgroundWorkTurn;
+    if (owner) {
+      owner.register(jobId);
+      this.backgroundWorkOwners.set(jobId, owner);
+    }
+    return owner;
+  }
+  /** Per-session write chain so route-state persists land in call order. */
+  private _modelRouteStatePersists = new Map<string, Promise<void>>();
+  private defaultSessionId = "default";
+
+  /** Optional userId — set by LocalSpawner for per-user skill directory isolation */
+  userId?: string;
+
+  /** Optional agentId — set by LocalSpawner / K8s spawner; used for metrics labeling */
+  agentId?: string;
+
+  /** Optional credential broker — set by http-server for on-demand credential acquisition */
+  credentialBroker?: import("./credential-broker.js").CredentialBroker;
+
+  /**
+   * Optional Runtime callback client. In K8s, AgentBox runs in a separate pod
+   * and must persist delegation/audit rows through Runtime's internal API.
+   */
+  gatewayClient?: GatewayClient;
+
+  /**
+   * Optional override for the directory where the broker materializes credential
+   * files. LocalSpawner sets this to a per-user path so multiple
+   * AgentBoxes don't collide on a shared credentialsDir. When undefined the
+   * broker falls back to `<cwd>/.siclaw/credentials`.
+   */
+  credentialsDir?: string;
+
+  /**
+   * Optional directory containing this AgentBox's materialized knowledge.
+   * LocalSpawner sets an agent-scoped path because every local box shares one
+   * process and cwd. K8s leaves this unset and uses the pod-local config path.
+   */
+  knowledgeDir?: string;
+
+  /** Agent-scoped skills base directory; LocalSpawner materializes into resolved/. */
+  skillsDir?: string;
+
+  /** Agent-scoped MCP bindings. Undefined keeps pod/standalone config compatibility. */
+  mcpServersState?: Record<string, unknown>;
+
+  /**
+   * Per-agent tool capability whitelist — the resolved `allowedTools` list for
+   * this AgentBox's agent (see core/tool-capabilities.ts).
+   *
+   * `null` is unrestricted only for an explicitly resolved Custom Agent.
+   * Built-in types expand their locked capability groups at the compiler
+   * boundary; unresolved startup state remains fail-closed.
+   *
+   * This state is PER-AGENT by construction: one AgentBoxSessionManager instance
+   * per agent (K8s = one pod; LocalSpawner = one `new AgentBoxSessionManager()`
+   * per agent). It is filled at startup (K8s: explicit fetch in agentbox-main;
+   * Local: LocalSpawner injection) and refreshed on POST /api/reload-tools via a
+   * per-box handler that writes here — never via loadConfig/writeConfig/process.env.
+   */
+  allowedToolsState: string[] | null = null;
+
+  /**
+   * Whether the control plane successfully resolved this Agent's type and tool
+   * policy. K8s/Local startup set false before fetching; the compiler then
+   * exposes no built-in or MCP tools until a concrete policy lands.
+   */
+  harnessResolvedState = true;
+
+  /** Agent type, fetched alongside allowedTools.
+   *  Drives capabilities and the legacy-row prompt fallback. */
+  agentTypeState: string = "custom";
+
+  /**
+   * Latest sub-agent tier MENU for this box (credential-free), refreshed by the
+   * tools sync handler. null = no tiers configured.
+   *
+   * Box-level because it arrives on a box-level channel — but a session must NOT
+   * read it at spawn time. Each session snapshots it at creation
+   * (`managedSession.subagentTierMenu`), because the menu that built a session's
+   * tool description is the menu that session has to honour: resolving against a
+   * newer one would run a model the operator did not intend for a tier name the
+   * lead chose from the older menu.
+   */
+  subagentTierMenuState: SubagentTierMenu | null = null;
+
+  /** Callback fired after a session is released — used by http-server to check idle status */
+  onSessionRelease?: () => void;
+
+  /** Last model selection supplied by the gateway for this AgentBox. */
+  private delegationModelProvider?: string;
+  private delegationModelId?: string;
+  private delegationModelConfig?: Record<string, unknown>;
+
+  // ── Shared components (AgentBox-level, outlive individual sessions) ──
+  private _sharedMemoryIndexer: MemoryIndexer | null = null;
+  private _sharedKnowledgeIndexer: KnowledgeResolver | null = null;
+  /** Whether shared components have been initialized */
+  private _sharedInitialized = false;
+
+  setDelegationModel(opts: {
+    provider?: string;
+    modelId?: string;
+    config?: Record<string, unknown>;
+  }): void {
+    if (opts.provider) this.delegationModelProvider = opts.provider;
+    if (opts.modelId) this.delegationModelId = opts.modelId;
+    if (opts.config) this.delegationModelConfig = opts.config;
+  }
+
+  /**
+   * The parent's effective model as a routing candidate — the fallback target for
+   * every tier miss, and what a sub-agent runs on when no tier applies.
+   *
+   * Reads what the routing runner published for the CURRENT turn OF THIS SESSION
+   * (`effectiveModelCandidate`): the parent may already have failed over, and
+   * sending children at the configured primary would aim them at a model the
+   * parent just found broken.
+   *
+   * ⚠️ SESSION-OWNED ONLY — deliberately no box-level fallback. This used to fall
+   * back to `delegationModel*`, which is box-scoped: with more than one live
+   * session it holds whichever one most recently bound a model, so session A's
+   * children could be placed on session B's provider config, credentials included.
+   * That is precisely the isolation the two-channel split exists to preserve.
+   *
+   * Both prompt paths now publish (HTTP via its own `onAttemptReady`, synthetic via
+   * the one in `processSyntheticPrompt`), so nothing legitimate reached that
+   * fallback anyway. When a session genuinely has nothing published, `null` is the
+   * honest answer and `applyParent` already handles it: the child runs on whatever
+   * the factory gave it, which is the pre-tiering no-op path. Borrowing another
+   * session's binding is never the better answer.
+   */
+  private effectiveParentCandidate(
+    parentSessionId: string,
+  ): (ModelRouteCandidate & { params?: BrainModelParams }) | null {
+    const parent = this.sessions.get(parentSessionId);
+    const live = parent?.effectiveModelCandidate;
+    if (!live) return null;
+    // Carry the parent's ACTUAL tunables alongside its model. Only meaningful
+    // together: restoring one without the other puts the child on the right model
+    // at the wrong level.
+    return { ...live, params: parent?.effectiveModelParams ?? undefined };
+  }
+
+  /**
+   * Build the immutable tier plan for one `spawn_subagent` dispatch.
+   *
+   * Captured ONCE, at dispatch, and reused by the collapse path, every map child,
+   * every later wave, the background continuation, and the reduce child. See
+   * docs/design/subagent-model-tiering.md §4.
+   */
+  buildTierPlan(
+    parentSessionId: string,
+    requestedTier?: string | null,
+    subagentType?: string,
+  ): SubagentTierPlan {
+    const parent = this.sessions.get(parentSessionId);
+    // Resolution order (design §3.7): env override > request > type default >
+    // inherit. Recorded alongside the tier so a report can say WHICH level won —
+    // "the lead chose fast" and "ops pinned fast" look identical otherwise.
+    const resolved = resolveRequestedTier(requestedTier, subagentType);
+    return {
+      menu: parent?.subagentTierMenu ?? null,
+      candidates: parent?.subagentTierCandidates ?? null,
+      requestedTier: resolved.tier,
+      selectionSource: resolved.source,
+      effectiveParent: this.effectiveParentCandidate(parentSessionId),
+    };
+  }
+
+  /**
+   * Put a child brain on its model, and report what actually happened.
+   *
+   * Ordering per candidate is fixed and mirrors the routing runner's:
+   * `registerProvider` → `findModel` → `setModel` → apply params → fit check.
+   * Params are applied unconditionally after `setModel` because the level is
+   * session state a previous model may have moved.
+   *
+   * Everything that can fail BEFORE the child prompts is a fallback to the
+   * parent's effective model, never an error — a bad tier must not cost the caller
+   * its task. The one exception is the parent itself failing to apply: there is no
+   * further fallback by definition, so the child fails with
+   * `parent_fallback_failed` rather than looping.
+   */
+  private async applyChildModel(
+    child: { brain: BrainSession },
+    plan: SubagentTierPlan | undefined,
+    briefing: string,
+  ): Promise<ChildModelOutcome> {
+    const requested = plan?.requestedTier ?? null;
+    const parentCandidate = plan?.effectiveParent ?? null;
+
+    const applyParent = async (
+      reason: TierFallbackReason | undefined,
+      source: TierSelectionSource,
+    ): Promise<ChildModelOutcome> => {
+      if (!parentCandidate) {
+        // No binding at all — the pre-tiering no-op path. The child runs on
+        // whatever the factory gave it.
+        return { requestedTier: requested, resolvedTier: null, source, fallbackReason: reason };
+      }
+      // `reason` is undefined on the plain inherit path and set on every fallback.
+      // That distinction decides whether the child's tunables are touched AT ALL.
+      //
+      // Inherit must leave them alone. Before tiering a child was placed on its
+      // model with registerProvider + setModel and nothing else, so both applying
+      // the parent candidate's own params and writing back a captured level would
+      // be new behaviour — and contract 1 says a deployment with no tiers behaves
+      // exactly as it did. Note pi's setModel consults supportsThinking() on the
+      // model being switched AWAY from and hands out the deployment default when
+      // that model is non-reasoning; writing anything over that would replace the
+      // default with a clamped artifact.
+      //
+      // Fallback is the opposite case: the tier has already moved the level, and
+      // neither setModel nor applyModelParams can lower it, so the parent's real
+      // params are the restore target.
+      const isFallback = reason !== undefined;
+      const applied = await this.putBrainOnCandidate(
+        child.brain, parentCandidate, briefing, false,
+        isFallback,
+        isFallback ? plan?.effectiveParent?.params : undefined,
+      );
+      if (!applied.ok) {
+        return {
+          requestedTier: requested,
+          resolvedTier: null,
+          source,
+          fallbackReason: "parent_fallback_failed",
+          failed: true,
+          detail: applied.detail,
+        };
+      }
+      return {
+        requestedTier: requested,
+        resolvedTier: null,
+        source,
+        fallbackReason: reason,
+        provider: parentCandidate.provider,
+        modelId: parentCandidate.modelId,
+      };
+    };
+
+    const selection = resolveTierSelection(plan?.menu, plan?.candidates, requested);
+    if (selection.kind === "inherit") return applyParent(undefined, "inherit");
+    if (selection.kind === "fallback") return applyParent(selection.reason, plan?.selectionSource ?? "request");
+
+    const tierCandidate: ModelRouteCandidate = {
+      provider: selection.candidate.provider,
+      modelId: selection.candidate.modelId,
+      modelConfig: selection.candidate.modelConfig,
+    };
+    // A tier IS an explicit request to run differently, so its params apply.
+    const applied = await this.putBrainOnCandidate(child.brain, tierCandidate, briefing, true, true);
+    if (!applied.ok) {
+      // The tier could not be used. The brain may already have been moved part of
+      // the way onto it, so restoring the parent re-runs the whole sequence.
+      return applyParent(applied.reason, plan?.selectionSource ?? "request");
+    }
+    return {
+      requestedTier: requested,
+      resolvedTier: selection.candidate.tier,
+      source: plan?.selectionSource ?? "request",
+      provider: tierCandidate.provider,
+      modelId: tierCandidate.modelId,
+    };
+  }
+
+  /**
+   * Register + select one candidate on a brain, then check the prompt fits.
+   *
+   * The fit check is PURE (`checkContextFitForModelPrompt`): a tier model may have
+   * a smaller window than the parent, and the alternative to checking is failing
+   * mid-stream. It must not be `ensureContextForModelPrompt`, which compacts —
+   * that would rewrite the child's history, which at this point is nothing but the
+   * task briefing, and spend a model call to decide whether to spend a model call.
+   */
+  private async putBrainOnCandidate(
+    brain: BrainSession,
+    candidate: ModelRouteCandidate,
+    briefing: string,
+    checkFit: boolean,
+    /**
+     * Whether to touch the brain's runtime tunables at all.
+     *
+     * FALSE on the plain inherit path, and that is a compatibility requirement
+     * rather than an optimisation: before tiering, a child was placed on its model
+     * with `registerProvider` + `setModel` and nothing else. Applying the parent
+     * candidate's `params` here would start honouring a `reasoning_effort` that
+     * every child has ignored until now — a behaviour change for deployments that
+     * configured no tiers, which contract 1 forbids.
+     *
+     * TRUE once a tier has been attempted: the brain's level has already been
+     * moved, so leaving it alone is no longer the neutral option.
+     */
+    applyParams: boolean,
+    /**
+     * Tunables to restore before the candidate's own are applied. Supplied on the
+     * FALLBACK path, where a rejected tier may have left the level raised and
+     * neither `setModel` nor `applyModelParams` will lower it.
+     */
+    restoreParams?: BrainModelParams,
+  ): Promise<{ ok: true } | { ok: false; reason: TierFallbackReason; detail?: string }> {
+    const resolved = withResolvedCandidateConfig(candidate);
+    try {
+      if (resolved.modelConfig && brain.registerProvider) {
+        brain.registerProvider(resolved.provider, resolved.modelConfig);
+      }
+      const model = brain.findModel(resolved.provider, resolved.modelId);
+      if (!model) {
+        return {
+          ok: false,
+          reason: "model_not_found",
+          detail: `${resolved.provider}/${resolved.modelId}`,
+        };
+      }
+      // Unconditional, without a `modelNeedsRebind` guard — the routing runner can
+      // skip a no-op switch, this path cannot, because the switch is also what
+      // re-clamps the level to the target model's capabilities.
+      await brain.setModel(model);
+
+      if (applyParams) {
+        // Restore the parent's real params BEFORE applying the candidate's own, so
+        // an explicit setting still wins. `setModel` does not do this for us: pi
+        // carries the current thinking level across a switch whenever the target
+        // supports thinking, so a rejected `xhigh` tier would otherwise leave the
+        // parent model running at `xhigh`.
+        if (restoreParams && brain.applyModelParams) brain.applyModelParams(restoreParams);
+        applyModelParamsForCandidate(brain, resolved, resolved.modelConfig);
+      }
+
+      if (checkFit && brain.checkContextFitForModelPrompt) {
+        const fit = brain.checkContextFitForModelPrompt(model, briefing);
+        if (!fit.ok) {
+          return { ok: false, reason: "context_overflow", detail: fit.errorMessage };
+        }
+      }
+      return { ok: true };
+    } catch (err) {
+      return {
+        ok: false,
+        reason: "model_setup_failed",
+        detail: err instanceof Error ? err.message : String(err),
+      };
+    }
+  }
+
+  /**
+   * Get base session storage directory.
+   * Reads userDataDir from settings.json.
+   */
+  private usageOutbox?: UsageOutbox;
+  setUsageRole(sessionId: string, role: "root" | "delegated"): void {
+    const managed = this.sessions.get(sessionId);
+    if (managed) this.attachUsage(managed.brain, sessionId, role);
+  }
+  private attachUsage(brain: BrainSession, sessionId: string, role: "root" | "internal_subagent" | "delegated", traceId?: string): void {
+    if (!this.gatewayClient || !this.agentId) return;
+    if (!this.usageOutbox) {
+      // Agent identity partitions local spawners that share a user data directory.
+      const agentKey = Buffer.from(this.agentId + ":" + (process.env.SICLAW_POD_NAME || "local")).toString("hex");
+      try {
+        this.usageOutbox = new UsageOutbox(path.join(this.getBaseSessionDir(), "..", "usage-outbox", agentKey), async batch => {
+          const result = await this.gatewayClient!.sendDelegationPersistenceEvent({ type: "usage.record_calls", batch });
+          if (!result.ok || !result.usage) throw new Error("usage persistence unavailable");
+          return result.usage;
+        });
+      } catch {
+        console.warn("[model-usage] collector unavailable; usage coverage is unknown");
+        return;
+      }
+    }
+    brain.llmCalls?.setUsageSink?.({
+      context: () => {
+        const rootTrace = traceId ?? tracingRecorder.getRootTraceId(sessionId);
+        return { sessionId, executionRole: role, traceId: rootTrace, ...(rootTrace ? { requestId: rootTrace } : {}) };
+      },
+      record: observation => this.usageOutbox!.record(observation),
+    });
+  }
+
+  private getBaseSessionDir(): string {
+    const config = loadConfig();
+    const userDataDir = path.resolve(process.cwd(), config.paths.userDataDir);
+    return path.join(userDataDir, "agent", "sessions");
+  }
+
+  /**
+   * Get per-session storage directory.
+   * Each gateway sessionId gets its own subdirectory so pi-coding-agent
+   * sessions are isolated and correctly restored after pod restarts.
+   */
+  private getSessionDir(sessionId: string): string {
+    const base = this.getBaseSessionDir();
+    scheduleToolOutputCleanup(base);
+    const dir = path.join(base, sessionId);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    return dir;
+  }
+
+  /**
+   * Has this session already accepted `turnId`? The AgentBox is the dispatch
+   * de-duplication authority across a Runtime restart, because it is what runs
+   * the turn and it outlives the Runtime. See turn-ledger.ts.
+   */
+  hasAcceptedTurn(sessionId: string, turnId: string): boolean {
+    if (!sessionId || !turnId) return false;
+    return hasAcceptedTurn(this.getSessionDir(sessionId), turnId);
+  }
+
+  /** Records `turnId` as accepted by this session (durable, best-effort). */
+  recordAcceptedTurn(sessionId: string, turnId: string): void {
+    if (!sessionId || !turnId) return;
+    recordAcceptedTurn(this.getSessionDir(sessionId), turnId);
+  }
+
+  /**
+   * Get the memory directory path.
+   */
+  private getMemoryDir(): string {
+    const config = loadConfig();
+    const userDataDir = path.resolve(process.cwd(), config.paths.userDataDir);
+    return path.join(userDataDir, "memory");
+  }
+
+  private async createSharedMemoryIndexer(memoryDir: string): Promise<MemoryIndexer> {
+    if (!fs.existsSync(memoryDir)) {
+      fs.mkdirSync(memoryDir, { recursive: true });
+    }
+    const embeddingOpts = getEmbeddingConfig() ?? undefined;
+    const indexer = await createMemoryIndexer(memoryDir, embeddingOpts);
+    await indexer.sync();
+    indexer.startWatching();
+    return indexer;
+  }
+
+  private async createSharedKnowledgeIndexer(): Promise<KnowledgeResolver> {
+    const config = loadConfig();
+    const knowledgeDir = this.knowledgeDir ?? path.resolve(process.cwd(), config.paths.knowledgeDir);
+    const resolver = createKnowledgeResolver(knowledgeDir);
+    await resolver.sync();
+    return resolver;
+  }
+
+  /** Reconcile search immediately after an Agent knowledge bundle changes. */
+  async syncKnowledgeIndex(): Promise<void> {
+    await this._sharedKnowledgeIndexer?.sync();
+  }
+
+  /**
+   * Lazily initialize shared components (memory indexer, MCP manager).
+   * Called on first getOrCreate(). Idempotent.
+   */
+  private async ensureSharedComponents(): Promise<void> {
+    if (this._sharedInitialized) return;
+    this._sharedInitialized = true;
+
+    try {
+      this._sharedKnowledgeIndexer = await this.createSharedKnowledgeIndexer();
+      console.log(`[agentbox-session] Shared knowledge label resolver initialized`);
+    } catch (err) {
+      console.warn(`[agentbox-session] Shared knowledge label resolver init failed:`, err);
+      this._sharedKnowledgeIndexer = null;
+    }
+
+    if (!isMemoryEnabled()) {
+      this._sharedMemoryIndexer = null;
+      console.log(`[agentbox-session] Memory disabled by SICLAW_MEMORY_ENABLED`);
+      return;
+    }
+
+    const memoryDir = this.getMemoryDir();
+
+    // ── Memory indexer ──
+    try {
+      this._sharedMemoryIndexer = await this.createSharedMemoryIndexer(memoryDir);
+      console.log(`[agentbox-session] Shared memory indexer initialized for ${memoryDir}`);
+    } catch (err) {
+      console.warn(`[agentbox-session] Shared memory indexer init failed:`, err);
+      this._sharedMemoryIndexer = null;
+    }
+    // MCP is initialized per-session inside createSiclawSession via loadConfig().mcpServers.
+  }
+
+  /** Pending plan auto-clear timers, keyed by taskListId (all tasks completed → clear after delay). */
+  private ledgerHideTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+
+  /**
+   * Ceiling on concurrent sub-agent child sessions across the WHOLE process, every conversation
+   * included. This is the memory guard: a child is a full agent session, and queueing costs one
+   * user latency where an OOMKill costs every session in the box its work.
+   *
+   * Fairness is a separate concern, held by each session's own `_subagentLimiter` — see
+   * {@link sessionSubagentLimiter}. This limiter used to serve both purposes at a cap of 4,
+   * which made one conversation's fan-out everyone else's queue.
+   */
+  private podSubagentLimiter = new ConcurrencyLimiter(getSubagentPodConcurrency());
+
+  /**
+   * Collective cap on GROUP-spawned children (map workers AND the reduce child) across ALL live
+   * groups in this AgentBox: `max(1, pod - 1)`. A single group's worker pool already stays one
+   * below its SESSION's cap, but that guarantee is per-group and per-session: several batches in
+   * different conversations would together saturate the pod ceiling and park an interactive
+   * single spawn behind a ~10-min child.
+   *
+   * ⚠️ Acquisition order is fixed at **group → session → pod**, and every path takes them in that
+   * order. A pod-slot holder therefore never waits on a session slot, and a session-slot holder
+   * never waits on a group slot, so the wait-for graph stays acyclic.
+   */
+  private podGroupLimiter = new ConcurrencyLimiter(getGroupPodShare());
+
+  /**
+   * Where children whose parent session is no longer resident compete.
+   *
+   * A background group outlives its parent's release, so its remaining children would otherwise
+   * have no session limiter at all and be bounded only by the pod ceiling. One shared limiter
+   * keeps them collectively bounded rather than minting a fresh full-size one per orphan.
+   */
+  private detachedSubagentLimiter = new ConcurrencyLimiter(getSubagentConcurrency());
+
+  /**
+   * Unified background-job registry (sub-agents + bash), keyed by jobId.
+   * Replaces the old inline subagentJobs map; shared by notifyParent / job_stop.
+   */
+  private jobs = new JobRegistry();
+
+  /**
+   * Sessions for which a Stop arrived BEFORE the session existed (pre-spawn). Consumed one-shot
+   * by the next getOrCreate-driven /api/prompt for that id (the prompt being cancelled — which is
+   * already in flight and cold-starting, so it consumes within the cold-start window). The TTL
+   * is only a leak backstop for an ORPHAN (a Stop whose paired prompt never arrives). Keep it
+   * tight: it must outlast a cold start (image pull / container start, "routinely exceeds 30s"
+   * per the runtime's async-ack comment) but no longer — a too-long TTL widens the window in
+   * which a stale orphan could wrongly short-circuit a brand-new, deliberate prompt for the same
+   * reused sessionId. 3 min covers cold start with margin while bounding that risk.
+   */
+  /**
+   * sessionId → (turnId, or "" for a session-wide latch) → expiry timer.
+   *
+   * One slot per session would let two turn-scoped latches overwrite each other:
+   * cancelling turn B while A is still running is a normal sequence, and dropping
+   * either latch loses a cancellation the caller was told had been accepted.
+   */
+  private _pendingAborts = new Map<string, Map<string, ReturnType<typeof setTimeout>>>();
+  private static readonly PENDING_ABORT_TTL_MS = 180_000;
+
+  /**
+   * Record a pre-spawn Stop so the imminent /api/prompt short-circuits (see
+   * _pendingAborts). A turnId narrows the latch to the ONE prompt it was meant to
+   * cancel, which is what keeps an orphan from cancelling an unrelated later prompt
+   * on the same reused session id; without one the latch stays session-wide, as it
+   * was before callers could name a turn.
+   */
+  markPendingAbort(sessionId: string, turnId?: string): void {
+    // Only a TRUE pre-spawn Stop should arm a pending abort: one where the session was NEVER
+    // created, so no in-flight turn exists yet and the imminent first /api/prompt is the one to
+    // cancel. A genuine pre-spawn session has no on-disk history dir yet; a session that ran
+    // before and was merely RELEASED from memory (30s TTL) always does. Without this guard, a
+    // Stop on a released-but-idle session (e.g. the Stop button still live after a missed
+    // prompt_done) would arm a pending abort that silently cancels the user's NEXT prompt for
+    // the same reused sessionId. If the existence check throws, fall through and arm (best-effort).
+    // The dir check exists only because a SESSION-WIDE latch could cancel an
+    // unrelated later prompt: a released-but-idle session (30s TTL) always has a
+    // history dir, and a Stop on it would otherwise arm a latch the user's next
+    // prompt consumes. A turn-scoped latch cannot do that — only that turn's own
+    // prompt consumes it — so skipping the check is what lets a Stop on a REUSED
+    // session (a restored thread already has a dir) arm anything at all.
+    if (turnId === undefined) {
+      try {
+        if (fs.existsSync(path.join(this.getBaseSessionDir(), sessionId))) return;
+      } catch { /* fall through — arm */ }
+    }
+    const slot = turnId ?? "";
+    const forSession = this._pendingAborts.get(sessionId) ?? new Map<string, ReturnType<typeof setTimeout>>();
+    const existing = forSession.get(slot);
+    if (existing) clearTimeout(existing);
+    const timer = setTimeout(() => {
+      const current = this._pendingAborts.get(sessionId);
+      current?.delete(slot);
+      if (current && current.size === 0) this._pendingAborts.delete(sessionId);
+    }, AgentBoxSessionManager.PENDING_ABORT_TTL_MS);
+    timer.unref?.();
+    forSession.set(slot, timer);
+    this._pendingAborts.set(sessionId, forSession);
+  }
+
+  /**
+   * Consume (one-shot) a pre-spawn Stop recorded by markPendingAbort.
+   *
+   * A latch that names a turn only cancels THAT turn: a prompt for a different turn
+   * leaves it in place (its own prompt may still be on the way) and runs normally.
+   */
+  consumePendingAbort(sessionId: string, turnId?: string): boolean {
+    const forSession = this._pendingAborts.get(sessionId);
+    if (!forSession) return false;
+    // This turn's own latch, or a session-wide one that names no turn. A latch for a
+    // DIFFERENT turn is left in place: its prompt may still be on the way.
+    const slot = turnId !== undefined && forSession.has(turnId) ? turnId : forSession.has("") ? "" : undefined;
+    if (slot === undefined) return false;
+    clearTimeout(forSession.get(slot)!);
+    forSession.delete(slot);
+    if (forSession.size === 0) this._pendingAborts.delete(sessionId);
+    return true;
+  }
+
+  /**
+   * Discard buffered background-job completion notifications + cancel the coalesce timer for a
+   * session. Called from /abort: a job that completed moments before Stop already armed the
+   * coalesce timer, which would otherwise flush → runSyntheticPrompt → brain.prompt() AFTER Stop
+   * ("comes back to life"). The per-entry suppressNotifyTurn check still guards the flush path,
+   * but clearing here makes the resurrection impossible regardless.
+   */
+  discardPendingNotifications(sessionId: string): void {
+    const managed = this.sessions.get(sessionId);
+    if (!managed) return;
+    this.discardPendingNotificationsFor(sessionId, managed);
+  }
+
+  private discardPendingNotificationsFor(sessionId: string, managed: ManagedSession): void {
+    // A queued synthetic turn can outlive an explicit close followed by a new
+    // session with the same id. Never let stale work drain or schedule release
+    // on that replacement.
+    if (this.sessions.get(sessionId) !== managed) return;
+    managed._backgroundWorkTurn?.cancel();
+    this.clearPendingNotificationState(managed);
+    // scheduleRelease() may have declined to arm while the notification buffer
+    // owned the session. Once Stop abandons that work, restore the ordinary
+    // lifecycle only if no prompt or detached owner is still using the brain.
+    if (
+      managed._backgroundWorkCount === 0 &&
+      managed._promptDone &&
+      !managed._promptInflight
+    ) {
+      this.scheduleRelease(sessionId);
+    }
+  }
+
+  private clearPendingNotificationState(managed: ManagedSession): void {
+    managed._pendingNotifications.length = 0;
+    if (managed._coalesceTimer !== null) {
+      clearTimeout(managed._coalesceTimer);
+      managed._coalesceTimer = null;
+    }
+  }
+
+  /**
+   * The single spawn_subagent executor (design v3 §"Orchestration (batch path)", single-tool merge). The tool always
+   * hands over a batch plan (1..N rendered tasks + optional reduce); this dispatches on its shape:
+   *
+   *  - COLLAPSE (renderedTasks.length === 1 && no reducePrompt) → one legacy child run. The child
+   *    request is derived verbatim from the single task with the BARE spawnId (no `#`), so its
+   *    events, delegation_id, and completion notification are byte-identical to the pre-v3 single
+   *    spawn — the runSpawnedSubagent / startBackgroundSubagent bodies are unchanged, this is only
+   *    a new call site.
+   *  - BATCH (otherwise) → the map→reduce group orchestration (runSubagentGroup / background group).
+   *
+   * Foreground vs background was already resolved at the tool layer (conditional default); here we
+   * only branch on request.runInBackground.
+   */
+  private createSpawnSubagentExecutor(): SpawnSubagentExecutor {
+    const dispatch = this.createRawSpawnSubagentExecutor();
+    return async (request, onProgress, signal) => {
+      validateSubagentContextSelection(request.forkTurns);
+      if (request.resumeHandle && request.forkTurns !== undefined) throw new Error("Cannot change fork_turns on a resumed child");
+      const parent = this.sessions.get(request.parentSessionId);
+      if (request.forkTurns !== undefined && request.forkTurns !== "none") {
+        if (!parent || parent.userId !== request.userId || !Array.isArray(parent.session.messages)) {
+          throw new Error("Active parent context is unavailable for this session and user");
+        }
+        request = { ...request, parentContext: captureSubagentContext(parent.session.messages, request.forkTurns, request.spawnId) };
+      } else {
+        request = { ...request, parentContext: undefined };
+      }
+      if (signal?.aborted || this.sessions.get(request.parentSessionId)?._aborted) {
+        if (request.resumeHandle) throw new Error("Subagent follow-up cancelled");
+        return dispatch(request, onProgress, signal);
+      }
+      const store = new ToolResultArtifactStore({
+        rootDir: toolResultArtifactRoot(this.getSessionDir(request.parentSessionId)),
+        getScope: () => ({ agentId: request.parentAgentId ?? `user:${request.userId}`, sessionId: request.parentSessionId }),
+      });
+      let restoredSession: SessionManager | undefined;
+      if (request.resumeHandle) {
+        if (request.renderedTasks.length !== 1 || request.reducePrompt || request.modelTier) throw new Error("Follow-up requires one task without reduce or tier override");
+        const ticket = await readSubagentTicket(store, request.resumeHandle, request.userId);
+        const active = this.subagentRuns.get(ticket.childSessionId);
+        if (active) {
+          await active.mailbox.send(request.renderedTasks[0].prompt);
+          return { status: "launched", jobId: active.jobId, childSessionId: ticket.childSessionId, resumeHandle: request.resumeHandle, steered: true };
+        }
+        // A ticket is not proof of an executed transcript (a queued task may have been skipped).
+        restoredSession = openSubagentTranscript(this.getSessionDir(ticket.childSessionId));
+        request = { ...request, subagentType: ticket.subagentType, renderedTasks: [{ ...request.renderedTasks[0], childSessionId: ticket.childSessionId, resumeHandle: request.resumeHandle }] };
+      } else {
+        const tickets = await createSubagentTickets(store, request.userId, request.subagentType, request.renderedTasks.length);
+        request = { ...request, renderedTasks: request.renderedTasks.map((task, index) => ({
+          ...task, childSessionId: tickets[index].childSessionId, resumeHandle: tickets[index].resumeHandle,
+        })) };
+      }
+      // Reserve all IDs before yielding: concurrent follow-ups never start two brains for one transcript.
+      for (const task of request.renderedTasks) {
+        if (this.subagentRuns.has(task.childSessionId!)) throw new Error("Subagent is already running; retry with its handle");
+        this.subagentRuns.set(task.childSessionId!, { mailbox: new SubagentMailbox(), jobId: request.spawnId, restoredSession });
+      }
+      let detached = false;
+      try {
+        const result = await dispatch(request, onProgress, signal);
+        if (result.status === "launched") {
+          detached = this.jobs.get(request.spawnId)?.status === "running";
+          const children = request.renderedTasks.map(t => ({ childSessionId: t.childSessionId!, resumeHandle: t.resumeHandle!, item: t.item }));
+          if ("childSessionId" in result) return { ...result, resumeHandle: children[0].resumeHandle };
+          return { ...result, children };
+        }
+        return result;
+      } finally {
+        if (!detached) {
+          for (const task of request.renderedTasks) this.releaseSubagentRun(task.childSessionId, request.spawnId);
+        }
+      }
+    };
+  }
+
+  private releaseSubagentRun(childSessionId: string | undefined, jobId: string): void {
+    // A finished group's cleanup may race a newly started continuation of the same child.
+    if (childSessionId && this.subagentRuns.get(childSessionId)?.jobId === jobId) {
+      this.subagentRuns.delete(childSessionId);
+    }
+  }
+
+  private createRawSpawnSubagentExecutor(): SpawnSubagentExecutor {
+    return async (request, onProgress, signal) => {
+      request = { ...request, agentPrompt: this.sessions.get(request.parentSessionId)?.agentPrompt };
+      // Capture the parent's trace context ONCE at dispatch — synchronously, while the parent
+      // turn's trace is still live (a background parent may end its prompt before the child
+      // starts). request.spawnId === the tool-call id BOTH here and as the batch groupId, so this
+      // ensureToolSpan resolves the ONE spawn_subagent tool span; every child (collapse / map /
+      // reduce) nests under it (spawnSpanContext) and shares the DB trace_id (mainTraceId).
+      // ⚠️ Never re-capture per child with a derived `${groupId}#i` id — that mints phantom spans.
+      const traceCtx = {
+        mainTraceId: tracingRecorder.getRootTraceId(request.parentSessionId),
+        spawnSpanContext: tracingRecorder.ensureToolSpan(request.parentSessionId, request.spawnId, "spawn_subagent"),
+      };
+
+      // Tier plan captured ONCE, here, for the same reason the trace context is:
+      // children start in waves and the state behind this is mutable. Every child
+      // of this dispatch — collapse, each map wave, the detached continuation, and
+      // the reduce — resolves against this one snapshot, so a batch cannot
+      // straddle a configuration change and report both halves as one result.
+      const tierPlan = this.buildTierPlan(request.parentSessionId, request.modelTier, request.subagentType);
+
+      const isCollapse = request.renderedTasks.length === 1 && !request.reducePrompt && !request.targetCoverage;
+
+      if (isCollapse) {
+        const task = request.renderedTasks[0];
+        // Derive the per-child request. spawnId stays the bare toolCallId (request.spawnId) so the
+        // collapse path's delegation_event folds via the single-subagent UI path, exactly as before.
+        const childReq: SpawnSubagentRequest = {
+          parentContext: request.parentContext,
+          agentPrompt: request.agentPrompt,
+          childSessionId: task.childSessionId,
+          resumeHandle: task.resumeHandle,
+          targetCoverage: request.targetCoverage,
+          description: request.description,
+          prompt: task.prompt,
+          subagentType: request.subagentType,
+          runInBackground: request.runInBackground,
+          parentSessionId: request.parentSessionId,
+          parentAgentId: request.parentAgentId,
+          userId: request.userId,
+          taskListId: request.taskListId,
+          spawnId: request.spawnId,
+          tierPlan,
+        };
+        if (childReq.runInBackground) return this.startBackgroundSubagent(childReq, traceCtx);
+        // Already aborted before we even queue (e.g. the whole turn was cancelled): don't
+        // acquire a slot or spin up a throwaway child session — short-circuit cleanly.
+        if (signal?.aborted) {
+          return { status: "partial", summary: "Sub-agent cancelled before starting.", childSessionId: "", toolCalls: 0, durationMs: 0 };
+        }
+        // Cap concurrent foreground children: a wide fan-out queues past the limit
+        // instead of spinning up one child agent + LLM stream per target at once.
+        // Session slot first, then the pod ceiling — see podGroupLimiter for why the
+        // order is fixed.
+        const sessionLim = this.sessionSubagentLimiter(childReq.parentSessionId);
+        const podLim = this.podSubagentLimiter;
+        // Report whichever gate is actually holding this child back; blaming the
+        // session cap when the box is full sends an operator to the wrong knob.
+        const lim = sessionLim.atCapacity ? sessionLim : podLim;
+        const knob = lim === sessionLim ? "SICLAW_SUBAGENT_CONCURRENCY" : "SICLAW_SUBAGENT_POD_CONCURRENCY";
+        if (sessionLim.atCapacity || podLim.atCapacity) {
+          console.log(
+            `[agentbox-session] sub-agent "${childReq.description}" queued — ` +
+            `${lim.activeCount}/${lim.limit} running, ${lim.pendingCount + 1} waiting (${knob}=${lim.limit})`,
+          );
+          // Tell the UI this child is waiting for a slot, not running — otherwise pi's
+          // batch tool_execution_start already painted it as "running" (spinner).
+          onProgress?.({
+            status: "queued",
+            toolCalls: 0,
+            steps: [],
+            activity: lim === sessionLim
+              ? `Waiting for a free slot (${lim.limit} sub-agents run at a time)…`
+              : `Waiting for a free slot (this agent's box is at its ${lim.limit}-sub-agent ceiling)…`,
+          });
+        }
+        return sessionLim.run(() => podLim.run(() => {
+          console.log(`[agentbox-session] sub-agent "${childReq.description}" started — ${sessionLim.activeCount}/${sessionLim.limit} in session, ${podLim.activeCount}/${podLim.limit} in box`);
+          // Flip a previously-queued card to "running" immediately on slot acquisition,
+          // before the child's first tool call emits progress (avoids a stale "Queued").
+          onProgress?.({ status: "running", toolCalls: 0, steps: [] });
+          return this.runSpawnedSubagent(childReq, { ...traceCtx }, onProgress, signal);
+        }));
+      }
+
+      // ── Batch (map→reduce): background (default for a multi-item batch) → register a job, return
+      //    "launched", notify on completion; foreground → run the whole group and return inline. ──
+      // Carry the dispatch snapshot on the request so both the foreground and the
+      // detached background path hand the SAME plan to every child. A background
+      // group outlives its parent turn, so re-reading state later would resolve
+      // against a session that no longer exists.
+      const plannedRequest: SpawnSubagentGroupRequest = { ...request, tierPlan };
+
+      if (plannedRequest.runInBackground) {
+        return this.startBackgroundSubagentGroup(plannedRequest, traceCtx);
+      }
+      // Already aborted before we queue anything (whole turn cancelled): short-circuit
+      // without creating any child session — every item is skipped.
+      if (signal?.aborted) {
+        return {
+          status: "failed",
+          itemResults: request.renderedTasks.map((t) => ({
+            item: t.item,
+            status: "skipped" as const,
+            summary: "Group cancelled before starting.",
+            childSessionId: "",
+          })),
+          durationMs: 0,
+        };
+      }
+      // Foreground group: throttle per-item progress frames (a 50-item batch emits ~2N frames, each
+      // an N-entry array). The card's terminal state comes from the inline return value, so dropping
+      // a mid-run frame is harmless; cancel the trailing timer once the group returns so no late
+      // frame lands after execute() has already returned (reviewer A-F8). Background groups use the
+      // separate throttled group_progress emitter instead.
+      const throttled = onProgress ? throttleTrailing(onProgress, GROUP_PROGRESS_THROTTLE_MS) : undefined;
+      try {
+        return await this.runSubagentGroup(plannedRequest, throttled?.call, signal, traceCtx);
+      } finally {
+        throttled?.cancel();
+      }
+    };
+  }
+
+  /**
+   * Core group orchestration (design §"Orchestration (batch path)"). Shared by the foreground and background
+   * paths. Contract:
+   *  - The orchestrator itself NEVER holds a sub-agent slot (that would deadlock when several
+   *    groups run at once). It submits children INTO the limiters via a worker pool that keeps
+   *    at most `getGroupWorkerShare()` in flight, so an interactive spawn_subagent always keeps
+   *    ≥1 of the session's slots.
+   *  - Child sessions are created LAZILY inside each worker (via runSpawnedSubagent) — never
+   *    all N at once.
+   *  - Each child goes through the UNCHANGED runSpawnedSubagent (600s child backstop, transcript
+   *    persistence, delegation_event). Group children are tagged `{groupId}#{index}`.
+   *  - A single failed/timed-out item does NOT abort the group; its status + summary flow
+   *    into the reduce input (a bounded, deliberate exception to fail-fast: a failure is a
+   *    valid diagnostic signal, not dirty data to propagate).
+   *  - Circuit breaker (completion order): first 5 all-failed with zero success → stop
+   *    submitting + abort in-flight; the rest are `skipped`.
+   *  - Group-level backstop (scaled to size) aborts the MAP phase; a reduce still runs if
+   *    ≥1 item produced usable output and the user didn't cancel.
+   */
+  private async runSubagentGroup(
+    request: SpawnSubagentGroupRequest,
+    onProgress?: (progress: SubagentGroupProgress) => void,
+    signal?: AbortSignal,
+    traceCtx?: SubagentTraceContext,
+  ): Promise<SubagentGroupReport> {
+    try { return await this.executeSubagentGroup(request, onProgress, signal, traceCtx); }
+    finally { for (const task of request.renderedTasks) this.releaseSubagentRun(task.childSessionId, request.spawnId); }
+  }
+
+  private async executeSubagentGroup(
+    request: SpawnSubagentGroupRequest,
+    onProgress?: (progress: SubagentGroupProgress) => void,
+    signal?: AbortSignal,
+    traceCtx?: SubagentTraceContext,
+  ): Promise<SubagentGroupReport> {
+    const startedAt = Date.now();
+    const groupId = request.spawnId;
+    const tasks = request.renderedTasks;
+    const total = tasks.length;
+
+    // Two abort scopes:
+    //  - userAbort fires ONLY on the external signal (user Stop / job_stop). It cancels
+    //    both the map children AND the reduce child.
+    //  - mapAbort fires on userAbort OR the group timeout OR a circuit-break. It cancels
+    //    only the MAP children — a map-phase timeout must NOT kill a still-valuable reduce
+    //    (which keeps its own 600s child backstop).
+    // Resolved ONCE for the whole group, not per child: a background group outlives its
+    // parent session's release, and re-resolving mid-run would silently move the surviving
+    // children onto the detached limiter while their siblings still hold the session's.
+    const sessionLim = this.sessionSubagentLimiter(request.parentSessionId);
+
+    const userAbort = new AbortController();
+    const mapAbort = new AbortController();
+    const onExternalAbort = () => { userAbort.abort(); mapAbort.abort(); };
+    if (signal) {
+      if (signal.aborted) onExternalAbort();
+      else signal.addEventListener("abort", onExternalAbort, { once: true });
+    }
+
+    let timedOut = false;
+    const maxRuntimeMs = getSubagentGroupMaxRuntimeMs(total, getGroupWorkerShare());
+    const timer = setTimeout(() => { timedOut = true; mapAbort.abort(); }, maxRuntimeMs);
+    timer.unref?.();
+
+    type ItemState = {
+      status: "queued" | "running" | GroupItemStatus;
+      summary: string;
+      fullSummary?: string;
+      childSessionId: string;
+      activity?: string;
+      /** Which model this item ran on and why — absent for items that never started. */
+      tierOutcome?: ChildModelOutcome;
+    };
+    const states: ItemState[] = tasks.map(() => ({ status: "queued", summary: "", childSessionId: "" }));
+    let reduceChildSessionId: string | undefined;
+    const breaker = new GroupCircuitBreaker();
+
+    const emit = (phase: "map" | "reduce") =>
+      onProgress?.({
+        phase,
+        items: states.map((s, index) => ({
+          index,
+          item: tasks[index].item,
+          status: s.status,
+          ...(s.childSessionId ? { childSessionId: s.childSessionId } : {}),
+          ...(s.activity ? { activity: s.activity } : {}),
+        })),
+        ...(reduceChildSessionId ? { reduceChildSessionId } : {}),
+      });
+
+    const skipReason = (): string =>
+      timedOut
+        ? "Skipped (group timed out before this item started)."
+        : breaker.tripped
+          ? "Skipped (circuit breaker: too many early failures)."
+          : "Skipped (group cancelled).";
+
+    const runOne = async (i: number): Promise<void> => {
+      const state = states[i];
+      // (A) Aborted / tripped BEFORE this item starts → never spawn a child (honestly `skipped`:
+      //     no child session, no persisted event). Emit so the live card reflects it too (#3).
+      if (mapAbort.signal.aborted || breaker.tripped) {
+        state.status = "skipped";
+        state.summary = skipReason();
+        emit("map");
+        return;
+      }
+      const childReq: SpawnSubagentRequest = {
+        agentPrompt: request.agentPrompt,
+        parentContext: request.parentContext,
+        resumeHandle: tasks[i].resumeHandle,
+        description: `${request.description} [${i + 1}/${total}]`,
+        prompt: tasks[i].prompt,
+        subagentType: request.subagentType,
+        runInBackground: false,
+        parentSessionId: request.parentSessionId,
+        parentAgentId: request.parentAgentId,
+        userId: request.userId,
+        taskListId: request.taskListId,
+        // `#` is not touched by delegation-id validation (verified): children of a group are
+        // tied to it by this prefix, which the UI groups on.
+        spawnId: `${groupId}#${i}`,
+        // The dispatch snapshot, identical for every wave. A batch is one unit of
+        // work and must report against one model.
+        tierPlan: request.tierPlan,
+      };
+      // (B) The group may abort (circuit break / timeout / user stop) WHILE this item is still
+      //     queued for a global-limiter slot (saturated by another session). Re-check AFTER the
+      //     slot is acquired: if aborted, don't create a child at all — spawning one only to have
+      //     it persist a session + user message and then bail is wasted work AND a wrong `partial`.
+      //     Honestly `skipped` (never started). A closure flag, not a sentinel in the result union.
+      let skippedInSlot = false;
+      let res: SpawnSubagentResult | undefined;
+      try {
+        res = await this.podGroupLimiter.run(() => sessionLim.run(() => this.podSubagentLimiter.run(async () => {
+          if (mapAbort.signal.aborted) {
+            skippedInSlot = true;
+            return undefined;
+          }
+          // Mark `running` + emit only once the slot is acquired — an item still waiting for a
+          // limiter slot must stay `queued`, not report as running. Pre-assign the exact session
+          // id runSpawnedSubagent will persist so the live UI can open the child transcript from
+          // the first running frame instead of waiting for the terminal result.
+          const childSessionId = tasks[i].childSessionId ?? randomUUID();
+          state.childSessionId = childSessionId;
+          state.status = "running";
+          emit("map");
+          return this.runSpawnedSubagent(
+            childReq,
+            { ...traceCtx, childSessionId },
+            (progress) => {
+              const activity = progress.activity?.trim();
+              if (!activity || activity === state.activity) return;
+              state.activity = activity;
+              emit("map");
+            },
+            mapAbort.signal,
+          );
+        })));
+      } catch (err) {
+        res = {
+          status: "failed",
+          summary: `Sub-agent errored: ${err instanceof Error ? err.message : String(err)}`,
+          // The id was already exposed in the running frame and may already own
+          // persisted rows. Keep it stable even if an unexpected exception
+          // escapes runSpawnedSubagent before it can return its normal envelope.
+          childSessionId: state.childSessionId,
+          toolCalls: 0,
+          durationMs: 0,
+        };
+      }
+      if (skippedInSlot || res === undefined) {
+        state.status = "skipped";
+        state.summary = skipReason();
+        emit("map");
+        return;
+      }
+      if (res.status === "launched") {
+        // Defensive: a foreground child never returns launched.
+        state.status = "failed";
+        state.summary = "Unexpected launched status in group map stage.";
+      } else {
+        // A map child's `partial` is ALWAYS a cancellation stub: runSpawnedSubagent only reports
+        // `partial` when it was stopped (by mapAbort, or by the parent session's `_aborted` during
+        // its setup window) — there is no "made real partial progress" path. Keep the honest
+        // `partial` status: it matches the child's own persisted terminal event (so reload agrees
+        // with live) and the pre-existing single-spawn contract. It does NOT feed the reduce gate
+        // (which counts `done` only), so a cancellation stub can never fabricate a reduce over nothing.
+        state.status = res.status;
+        state.summary = res.summary;
+        state.fullSummary = res.fullSummary ?? res.summary;
+        state.childSessionId = res.childSessionId;
+        state.tierOutcome = res.tierOutcome;
+      }
+      breaker.record(state.status as GroupItemStatus);
+      if (breaker.tripped) {
+        // Stop the whole map phase: skip everything not yet started + abort in-flight.
+        mapAbort.abort();
+      }
+      emit("map");
+    };
+
+    // Worker pool via the shared ConcurrencyLimiter (reuse — one concurrency primitive, not a
+    // hand-rolled index counter): at most `getGroupWorkerShare()` items are submitted per group,
+    // one below the SESSION cap, so this conversation keeps a slot for an interactive spawn.
+    // The same guarantee at the BOX level is the manager-wide `podGroupLimiter` — this per-group
+    // pool alone can't provide it once two batches run in different sessions. runOne never throws
+    // (it catches internally), so no pool.run() rejects.
+    const pool = new ConcurrencyLimiter(Math.min(getGroupWorkerShare(), total));
+    await Promise.all(tasks.map((_, i) => pool.run(() => runOne(i))));
+
+    // One consolidated frame after the pool drains so the live card shows every terminal status
+    // (including `skipped`) before the reduce phase begins (#3, live path).
+    emit("map");
+
+    // Disarm the group timer NOW that the map phase has drained. Its semantics is a MAP-phase
+    // backstop (it fires `mapAbort`); leaving it armed through a slow reduce would let it fire
+    // during the reduce and set `timedOut = true`, which the overall-status derivation would then
+    // mistake for a map-phase timeout (flagging a map-partial batch `timed_out` instead of
+    // `partial`). The reduce child keeps its own independent 600s backstop, so nothing is left
+    // unguarded.
+    clearTimeout(timer);
+
+    // ── Reduce stage ──
+    const doneCount = states.filter((s) => s.status === "done").length;
+    const usableCount = states.filter((s) => s.status === "done" || s.status === "partial").length;
+
+    let reduceSummary: string | undefined;
+    let reduceTruncated = false;
+    let reduceError: string | undefined;    // reduce ran but did not complete → drives status + groupSummary (kept off the report as its own key)
+    let reduceSkippedForCancel = false;      // reduce requested but skipped because the user cancelled
+
+    // Require at least one accepted result before synthesis. Partial results may now contain
+    // useful evidence without satisfying their assignment; preserve them in the reducer input
+    // and the parent report, but never turn an entirely unverified batch into a green completion.
+    if (request.reducePrompt) {
+      if (userAbort.signal.aborted) {
+        reduceSkippedForCancel = true;
+      } else if (doneCount > 0 && !breaker.tripped) {
+        const outcomes: GroupItemOutcome[] = states.map((s, i) => ({
+          item: tasks[i].item,
+          status: s.status as GroupItemStatus,
+          summary: s.fullSummary ?? s.summary,
+        }));
+        const reduceReq: SpawnSubagentRequest = {
+          agentPrompt: request.agentPrompt,
+          parentContext: request.parentContext,
+          description: `${request.description} — summary`,
+          prompt: request.reducePrompt,
+          inputReports: outcomes,
+          subagentType: request.subagentType,
+          runInBackground: false,
+          parentSessionId: request.parentSessionId,
+          parentAgentId: request.parentAgentId,
+          userId: request.userId,
+          taskListId: request.taskListId,
+          spawnId: `${groupId}#reduce`,
+          // Reduce does NOT downgrade: same snapshot, but with the tier request
+          // dropped so it lands on the parent's effective model. Synthesis is the
+          // step a cheaper model hurts most, and reduce runs once — there is
+          // nothing to save. Not a caller-visible option.
+          tierPlan: request.tierPlan
+            ? { ...request.tierPlan, requestedTier: null, selectionSource: "inherit" }
+            : undefined,
+        };
+        try {
+          const reduceRes = await this.podGroupLimiter.run(() => sessionLim.run(() => this.podSubagentLimiter.run(() => {
+            // Match map-item semantics: advertise the reduce child only after it owns
+            // an execution slot. Until then the batch remains in its completed map
+            // state instead of exposing a session that has not started yet.
+            reduceChildSessionId = randomUUID();
+            emit("reduce");
+            return this.runSpawnedSubagent(
+              reduceReq,
+              { ...traceCtx, childSessionId: reduceChildSessionId },
+              undefined,
+              userAbort.signal,
+            );
+          })));
+          if (reduceRes.status === "done") {
+            // Keep the complete synthesis. Model context is bounded by recoverable artifacts,
+            // not by dropping the report tail before it reaches the caller.
+            reduceSummary = reduceRes.fullSummary ?? reduceRes.summary;
+            reduceTruncated = false;
+            reduceChildSessionId = reduceRes.childSessionId;
+          } else {
+            // Reduce child failed / timed out / cancelled: do NOT set reduceSummary — that would
+            // strip every per-item summary from the model's result (hasReduce becomes true), throwing
+            // away a successful map phase over one transient synthesis error. Keep per-item summaries;
+            // record the failure so status + groupSummary reflect it.
+            reduceError =
+              `Reduce stage did not complete (${reduceRes.status}); per-item results are preserved below.`;
+          }
+        } catch (err) {
+          reduceError =
+            `Reduce stage failed: ${err instanceof Error ? err.message : String(err)}; per-item results are preserved below.`;
+        }
+      }
+    }
+
+    // ── Overall status (minimal ladder reorder) ──
+    // `doneCount === total` moves ABOVE `userAbort` so a Stop that lands AFTER every item already
+    // finished `done` still reports `done`, not a spurious `partial`. `usableCount === 0` stays at
+    // position 2 (done ⊆ usable, so it never collides with `doneCount === total`), preserving the
+    // existing "cancel/timeout with nothing usable → failed" contract and staying consistent with
+    // the pre-launch-abort short path. A fully-`done` batch whose reduce failed or was cancel-skipped
+    // reports `partial` (synthesis missing ⇒ not a full success). `timedOut` is map-phase only (timer
+    // disarmed before reduce), so a slow reduce never flips it.
+    const circuitBroken = breaker.tripped;
+    let status: SubagentGroupReport["status"];
+    if (circuitBroken) status = "failed"; // systematic failure (reduce skipped) → whole batch failed
+    else if (doneCount === total) status = (reduceError || reduceSkippedForCancel) ? "partial" : "done";
+    else if (usableCount === 0) status = "failed";
+    else if (userAbort.signal.aborted) status = "partial";
+    else if (timedOut) status = "timed_out";
+    else status = "partial";
+
+    const durationMs = Date.now() - startedAt;
+    const itemResults: SubagentGroupItemResult[] = states.map((s, i) => ({
+      item: tasks[i].item,
+      resumeHandle: tasks[i].resumeHandle,
+      status: s.status as GroupItemStatus,
+      summary: s.summary,
+      fullSummary: s.fullSummary,
+      childSessionId: s.childSessionId,
+      tierOutcome: s.tierOutcome,
+    }));
+
+    // Group-level explanation surfaced when there is NO reduce summary (circuit break / reduce
+    // failure / cancel-skip) — so the user learns WHY the batch stopped even with no reduce child.
+    // `undefined` on the plain paths (the reduce summary / per-item digest already covers it).
+    const groupSummary = circuitBroken
+      ? breaker.reason
+      : reduceError
+        ? reduceError
+        : reduceSkippedForCancel
+          ? "Reduce stage skipped: the batch was cancelled before synthesis."
+          : undefined;
+
+    // Persisted terminal event content: reduce summary, else the group explanation, else a status
+    // digest — always non-empty.
+    const capsule = reduceSummary ?? groupSummary ?? summarizeItemStatuses(itemResults);
+    const targetCoverage = finishTargetCoverage(request.targetCoverage, itemResults.map(item => item.status));
+
+    // Group terminal delegation_event (design §"Persistence & lineage"): delegationId == groupId ties the
+    // per-child events (`{groupId}#{i}`) together so the UI rebuilds the card on reload. The per-item
+    // `itemStatuses` snapshot lets the UI render never-persisted (skipped) items on reload instead of
+    // the live-only "running" fallback. childSessionId → reduce child when present, else "".
+    await this.persistGroupTerminalEvent(request, {
+      status,
+      capsule,
+      summaryTruncated: reduceTruncated,
+      reduceChildSessionId,
+      // Tier outcome rides the terminal event because for a BACKGROUND group it is
+      // the only place a result survives: the tool call returned `launched` long
+      // before any of this was known, so nothing else ever carries which model ran
+      // or why it fell back. Identifiers only — `modelConfig` never leaves the
+      // candidate payload, and this record is persisted.
+      itemStatuses: itemResults.map((r, i) => ({
+        index: i,
+        status: r.status,
+        ...(r.tierOutcome ? { tier: persistableTierOutcome(r.tierOutcome) } : {}),
+      })),
+      targetCoverage,
+      durationMs,
+      traceId: traceCtx?.mainTraceId,
+    });
+
+    return {
+      status,
+      itemResults,
+      coverage: targetCoverage,
+      ...(reduceSummary !== undefined ? { reduceSummary } : {}),
+      ...(reduceChildSessionId ? { reduceChildSessionId } : {}),
+      ...(circuitBroken ? { circuitBroken } : {}),
+      ...(groupSummary !== undefined ? { groupSummary } : {}),
+      durationMs,
+    };
+  }
+
+  /** Persist the group's terminal delegation_event (best-effort; no-op without persistence). */
+  private async persistGroupTerminalEvent(
+    request: SpawnSubagentGroupRequest,
+    outcome: {
+      status: "done" | "partial" | "failed" | "timed_out";
+      capsule: string;
+      summaryTruncated: boolean;
+      reduceChildSessionId?: string;
+      itemStatuses?: Array<{ index: number; status: GroupItemStatus; tier?: PersistedTierOutcome }>;
+      targetCoverage?: SubagentTargetCoverage;
+      durationMs: number;
+      traceId?: string;
+    },
+  ): Promise<void> {
+    const agentId = request.parentAgentId ?? this.agentId ?? null;
+    const canPersist = Boolean(this.gatewayClient && agentId && request.userId && request.parentSessionId);
+    if (!canPersist) return;
+    try {
+      await this.persistAppendDelegationEvent({
+        parentSessionId: request.parentSessionId,
+        parentAgentId: agentId,
+        userId: request.userId,
+        delegationId: request.spawnId,
+        childSessionId: outcome.reduceChildSessionId ?? "",
+        targetAgentId: agentId,
+        status: outcome.status,
+        capsule: outcome.capsule,
+        fullSummary: outcome.capsule,
+        summaryTruncated: outcome.summaryTruncated,
+        ...(outcome.itemStatuses ? { itemStatuses: outcome.itemStatuses } : {}),
+        ...(outcome.targetCoverage ? { targetCoverage: outcome.targetCoverage } : {}),
+        scope: request.description,
+        toolCalls: 0,
+        durationMs: outcome.durationMs,
+        traceId: outcome.traceId,
+      });
+    } catch (err) {
+      console.warn(`[agentbox-session] group terminal delegation event persist failed for ${request.spawnId}:`, err);
+    }
+  }
+
+  /**
+   * Launch a sub-agent group detached (design §"Job model & notification"). Registers a JobRegistry job
+   * (reusing type "subagent" + isGroup), returns "launched" immediately, and notifies the
+   * parent on completion. Background work blocks session release until it finishes.
+   */
+  private startBackgroundSubagentGroup(request: SpawnSubagentGroupRequest, traceCtx?: SubagentTraceContext): SubagentGroupResult {
+    this.registerBackgroundWork(request.parentSessionId, request.spawnId);
+    const jobId = request.spawnId;
+    const controller = new AbortController();
+
+    // Stop latch: the user pressed Stop before this group launched → register it terminal
+    // ("stopped") and skip the run. suppressNotifyTurn keeps the model from waking on its
+    // own cancellation.
+    if (this.sessions.get(request.parentSessionId)?._aborted) {
+      this.jobs.register({
+        jobId,
+        type: "subagent",
+        isGroup: true,
+        parentSessionId: request.parentSessionId,
+        status: "stopped",
+        description: request.description,
+        startedAt: Date.now(),
+        notified: false,
+        suppressNotifyTurn: true,
+      });
+      // notifyParent gives the LIVE card fold; it is NOT persisted. Mirror the single-spawn stop
+      // latch and ALSO write the bare-groupId terminal delegation_event — WITHOUT it the group
+      // launch card re-paints as "Running…" forever on reload (annotateGroupCompletions finds a
+      // launched group with no terminal event → hasActiveBackgroundGroup stays true). status
+      // "partial" mirrors the single-spawn stopped mapping (the delegation enum has no "stopped");
+      // every item is `skipped` (none ever started) so the reloaded card renders them correctly.
+      void this.persistGroupTerminalEvent(request, {
+        status: "partial",
+        capsule: `Sub-agent group "${request.description}" was stopped before it started.`,
+        summaryTruncated: false,
+        itemStatuses: request.renderedTasks.map((_, i) => ({ index: i, status: "skipped" as GroupItemStatus })),
+        targetCoverage: finishTargetCoverage(request.targetCoverage, request.renderedTasks.map(() => "skipped")),
+        durationMs: 0,
+        traceId: traceCtx?.mainTraceId,
+      });
+      void this.notifyParent(request.parentSessionId, jobId, {
+        taskId: jobId,
+        status: "stopped",
+        summary: `Sub-agent group "${request.description}" was stopped`,
+      });
+      return { status: "launched", jobId };
+    }
+
+    this.jobs.register({
+      jobId,
+      type: "subagent",
+      isGroup: true,
+      parentSessionId: request.parentSessionId,
+      status: "running",
+      description: request.description,
+      startedAt: Date.now(),
+      notified: false,
+      abort: () => controller.abort(),
+    });
+
+    const parent = this.sessions.get(request.parentSessionId);
+    if (parent) {
+      parent._backgroundWorkCount++;
+      if (parent._releaseTimer) {
+        clearTimeout(parent._releaseTimer);
+        parent._releaseTimer = null;
+      }
+    }
+
+    // Live per-item progress for the background group card (design §"Progress (two paths that must not be confused)", decision #16):
+    // the tool's onUpdate goes dead after "launched", so push a throttled `group_progress`
+    // chat event instead. It is LIVE-ONLY (never persisted) — the card's authoritative state
+    // rebuilds from the persisted per-child + terminal delegation_events on refetch/reload, so
+    // a dropped/coalesced progress frame only costs immediacy, never correctness. Same
+    // emit_chat_event channel as subagent_done, so it degrades gracefully on an old frontend
+    // (unknown event type ignored) and no-ops when persistence isn't wired (gatewayClient absent).
+    const onProgress = this.makeGroupProgressEmitter(request.parentSessionId, jobId);
+
+    void this.runSubagentGroup(request, onProgress.emit, controller.signal, traceCtx)
+      .then(async (report) => {
+        await this.persistSubagentJobOutput(jobId, JSON.stringify(report));
+        onProgress.settle();
+        const job = this.jobs.get(jobId);
+        const stopped = job?.status === "stopped";
+        const status: JobStatus = stopped ? "stopped" : report.status;
+        this.jobs.setStatus(jobId, status);
+        void this.notifyParent(request.parentSessionId, jobId, {
+          taskId: jobId,
+          status,
+          summary: stopped
+            ? `Sub-agent group "${request.description}" was stopped`
+            : buildGroupNotificationSummary(request.description, report) +
+              (report.coverage ? `\nSnapshot coverage: ${JSON.stringify(report.coverage)}` : "") +
+              `\nComplete reports: call task_output with task_id=${JSON.stringify(jobId)}, offset=0; follow next_offset.`,
+        });
+      })
+      .catch((err) => {
+        console.warn(`[agentbox-session] background sub-agent group ${jobId} failed:`, err);
+        const stopped = this.jobs.get(jobId)?.status === "stopped";
+        this.jobs.setStatus(jobId, stopped ? "stopped" : "failed");
+        void this.notifyParent(request.parentSessionId, jobId, {
+          taskId: jobId,
+          status: stopped ? "stopped" : "failed",
+          summary: stopped
+            ? `Sub-agent group "${request.description}" was stopped`
+            : `Sub-agent group "${request.description}" failed: ${err instanceof Error ? err.message : String(err)}`,
+        });
+      })
+      .finally(() => {
+        onProgress.settle();
+        this.releaseBackgroundWork(request.parentSessionId);
+      });
+
+    return { status: "launched", jobId };
+  }
+
+  /**
+   * Build a throttled `group_progress` emitter for a background group (design §"Progress (two paths that must not be confused)"). It
+   * coalesces the per-item transition callbacks (which fire on every item start/finish) into at
+   * most one chat event per {@link GROUP_PROGRESS_THROTTLE_MS}, always flushing the latest state
+   * via a trailing timer so the final "all terminal / reduce" frame is never lost. `settle()`
+   * is flush-then-stop: it synchronously emits any pending trailing frame BEFORE clearing, so the
+   * last live frame the card sees is the terminal one (the completion refetch reconciles the full
+   * per-item detail afterwards). Dropping it here — the old behaviour — left the live card animating
+   * one frame short of terminal until the refetch landed (smoke defect S2).
+   */
+  private makeGroupProgressEmitter(
+    parentSessionId: string,
+    jobId: string,
+  ): { emit: (progress: SubagentGroupProgress) => void; settle: () => void } {
+    let lastEmitAt = 0;
+    let pending: ReturnType<typeof setTimeout> | null = null;
+    let latest: SubagentGroupProgress | null = null;
+    const flush = () => {
+      pending = null;
+      if (!latest) return;
+      lastEmitAt = Date.now();
+      const snapshot = latest;
+      latest = null;
+      const items = snapshot.items.map(({ index, status, childSessionId, activity, item }) => ({
+        index,
+        ...(item !== undefined ? { item } : {}),
+        status,
+        ...(childSessionId ? { child_session_id: childSessionId } : {}),
+        ...(activity ? { activity } : {}),
+      }));
+      void this.persistDelegationEvent({
+        type: "delegation.emit_chat_event",
+        sessionId: parentSessionId,
+        event: {
+          type: "group_progress",
+          job_id: jobId,
+          phase: snapshot.phase,
+          items,
+          ...(snapshot.reduceChildSessionId
+            ? { reduce_child_session_id: snapshot.reduceChildSessionId }
+            : {}),
+        },
+      }).catch((err) => {
+        // Best-effort live update (never rethrow): correctness rebuilds from the persisted per-child
+        // + terminal events on refetch. Log so a systematically failing progress channel is visible.
+        console.warn(`[agentbox-session] group ${jobId} group_progress emit failed:`, err);
+      });
+    };
+    return {
+      emit: (progress) => {
+        latest = progress;
+        const elapsed = Date.now() - lastEmitAt;
+        if (elapsed >= GROUP_PROGRESS_THROTTLE_MS) {
+          flush();
+        } else if (!pending) {
+          pending = setTimeout(flush, GROUP_PROGRESS_THROTTLE_MS - elapsed);
+          pending.unref?.();
+        }
+      },
+      // Flush-then-stop: emit the pending trailing frame (the terminal snapshot) synchronously,
+      // then clear the timer. Idempotent — a second settle() finds no pending frame and no-ops.
+      settle: () => {
+        if (pending) { clearTimeout(pending); pending = null; }
+        flush();
+      },
+    };
+  }
+
+  private createJobStopExecutor(): JobStopExecutor {
+    // Shared stop logic lives on JobRegistry (same as the CLI path).
+    return async (jobId) => this.jobs.stopJob(jobId);
+  }
+
+  private async persistSubagentJobOutput(jobId: string, report: string): Promise<void> {
+    const job = this.jobs.get(jobId);
+    if (!job) throw new Error("Background report has no owning job");
+    const store = new ToolResultArtifactStore({
+      rootDir: toolResultArtifactRoot(this.getSessionDir(job.parentSessionId)),
+      getScope: () => ({ agentId: this.agentId ?? `user:${this.userId}`, sessionId: job.parentSessionId }),
+    });
+    const saved = await store.capture({ text: report, toolCallId: jobId, toolName: "subagent_report" });
+    if (!("reference" in saved)) throw new Error(`Background report storage failed: ${saved.failure.reason}`);
+    job.reportArtifact = saved.reference;
+  }
+
+  private createTaskOutputReader(parentSessionId: string): TaskOutputReader {
+    // Snapshot the job's live status so task_output can report running/terminal (same as CLI).
+    return (jobId) => this.jobs.get(jobId)?.parentSessionId === parentSessionId
+      ? this.jobs.snapshot(jobId) : { found: false };
+  }
+
+  private createChannelMessageExecutor(): ChannelMessageExecutor {
+    return async (request) => {
+      if (!(this.gatewayClient && this.agentId)) {
+        return {
+          delivered: false,
+          message: "channel_update unavailable: gateway delivery is not configured for this AgentBox.",
+        };
+      }
+      const text = request.text.trim();
+      if (!text) {
+        return { delivered: false, message: "channel_update skipped: empty text." };
+      }
+      const response = await this.persistDelegationEvent({
+        type: "channel.deliver_message",
+        message: {
+          sessionId: request.sessionId,
+          kind: request.kind,
+          text,
+          fromAgentId: this.agentId,
+        },
+      });
+      return {
+        delivered: response.ok,
+        message: response.ok
+          ? `channel_update ${request.kind} accepted by Gateway.`
+          : `channel_update ${request.kind} was not delivered.`,
+      };
+    };
+  }
+
+  /**
+   * Stop ALL running background jobs (background exec + background sub-agents) of a session.
+   * Called from the /abort handler so the user's "Stop" button halts everything the session is
+   * running — not just the live turn (foreground tools/sub-agents die with the turn's abort
+   * signal), but also the detached background jobs, which are otherwise decoupled from the turn.
+   * Returns how many were stopped.
+   */
+  stopSessionJobs(sessionId: string, jobIds?: readonly string[]): number {
+    let stopped = 0;
+    for (const job of this.jobs.list(sessionId)) {
+      if (jobIds && !jobIds.includes(job.jobId)) continue;
+      // suppressNotifyTurn: the user's Stop is terminal. The completion still folds each job's card
+      // to "stopped", but we must NOT wake the model with a synthetic turn reacting to the
+      // cancellation — that "comes back to life after Stop" is exactly what the button must avoid.
+      if (job.status === "running" && this.jobs.stopJob(job.jobId, { suppressNotifyTurn: true }).stopped) stopped++;
+    }
+    return stopped;
+  }
+
+  /**
+   * Background exec executor (run_in_background on bash / node_exec / pod_exec). Injected
+   * into ToolRefs; the calling tool hands over the already-assembled command. Throws when
+   * the per-session concurrency cap is reached so the tool falls back to foreground.
+   */
+  private createBackgroundExecExecutor(): BackgroundExecExecutor {
+    return (req) => {
+      // Stop latch: the user pressed Stop on this session; do NOT spawn a new background job.
+      // Register a terminal "stopped" job and return a normal launched handle — NEVER throw,
+      // because every background-capable tool treats an executor throw as "fall back to a
+      // FOREGROUND run", which would re-introduce the escape this latch closes. The launching
+      // tool's card folds to stopped via the exec_job_done event from notifyParent below;
+      // suppressNotifyTurn keeps the model from waking on its own cancellation.
+      const aborting = this.sessions.get(req.parentSessionId);
+      if (aborting?._aborted) {
+        const outputFile = getTaskOutputPath(req.jobId);
+        const disk = new DiskTaskOutput(req.jobId);
+        void disk.ensureCreated().then(() => disk.markFinal()).catch(() => {});
+        this.jobs.register({
+          jobId: req.jobId,
+          type: req.jobType ?? "bash",
+          parentSessionId: req.parentSessionId,
+          description: req.description,
+          status: "stopped",
+          startedAt: Date.now(),
+          notified: false,
+          suppressNotifyTurn: true,
+          outputFile,
+        });
+        try { req.onComplete?.(); } catch { /* best-effort (e.g. node_exec debug-pod unpin) */ }
+        void this.notifyParent(req.parentSessionId, req.jobId, {
+          taskId: req.jobId,
+          outputFile,
+          status: "stopped",
+          summary: `Background command "${req.description}" was stopped`,
+        });
+        return { jobId: req.jobId, outputFile };
+      }
+
+      const cap = getBackgroundBashConcurrency();
+      // Cap counts ALL background exec jobs (bash/node/pod), not sub-agents.
+      const running = this.jobs
+        .list(req.parentSessionId)
+        .filter((j) => j.type !== "subagent" && j.status === "running").length;
+      if (running >= cap) {
+        throw new Error(
+          `Background exec concurrency cap reached (${running}/${cap}); run this command in the foreground.`,
+        );
+      }
+
+      const parent = this.sessions.get(req.parentSessionId);
+      if (parent) {
+        parent._backgroundWorkCount++;
+        if (parent._releaseTimer) {
+          clearTimeout(parent._releaseTimer);
+          parent._releaseTimer = null;
+        }
+      }
+
+      // Register BEFORE spawning: even a synchronously completed job belongs to
+      // this request. Roll back if launch throws and the tool falls back foreground.
+      const owner = this.registerBackgroundWork(req.parentSessionId, req.jobId);
+
+      // Pair the increment with the decrement: if spawnBackgroundBash throws
+      // synchronously (e.g. SanitizingLineBuffer fail-closed, spawn EACCES) the job's
+      // close/error handlers never wire onSettled, so undo the increment here — otherwise
+      // _backgroundWorkCount leaks and the session can never be released.
+      try {
+        return spawnBackgroundBash(
+          req,
+          this.jobs,
+          (jobId, n) => void this.notifyParent(req.parentSessionId, jobId, n),
+          () => this.releaseBackgroundWork(req.parentSessionId),
+        );
+      } catch (err) {
+        owner?.unregister(req.jobId);
+        this.backgroundWorkOwners.delete(req.jobId);
+        this.releaseBackgroundWork(req.parentSessionId);
+        throw err;
+      }
+    };
+  }
+
+  /** Decrement a parent's background-work count and re-arm release once idle. */
+  private releaseBackgroundWork(parentSessionId: string): void {
+    const current = this.sessions.get(parentSessionId);
+    if (!current) return;
+    current._backgroundWorkCount = Math.max(0, current._backgroundWorkCount - 1);
+    if (current._backgroundWorkCount === 0 && current._promptDone) {
+      this.scheduleRelease(current.id);
+    }
+  }
+
+  /**
+   * Launch a sub-agent detached (design §7). Returns immediately with status
+   * "launched"; on completion notifyParent injects a <task_notification> into the
+   * parent model. Background work blocks session release until it finishes.
+   */
+  private startBackgroundSubagent(request: SpawnSubagentRequest, traceCtx?: SubagentTraceContext): SpawnSubagentResult {
+    this.registerBackgroundWork(request.parentSessionId, request.spawnId);
+    const childSessionId = request.childSessionId ?? randomUUID();
+    const jobId = request.spawnId;
+    // Stop latch: the user pressed Stop before this sub-agent launched; register it terminal
+    // ("stopped") and skip runSpawnedSubagent so no child run/LLM work starts. suppressNotifyTurn
+    // keeps the model from waking on the cancellation.
+    if (this.sessions.get(request.parentSessionId)?._aborted) {
+      this.jobs.register({
+        jobId,
+        type: "subagent",
+        parentSessionId: request.parentSessionId,
+        childSessionId,
+        status: "stopped",
+        description: request.description,
+        startedAt: Date.now(),
+        notified: false,
+        suppressNotifyTurn: true,
+      });
+      // notifyParent gives the LIVE card fold (subagent_done). It is NOT persisted, so we ALSO
+      // write the terminal delegation_event + child session row that runSpawnedSubagent would
+      // have written — without these the launch card re-paints as "Running…" forever on reload
+      // (annotateSubagentCompletions reads the persisted delegation_event), and the
+      // "open transcript" deep-link 404s. Mirrors runSpawnedSubagent's terminal persistence.
+      const stoppedAgentId = request.parentAgentId ?? this.agentId ?? null;
+      if (this.gatewayClient && stoppedAgentId && request.userId) {
+        void (async () => {
+          try {
+            await this.persistEnsureChatSession(
+              childSessionId, stoppedAgentId, request.userId,
+              `Sub-agent: ${request.description}`,
+              "", "subagent",
+              { parentSessionId: request.parentSessionId, parentAgentId: stoppedAgentId, delegationId: jobId, targetAgentId: stoppedAgentId },
+            );
+          } catch { /* best-effort */ }
+          try {
+            await this.persistAppendDelegationEvent({
+              parentSessionId: request.parentSessionId,
+              parentAgentId: stoppedAgentId,
+              userId: request.userId,
+              delegationId: jobId,
+              childSessionId,
+              targetAgentId: stoppedAgentId,
+              // "partial" is the terminal status runSpawnedSubagent persists for a stopped
+              // sub-agent (the delegation status enum has no "stopped"); keep it consistent so
+              // the card folds the same way on reload.
+              status: "partial",
+              capsule: `Sub-agent "${request.description}" was stopped`,
+              fullSummary: `Sub-agent "${request.description}" was stopped before it started.`,
+              summaryTruncated: false,
+              scope: request.prompt,
+              toolCalls: 0,
+              durationMs: 0,
+              traceId: traceCtx?.mainTraceId,
+            });
+          } catch { /* best-effort */ }
+        })();
+      }
+      void this.notifyParent(request.parentSessionId, jobId, {
+        taskId: jobId,
+        status: "stopped",
+        summary: `Sub-agent "${request.description}" was stopped`,
+      });
+      return { status: "launched", childSessionId, jobId };
+    }
+    this.jobs.register({
+      jobId,
+      type: "subagent",
+      parentSessionId: request.parentSessionId,
+      childSessionId,
+      status: "running",
+      description: request.description,
+      startedAt: Date.now(),
+      notified: false,
+    });
+
+    const parent = this.sessions.get(request.parentSessionId);
+    if (parent) {
+      parent._backgroundWorkCount++;
+      if (parent._releaseTimer) {
+        clearTimeout(parent._releaseTimer);
+        parent._releaseTimer = null;
+      }
+    }
+
+    // 🔴 A detached child is still a child: it holds a full agent session in this
+    // process, so it must take the same session -> pod slots a foreground spawn does.
+    // Returning before the limiters — as this path used to — let background fan-out
+    // ignore the box-wide ceiling entirely, which is the one guard standing between a
+    // wide detached batch and an OOMKill that takes every session in the box with it.
+    //
+    // The slots are acquired INSIDE the detached promise, so the caller still returns
+    // "launched" immediately; queueing delays the child's start, never the tool call.
+    const sessionLim = this.sessionSubagentLimiter(request.parentSessionId);
+    void sessionLim.run(() => this.podSubagentLimiter.run(() =>
+      this.runSpawnedSubagent(request, { childSessionId, jobId, ...traceCtx })))
+      .then(async (res) => {
+        if (res.status !== "launched") await this.persistSubagentJobOutput(jobId, res.fullSummary ?? res.summary);
+        const job = this.jobs.get(jobId);
+        const status: JobStatus =
+          job?.status === "stopped"
+            ? "stopped"
+            : res.status === "launched"
+              ? "running"
+              : res.status; // SpawnSubagentStatus terminal ⊂ JobStatus
+        this.jobs.setStatus(jobId, status);
+        const summary =
+          job?.status === "stopped"
+            ? `Sub-agent "${request.description}" was stopped`
+            : res.status === "launched"
+              ? `Sub-agent "${request.description}" finished`
+              : `Sub-agent "${request.description}" ${res.status}: ${res.summary}\n` +
+                `Complete report: call task_output with task_id=${JSON.stringify(jobId)}, offset=0; follow next_offset.`;
+        void this.notifyParent(request.parentSessionId, jobId, {
+          taskId: jobId,
+          status,
+          summary,
+        });
+      })
+      .catch((err) => {
+        console.warn(`[agentbox-session] background sub-agent ${jobId} failed:`, err);
+        // Honor a user job_stop: a rejection AFTER stop is a "stopped" outcome, not a
+        // spurious "failed" notification (mirrors the .then path).
+        const stopped = this.jobs.get(jobId)?.status === "stopped";
+        this.jobs.setStatus(jobId, stopped ? "stopped" : "failed");
+        void this.notifyParent(request.parentSessionId, jobId, {
+          taskId: jobId,
+          status: stopped ? "stopped" : "failed",
+          summary: stopped
+            ? `Sub-agent "${request.description}" was stopped`
+            : `Sub-agent "${request.description}" failed: ${err instanceof Error ? err.message : String(err)}`,
+        });
+      })
+      .finally(() => { this.releaseSubagentRun(childSessionId, request.spawnId); this.releaseBackgroundWork(request.parentSessionId); });
+
+    return {
+      status: "launched",
+      childSessionId,
+      jobId,
+    };
+  }
+
+  /**
+   * Inject a completed background job's <task_notification> into the parent model.
+   *  - claimNotification dedups (job_stop vs process-exit race → exactly one notice).
+   *  - Parent run in-flight → flush now via followUp (rides the current turn).
+   *  - Parent idle → buffer + a short coalescing window, so a burst of completions becomes
+   *    ONE synthetic turn (the model reacts once instead of re-summarizing per job).
+   */
+  private async notifyParent(
+    sessionId: string,
+    jobId: string,
+    n: TaskNotification,
+  ): Promise<void> {
+    const managed = this.sessions.get(sessionId);
+    if (!managed) return; // session released — nothing to notify (rare; release is deferred while work pending)
+    if (!this.jobs.claimNotification(jobId)) return;
+
+    // Surface the completion in the launching tool's OWN box, not as a chat bubble: persist a
+    // hidden exec_job_event (correlated to the launch by jobId) and fire a refetch so the box
+    // flips running → done/failed live and on reload. Exec jobs only (sub-agents have their
+    // own Jobs-bar fold). Independent of the model turn below.
+    const job = this.jobs.get(jobId);
+    if (job?.reportArtifact) {
+      n = { ...n, summary: `${n.summary}\n${formatToolResultArtifactReference(job.reportArtifact, "Complete background report", 1000)}` };
+    }
+    if (job && job.type !== "subagent") {
+      void this.persistExecJobEvent(sessionId, jobId, n.status, job.exitCode);
+    } else if (job) {
+      // Background sub-agent: fold its launch card live (running → done/failed/timed_out)
+      // regardless of the model's synthetic-turn reaction. The persisted delegation_event still
+      // drives the refetch fold; this TARGETED live event (mirrors exec_job_done) makes it
+      // immediate and paged-back/streaming-safe — without it, a completion the model correctly
+      // stays silent about leaves the card stuck on "Running…" until a manual refresh.
+      void this.persistDelegationEvent({
+        type: "delegation.emit_chat_event",
+        sessionId,
+        // is_group (additive, within the reused subagent branch) lets the frontend tell a group
+        // completion apart from a single sub-agent: the group card can't fold full per-item
+        // detail from this event alone, so the frontend does an authoritative refetch instead of
+        // the in-place status fold used for single sub-agents. Absent → treated as single.
+        event: { type: "subagent_done", sessionId, job_id: jobId, status: n.status, is_group: job.isGroup === true },
+      }).catch((err) => {
+        // Best-effort live card fold (never rethrow): the persisted delegation_event still drives
+        // the refetch fold. Log so a systematically failing completion channel is visible instead
+        // of silently leaving the card on "Running…".
+        console.warn(`[agentbox-session] ${job.isGroup ? "group" : "sub-agent"} ${jobId} subagent_done emit failed:`, err);
+      });
+    }
+
+    // User Stop is terminal: the card already folded to "stopped" above, but do NOT wake the model
+    // with a synthetic turn reacting to its own cancellation (the "won't stop" behavior). Card
+    // folds, model stays silent.
+    const owner = this.backgroundWorkOwners.get(jobId) ?? managed._backgroundWorkTurn;
+    this.backgroundWorkOwners.delete(jobId);
+    if (owner?.complete(n)) return;
+    if (job?.suppressNotifyTurn) return;
+
+    // Buffer the model-facing notification and arm the coalescing window. We deliver it ONLY
+    // via the synthetic-turn path (never followUp): the completion itself already shows in the
+    // tool box (exec_job_done above). Requests without an owner use the legacy
+    // queued delivery path; attached work has already returned above.
+    managed._pendingNotifications.push(n);
+    if (!managed._coalesceTimer) {
+      managed._coalesceTimer = setTimeout(() => {
+        void this.flushPendingNotifications(sessionId);
+      }, NOTIFICATION_COALESCE_MS);
+      managed._coalesceTimer.unref?.();
+    }
+  }
+
+  /**
+   * Deliver all buffered completion notifications as a single message. In-flight → followUp
+   * (rides the turn); idle → one synthetic turn. Re-fetches the session because the
+   * coalescing window may outlive it (released) — a no-op then. followUp rejection falls
+   * back to a synthetic turn so a notice is never lost (the latch is already spent).
+   */
+  private async flushPendingNotifications(sessionId: string): Promise<void> {
+    const managed = this.sessions.get(sessionId);
+    if (!managed) return;
+    if (managed._coalesceTimer) {
+      clearTimeout(managed._coalesceTimer);
+      managed._coalesceTimer = null;
+    }
+    // Stop is terminal: a Stop sets _aborted and stays true until the next REAL user prompt
+    // resets it. Do NOT flush a synthetic turn during the Stop window — that would wake the
+    // model on a completion it cancelled ("comes back to life after Stop").
+    if (managed._aborted) {
+      this.discardPendingNotificationsFor(sessionId, managed);
+      return;
+    }
+    if (!managed._promptDone) {
+      // A turn is running — wait for it to finish, then deliver as a synthetic turn (where a
+      // pure-ack reaction is suppressed). Re-arm rather than followUp: a followUp's ack rides
+      // the running turn and can't be suppressed. The box already updated live, so the user
+      // isn't waiting on this; only the model's optional reaction is deferred.
+      managed._coalesceTimer = setTimeout(() => {
+        void this.flushPendingNotifications(sessionId);
+      }, NOTIFICATION_COALESCE_MS);
+      managed._coalesceTimer.unref?.();
+      return;
+    }
+    const batch = managed._pendingNotifications.splice(0);
+    if (batch.length === 0) return;
+    // Public model output must not be filtered by tool usage or the types of
+    // jobs coalesced into this batch. Required subagents bypass this legacy
+    // detached-job path and are consumed by their original HTTP prompt.
+    await this.runSyntheticPrompt(managed, buildNotificationBatch(batch));
+  }
+
+  /**
+   * Run a notification as a synthetic parent turn when the parent is idle. Serialized
+   * via _syntheticPromptQueue; acquires the SAME _promptDone/_promptInflight mutex that
+   * HTTP /prompt uses, SYNCHRONOUSLY before any await — so an interleaving /prompt either
+   * already started (re-check degrades us to followUp) or hits the 409 guard. This closes
+   * the TOCTOU documented at the _promptInflight declaration.
+   */
+  private runSyntheticPrompt(managed: ManagedSession, text: string): Promise<void> {
+    const run = (managed._syntheticPromptQueue ?? Promise.resolve())
+      .catch(() => {})
+      .then(async () => {
+        // Stop is terminal: if the user pressed Stop while this synthetic turn was queued, do
+        // NOT start it (and do NOT followUp — that would ride a turn too). _aborted stays true
+        // until the next real user prompt resets it. Checked under the queue, before the reset.
+        if (managed._aborted) {
+          this.discardPendingNotificationsFor(managed.id, managed);
+          return;
+        }
+        // Re-check under the queue: an HTTP /prompt may have started since notifyParent
+        // decided "idle". If so, degrade to followUp (delivered to that running turn).
+        if (!managed._promptDone || managed._promptInflight) {
+          await managed.brain.followUp(text);
+          return;
+        }
+        // Acquire the mutex synchronously (no await between check and set).
+        managed._promptDone = false;
+        managed._aborted = false;
+        // Cancel any pending release timer (mirrors getOrCreate): a background job's
+        // onSettled may have armed scheduleRelease just before this turn started — left
+        // running, release() would tear the session down mid-synthetic-turn (it has no
+        // in-flight guard). Both run in this same tick, so clearing here always wins.
+        if (managed._releaseTimer) {
+          clearTimeout(managed._releaseTimer);
+          managed._releaseTimer = null;
+        }
+        let release!: () => void;
+        managed._promptInflight = new Promise<void>((r) => { release = r; });
+        if (managed.turnRef) managed.turnRef.current += 1;
+        // Buffer events so a reconnecting SSE client can replay the synthetic turn.
+        // The /send SSE consumer is already gone (turn 1 closed it), so the synthetic
+        // turn has NO gateway consumer — persist + live-emit its completed messages
+        // ourselves (via the delegation channel) so the notification + the model's
+        // reaction appear in chat history (refresh) and live in a connected session.
+        managed._eventBuffer = [];
+        if (managed._bufferUnsub) managed._bufferUnsub();
+        const sid = managed.id;
+        // delegation.append_message / emit_chat_event auth is agent+session based and does
+        // NOT need userId (the agentbox often has SICLAW_AGENT_ID but no USER_ID env), so
+        // gate only on gatewayClient + agentId.
+        const canPersist = Boolean(this.gatewayClient && this.agentId);
+        // P3.7: if we can't persist, the synthetic turn runs but neither persists nor fires
+        // the live `background_turn_done` trigger, so the user never sees the background
+        // job's completion (it's effectively lost). That only happens when gatewayClient /
+        // agentId aren't wired — a deployment misconfig. Surface it once so it's diagnosable
+        // instead of a silent disappearance.
+        if (!canPersist && !warnedNoPersist) {
+          warnedNoPersist = true;
+          console.warn(
+            "[agentbox-session] background-job completion turns cannot be persisted/delivered " +
+            `(gatewayClient=${Boolean(this.gatewayClient)}, agentId=${Boolean(this.agentId)}). ` +
+            "Set SICLAW_AGENT_ID and wire the gateway client so completions survive a refresh.",
+          );
+        }
+        // Buffer the turn's messages and whether it did any real work (a tool call). We
+        // persist at turn end, conditionally — a reaction with NO tool call is a pure
+        // acknowledgement and is dropped (no bubble); see the finally block.
+        const turnMessages: any[] = [];
+        // Synthetic turns have no gateway SSE consumer to pair lifecycle events with their
+        // persisted tool-result rows. Retain the invocation label until message_end arrives.
+        const toolsetsByCallId = new Map<string, string>();
+        let turnHadTool = false;
+        const routePolicy = managed.modelRoutePolicy;
+        // Single entry: every synthetic turn runs through the routing runner —
+        // real routing when a fallback target exists, otherwise a lone candidate
+        // built from the current model. The runner's emitBrainEvent is the sole
+        // event source whenever a policy resolves; only the no-current-model edge
+        // falls back to a bare prompt collected via the subscription below.
+        const effectivePolicy = resolveEffectivePolicy(routePolicy, managed.modelRouteState, managed.brain.getModel?.());
+        managed._routeBrainEventsThroughExtra = effectivePolicy !== undefined;
+        let latestModelRouteSwitch: Extract<ModelRouteEvent, { type: "model_route_switch" }> | null = null;
+        let currentModelRouteMetadata: Record<string, unknown> | null = null;
+        managed.brain.llmCalls?.beginPrompt(Date.now(), { explicit: true });
+        const handleRouteEvent = (event: ModelRouteEvent): void => {
+          if (event.type === "model_route_attempt" && event.status === "started") {
+            managed.brain.llmCalls?.beginAttempt(event.attempt);
+          } else if ((event.type === "model_route_attempt" && event.status === "failed") || event.type === "model_route_rollback") {
+            managed.brain.llmCalls?.rollbackAttempt();
+          }
+          if (!managed._promptDone) managed._eventBuffer.push({ ...event, sessionId: sid });
+          if (event.type === "model_route_switch") {
+            latestModelRouteSwitch = event;
+            return;
+          }
+          if (event.type !== "model_route_success") return;
+
+          const metadata: Record<string, unknown> = {
+            candidate_key: event.candidateKey,
+            provider: event.provider,
+            model_id: event.modelId,
+            is_fallback: event.isFallback,
+            primary_candidate_key: event.primaryCandidateKey,
+            attempt: event.attempt,
+          };
+          if (latestModelRouteSwitch && latestModelRouteSwitch.toCandidateKey === event.candidateKey) {
+            metadata.switched_from_candidate_key = latestModelRouteSwitch.fromCandidateKey;
+            metadata.switched_from_provider = latestModelRouteSwitch.fromProvider;
+            metadata.switched_from_model_id = latestModelRouteSwitch.fromModelId;
+            metadata.failure_kind = latestModelRouteSwitch.failureKind;
+            metadata.error_message = latestModelRouteSwitch.errorMessage;
+            metadata.cooldown_until = latestModelRouteSwitch.cooldownUntil;
+          }
+          if (event.recoveredFromCandidateKey) {
+            metadata.recovered_from_candidate_key = event.recoveredFromCandidateKey;
+            metadata.recovered_from_provider = event.recoveredFromProvider;
+            metadata.recovered_from_model_id = event.recoveredFromModelId;
+          }
+          currentModelRouteMetadata = event.isFallback || event.recoveredFromCandidateKey ? metadata : null;
+        };
+        const handleBrainEvent = (event: any): void => {
+          if (!managed._promptDone) managed._eventBuffer.push(event);
+          if (
+            event?.type === "tool_execution_start" || event?.type === "tool_start" ||
+            event?.type === "tool_execution_end" || event?.type === "tool_end"
+          ) {
+            const callId = event.toolCallId ?? event.toolUseID;
+            if (callId != null && typeof event.toolset === "string" && event.toolset.length > 0) {
+              toolsetsByCallId.set(String(callId), event.toolset);
+            }
+          }
+          if (event?.type === "tool_execution_start") turnHadTool = true;
+          if (event?.type === "message_end" && event.message) {
+            if (event.message.role === "toolResult") turnHadTool = true;
+            if (event.message.role === "toolResult" && event.message.toolset == null) {
+              const callId = extractToolResultId(event.message);
+              const toolset = callId ? toolsetsByCallId.get(callId) : undefined;
+              turnMessages.push(toolset ? { ...event.message, toolset } : event.message);
+            } else {
+              turnMessages.push(event.message);
+            }
+          }
+        };
+        const brainUnsub = managed.brain.subscribe((event: any) => {
+          if (effectivePolicy === undefined) handleBrainEvent(event);
+        });
+        managed._bufferUnsub = () => brainUnsub();
+        try {
+          await runPromptWithModelRouting(
+            managed.brain,
+            text,
+            effectivePolicy,
+            managed.modelRouteState,
+            {
+              emitEvent: handleRouteEvent,
+              emitBrainEvent: handleBrainEvent,
+              onStateChange: () => this.persistModelRouteState(managed.id, managed.modelRouteState),
+              shouldAbort: () => managed._aborted,
+              // Synthetic background turns persist by collecting brain events
+              // (turnMessages) and have no live viewer — buffer every attempt
+              // so a failed primary can't leak into the persisted turn.
+              optimisticPrimaryStream: false,
+              // Publish THIS session's running candidate, exactly as the HTTP path
+              // does. A synthetic turn can spawn sub-agents, so without this the
+              // tier plan had no session-owned answer for "what is the parent on"
+              // and fell through to box-level state — which, with more than one
+              // live session, is whichever session most recently bound a model.
+              // That would hand session A's children session B's provider config,
+              // credentials included.
+              onAttemptReady: (candidate) => {
+                managed.effectiveModelCandidate = candidate;
+                managed.effectiveModelParams = managed.brain.captureModelParams?.() ?? null;
+              },
+            },
+          );
+        } catch (err) {
+          console.warn(`[agentbox-session] synthetic prompt failed for ${managed.id}:`, err);
+        } finally {
+          // Preserve non-empty public output, including pure-text reports.
+          const turnHadText = turnMessages.some((m) => {
+            if (m.role !== "assistant") return false;
+            const c = Array.isArray(m.content)
+              ? m.content.filter((x: any) => x?.type === "text").map((x: any) => x.text ?? "").join("")
+              : typeof m.content === "string" ? m.content : "";
+            return c.trim().length > 0;
+          });
+          if (canPersist && !managed._aborted && (turnHadTool || turnHadText)) {
+            try {
+              // Preserve message order; emit done only after every write succeeds.
+              for (const message of turnMessages) {
+                await this.persistSyntheticMessage(sid, message, currentModelRouteMetadata);
+              }
+              await this.persistDelegationEvent({
+                type: "delegation.emit_chat_event",
+                sessionId: sid,
+                event: { type: "background_turn_done", sessionId: sid },
+              });
+            } catch (err) {
+              console.error(`[agentbox-session] background report delivery failed for ${sid}:`, err);
+              await this.persistDelegationEvent({
+                type: "delegation.emit_chat_event", sessionId: sid,
+                event: { type: "stream_error", sessionId: sid, error: "Background report could not be saved" },
+              }).catch(error => console.error(`[agentbox-session] background error delivery failed for ${sid}:`, error));
+            }
+          }
+          managed.brain.llmCalls?.endPrompt({ explicit: true });
+          managed._promptDone = true;
+          managed._routeBrainEventsThroughExtra = false;
+          if (managed._bufferUnsub) { managed._bufferUnsub(); managed._bufferUnsub = null; }
+          for (const cb of managed._promptDoneCallbacks) { try { cb(); } catch { /* ignore */ } }
+          managed._promptDoneCallbacks.clear();
+          managed._promptInflight = null;
+          release();
+          if (managed._backgroundWorkCount === 0) this.scheduleRelease(managed.id);
+        }
+      });
+    const queued = run.finally(() => {
+      if (managed._syntheticPromptQueue === queued) managed._syntheticPromptQueue = null;
+    });
+    managed._syntheticPromptQueue = queued;
+    return run;
+  }
+
+  private async persistDelegationEvent(event: DelegationPersistenceEvent): Promise<DelegationPersistenceResponse> {
+    if (!this.gatewayClient) return { ok: false };
+    return this.gatewayClient.sendDelegationPersistenceEvent(event);
+  }
+
+  /**
+   * Persist a hidden completion marker for a background exec job, then fire a refetch so the
+   * frontend folds it into the launching tool's box (running → done/failed). Correlated to
+   * the launch by jobId (=== the launch result's backgroundTaskId). No-op when persistence
+   * isn't wired (gatewayClient/agentId absent).
+   */
+  private async persistExecJobEvent(
+    sessionId: string,
+    jobId: string,
+    status: JobStatus,
+    exitCode: number | undefined,
+  ): Promise<void> {
+    if (!(this.gatewayClient && this.agentId)) return;
+    try {
+      await this.persistAppendMessage({
+        sessionId,
+        parentSessionId: sessionId,
+        fromAgentId: this.agentId,
+        targetAgentId: this.agentId,
+        role: "user",
+        content: "",
+        metadata: { kind: "exec_job_event", job_id: jobId, status, exit_code: exitCode ?? null },
+        outcome: status === "failed" ? "error" : null,
+      });
+      // Live, TARGETED box update (not a refetch): the frontend flips the launching tool's
+      // box in place — works even while a turn is streaming (so it's immediate, not delayed
+      // until the in-flight turn ends), and never clobbers the live stream.
+      await this.persistDelegationEvent({
+        type: "delegation.emit_chat_event",
+        sessionId,
+        event: { type: "exec_job_done", job_id: jobId, status, exit_code: exitCode ?? null },
+      });
+    } catch { /* best-effort UI update */ }
+  }
+
+  /**
+   * Persist one completed message of a synthetic notification turn to the PARENT session
+   * (sessionId === parentSessionId so the delegation auth passes for our own agent).
+   * Reuses the delegation append channel since the gateway's per-/send SSE consumer is
+   * not attached to this turn. The leading <task_notification> user message is tagged
+   * metadata.kind so the UI can fold it like other system notices.
+   */
+  private async persistSyntheticMessage(
+    sessionId: string,
+    message: any,
+    modelRouteMetadata?: Record<string, unknown> | null,
+  ): Promise<void> {
+    const role: "user" | "assistant" | "tool" =
+      message.role === "toolResult" ? "tool" : message.role === "assistant" ? "assistant" : "user";
+    const content = Array.isArray(message.content)
+      ? message.content.filter((c: any) => c?.type === "text").map((c: any) => c.text ?? "").join("")
+      : typeof message.content === "string" ? message.content : "";
+    if (role === "assistant" && !content.trim()) return; // skip empty (pure tool-call) assistant frames
+    const isNotification = role === "user" && content.trimStart().startsWith("<task_notification>");
+    await this.persistAppendMessage({
+      sessionId,
+      parentSessionId: sessionId,
+      fromAgentId: this.agentId,
+      targetAgentId: this.agentId,
+      role,
+      content,
+      toolName: message.toolName ?? null,
+      toolset: message.toolset ?? null,
+      metadata: isNotification
+        ? { kind: "task_notification" }
+        : role === "assistant" && modelRouteMetadata
+          ? { model_route: modelRouteMetadata }
+          : role === "tool" ? persistableToolDetails(message.details, value => redactText(value, buildRedactionConfigForModelConfig(this.delegationModelConfig))) : null,
+      // A COMPLETED tool row must persist a terminal outcome. Without this a successful tool call
+      // in a synthetic (background-completion) turn was written with outcome=null, which the
+      // frontend maps to "running" → a spinner that never resolves and a recovered-run poller stuck
+      // on "Thinking…" after refresh. Only tool rows carry an outcome; user/assistant rows stay null.
+      outcome: role === "tool" ? (message.isError ? "error" : "success") : null,
+    });
+  }
+
+  private async persistEnsureChatSession(
+    sessionId: string,
+    agentId: string,
+    userId: string,
+    title?: string,
+    preview?: string,
+    origin?: string,
+    lineage?: DelegationLineagePayload,
+  ): Promise<void> {
+    await this.persistDelegationEvent({
+      type: "delegation.ensure_session",
+      sessionId,
+      agentId,
+      userId,
+      title,
+      preview,
+      origin,
+      lineage,
+    });
+  }
+
+  private async persistAppendMessage(message: DelegationAppendMessagePayload): Promise<string> {
+    // The brain records the user turn with the agentbox's injected
+    // `[System: respond in X]` language directive. Strip it before syncing the user
+    // message to the portal so it never surfaces in any consumer's chat UI (the
+    // directive already did its job at the model; it's not part of the user's text).
+    if (message.role === "user" && typeof message.content === "string") {
+      message = { ...message, content: stripLanguageDirective(message.content) };
+    }
+    const result = await this.persistDelegationEvent({ type: "delegation.append_message", message });
+    if (!result.ok) throw new Error("Message persistence was rejected");
+    return result.id ?? "";
+  }
+
+  /**
+   * Persist a task-ledger mutation as a chat_message (metadata.kind === "task_event"),
+   * reusing the delegation append channel. The Web UI folds these into the plan on load,
+   * so the plan survives refresh (design §14, Approach A). Best-effort.
+   */
+  private async persistTaskEvent(sessionId: string, event: TaskEvent): Promise<void> {
+    await this.persistAppendMessage(buildTaskEventChatMessage(sessionId, event));
+  }
+
+  /**
+   * Task-event appends, one at a time per taskListId — see keyed-writes.ts for why order matters
+   * here while the snapshot writer coalesces instead.
+   */
+  private taskEventQueue = createSerialQueue<{ sessionId: string; event: TaskEvent }>(
+    async ({ sessionId, event }) => {
+      try {
+        await this.persistTaskEvent(sessionId, event);
+      } catch (err) {
+        console.warn(`[agentbox-session] task_event persist failed for ${sessionId}:`, err);
+      }
+    },
+  );
+
+  // ── Backend task-ledger durability (design §14) ────────────────────────────
+  // The ledger is in-memory (task-ledger.ts), keyed by taskListId == session id.
+  // The module map survives session release within a process; these helpers add
+  // a PV-backed snapshot so the plan also survives a full pod/process restart.
+  private ledgerFile(taskListId: string): string {
+    return path.join(this.getSessionDir(taskListId), ".plan-ledger.json");
+  }
+
+  private modelRouteStateFile(sessionId: string): string {
+    return path.join(this.getSessionDir(sessionId), ".model-route-state.json");
+  }
+
+  private loadModelRouteState(sessionId: string): ModelRouteState {
+    try {
+      const raw = JSON.parse(fs.readFileSync(this.modelRouteStateFile(sessionId), "utf8"));
+      return normalizeModelRouteState(raw);
+    } catch (err) {
+      // Missing file is the normal first-run case; anything else (corrupt
+      // JSON, permissions) silently resetting cooldowns deserves a trace.
+      if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") {
+        console.warn(`[agentbox-session] model-route state for ${sessionId} unreadable, starting fresh:`, err);
+      }
+      return createModelRouteState();
+    }
+  }
+
+  /**
+   * Best-effort model-route state durability. The state is independent of
+   * pi-agent's append-only JSONL history: it controls which candidate Siclaw
+   * should try next after AgentBox release/rebuild, but it does not alter the
+   * conversation context.
+   */
+  persistModelRouteState(sessionId: string, state: ModelRouteState): void {
+    const file = this.modelRouteStateFile(sessionId);
+    // Snapshot synchronously, then serialize writes per session: each write is
+    // atomic (tmp + rename), but without ordering a slow older write could
+    // rename over a newer one, leaving stale state on disk.
+    const payload = `${JSON.stringify(normalizeModelRouteState(state), null, 2)}\n`;
+    const prev = this._modelRouteStatePersists.get(sessionId) ?? Promise.resolve();
+    const next = prev.then(async () => {
+      const tmp = `${file}.${randomUUID()}.tmp`;
+      try {
+        await fs.promises.writeFile(tmp, payload, "utf8");
+        await fs.promises.rename(tmp, file);
+      } catch (err) {
+        console.warn(`[agentbox-session] model-route state persist failed for ${sessionId}:`, err);
+        void fs.promises.unlink(tmp).catch(() => {});
+      }
+    });
+    this._modelRouteStatePersists.set(sessionId, next);
+    void next.finally(() => {
+      if (this._modelRouteStatePersists.get(sessionId) === next) {
+        this._modelRouteStatePersists.delete(sessionId);
+      }
+    });
+  }
+
+  /**
+   * Best-effort: write the current ledger snapshot to the PV session dir. Writes to a
+   * unique temp file then atomically renames over the target, so a wide fan-out's
+   * interleaved snapshot writes can never leave a half-written / truncated file for a
+   * concurrent reader (rehydrate-on-restart) — last writer wins cleanly.
+   */
+  /**
+   * Snapshot the ledger to the PV, one write in flight per taskListId.
+   *
+   * Serialisation is a correctness requirement, not a throughput one: write-tmp-then-rename gives no
+   * ordering between concurrent pairs, so the rename that lands last wins. One task_event per turn
+   * hid that by spacing the writes seconds apart; a batched task_create fires N in one synchronous
+   * loop, and a snapshot of one task can then overwrite a snapshot of five — losing tasks on the
+   * next pod restart, when rehydrateLedger reads the file. See coalesced-write.ts.
+   */
+  private persistLedgerSnapshot = createCoalescedWriter(async (taskListId: string) => {
+    // Read INSIDE the write: the coalesced follow-up exists to observe the final state. peek, NOT
+    // getOrCreate — a follow-up that outlives close() would otherwise create a fresh empty ledger
+    // and rename `[]` over the durable snapshot that closure deliberately keeps. close() drains
+    // this writer first, so reaching here with no ledger means the session is already gone and
+    // there is nothing left to record.
+    const ledger = peekLedger(taskListId);
+    if (!ledger) return;
+    const tasks = ledger.snapshot();
+    const file = this.ledgerFile(taskListId);
+    const tmp = `${file}.${randomUUID()}.tmp`;
+    try {
+      await fs.promises.writeFile(tmp, JSON.stringify(tasks), "utf8");
+      await fs.promises.rename(tmp, file);
+    } catch (err) {
+      console.warn(`[agentbox-session] plan-ledger snapshot failed for ${taskListId}:`, err);
+      void fs.promises.unlink(tmp).catch(() => {});
+    }
+  });
+
+  /** Restore the ledger from the PV snapshot — only when the in-memory copy is
+   *  empty (i.e. after a process restart; a release-survived ledger is kept). */
+  private rehydrateLedger(taskListId: string): void {
+    const ledger = getOrCreateLedger(taskListId);
+    if (ledger.size > 0) return;
+    try {
+      const tasks = JSON.parse(fs.readFileSync(this.ledgerFile(taskListId), "utf8")) as LedgerTask[];
+      if (Array.isArray(tasks) && tasks.length > 0) ledger.hydrate(tasks);
+    } catch { /* no snapshot (new session) — fine */ }
+  }
+
+  /** CC V2 resetTaskList parity: when every task is completed, clear the plan after a
+   *  short delay; a new pending task before the timer fires cancels the clear. The
+   *  reset is emitted as a task_event so the UI/foldPlan + persistence reset too. The
+   *  ledger's id sequence is preserved so the next plan's ids never reuse cleared ones. */
+  private scheduleLedgerAutoClear(taskListId: string, emit: (event: Record<string, unknown>) => void): void {
+    const existing = this.ledgerHideTimers.get(taskListId);
+    if (getOrCreateLedger(taskListId).allCompleted()) {
+      if (existing) return; // already scheduled
+      const timer = setTimeout(() => {
+        this.ledgerHideTimers.delete(taskListId);
+        const ledger = getOrCreateLedger(taskListId);
+        if (!ledger.allCompleted()) return; // a new task arrived; abort the clear
+        // Only the parent touches the ledger (sub-agents have no task tools — see
+        // isSubagent gating), so allCompleted() reflects the whole plan and clearing
+        // here can't wipe anything out from under a child. No in-flight-child guard.
+        ledger.clear();
+        emit({ kind: "task_event", taskListId, action: "reset" });
+      }, LEDGER_AUTOCLEAR_MS);
+      timer.unref?.();
+      this.ledgerHideTimers.set(taskListId, timer);
+    } else if (existing) {
+      clearTimeout(existing);
+      this.ledgerHideTimers.delete(taskListId);
+    }
+  }
+
+  private async persistUpdateMessage(message: DelegationUpdateMessagePayload): Promise<void> {
+    await this.persistDelegationEvent({ type: "delegation.update_message", message });
+  }
+
+  private async persistUpdateDelegationToolMessage(message: DelegationToolUpdatePayload): Promise<void> {
+    await this.persistDelegationEvent({ type: "delegation.update_tool_message", message });
+  }
+
+  private async persistAppendDelegationEvent(event: DelegationEventPayload): Promise<string> {
+    const result = await this.persistDelegationEvent({ type: "delegation.append_event", event });
+    return result.id ?? "";
+  }
+
+  /**
+   * spawn_subagent executor (design §6). Foreground/blocking: create a child
+   * sub-session of the same agent core under the selected agent-type, run the
+   * bounded task, and return its final report inline. The child shares the
+   * parent's task ledger (taskListId) and is NOT given spawn_subagent (no recursion).
+   *
+   * Observability (design §13): the child runs as its own persisted session with
+   * lineage; every tool call and assistant message is streamed-and-persisted; and a
+   * terminal event is ALWAYS emitted (including on failure/timeout) so the full
+   * record — and the reason it failed — survives for UI drill-in.
+   */
+  private async runSpawnedSubagent(
+    request: SpawnSubagentRequest,
+    opts?: { childSessionId?: string; jobId?: string; mainTraceId?: string; spawnSpanContext?: SpanContext },
+    onProgress?: (progress: SpawnSubagentProgress) => void,
+    signal?: AbortSignal,
+  ): Promise<SpawnSubagentResult> {
+    const startedAt = Date.now();
+    const childSessionId = opts?.childSessionId ?? request.childSessionId ?? randomUUID();
+    // Trace context captured at dispatch by createSpawnSubagentExecutor (see there):
+    //  - mainTraceId: the parent interaction's root trace id → stamps chat_messages.trace_id
+    //    on every child row so a whole interaction shares one trace_id (DB audit).
+    //  - spawnSpanContext: the parent's spawn_subagent tool span → the child ROOT nests UNDER
+    //    it (span tree). Undefined when tracing is off / uncapturable → startPrompt falls back
+    //    to a sibling root via mainTraceId, or id-only. Both are span/DB-only, never affect logic.
+    const mainTraceId = opts?.mainTraceId;
+    const spawnSpanContext = opts?.spawnSpanContext;
+    const childSessionDir = this.getSessionDir(childSessionId);
+    const childSessionManager = this.subagentRuns.get(childSessionId)?.restoredSession
+      ?? SessionManager.continueRecent(process.cwd(), childSessionDir);
+    const config = loadConfig();
+    const kubeconfigRef: KubeconfigRef = {
+      credentialsDir: this.credentialsDir ?? path.resolve(process.cwd(), config.paths.credentialsDir),
+      credentialBroker: this.credentialBroker,
+    };
+    const type = getSubagentType(request.subagentType) ?? getSubagentType(DEFAULT_SUBAGENT_TYPE)!;
+    const agentId = request.parentAgentId ?? this.agentId ?? null;
+
+    /**
+     * Reuse the parent's MCP connections instead of dialling the same servers again.
+     *
+     * Without this the child takes agent-factory's `new McpClientManager(...)` branch
+     * and AWAITS `initialize()` inside the spawn — for stdio servers that is a child
+     * process per sub-agent per server, and a wide fan-out pays it once per item
+     * before any of them can start work. The servers and their tools are identical to
+     * the parent's, since the child inherits the parent's agent and config.
+     *
+     * Undefined when the parent has no MCP configured or is no longer resident (a
+     * background child outliving its parent's release): the child then owns its own
+     * manager exactly as before.
+     */
+    const sharedMcpManager = this.sessions.get(request.parentSessionId)?.mcpManager;
+
+    const child = await createSiclawSession({
+      mcpManager: sharedMcpManager,
+      sessionManager: childSessionManager,
+      kubeconfigRef,
+      mode: "web",
+      memoryIndexer: this._sharedMemoryIndexer ?? undefined,
+      knowledgeIndexer: this._sharedKnowledgeIndexer ?? undefined,
+      userId: request.userId,
+      agentId,
+      knowledgeDir: this.knowledgeDir,
+      portalSkillsDir: this.skillsDir ? path.join(this.skillsDir, "resolved") : undefined,
+      mcpServers: this.mcpServersState,
+      agentType: normalizeAgentType(this.agentTypeState),
+      harnessResolved: this.harnessResolvedState,
+      // A spawned sub-agent must never be broader than its parent: inherit the
+      // parent's per-agent tool whitelist. Explicit Custom null remains
+      // unrestricted; built-in null is expanded to the type's locked groups.
+      allowedTools: this.allowedToolsState,
+      // The plan is parent-owned: sub-agents have no task tools (isSubagent hides
+      // them), so the child neither reads nor writes the ledger — the parent marks
+      // tasks complete as children report back. The parent's taskListId is therefore
+      // intentionally NOT shared with the child (nothing there would consume it).
+      isSubagent: true,
+      // The agent-type's prompt flavour for this child.
+      systemPromptAppend: request.agentPrompt,
+      subagentPrompt: type.systemPromptAddendum,
+      // Deliberately omit spawnSubagentExecutor + delegate executors → the child
+      // never sees spawn_subagent (no recursion).
+    });
+    child.sessionIdRef.current = childSessionId;
+    const mailbox = this.subagentRuns.get(childSessionId)?.mailbox;
+    mailbox?.attach(child.brain);
+    this.attachUsage(child.brain, childSessionId, "internal_subagent", mainTraceId);
+
+    // ── Model selection: tier, or the parent's effective model ──────────────
+    //
+    // `request.tierPlan` is the SNAPSHOT captured when spawn_subagent dispatched
+    // (menu + candidates + effective parent), shared by every child of that call
+    // and every later wave of a batch. Reading live state per child would let a
+    // long batch straddle a configuration change and report both halves as one.
+    // Redact the union of the parent's credentials and every tier candidate's: a
+    // tiered child may run on another provider entirely, and its own apiKey/baseUrl
+    // would otherwise pass through echoed tool output unmasked. Cheap and static,
+    // so it covers every candidate rather than only the one that resolved.
+    //
+    // Built BEFORE the outcome exists, because the outcome is the first thing that
+    // needs it — see the sanitize below.
+    const redactionConfig = buildRedactionConfigForModelConfig(
+      this.delegationModelConfig,
+      ...(request.tierPlan?.candidates?.candidates ?? []).map((c) => c.modelConfig),
+      request.tierPlan?.effectiveParent?.modelConfig,
+    );
+
+    const rawTierOutcome = await this.applyChildModel(child, request.tierPlan, request.prompt);
+    // `detail` is the raw `registerProvider` / `setModel` exception text, and such an
+    // exception routinely quotes the endpoint it dialled and sometimes the key it
+    // sent. Sanitized ONCE, here, rather than at each consumer: it is thrown at the
+    // prompt boundary, persisted onto the terminal event, and returned to the caller,
+    // and a fix applied per consumer leaves whichever one is added next unprotected.
+    // Redacting the summaries alone was not enough — the field itself still carried
+    // the key into the returned report.
+    const tierOutcome: ChildModelOutcome = rawTierOutcome.detail
+      ? { ...rawTierOutcome, detail: redactText(rawTierOutcome.detail, redactionConfig) }
+      : rawTierOutcome;
+
+    // A `failed` outcome means not even the parent's effective model could be
+    // applied, so there is nothing left to fall back to (§7.4). It is NOT handled
+    // here: it throws at the prompt boundary below, so the failure funnels through
+    // the same cleanup and terminal-event persistence as any other.
+
+    // Sub-agent trace: open a ROOT span that NESTS under the parent's spawn_subagent tool
+    // span (spawnSpanContext) so its tree hangs beneath that tool call in Langfuse; falls back
+    // to a sibling root under T1 via mainTraceId when the spawn span could not be captured.
+    // Placed AFTER model setup so the ROOT captures llm.model_name; attach must precede
+    // startPrompt (else startPrompt takes the id-only branch). Both self-gate on tracing state.
+    tracingRecorder.attach(childSessionId, child.brain, { userId: request.userId, agentId });
+    tracingRecorder.startPrompt(childSessionId, request.prompt, request.userId, mainTraceId, spawnSpanContext);
+
+    // Cancellation: stopRequested is set by either the parent's abort signal
+    // (main "stop" button → the spawn_subagent tool's signal) or job_stop.
+    let stopRequested = false;
+    const requestStop = (reason: string) => {
+      stopRequested = true;
+      void abortBrainBestEffort(child.brain, reason);
+    };
+    if (signal) {
+      if (signal.aborted) requestStop(`parent aborted ${childSessionId}`);
+      else signal.addEventListener("abort", () => requestStop(`parent aborted ${childSessionId}`), { once: true });
+    }
+    // Wire job cancellation (job_stop) into this run once the child exists.
+    if (opts?.jobId) {
+      const job = this.jobs.get(opts.jobId);
+      if (job) {
+        job.childSessionId = childSessionId;
+        job.abort = () => requestStop(`job_stop ${childSessionId}`);
+      }
+    }
+
+    // Setup-window Stop: if the user pressed Stop while we were awaiting createSiclawSession
+    // above (job.abort was not wired yet, so a /abort sweep's stopJob no-op'd with "starting up"
+    // and left the job "running"), honour it now before the child's run starts. The reliable
+    // signal is the PARENT session's _aborted (set at /abort, true for the whole Stop window) —
+    // NOT the job status, which stopJob never set to "stopped" in this window.
+    if (this.sessions.get(request.parentSessionId)?._aborted) {
+      requestStop(`parent stopped during sub-agent setup ${childSessionId}`);
+    }
+
+    // ── Transcript persistence (design §13). Serialized via a promise queue so
+    //    writes land in order; a write failure disables the trace but never the run. ──
+    const delegationId = request.spawnId;
+    const lineage = { parentSessionId: request.parentSessionId, parentAgentId: agentId, delegationId, targetAgentId: agentId };
+    // canPersist = is the trace persistable at all (config present). Constant — never
+    // flipped. persistTrace is the per-write latch that disables further *non-terminal*
+    // writes after the first failure; the terminal event must NOT ride this latch.
+    const canPersist = Boolean(agentId && request.userId && request.parentSessionId);
+    let persistTrace = canPersist;
+    let persistQueue: Promise<void> = Promise.resolve();
+    const enqueuePersist = (op: () => Promise<void>) => {
+      if (!persistTrace) return;
+      persistQueue = persistQueue.then(op).catch((err) => {
+        persistTrace = false;
+        console.warn(`[agentbox-session] sub-agent trace persistence disabled for ${childSessionId}:`, err);
+      });
+    };
+
+    if (persistTrace && agentId) {
+      try {
+        await this.persistEnsureChatSession(
+          childSessionId,
+          agentId,
+          request.userId,
+          `Sub-agent: ${request.description}`,
+          redactText(request.prompt, redactionConfig).slice(0, 500),
+          "subagent",
+          lineage,
+        );
+        await this.persistAppendMessage({
+          sessionId: childSessionId,
+          role: "user",
+          content: redactText(request.prompt, redactionConfig),
+          fromAgentId: agentId,
+          parentSessionId: request.parentSessionId,
+          delegationId,
+          targetAgentId: agentId,
+          traceId: mainTraceId,
+        });
+      } catch (err) {
+        persistTrace = false;
+        console.warn(`[agentbox-session] could not initialize sub-agent trace ${childSessionId}:`, err);
+      }
+    }
+
+    const extractEventText = (content: unknown): string =>
+      Array.isArray(content)
+        ? content.filter((c: any) => c?.type === "text").map((c: any) => c.text as string).join("")
+        : "";
+
+    let finalText = "";
+    let lastStopReason: string | undefined;
+    const responseFragments: string[] = [];
+    let reviewing = false;
+    let deadlineReached = false;
+    let childTimer: ReturnType<typeof setTimeout> | undefined;
+    let toolCalls = 0;
+    let status: SpawnSubagentStatus = "done";
+    const pendingTools = new Map<string, { startMs: number; toolName: string; toolset?: string; toolInput?: string }>();
+    // Ordered steps (assistant reasoning + tool calls) streamed to the parent UI so the
+    // card shows the sub-agent's execution live, like a mini main-agent run.
+    const liveSteps: SubagentStep[] = [];
+    const emitProgress = (activity?: string) =>
+      onProgress?.({ status: "running", toolCalls, steps: liveSteps.map((s) => ({ ...s })), activity });
+
+    const unsubscribe = child.brain.subscribe((event: any) => {
+      // Feed the recorder FIRST, unconditionally (gated on tracing state), so the child's
+      // span tree captures every turn/llm/tool before the progress/persist bookkeeping below.
+      if (isTracingEnabled()) tracingRecorder.handleEvent(childSessionId, event);
+      if (reviewing) return;
+      if (event?.type === "message_end" && event.message?.role === "user") {
+        const text = typeof event.message.content === "string" ? event.message.content : extractEventText(event.message.content);
+        for (const guidance of mailbox?.consumeGuidance(text) ?? []) {
+          enqueuePersist(async () => {
+            await this.persistAppendMessage({
+              sessionId: childSessionId, role: "user", content: redactText(guidance, redactionConfig),
+              metadata: { kind: "steer" }, fromAgentId: agentId,
+              parentSessionId: request.parentSessionId, delegationId, targetAgentId: agentId, traceId: mainTraceId,
+            });
+          });
+        }
+      }
+      if (event?.type === "tool_execution_start" || event?.type === "tool_start") {
+        toolCalls++;
+        const toolName = (event.toolName as string) || (event.name as string) || "tool";
+        const id = String(event.toolCallId ?? event.toolUseID ?? `${toolName}-${toolCalls}`);
+        pendingTools.set(id, {
+          startMs: Date.now(),
+          toolName,
+          ...(typeof event.toolset === "string" && event.toolset.length > 0 ? { toolset: event.toolset } : {}),
+          toolInput: event.args ? redactText(JSON.stringify(event.args), redactionConfig) : undefined,
+        });
+        emitProgress(`Running ${toolName}…`);
+      }
+      if (event?.type === "tool_execution_end" || event?.type === "tool_end") {
+        const id = String(event.toolCallId ?? event.toolUseID ?? "");
+        const pending = pendingTools.get(id);
+        pendingTools.delete(id);
+        const toolName = (event.toolName as string) || (event.name as string) || pending?.toolName || "tool";
+        const durationMs = pending ? Date.now() - pending.startMs : null;
+        const outcome: "success" | "error" = event.isError ? "error" : "success";
+        const resultText = redactText(extractEventText(event.result?.content), redactionConfig);
+        liveSteps.push({ kind: "tool", toolName, toolInput: pending?.toolInput, content: resultText.slice(0, 1000), outcome, durationMs });
+        emitProgress(`Finished ${toolName}`);
+        enqueuePersist(async () => {
+          await this.persistAppendMessage({
+            sessionId: childSessionId,
+            role: "tool",
+            content: resultText,
+            metadata: { ...persistableToolDetails(event.result?.details, value => redactText(value, redactionConfig)), ...getToolResultArtifactDetails(event.result?.details) },
+            toolName,
+            toolset: pending?.toolset ?? (typeof event.toolset === "string" ? event.toolset : null),
+            toolInput: pending?.toolInput,
+            outcome,
+            durationMs,
+            fromAgentId: agentId,
+            parentSessionId: request.parentSessionId,
+            delegationId,
+            targetAgentId: agentId,
+            traceId: mainTraceId,
+          });
+        });
+      }
+      if (event?.type === "message_end" && event.message?.role === "assistant") {
+        lastStopReason = event.message.stopReason;
+        const text = extractEventText(event.message.content).trim();
+        if (text) {
+          finalText = [...responseFragments, text].join("\n");
+          if (lastStopReason === "length") responseFragments.push(text);
+          liveSteps.push({ kind: "assistant", text: redactText(text, redactionConfig) });
+          emitProgress();
+          enqueuePersist(async () => {
+            await this.persistAppendMessage({
+              sessionId: childSessionId,
+              role: "assistant",
+              content: redactText(text, redactionConfig),
+              metadata: {
+                phase: assistantTextBlocks(event.message).find((b) => b.phase)?.phase,
+                stop_reason: event.message.stopReason,
+                ...(event.message.errorMessage ? { error_message: redactText(event.message.errorMessage, redactionConfig) } : {}),
+                assistant_item: {
+                  api: event.message.api, provider: event.message.provider, model: event.message.model,
+                  textSignature: event.message.content?.find((b: any) => b.type === "text")?.textSignature,
+                },
+              },
+              fromAgentId: agentId,
+              parentSessionId: request.parentSessionId,
+              delegationId,
+              targetAgentId: agentId,
+              traceId: mainTraceId,
+            });
+          });
+        }
+      }
+    });
+
+    let interruptedTool: string | undefined;
+    try {
+      // Stop landed before/during setup: requestStop already fired, but child.brain.abort() is a
+      // no-op with no active run — so DON'T start the prompt at all, or it would run a fresh,
+      // un-aborted turn. Throw straight into the stopRequested branch below.
+      if (stopRequested) throw new Error("stopped before sub-agent prompt started");
+      // Not even the parent's effective model could be applied (§7.4). Throw rather
+      // than returning early: this path has to reach the same `finally` — which
+      // shuts down an MCP manager this child opened — and the terminal-event
+      // persistence below, or the card sticks "Running" on reload and the child
+      // leaks its connections.
+      if (tierOutcome.failed) {
+        // REDACTED AT CONSTRUCTION, not just where it is rendered. `detail` is the
+        // raw `registerProvider` / `setModel` exception text, and a provider setup
+        // failure routinely quotes the baseUrl it dialled and sometimes the key it
+        // sent. From here the message becomes `finalText`, which is logged,
+        // persisted to the delegation transcript, shown in the UI, and returned to
+        // the PARENT MODEL as the tool result — so the moment it carries a secret
+        // it has carried it into a prompt. Redacting the thrown value means every
+        // one of those derives from sanitized text without each having to remember.
+        throw new Error(
+          `sub-agent could not be placed on a model${tierOutcome.detail ? `: ${tierOutcome.detail}` : ""}`,
+        );
+      }
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        childTimer = setTimeout(() => {
+          deadlineReached = true;
+          reject(new Error("spawn_subagent_timeout"));
+        }, DELEGATED_AGENT_MAX_RUNTIME_MS);
+        childTimer.unref?.();
+      });
+      const execution = async () => {
+        if (request.parentContext) {
+          const source = new ToolResultArtifactStore({
+            rootDir: toolResultArtifactRoot(this.getSessionDir(request.parentSessionId)),
+            getScope: () => ({ agentId: request.parentAgentId ?? `user:${request.userId}`, sessionId: request.parentSessionId }),
+          });
+          const content = await materializeSubagentContext(request.parentContext, source, child.toolResultArtifactStore,
+            text => redactText(text, redactionConfig), () => stopRequested || deadlineReached);
+          if (stopRequested || deadlineReached) throw new Error("stopped before context inheritance completed");
+          await child.session.sendCustomMessage({ customType: "subagent-parent-context", content, display: false }, { triggerTurn: false });
+        }
+        const promptRequest = request.inputReports ? {
+          ...request,
+          prompt: await prepareReduceEvidence(request.prompt, request.inputReports, child.toolResultArtifactStore),
+        } : request;
+        const model = child.brain.getModel();
+        if (request.parentContext && model && child.brain.checkContextFitForModelPrompt) {
+          const fit = child.brain.checkContextFitForModelPrompt(model, this.buildSpawnedSubagentPrompt(promptRequest));
+          if (!fit.ok) throw new Error("Inherited context exceeds the child model window; use a smaller fork_turns selection or a larger model tier.");
+        }
+        if (stopRequested || deadlineReached) throw new Error("stopped before sub-agent prompt started");
+        return runSubagentToAcceptance({
+        brain: child.brain,
+        prompt: this.buildSpawnedSubagentPrompt(promptRequest),
+        assignment: `Task: ${request.description}\n\n${request.prompt}`,
+        mailbox,
+        stopped: () => stopRequested || deadlineReached,
+        stopReason: () => lastStopReason,
+        reviewing: (active) => { reviewing = active; },
+        });
+      };
+      const acceptance = await Promise.race([execution(), timeoutPromise]);
+      if (!acceptance.accepted && !stopRequested) {
+        status = lastStopReason === "error" ? "failed" : "partial";
+        finalText = `${finalText}\n\n[Task completion not verified: ${redactText(acceptance.reason ?? "incomplete", redactionConfig)}]`;
+      }
+    } catch (err) {
+      interruptedTool = [...pendingTools.values()][0]?.toolName;
+      if (stopRequested) {
+        status = "partial";
+        finalText = finalText
+          ? `Sub-agent cancelled by job_stop. Partial report:\n\n${finalText}`
+          : "Sub-agent cancelled by job_stop before producing a report.";
+      } else if (err instanceof Error && err.message === "spawn_subagent_timeout") {
+        status = "timed_out";
+        await abortBrainBestEffort(child.brain, `spawned sub-agent ${childSessionId}`);
+        finalText = finalText
+          ? `Sub-agent timed out after ${DELEGATED_AGENT_MAX_RUNTIME_MS}ms. Partial report:\n\n${finalText}`
+          : `Sub-agent timed out after ${DELEGATED_AGENT_MAX_RUNTIME_MS}ms with no output.`;
+      } else {
+        status = "failed";
+        // Redact before BOTH uses. The union config covers the parent's credentials
+        // and every tier candidate's, because a tiered child may run on a different
+        // provider entirely — and an exception raised inside a model call is exactly
+        // the kind that quotes its endpoint back. Logging the raw `err` object was
+        // the remaining hole after the thrown message was sanitized above: a log
+        // line is no less of a disclosure than the tool result.
+        const failureText = redactText(
+          err instanceof Error ? err.message : String(err),
+          redactionConfig,
+        );
+        console.warn(`[agentbox-session] sub-agent ${childSessionId} failed: ${failureText}`);
+        finalText = finalText || `Sub-agent failed: ${failureText}`;
+      }
+    } finally {
+      mailbox?.close();
+      if (childTimer) clearTimeout(childTimer);
+      unsubscribe();
+      // Shut down only connections this child opened. A manager shared with the
+      // parent outlives every child and is torn down with the parent session.
+      if (child.mcpManager && child.mcpManager !== sharedMcpManager) {
+        await child.mcpManager.shutdown().catch((err) =>
+          console.warn(`[agentbox-session] spawned sub-agent MCP shutdown failed for ${childSessionId}:`, err),
+        );
+      }
+    }
+
+    // If job_stop aborted but prompt() resolved instead of throwing, reflect it.
+    if (stopRequested && status === "done") {
+      status = "partial";
+      finalText = finalText
+        ? `Sub-agent cancelled by job_stop. Partial report:\n\n${finalText}`
+        : "Sub-agent cancelled by job_stop before producing a report.";
+    }
+
+    if (!finalText) {
+      if (status === "done") status = "failed";
+      finalText = "(sub-agent produced no output)";
+    }
+
+    // Status is FINAL here → close the child's trace ROOT (span export). detach in the
+    // finally below is the structural safety net: it ALWAYS runs even if a persist throws,
+    // so no child trace is left open. endPrompt stays outside the try so it runs before the
+    // terminal persist, mirroring the main-prompt ordering.
+    tracingRecorder.endPrompt(childSessionId, status === "done" ? "completed" : "error");
+    try {
+      const bundle = buildDelegateSummaryBundle(redactText(finalText, redactionConfig));
+      const durationMs = Date.now() - startedAt;
+
+      // Drain prior (best-effort) trace writes, then emit the terminal event.
+      await persistQueue;
+      // Terminal event ALWAYS — including failure/timeout (design §13 hard requirement).
+      // Routed OFF the persistTrace latch: a transient failure on an earlier trace write
+      // must not drop this, or the child is left stuck "running" in the UI forever. It
+      // still respects whether persistence is configured at all (canPersist).
+      if (canPersist) {
+        try {
+          await this.persistAppendDelegationEvent({
+            parentSessionId: request.parentSessionId,
+            parentAgentId: agentId,
+            userId: request.userId,
+            delegationId,
+            childSessionId,
+            targetAgentId: agentId,
+            status,
+            capsule: bundle.capsule,
+            fullSummary: bundle.fullSummary,
+            summaryTruncated: bundle.truncated,
+            scope: request.prompt,
+            toolCalls,
+            durationMs,
+            interruptedTool,
+            traceId: mainTraceId,
+            // Same reason as the group's terminal event: a DETACHED single spawn
+            // returned `launched` long before this, so without it here nothing
+            // records which model ran or why it fell back. Identifiers only.
+            ...(tierOutcome ? { tier: persistableTierOutcome(tierOutcome) } : {}),
+          });
+        } catch (err) {
+          console.warn(`[agentbox-session] terminal delegation event persist failed for ${childSessionId}:`, err);
+        }
+      }
+
+      return {
+        status,
+        summary: bundle.capsule,
+        fullSummary: bundle.fullSummary,
+        resumeHandle: request.resumeHandle,
+        coverage: finishTargetCoverage(request.targetCoverage, [status]),
+        childSessionId,
+        toolCalls,
+        durationMs,
+        interruptedTool,
+        steps: liveSteps,
+        tierOutcome,
+      };
+    } finally {
+      tracingRecorder.detach(childSessionId);
+    }
+  }
+
+  private buildSpawnedSubagentPrompt(request: SpawnSubagentRequest): string {
+    // Make the sub-agent answer in the user's language (same mechanism the main
+    // agent uses): detect from the briefing the parent wrote and inject the directive.
+    const lang = detectLanguage(`${request.description}\n${request.prompt}`);
+    const langDirective = lang !== "English" ? `[System: respond in ${lang}]\n` : "";
+    return `${langDirective}Task: ${request.description}\n\n${request.prompt.trim()}\n\n` +
+      `Complete this task now and end with a concise findings report — the caller only sees your ` +
+      `final report, not your intermediate steps. Report missing authorization or other blockers to the caller; do not assume approval.`;
+  }
+
+  /**
+   * Get or create a session.
+   * Each gateway sessionId maps to its own pi-coding-agent session directory,
+   * so pod restarts correctly restore the matching conversation context.
+   *
+   * After Phase 2, sessions are released after each prompt completes.
+   * getOrCreate() restores from JSONL, reusing shared components for fast recovery.
+   */
+  private async releaseForRebuild(sessionId: string, managed: ManagedSession): Promise<void> {
+    if (managed._releaseTimer) {
+      clearTimeout(managed._releaseTimer);
+      managed._releaseTimer = null;
+    }
+    await this.release(sessionId);
+  }
+
+  /**
+   * Sessions handed away have a durable sibling marker. The source finishes
+   * appending its terminal tool result before release deletes the stale cache.
+   * Only successful control-plane rehydration clears the marker, including
+   * after a process restart or a hand-back to a still-resident session.
+   */
+  private readonly evictedSessions = new Set<string>();
+
+  private removeCachedSessionTranscript(sessionId: string): void {
+    const directory = this.getSessionDir(sessionId);
+    // Handoff invalidates the conversational cache, not scoped evidence still referenced by
+    // history. Artifacts retain their own TTL and authorization; they are never shared implicitly.
+    for (const name of fs.readdirSync(directory)) {
+      if (name !== ".tool-results") fs.rmSync(path.join(directory, name), { recursive: true, force: true });
+    }
+    if (fs.readdirSync(directory).length === 0) fs.rmdirSync(directory);
+  }
+
+
+  /**
+   * Forget a session this box has handed away. See `evictedSessions`.
+   */
+  async evictSessionContext(sessionId: string): Promise<void> {
+    const id = sessionId?.trim();
+    if (!id) return;
+    const marker = `${this.getSessionDir(id)}.handoff`;
+    fs.mkdirSync(path.dirname(marker), { recursive: true });
+    fs.writeFileSync(marker, "reload from control plane\n", { mode: 0o600 });
+    this.evictedSessions.add(id);
+  }
+
+  /**
+   * Make sure a continuation has context to continue FROM — the checkpointer read.
+   *
+   * Local JSONL is a cache; the control plane is the authority. When this box has
+   * nothing for `sessionId` (another agent ran the earlier turns, or a replica /
+   * restart moved the session here), pull the transcript and write it as a pi
+   * session BEFORE `getOrCreate` runs `continueRecent` — which then restores it
+   * through the exact path a pod restart already uses. Nothing downstream learns
+   * the history was ever remote.
+   *
+   * Returns whether context now exists, so the strict `requireExistingSession`
+   * check in http-server can read the truthful state instead of the pre-load one.
+   *
+   * A failure returns false. Handoff requests require existing history and the
+   * HTTP boundary rejects them rather than starting with missing context.
+   */
+  async ensureSessionContext(sessionId?: string): Promise<boolean> {
+    const id = sessionId?.trim();
+    if (!id) return false;
+    // Release a completed resident brain before rebuilding its stale transcript.
+    // Keep the durable marker until a nonempty history has been written.
+    const marker = `${this.getSessionDir(id)}.handoff`;
+    if (this.evictedSessions.has(id) || fs.existsSync(marker)) {
+      const resident = this.sessions.get(id);
+      if (resident && (!resident._promptDone || resident._promptInflight)) return false;
+      if (resident?._releaseTimer) { clearTimeout(resident._releaseTimer); resident._releaseTimer = null; }
+      await this.release(id);
+      try {
+        this.removeCachedSessionTranscript(id);
+      } catch (err) {
+        console.error(`[agentbox-session] Cannot discard stale context for ${id}:`, err);
+        return false;
+      }
+    } else if (this.hasRestorableSessionContext(id)) {
+      return true;
+    }
+    const gc = this.gatewayClient;
+    if (!gc) return false;
+    try {
+      const { messages } = await gc.fetchSessionHistory(id);
+      if (!messages?.length) return false; // a genuinely new session — nothing to load
+      const { written } = writeRehydratedSession(process.cwd(), this.getSessionDir(id), messages);
+      if (restoreTaskLedgerFromHistory(id, messages)) await this.persistLedgerSnapshot(id);
+      console.log(`[agentbox-session] Rehydrated session ${id} from the control plane: ${messages.length} rows → ${written} messages`);
+      if (written > 0) {
+        fs.rmSync(marker, { force: true });
+        this.evictedSessions.delete(id);
+      }
+      return written > 0;
+    } catch (err) {
+      console.error(`[agentbox-session] Could not rehydrate session ${id} from the control plane; strict continuations must not start:`, err);
+      return false;
+    }
+  }
+
+  /**
+   * Whether a requested continuation can recover real conversation context.
+   * A resident session is resumable in memory; otherwise the pi-agent JSONL
+   * must contain more than its header. Fail closed when the history is absent
+   * or unreadable so a continuation never starts from an isolated answer.
+   */
+  hasRestorableSessionContext(sessionId?: string): boolean {
+    const id = sessionId?.trim();
+    if (!id) return false;
+    if (this.sessions.has(id)) return true;
+
+    const sessionDir = path.join(this.getBaseSessionDir(), id);
+    if (!fs.existsSync(sessionDir)) return false;
+    try {
+      return SessionManager.continueRecent(process.cwd(), sessionDir).getEntries().some(
+        (entry: { type?: string; message?: { role?: string } }) =>
+          entry.type === "message" && (entry.message?.role === "user" || entry.message?.role === "assistant"),
+      );
+    } catch (err) {
+      console.warn(`[agentbox-session] Session context for ${id} is unreadable:`, err);
+      return false;
+    }
+  }
+
+  async getOrCreate(
+    sessionId?: string,
+    mode?: SessionMode,
+    systemPromptTemplate?: string,
+    activeMode: AgentMode = "normal",
+    requestUserId?: string,
+    allowInputRequest = false,
+    handoffSupported = false,
+    handoffPolicy?: import("../shared/agent-handoff.js").HandoffPolicy,
+  ): Promise<ManagedSession> {
+    const id = sessionId || this.defaultSessionId;
+    const effectiveUserId = requestUserId?.trim() || this.userId;
+
+    const existing = this.sessions.get(id);
+    if (existing) {
+      existing.lastActiveAt = new Date();
+      if (effectiveUserId && existing.userId && effectiveUserId !== existing.userId) {
+        throw new Error(`Session ${id} is already bound to a different user`);
+      }
+      const needsUserIdentityRebuild = Boolean(effectiveUserId && !existing.userId);
+      // Config invalidation is stronger than the ordinary release timer:
+      // even if the next message races the 0ms timer, an idle session must be
+      // rebuilt so it cannot run one extra turn with stale prompt/tool state.
+      if (
+        existing._invalidated &&
+        existing._promptDone &&
+        !existing._promptInflight &&
+        existing._backgroundWorkCount === 0 &&
+        !this.hasPendingNotificationWork(existing)
+      ) {
+        await this.releaseForRebuild(id, existing);
+      } else if (
+        existing._invalidated &&
+        (!existing._promptDone || existing._promptInflight)
+      ) {
+        // The active prompt still owns the brain. Return it so the ordinary
+        // busy-session boundary rejects/steers the concurrent turn. Detached
+        // background work does not own brain.prompt(), so an otherwise-idle
+        // invalidated session remains usable with its old prompt until that
+        // work finishes; scheduleRelease() then forces the deferred rebuild.
+        return existing;
+      } else {
+        // Cancel pending release — session is being reused
+        if (existing._releaseTimer) {
+          clearTimeout(existing._releaseTimer);
+          existing._releaseTimer = null;
+          console.log(`[agentbox-session] Cancelled pending release for session ${id}`);
+        }
+        // Rebuild an idle session when its execution context changes.
+        const sameInputCapability = existing.allowInputRequest === allowInputRequest
+          && Boolean(existing.handoffSupported) === handoffSupported
+          && JSON.stringify(existing.handoffPolicy) === JSON.stringify(handoffPolicy)
+          && existing.mode === (mode ?? "web");
+        if (
+          (existing.activeMode === activeMode && sameInputCapability && !needsUserIdentityRebuild) ||
+          !existing._promptDone ||
+          existing._promptInflight
+        ) {
+          return existing;
+        }
+        console.log(
+          `[agentbox-session] Rebuilding session ${id} for context change ${existing.activeMode}/input=${existing.allowInputRequest}/${existing.userId ?? "anonymous"} -> ${activeMode}/input=${allowInputRequest}/${effectiveUserId ?? "anonymous"}`,
+        );
+        await this.releaseForRebuild(id, existing);
+      }
+    }
+
+    // Ensure shared components are ready
+    await this.ensureSharedComponents();
+
+    const sessionDir = this.getSessionDir(id);
+    console.log(`[agentbox-session] Creating session: ${id} in ${sessionDir}`);
+    const modelRouteState = this.loadModelRouteState(id);
+
+    if (isMemoryEnabled()) {
+      const memoryDir = this.getMemoryDir();
+      if (!fs.existsSync(memoryDir)) {
+        fs.mkdirSync(memoryDir, { recursive: true });
+      }
+    }
+
+    // continueRecent with proper cwd + sessionDir — restores the correct
+    // conversation after pod restart, or creates new if directory is empty.
+    // NOTE: cwd is the first arg (stored in session header), sessionDir is
+    // the second (where JSONL files are stored). Passing sessionDir as cwd
+    // caused pi-agent to encode the path and store JSONL in a different dir.
+    const frameworkSessionManager = SessionManager.continueRecent(process.cwd(), sessionDir);
+    const isNewSession = frameworkSessionManager.getEntries().length <= 1; // only session header
+
+    const config = loadConfig();
+    const kubeconfigRef: KubeconfigRef = {
+      // Prefer the per-user dir set by LocalSpawner; fall back to the
+      // config-driven global path (K8s mode and CLI both use this).
+      credentialsDir: this.credentialsDir ?? path.resolve(process.cwd(), config.paths.credentialsDir),
+      credentialBroker: this.credentialBroker,
+    };
+    const effectiveMode = mode ?? "web";
+
+    // Per-session extra event bus — tools (e.g. spawn_subagent) use
+    // this to push custom events into the SSE stream alongside the brain's events.
+    // Allocated BEFORE createSiclawSession so we can wire the emitter into
+    // ToolRefs. Buffered events replay to the SSE handler on connect.
+    const extraEventSubs = new Set<(event: Record<string, unknown>) => void>();
+    const extraEventBuffer: Record<string, unknown>[] = [];
+    // Cap the buffer so a long batch with no SSE client (e.g. user closed
+    // the tab while a 10-min delegation runs) cannot grow the heap without
+    // bound. 1000 events is far above any realistic SSE catch-up window.
+    // On overflow, drop the OLDEST event — late connectors lose context but
+    // never OOM the agentbox process. Warn once per session so operators
+    // can see when it happens; subsequent drops stay silent.
+    const EXTRA_EVENT_BUFFER_CAP = 1000;
+    let extraEventBufferOverflowed = false;
+    const emitExtraEvent = (event: Record<string, unknown>) => {
+      if (event.type === "handoff_requested") {
+        const owner = this.sessions.get(id)?._backgroundWorkTurn;
+        if (owner) {
+          owner.cancel();
+          this.stopSessionJobs(id, owner.jobIds);
+        }
+      }
+      // Task ledger events are persisted (refresh recovery, design §14 Approach A)
+      // in addition to being streamed live below.
+      if (isTaskEvent(event)) {
+        // Queued per taskListId, not fired off independently. These are a LOG replayed in order to
+        // rebuild the plan, and the receiver sequences them by arrival — so two appends racing can
+        // be recorded in either order, and last-write-wins replay then applies a stale status over a
+        // fresh one or re-adds a deleted task. Batching made that ordinary: one turn now emits
+        // several in a single synchronous loop.
+        this.taskEventQueue.push(event.taskListId ?? id, { sessionId: id, event });
+        // Snapshot the (shared) ledger to the PV session dir so the backend plan
+        // survives a pod/process restart — keyed by the event's taskListId (the
+        // parent's id, even when a sub-agent mutated a task it owns).
+        this.persistLedgerSnapshot(event.taskListId ?? id);
+        // CC V2 parity: once the whole plan is completed, auto-clear it after a
+        // short delay (a new pending task before then cancels the clear).
+        if (event.action !== "reset") this.scheduleLedgerAutoClear(event.taskListId ?? id, emitExtraEvent);
+      }
+      if (extraEventSubs.size === 0) {
+        extraEventBuffer.push(event);
+        if (extraEventBuffer.length > EXTRA_EVENT_BUFFER_CAP) {
+          extraEventBuffer.shift();
+          if (!extraEventBufferOverflowed) {
+            extraEventBufferOverflowed = true;
+            console.warn(`[agentbox-session] extra event buffer for session ${id} exceeded ${EXTRA_EVENT_BUFFER_CAP}; dropping oldest events`);
+          }
+        }
+      } else for (const sub of extraEventSubs) { try { sub(event); } catch { /* best-effort */ } }
+    };
+
+    // Rehydrate the task ledger before the agent runs. The module-level ledger
+    // map survives session release within a process; this restores it after a
+    // full pod/process restart from the PV snapshot. taskListId == session id.
+    this.rehydrateLedger(id);
+
+    const gc = this.gatewayClient;
+    // Load the authorized handoff index from the control plane.
+    let handoffTargets: HandoffTarget[] | undefined;
+    if (gc) {
+      try {
+        const r = await gc.fetchHandoffTargets();
+        handoffTargets = r.targets?.length ? r.targets : undefined;
+      } catch (err) {
+        console.warn(`[agentbox-session] fetchHandoffTargets failed for ${id}:`, err);
+      }
+    }
+    const scriptInfo = effectiveMode === "web" && gc ? await gc.scriptSandboxInfo() : undefined;
+    const result = await createSiclawSession({
+      scriptExecutor: scriptInfo?.enabled ? (request, _sessionId, signal) => gc!.runScript(request, id, signal) : undefined,
+      scriptSandboxInfo: scriptInfo,
+      sessionManager: frameworkSessionManager,
+      kubeconfigRef,
+      mode: effectiveMode,
+      activeMode,
+      memoryIndexer: this._sharedMemoryIndexer ?? undefined,
+      knowledgeIndexer: this._sharedKnowledgeIndexer ?? undefined,
+      userId: effectiveUserId,
+      agentId: this.agentId ?? null,
+      knowledgeDir: this.knowledgeDir,
+      portalSkillsDir: this.skillsDir ? path.join(this.skillsDir, "resolved") : undefined,
+      mcpServers: this.mcpServersState,
+      agentType: normalizeAgentType(this.agentTypeState),
+      harnessResolved: this.harnessResolvedState,
+      // Per-agent tool capability whitelist. null remains unrestricted only for
+      // explicit Custom; built-in types expand their locked capability groups.
+      allowedTools: this.allowedToolsState,
+      // The stored system_prompt is the optional Agent-owned Addendum, not a
+      // replacement for Siclaw's platform or type contract. Keep the
+      // platform template so safety/mode rules and dynamic context continue to
+      // be assembled by agent-factory.
+      systemPromptTemplate: undefined,
+      // Use the Agent-owned prompt addendum.
+      systemPromptAppend: systemPromptTemplate,
+      // Keep an internal target index; discover matching coverage on demand.
+      handoffTargets,
+      searchHandoffTargets: gc ? query => gc.searchHandoffTargets(query) : undefined,
+      getHandoffTraceContext: (callId) => tracingRecorder.captureHandoffTrace(id, callId),
+      evictSessionContext: async () => { await this.evictSessionContext(id); },
+      // Stable per-session ledger key so the plan survives release/rebuild
+      // (a fresh random id would orphan the prior in-memory ledger every turn).
+      taskListId: id,
+      sessionEventEmitter: emitExtraEvent,
+      allowInputRequest,
+      handoffSupported,
+      handoffPolicy,
+      // spawn_subagent is available in normal chat (top-level sessions only — child
+      // sessions above omit this executor, so sub-agents cannot recurse).
+      spawnSubagentExecutor: this.createSpawnSubagentExecutor(),
+      // Snapshot the box's menu at creation — this is the value the session will
+      // hold for its lifetime, and the tool schema built below derives from it.
+      subagentTierMenu: this.subagentTierMenuState,
+      jobStopExecutor: this.createJobStopExecutor(),
+      backgroundExecExecutor: this.createBackgroundExecExecutor(),
+      taskOutputReader: this.createTaskOutputReader(id),
+      channelMessageExecutor: this.createChannelMessageExecutor(),
+    });
+
+    // Populate sessionIdRef so skill_call events can associate with this session
+    result.sessionIdRef.current = id;
+    this.attachUsage(result.brain, id, "root");
+
+    // New session: sync memory index, then purge stale investigations (chained to avoid race)
+    if (isMemoryEnabled() && isNewSession && this._sharedMemoryIndexer) {
+      const memDir = this.getMemoryDir();
+      this._sharedMemoryIndexer.sync()
+        .then(() => this._sharedMemoryIndexer!.purgeStaleInvestigations(memDir, { skipSync: true }))
+        .catch(err => console.warn("[agentbox-session] Memory sync/purge failed:", err));
+    }
+
+    const managed: ManagedSession = {
+      agentPrompt: systemPromptTemplate,
+      id,
+      userId: effectiveUserId,
+      brain: result.brain,
+      session: result.session,
+      toolNames: (result.customTools ?? []).map((tool) => tool.name).sort(),
+      skillNames: [...(result.skillNames ?? [])].sort(),
+      skillDigests: { ...(result.skillDigests ?? {}) },
+      getSkillSnapshot: result.getSkillSnapshot,
+      getPromptInspection: result.getPromptInspection,
+      createdAt: new Date(),
+      lastActiveAt: new Date(),
+      _promptDoneCallbacks: new Set(),
+      isCompacting: false,
+      isAgentActive: false,
+      isRetrying: false,
+      _promptDone: true,
+      _eventBuffer: [],
+      _bufferUnsub: null,
+      _syntheticPromptQueue: null,
+      kubeconfigRef,
+      // Snapshot the box's menu HERE, at creation, because the tool description
+      // built for this session is derived from it. A later reload changes what the
+      // next session advertises, not what this one resolves against.
+      subagentTierMenu: this.subagentTierMenuState,
+      // Installed per turn by the prompt path; a session starts with none.
+      subagentTierCandidates: null,
+      effectiveModelCandidate: null,
+      effectiveModelParams: null,
+      _aborted: false,
+      skillsDirs: result.skillsDirs,
+      mode: effectiveMode,
+      activeMode,
+      allowInputRequest,
+      handoffSupported,
+      handoffPolicy,
+      // Per-session references point to shared instances (not owned by session)
+      mcpManager: result.mcpManager,
+      memoryIndexer: result.memoryIndexer,
+      knowledgeIndexer: result.knowledgeIndexer,
+      dpStateRef: result.dpStateRef,
+      turnRef: result.turnRef,
+      _lastSavedMessageCount: 0,
+      _releaseTimer: null,
+      _invalidated: false,
+      _backgroundWorkCount: 0,
+      _subagentLimiter: new ConcurrencyLimiter(getSubagentConcurrency()),
+      modelRouteState,
+      modelRoutePolicy: undefined,
+      _routeBrainEventsThroughExtra: false,
+      _promptInflight: null,
+      _extraEventSubs: extraEventSubs,
+      _extraEventBuffer: extraEventBuffer,
+      _pendingNotifications: [],
+      _coalesceTimer: null,
+      _tracingUnsub: null,
+    };
+
+    this.sessions.set(id, managed);
+    emitDiagnostic({ type: "session_created", sessionId: id });
+
+    // OpenTelemetry trace recorder. Gated on isTracingEnabled() so that when
+    // tracing is disabled there is ZERO per-event overhead — no attach, no
+    // brain subscription, no closure on the hot path. initTracing() runs in
+    // main() before any session is built, so the flag is settled here.
+    // When disabled, _tracingUnsub stays null and teardownTracing tolerates it.
+    //
+    // The subscription is GATED to mirror the SSE consumer: brain events flow to
+    // the recorder only when routing is NOT rewriting them through the extra-event
+    // channel (same _routeBrainEventsThroughExtra gate as http-server.ts). During
+    // routing, brain events + model_route_* events reach the recorder via
+    // emitSessionExtraEvent → handleEvent instead.
+    if (isTracingEnabled()) {
+      tracingRecorder.attach(id, result.brain, { userId: effectiveUserId, agentId: this.agentId });
+      managed._tracingUnsub = result.brain.subscribe((event: any) => {
+        if (managed._routeBrainEventsThroughExtra) return;
+        tracingRecorder.handleEvent(id, event);
+      });
+    }
+
+    // Tool execution timing (for tool_call diagnostic events).
+    // NOTE: tool_execution_start/end events depend on pi-agent's event stream —
+    // if these events aren't emitted, tool metrics will be zero for those
+    // sessions (best-effort, no incorrect data).
+    // Key by toolCallId (unique per invocation) to avoid concurrent same-name tool overwrites.
+    const toolStartTimes = new Map<string, { name: string; startMs: number }>();
+    let toolCallSeq = 0;
+
+    // Track agent lifecycle state + debug logging
+    result.brain.subscribe((event: any) => {
+      // Update lastActiveAt on every event (used by Phase 2 stuck detection)
+      managed!.lastActiveAt = new Date();
+
+      // Tool execution metrics
+      if (event.type === "tool_execution_start") {
+        // Only a real toolCallId can pair a start with its own end. The old fallback minted `seq-N` on
+        // start and read `seq-<current counter>` on end, which pairs an end with the LATEST start rather
+        // than its own — pi-agent runs a same-turn tool batch in parallel, so under concurrency the
+        // duration was attributed to a different call. Same class of bug as the persistence pairing fixed
+        // in 895c23e4, and the same reason it is invisible: a wrong number looks like a number.
+        //
+        // Without an id there is nothing to pair on, so the metric is SKIPPED rather than guessed. A
+        // missing duration is honest; a duration belonging to another call is not.
+        if (event.toolCallId) {
+          toolStartTimes.set(event.toolCallId, { name: event.toolName, startMs: Date.now() });
+        }
+      } else if (event.type === "tool_execution_end") {
+        const callId = event.toolCallId;
+        const entry = callId ? toolStartTimes.get(callId) : undefined;
+        if (callId) toolStartTimes.delete(callId);
+        emitDiagnostic({
+          type: "tool_call",
+          toolName: event.toolName ?? entry?.name ?? "unknown",
+          outcome: event.isError ? "error" : "success",
+          // 0 used to mean both "instant" and "we could not pair this" — indistinguishable downstream.
+          durationMs: entry ? Date.now() - entry.startMs : undefined,
+          userId: effectiveUserId ?? "unknown",
+          agentId: this.agentId ?? null,
+        });
+      }
+      if (event.type === "agent_start") {
+        managed!.isAgentActive = true;
+      } else if (event.type === "agent_end") {
+        managed!.isAgentActive = false;
+      } else if (event.type === "auto_compaction_start") {
+        managed!.isCompacting = true;
+      } else if (event.type === "auto_compaction_end") {
+        managed!.isCompacting = false;
+      } else if (event.type === "auto_retry_start") {
+        managed!.isRetrying = true;
+      } else if (event.type === "auto_retry_end") {
+        managed!.isRetrying = false;
+      }
+
+      // Debug logging for diagnosing mid-execution stops
+      switch (event.type) {
+        case "agent_start":
+          console.log(`[agentbox-debug] [${id}] agent_start`);
+          break;
+        case "agent_end":
+          console.log(`[agentbox-debug] [${id}] agent_end messages=${event.messages?.length ?? 0}`);
+          break;
+        case "turn_start":
+          console.log(`[agentbox-debug] [${id}] turn_start`);
+          break;
+        case "turn_end":
+          console.log(`[agentbox-debug] [${id}] turn_end toolResults=${event.toolResults?.length ?? 0}`);
+          break;
+        case "message_start":
+          console.log(`[agentbox-debug] [${id}] message_start role=${event.message?.role}`);
+          break;
+        case "message_end": {
+          const msg = event.message;
+          const contentArr = Array.isArray(msg?.content) ? msg.content : [];
+          const textParts = contentArr
+            .filter((c: any) => c.type === "text")
+            .map((c: any) => c.text)
+            .join("")
+            .slice(0, 500);
+          const toolCallNames = contentArr
+            .filter((c: any) => c.type === "toolCall")
+            .map((c: any) => c.name);
+          console.log(`[agentbox-debug] [${id}] message_end role=${msg?.role} stopReason=${msg?.stopReason} toolCalls=[${toolCallNames?.join(",")}] text=${textParts?.slice(0, 200)} error=${msg?.errorMessage?.slice(0, 300) ?? ""}`);
+          break;
+        }
+        case "tool_execution_start":
+          console.log(`[agentbox-debug] [${id}] tool_start name=${event.toolName} args=${JSON.stringify(event.args).slice(0, 200)}`);
+          break;
+        case "tool_execution_end": {
+          const resultText = event.result?.content
+            ?.filter((c: any) => c.type === "text")
+            .map((c: any) => c.text ?? "")
+            .join("") ?? "";
+          console.log(`[agentbox-debug] [${id}] tool_end name=${event.toolName} isError=${event.isError} resultSize=${resultText.length}`);
+          break;
+        }
+        case "auto_compaction_start":
+          console.log(`[agentbox-debug] [${id}] compaction_start reason=${event.reason}`);
+          break;
+        case "auto_compaction_end":
+          console.log(`[agentbox-debug] [${id}] compaction_end aborted=${event.aborted} willRetry=${event.willRetry} error=${event.errorMessage}`);
+          break;
+        case "auto_retry_start":
+          console.log(`[agentbox-debug] [${id}] retry_start attempt=${event.attempt}/${event.maxAttempts} delay=${event.delayMs}ms error=${event.errorMessage}`);
+          break;
+        case "auto_retry_end":
+          console.log(`[agentbox-debug] [${id}] retry_end success=${event.success} attempt=${event.attempt} error=${event.finalError}`);
+          break;
+      }
+    });
+
+    return managed;
+  }
+
+  /**
+   * Get an existing session.
+   */
+  get(sessionId: string): ManagedSession | undefined {
+    return this.sessions.get(sessionId);
+  }
+
+  /**
+   * Read the last persisted dp-mode snapshot from the session JSONL without
+   * restoring the full session into memory.
+   */
+  getPersistedDpState(sessionId: string): PersistedDpStateSnapshot | null {
+    try {
+      const sessionDir = path.join(this.getBaseSessionDir(), sessionId);
+      if (!fs.existsSync(sessionDir)) return null;
+
+      const frameworkSessionManager = SessionManager.continueRecent(process.cwd(), sessionDir);
+      const entry = frameworkSessionManager.getEntries()
+        .filter((e: { type: string; customType?: string }) => e.type === "custom" && e.customType === "dp-mode")
+        .pop() as { data?: {
+          active?: boolean;
+          enabled?: boolean;
+          dpStatus?: string;
+          checklist?: unknown;
+          phase?: string;
+        } } | undefined;
+
+      if (!entry?.data) return null;
+
+      // New shape: {active: boolean}
+      if (typeof entry.data.active === "boolean") {
+        return { active: entry.data.active };
+      }
+      // Legacy: {enabled: bool}, {dpStatus: "idle"|"investigating"|...},
+      // or presence of checklist/phase under the old state machine.
+      if (entry.data.enabled === true) return { active: true };
+      if (entry.data.dpStatus && entry.data.dpStatus !== "idle") return { active: true };
+      if (entry.data.checklist) return { active: true };
+      if (entry.data.phase && entry.data.phase !== "idle") return { active: true };
+      return { active: false };
+    } catch (err) {
+      console.warn(`[agentbox-session] Failed to read persisted dp-state for ${sessionId}:`, err);
+    }
+
+    return null;
+  }
+
+  /**
+   * List all sessions.
+   */
+  list(): ManagedSession[] {
+    return Array.from(this.sessions.values());
+  }
+
+  /**
+   * Get the number of active (in-memory) sessions.
+   * Used by http-server idle self-destruct to decide when to start the shutdown timer.
+   */
+  activeCount(): number {
+    return this.sessions.size;
+  }
+
+  /**
+   * Sessions with a prompt actually running.
+   *
+   * Distinct from activeCount(): a session stays resident for SESSION_RELEASE_TTL_MS
+   * after its turn ends, so a box can hold many sessions while doing no work at all.
+   * This is the count that tracks real concurrent load — see capacity-metrics.ts.
+   */
+  inFlightCount(): number {
+    let n = 0;
+    for (const managed of this.sessions.values()) {
+      if (!managed._promptDone) n++;
+    }
+    return n;
+  }
+
+  /**
+   * Box-wide sub-agent occupancy, for the capacity gauges. Reports the POD limiter: the
+   * gauges describe the process, and a per-session number summed across sessions would
+   * exceed what the box can actually run.
+   */
+  subagentStats(): { active: number; pending: number; limit: number } {
+    return {
+      active: this.podSubagentLimiter.activeCount,
+      pending: this.podSubagentLimiter.pendingCount,
+      limit: this.podSubagentLimiter.limit,
+    };
+  }
+
+  /**
+   * The limiter a child spawned by `sessionId` competes in.
+   *
+   * Falls back to one shared detached limiter when the parent is no longer resident — a
+   * background group outlives its parent's release, and giving each orphan a fresh full-size
+   * limiter would leave them bounded only by the pod ceiling.
+   */
+  private sessionSubagentLimiter(sessionId: string): ConcurrencyLimiter {
+    return this.sessions.get(sessionId)?._subagentLimiter ?? this.detachedSubagentLimiter;
+  }
+
+  /**
+   * Schedule a delayed release for a session.
+   *
+   * Defaults to SESSION_RELEASE_TTL_MS (idle-release grace window). Callers can
+   * pass `ttlMs=0` for a "next-tick" release — the timer still goes through
+   * setTimeout, which means a getOrCreate() landing on the same session before
+   * the timer fires can cleanly clearTimeout() and avoid the shutdown. This
+   * cancel-window matters for reload-triggered invalidate(): see
+   * docs/design/mcp-session-lifecycle.md.
+   */
+  scheduleRelease(sessionId: string, ttlMs: number = SESSION_RELEASE_TTL_MS): void {
+    const managed = this.sessions.get(sessionId);
+    if (!managed) return;
+
+    if (managed._backgroundWorkCount > 0) {
+      console.log(
+        `[agentbox-session] Deferring release for session ${sessionId}; ` +
+        `${managed._backgroundWorkCount} background delegation batch(es) still running`,
+      );
+      return;
+    }
+
+    // Completion notifications own the parent session until their coalescing
+    // window has drained into a synthetic turn. Releasing here would make
+    // flushPendingNotifications() find no session and silently lose the
+    // detached job/sub-agent result. The synthetic turn's finally block
+    // re-arms release after delivery; the aborted path does the same after
+    // explicitly discarding the notification.
+    if (this.hasPendingNotificationWork(managed)) {
+      console.log(
+        `[agentbox-session] Deferring release for session ${sessionId}; ` +
+        "a background completion notification is still pending",
+      );
+      return;
+    }
+
+    // A configuration invalidation is a mandatory rebuild, not an ordinary
+    // idle eviction. This also closes the recovery path when detached
+    // background work deferred the original 0ms schedule: whichever later
+    // caller re-arms release must still use 0ms rather than the idle TTL.
+    const effectiveTtlMs = managed._invalidated ? 0 : ttlMs;
+
+    // Clear any existing timer
+    if (managed._releaseTimer) {
+      clearTimeout(managed._releaseTimer);
+    }
+
+    console.log(`[agentbox-session] Scheduling release for session ${sessionId} in ${effectiveTtlMs}ms`);
+    managed._releaseTimer = setTimeout(() => {
+      managed._releaseTimer = null;
+      this.release(sessionId).catch((err) => {
+        console.warn(`[agentbox-session] Scheduled release failed for ${sessionId}:`, err);
+      });
+    }, effectiveTtlMs);
+  }
+
+  private hasPendingNotificationWork(managed: ManagedSession): boolean {
+    return managed._pendingNotifications.length > 0 || managed._coalesceTimer !== null;
+  }
+
+  /**
+   * Mark a warm session for mandatory rebuild before its next idle prompt.
+   * Busy turns are never torn down; their prompt-done callback schedules the
+   * release. The flag closes the race where getOrCreate() arrives before that
+   * 0ms timer and would otherwise cancel it and reuse stale configuration.
+   */
+  invalidate(sessionId: string): void {
+    const managed = this.sessions.get(sessionId);
+    if (!managed) return;
+    managed._invalidated = true;
+    const schedule = () => this.scheduleRelease(sessionId, 0);
+    if (managed._promptDone && !managed._promptInflight) {
+      schedule();
+    } else {
+      managed._promptDoneCallbacks.add(schedule);
+    }
+  }
+
+  /**
+   * Release a session after prompt completion.
+   *
+   * When memory is enabled, performs memory auto-save (if new messages since
+   * last save) and syncs the shared memory index, then removes the session
+   * from the in-memory map.
+   * Shared components (memory indexer, MCP) are NOT destroyed.
+   *
+   * The session can be transparently restored from JSONL on the next getOrCreate().
+   */
+  /**
+   * Tear down the tracing recorder for a session: unsubscribe the gated brain
+   * listener and force-end any in-flight span tree. Idempotent — safe to call
+   * from release / close / closeAll (a session passes through at most one).
+   */
+  private teardownTracing(sessionId: string, managed: ManagedSession): void {
+    try { managed._tracingUnsub?.(); } catch { /* best-effort */ }
+    managed._tracingUnsub = null;
+    tracingRecorder.detach(sessionId);
+  }
+
+  async release(sessionId: string): Promise<void> {
+    const managed = this.sessions.get(sessionId);
+    if (!managed) {
+      // Not resident — but a handed-away session still has to lose its on-disk
+      // copy, and "already released" is one of the ways it gets here (a rebuild
+      // released it before the mark could be consumed).
+      this.dropEvictedTranscript(sessionId);
+      return;
+    }
+
+    console.log(`[agentbox-session] Releasing session: ${sessionId}`);
+
+    // 1. Auto-save session memory (dedup: only if new messages since last save)
+    if (isMemoryEnabled()) {
+      try {
+        const sessionDir = this.getSessionDir(sessionId);
+        const memoryDir = this.getMemoryDir();
+        const currentMessageCount = this.countJsonlMessages(sessionDir);
+
+        if (currentMessageCount > managed._lastSavedMessageCount) {
+          const saved = await saveSessionKnowledge({ sessionDir, memoryDir });
+          if (saved) {
+            managed._lastSavedMessageCount = currentMessageCount;
+            console.log(`[agentbox-session] Memory auto-saved for ${sessionId}: ${saved.map(f => path.basename(f)).join(", ")}`);
+          }
+        } else {
+          console.log(`[agentbox-session] Skipping memory auto-save for ${sessionId} (no new messages)`);
+        }
+      } catch (err) {
+        console.warn(`[agentbox-session] Memory auto-save failed for ${sessionId}:`, err);
+      }
+    } else {
+      console.log(`[agentbox-session] Skipping memory auto-save for ${sessionId} (memory disabled)`);
+    }
+
+    // 2. Shutdown per-session MCP connections
+    if (managed.mcpManager) {
+      try {
+        await managed.mcpManager.shutdown();
+      } catch (err) {
+        console.warn(`[agentbox-session] MCP shutdown failed for ${sessionId}:`, err);
+      }
+    }
+
+    // 3. Sync shared memory index to pick up the new summary file
+    if (isMemoryEnabled() && this._sharedMemoryIndexer) {
+      await this._sharedMemoryIndexer.sync().catch((err) => {
+        console.warn(`[agentbox-session] Memory sync on release failed:`, err);
+      });
+    }
+
+    // 3. Remove session from map (shared components remain alive).
+    // Guard: only delete if the map still holds the same instance — a new
+    // getOrCreate() may have replaced it while release() was running async.
+    if (this.sessions.get(sessionId) === managed) {
+      this.clearPendingNotificationState(managed);
+      this.sessions.delete(sessionId);
+      this.teardownTracing(sessionId, managed);
+      emitDiagnostic({ type: "session_released", sessionId });
+      console.log(`[agentbox-session] Session released: ${sessionId} (${this.sessions.size} remaining)`);
+      // Notify http-server to check idle status
+      this.onSessionRelease?.();
+    } else {
+      console.log(`[agentbox-session] Session ${sessionId} was replaced during release, skipping delete`);
+    }
+
+    this.dropEvictedTranscript(sessionId);
+  }
+
+  /**
+   * Drop the on-disk transcript of a session this box handed away, if it is
+   * marked. Ordered after `release`'s memory auto-save on purpose: what this box
+   * LEARNED in its own turns is worth keeping; what it is dropping is only its
+   * stale view of a conversation someone else now owns.
+   */
+  private dropEvictedTranscript(sessionId: string): void {
+    if (!this.evictedSessions.delete(sessionId) && !fs.existsSync(`${this.getSessionDir(sessionId)}.handoff`)) return;
+    try {
+      this.removeCachedSessionTranscript(sessionId);
+      console.log(`[agentbox-session] Evicted the local transcript for handed-off session ${sessionId}`);
+    } catch (err) {
+      console.warn(`[agentbox-session] Could not evict the local transcript for ${sessionId}:`, err);
+    }
+  }
+
+  /**
+   * Count message entries in the latest JSONL file for dedup tracking.
+   */
+  private countJsonlMessages(sessionDir: string): number {
+    try {
+      const files = fs.readdirSync(sessionDir).filter((f) => f.endsWith(".jsonl"));
+      if (files.length === 0) {
+        console.log(`[agentbox-session] countJsonlMessages: no .jsonl files in ${sessionDir}`);
+        return 0;
+      }
+
+      // Find the most recent file
+      files.sort((a, b) => {
+        const aTime = fs.statSync(path.join(sessionDir, a)).mtimeMs;
+        const bTime = fs.statSync(path.join(sessionDir, b)).mtimeMs;
+        return bTime - aTime;
+      });
+
+      const jsonlPath = path.join(sessionDir, files[0]);
+      const content = fs.readFileSync(jsonlPath, "utf-8");
+      let count = 0;
+      for (const line of content.split("\n")) {
+        if (!line.trim()) continue;
+        try {
+          const entry = JSON.parse(line);
+          if (entry.type === "message" && (entry.message?.role === "user" || entry.message?.role === "assistant")) {
+            count++;
+          }
+        } catch { /* skip malformed */ }
+      }
+      console.log(`[agentbox-session] countJsonlMessages: ${count} messages in ${jsonlPath}`);
+      return count;
+    } catch (err) {
+      console.warn(`[agentbox-session] countJsonlMessages error:`, err);
+      return 0;
+    }
+  }
+
+  /**
+   * Close the specified session (explicit user action, e.g. /new or /reset).
+   * Unlike release(), this is for permanent closure — but shared components
+   * are still NOT destroyed (they belong to the AgentBox).
+   */
+  async close(sessionId: string): Promise<void> {
+    const managed = this.sessions.get(sessionId);
+    if (managed) {
+      console.log(`[agentbox-session] Closing session: ${sessionId}`);
+      if (managed._releaseTimer) {
+        clearTimeout(managed._releaseTimer);
+        managed._releaseTimer = null;
+      }
+      this.clearPendingNotificationState(managed);
+      // Shutdown per-session MCP connections
+      if (managed.mcpManager) {
+        try {
+          await managed.mcpManager.shutdown();
+        } catch (err) {
+          console.warn(`[agentbox-session] MCP shutdown failed for ${sessionId}:`, err);
+        }
+      }
+      // Sync shared memory index (don't close it — it's shared)
+      if (this._sharedMemoryIndexer) {
+        try {
+          await this._sharedMemoryIndexer.sync();
+        } catch (err) {
+          console.warn(`[agentbox-session] Memory sync on close failed:`, err);
+        }
+      }
+      this.sessions.delete(sessionId);
+      // Permanent closure — drop the in-memory ledger so it doesn't accumulate
+      // (the durable snapshot + Portal task_events remain for history/recovery).
+      const hideTimer = this.ledgerHideTimers.get(sessionId);
+      if (hideTimer) {
+        clearTimeout(hideTimer);
+        this.ledgerHideTimers.delete(sessionId);
+      }
+      // Let the outstanding writes finish BEFORE the in-memory ledger goes away. Both read it, and
+      // both are asynchronous: dropping it first leaves a snapshot write to find nothing (writing an
+      // empty plan over the durable one this comment promises to keep) and a queued event append
+      // describing a task the plan no longer has. Draining is bounded — these are a file write and
+      // an append each.
+      try {
+        await Promise.all([
+          this.persistLedgerSnapshot.drain(sessionId),
+          this.taskEventQueue.drain(sessionId),
+        ]);
+      } catch (err) {
+        console.warn(`[agentbox-session] draining plan writes for ${sessionId} failed:`, err);
+      }
+      deleteLedger(sessionId);
+      this.teardownTracing(sessionId, managed);
+      emitDiagnostic({ type: "session_released", sessionId });
+    }
+  }
+
+  /**
+   * Close all sessions and destroy shared components.
+   * Called on AgentBox shutdown.
+   */
+  async closeAll(): Promise<void> {
+    console.log(`[agentbox-session] Closing all sessions (${this.sessions.size})`);
+    // Snapshot and clear the map atomically — prevents in-flight release()
+    // from emitting a duplicate session_released for the same session.
+    const snapshot = new Map(this.sessions);
+    this.sessions.clear();
+
+    for (const [id, managed] of snapshot) {
+      if (managed._releaseTimer) {
+        clearTimeout(managed._releaseTimer);
+        managed._releaseTimer = null;
+      }
+      this.clearPendingNotificationState(managed);
+      // Shutdown per-session MCP connections
+      if (managed.mcpManager) {
+        try {
+          await managed.mcpManager.shutdown();
+        } catch (err) {
+          console.warn(`[agentbox-session] MCP shutdown failed for ${id} during closeAll:`, err);
+        }
+      }
+      // Same reason close() drains: both plan writers are asynchronous and hold the only durable
+      // copy. This is the SIGTERM path, and the caller exits the process straight after — so a
+      // batch's queued event appends and its final snapshot are lost here unless they are awaited.
+      // Per session, since the queues are keyed by it.
+      try {
+        await Promise.all([
+          this.persistLedgerSnapshot.drain(id),
+          this.taskEventQueue.drain(id),
+        ]);
+      } catch (err) {
+        console.warn(`[agentbox-session] draining plan writes for ${id} during closeAll failed:`, err);
+      }
+      this.teardownTracing(id, managed);
+      emitDiagnostic({ type: "session_released", sessionId: id });
+    }
+
+    await this.usageOutbox?.close();
+
+    // Close shared memory indexer
+    if (this._sharedMemoryIndexer) {
+      try {
+        await this._sharedMemoryIndexer.sync();
+        this._sharedMemoryIndexer.close();
+        console.log(`[agentbox-session] Shared memory indexer closed`);
+      } catch (err) {
+        console.warn(`[agentbox-session] Shared memory indexer close error:`, err);
+      }
+      this._sharedMemoryIndexer = null;
+    }
+
+    if (this._sharedKnowledgeIndexer) {
+      try {
+        this._sharedKnowledgeIndexer.close();
+        console.log(`[agentbox-session] Shared knowledge label resolver closed`);
+      } catch (err) {
+        console.warn(`[agentbox-session] Shared knowledge label resolver close error:`, err);
+      }
+      this._sharedKnowledgeIndexer = null;
+    }
+
+    this._sharedInitialized = false;
+  }
+
+  /**
+   * Reset the shared memory indexer.
+   * Called after Gateway has cleared memory files on PVC.
+   * Gateway deletes the full memory/ directory, including .memory.db, so a
+   * live AgentBox must close the old sqlite handle and build a fresh indexer.
+   */
+  async resetMemory(): Promise<void> {
+    if (!isMemoryEnabled()) {
+      if (this._sharedMemoryIndexer) {
+        try {
+          this._sharedMemoryIndexer.close();
+        } catch (err) {
+          console.warn(`[agentbox-session] Memory indexer close during disabled reset failed:`, err);
+        }
+        this._sharedMemoryIndexer = null;
+      }
+      console.log(`[agentbox-session] Memory disabled; resetMemory is a no-op`);
+      return;
+    }
+
+    if (!this._sharedMemoryIndexer) {
+      console.log(`[agentbox-session] No memory indexer to reset`);
+      return;
+    }
+
+    try {
+      this._sharedMemoryIndexer.close();
+    } catch (err) {
+      console.warn(`[agentbox-session] Memory indexer close before reset failed:`, err);
+    }
+    this._sharedMemoryIndexer = null;
+
+    try {
+      const memoryDir = this.getMemoryDir();
+      this._sharedMemoryIndexer = await this.createSharedMemoryIndexer(memoryDir);
+      console.log(`[agentbox-session] Memory indexer rebuilt after PVC cleanup`);
+    } catch (err) {
+      console.warn(`[agentbox-session] Memory indexer rebuild after reset failed:`, err);
+    }
+  }
+}

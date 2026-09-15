@@ -1,0 +1,37 @@
+Thank you for installing {{ include "siclaw.fullname" . }}!
+
+{{- if and (eq (include "siclaw.runtime.enabled" .) "true") .Values.agentbox.persistence.enabled }}
+
+ℹ️  User data persistence is enabled (global default ON).
+   Chart-managed PVC: "{{ include "siclaw.dataPvcName" . }}" (ReadWriteMany).
+   {{- if not .Values.agentbox.persistence.storageClassName }}
+   ⚠️  agentbox.persistence.storageClassName is empty — the PVC will stay Pending until you set it to a RWX-capable StorageClass (e.g. nfs, efs-sc, csi-cephfs).
+   {{- end }}
+   Gateway will create per-user subdirectories automatically.
+{{- else if and (eq (include "siclaw.runtime.enabled" .) "true") (eq (include "siclaw.persistence.pvcAvailable" .) "true") }}
+
+ℹ️  User data persistence: global default OFF, PVC available for per-agent opt-in.
+   Referencing existing PVC: "{{ include "siclaw.dataPvcName" . }}" (must already exist, ReadWriteMany).
+   Agents are ephemeral (emptyDir) by default; only agents whose caller sends
+   persistence:true mount the PVC. The chart does NOT create this PVC.
+{{- end }}
+
+{{- if eq (include "siclaw.runtime.enabled" .) "true" }}
+ℹ️  Runtime mTLS CA
+   {{- $caSecret := include "siclaw.runtimeTls.caSecret" . }}
+   {{- $generateCa := include "siclaw.runtimeTls.generateCa" . }}
+   {{- if $caSecret }}
+   Source: external Secret "{{ $caSecret }}" (kubernetes.io/tls).
+   Rotate the Secret then `kubectl rollout restart deploy/{{ include "siclaw.fullname" . }}-runtime`
+   and delete cached AgentBox client cert Secrets to re-issue.
+   {{- else if eq $generateCa "true" }}
+   Source: chart-managed Secret "{{ include "siclaw.runtimeCaSecretName" . }}".
+   Annotated `helm.sh/resource-policy: keep` so it survives `helm uninstall`.
+   To rotate: `kubectl delete secret {{ include "siclaw.runtimeCaSecretName" . }} -n {{ .Release.Namespace }}`
+   then `helm upgrade` (this also requires deleting AgentBox client cert Secrets and recycling AgentBox pods).
+   ⚠️  GitOps users: do NOT run `helm template … | kubectl apply -f -` against a live cluster
+       — `lookup` cannot read the cluster from render-only contexts and would emit a fresh CA
+       every render, overwriting this Secret and breaking mTLS for every running AgentBox.
+       For pre-rendered pipelines, set runtime.tls.generateCa=false and supply runtime.tls.caSecret.
+   {{- end }}
+{{- end }}

@@ -1,0 +1,72 @@
+{
+  "report_summary": {
+    "desc": "汇报一段编译进度总结(产出/已并矛盾/待裁),一句到一段话。"
+  },
+  "source_inventory": {
+    "desc": "列出完整冻结 Raw 快照中的有界文件元数据。可选 glob 按路径段匹配：* 不跨目录，** 才跨目录。当前批次清单是交付责任边界,不是视野边界;用它发现邻近代码、配置、测试和部署原料,但不要代编其他批次负责的源。"
+  },
+  "source_read": {
+    "desc": "从完整冻结 Raw 快照中读取任一允许文件的有界 UTF-8 行区间。路径相对 Raw（可带或不带 raw/）；工具只读，并保留原始 source identity 供证据引用。"
+  },
+  "source_search": {
+    "desc": "在完整冻结 Raw 快照允许的 UTF-8 文件中搜索字面字符串，可用按路径段匹配的 Raw 相对 glob 收窄。搜索有累计文件数和字节预算；若结果的 truncated 或 budget_exhausted 为 true，继续缩小 glob。用于交叉核对组件事实、符号、配置项和部署关联。"
+  },
+  "propose_plan": {
+    "desc": "Plan 阶段对齐后调用:把一份简短、可读、可审核的编译计划(plan 参数,markdown)抛给负责人请求批准,然后停下等批准。在收到批准前不要写 candidate/ 页面。",
+    "ack": "计划已抛给负责人(UI 已显示计划与批准控件),等待批准。在收到批准消息前不要写 candidate/ 页面。",
+    "reminder": "(提醒:顺手把候选页清单以 `- [ ] 页名 — 一句话` 维护进 authoring/PLAN.md 的 ## Next Pages 作为你的工作状态,便于追踪进度;这不影响本次计划已抛出。)"
+  },
+  "delete_candidate_page": {
+    "desc": "归并重复页或孤儿页后，删除 candidate/ 下确属废弃的一篇 Markdown 页面。path 必须相对 candidate/（例如 `guide/old.md`）。不能删除 index.md/log.md、目录、非 Markdown、符号链接或 candidate/ 之外的内容；删除前先修好所有入链。",
+    "invalid": "拒绝不安全的 candidate 路径: {path}",
+    "markdown_only": "只能删除 candidate Markdown 页面: {path}",
+    "reserved": "不能删除保留的路由页面: {path}",
+    "not_found": "candidate 页面不存在: {path}",
+    "not_file": "candidate 路径不是普通文件: {path}",
+    "failed": "删除 candidate 页面 {path} 失败: {e}",
+    "deleted": "已删除 candidate 页面: {path}"
+  },
+  "file_ticket": {
+    "desc": "开一张矛盾工单。一律通过本工具开单,不要手写 authoring/CONTRADICTIONS.json:手写的票没有 ticket_kind,轮末会落成「未分类」并需要重新开单。每个搞不定的问题调一次,且必须在你已把 best-guess 写进页面并标了 ⚠️ 之后。参数:`ticket_kind` —— 两份以上【不同】raw 文档确实互相矛盾时填 `source_conflict`(该修的是原文,wiki 只是投影,由原文负责人处理);只有负责人能拍板的填 `model_gap`:单一来源、基于 BRIEF.json 的定调/范围问题、图读不清、你理解不了的地方。系统会拿你的 `sources` 核对 kind:两个及以上不同 raw 文档且都有引文 → 只能是 source_conflict;不足两个 → 只能是 model_gap;对不上会被拒并告知应填哪个,你按提示重提即可。`title`(短标题)、`question`(一句大白话)、`sources`([{doc, quote}],互相矛盾的原文段落或你判断的依据)、`options`(2–4 个干净的候选值,不要写「以…为准」)、`current_value`(你写进页面的值)、`affected_pages`(带 ⚠️ 的 candidate 文件)。id 由 question + 涉及文档算出:同一问题再提会更新那张票,不会重复开。",
+    "bad_kind": "file_ticket 需要 `ticket_kind`,取值之一:{kinds}",
+    "need_args": "file_ticket 需要 `title`、`question`、非空 `sources`(每条带 `doc`)、`current_value` 和 `affected_pages`。",
+    "kind_needs_conflict": "已拒:引用了 {n} 份不同的 raw 文档({docs})—— 这是 source_conflict(文档之间打架,该由原文负责人统一口径),不是 model_gap。请按 ticket_kind=source_conflict 重提。",
+    "kind_needs_gap": "已拒:只有 {n} 份 raw 文档带引文({docs})—— 来源之间没有分歧,这是 model_gap(只有负责人能拍板),不是 source_conflict。请按 ticket_kind=model_gap 重提。",
+    "failed": "工单写入失败:{e}",
+    "filed": "工单 {tid} 已开({kind});继续编译,不要等裁决",
+    "superseded": "同一问题的工单 {tid} 已存在,已更新({kind});未重复开单"
+  },
+  "resolve_ticket": {
+    "desc": "回修完一条矛盾工单后逐条调用(一条一次,别批量):登记你把哪条(ticket_id)按什么值(applied_value)回修了、实际改了哪几个 candidate 文件(pages_edited,必须覆盖该工单的 affected_pages)、一句话备注(note)。这会把该工单标为已回修并写下可审计的 agent_report —— 是「矛盾处理」显示「AI 已回修」、并让负责人核对的依据。`dispatch_nonce` 由运行时按当前裁决轮盖章——你可传任意字符串或省略,盒子会覆盖写入。非「应用裁决」轮次运行时会存空 nonce,使回执不对到任何裁决轮。",
+    "need_id": "resolve_ticket 需要 ticket_id",
+    "read_failed": "读 CONTRADICTIONS.json 失败: {e}",
+    "not_found": "没找到工单 {tid};现有 id: {ids}",
+    "write_failed": "写 CONTRADICTIONS.json 失败: {e}",
+    "registered": "工单 {tid} 已登记回修(agent_report 已写入)"
+  },
+  "exclude_source": {
+    "desc": "声明某个 raw 源【不编入】知识库,或【更正】一条你已登记的豁免。传 `path`(相对 raw/ 的精确文件路径,不接受 glob)和 `reason`(一句让负责人看得懂的理由,用知识库自己的语言)。系统会校验路径确实在源清单里、以规范格式写入豁免账本并去重。同一个 path 换一条新理由再调一次,即更新该行;理由完全相同则是空操作。要撤销一条豁免用 remove_exclusion。维护 authoring/EXCLUSIONS.json 的常规方式就是这两个工具;仅当工具无法表达该修改时,才允许手工编辑该文件作为兜底——无论哪种,系统都会在每轮结束后重新规范化该账本。",
+    "need_args": "exclude_source 需要同时给 `path` 和 `reason`。",
+    "not_in_inventory": "不是清单在册的 raw 源:{path}{hint}",
+    "hint_close": " —— 你是不是想说:{close}?",
+    "already": "早已豁免且理由相同(无需重复):{path}",
+    "updated": "豁免理由已更新:{path}",
+    "failed": "豁免写入失败:{e}",
+    "done": "已豁免并记录理由:{path}"
+  },
+  "remove_exclusion": {
+    "desc": "撤销一条豁免——当某个源是被误排除、其实该编,或者有一条错误的豁免行要清掉时用它。传 `path`:相对 raw/ 的精确源路径;若要删的是历史遗留的手写行,就原样传那行的 pattern 字符串(例如 `logs/**`)。匹配按 pattern 精确相等,绝不按【这个 pattern 能匹配到谁】来删,不会顺带带走邻近的行;返回实际删除了几行。若只是想改豁免【理由】,请改调 exclude_source 传新理由。",
+    "need_args": "remove_exclusion 需要给 `path`。",
+    "not_found": "账本里没有匹配的豁免行:{path}{hint}",
+    "hint_close": " —— 你是不是想说:{close}?",
+    "failed": "豁免删除失败:{e}",
+    "done": "豁免已撤销(删除 {count} 行):{path}"
+  },
+  "report_domain": {
+    "desc": "用**一句完整话**说明这个知识库属于什么领域、能回答哪一类问题。只给别的智能体判断「要不要打开这个库」——不是内容清单,也不是简介散文。**写法**:一句主题句,目标约 55 字,硬性不超过 100 字;超长会被拒收并要求重写,系统**不会截断**。不要写成「领域:A、B、C」或冒号后接清单,不要罗列页面或统计数量——清单每次编译就过期,漏一项会让路由器跳过这本有答案的库;领域略宽最多多打开一次。好:「GPU 集群硬件健康检查与故障诊断」。差:「集群运维:节点排障、网络诊断、存储扩容、告警处理」。库名含糊时(例如「通用知识库」)尤其重要。",
+    "need_args": "需要 domain:一句话说明这个库属于什么领域。",
+    "done": "已记录领域说明:{domain}",
+    "too_long": "未记录:领域说明超过 {limit} 字。请缩成一句完整主题句后重调(目标约 {target} 字,不要清单、不要半截句)。系统不会截断代写。",
+    "failed": "领域说明写入磁盘失败:{e}。在工作区可写之前不要用同一句重复提交。"
+  }
+}

@@ -1,0 +1,991 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { PiAgentBrain, requiredToolChoice } from "./pi-agent-brain.js";
+
+/** Fake AgentSession providing only what PiAgentBrain touches. */
+function makeFakeSession(overrides: Partial<Record<string, any>> = {}) {
+  const listeners = new Set<(event: any) => void>();
+  const emit = (event: any) => { for (const l of listeners) l(event); };
+  let activeToolNames = ["read", "mcp__result__submit"];
+
+  const session: any = {
+    prompt: vi.fn(async (_text: string) => {}),
+    abort: vi.fn(async () => {}),
+    subscribe: vi.fn((fn: (event: any) => void) => {
+      listeners.add(fn);
+      return () => listeners.delete(fn);
+    }),
+    reload: vi.fn(async () => {}),
+    steer: vi.fn(async () => {}),
+    clearQueue: vi.fn(() => ({ steering: [], followUp: [] })),
+    getContextUsage: vi.fn(() => ({ tokens: 10, contextWindow: 100, percent: 10 })),
+    getSessionStats: vi.fn(() => ({ tokens: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, total: 3 }, cost: 0.001 })),
+    model: { id: "m", name: "M", provider: "p", contextWindow: 100, maxTokens: 10, reasoning: false },
+    agent: {
+      onResponse: vi.fn(async () => {}),
+      state: { messages: [] },
+      streamFunction: vi.fn((_model: any, _context: any, _options?: any) => ({})),
+    },
+    getActiveToolNames: vi.fn(() => [...activeToolNames]),
+    setActiveToolsByName: vi.fn((names: string[]) => { activeToolNames = [...names]; }),
+    compact: vi.fn(async () => ({ summary: "ok", firstKeptEntryId: "entry-1", tokensBefore: 100 })),
+    settingsManager: {
+      getCompactionSettings: vi.fn(() => ({ enabled: true, reserveTokens: 16, keepRecentTokens: 20 })),
+    },
+    modelRuntime: {
+      getModel: vi.fn((provider: string, id: string) => ({
+        id, name: id, provider, contextWindow: 1000, maxTokens: 100, reasoning: false,
+      })),
+      registerProvider: vi.fn(),
+    },
+    setModel: vi.fn(async () => {}),
+    setThinkingLevel: vi.fn(),
+    __emit: emit,
+    ...overrides,
+  };
+  return session;
+}
+
+describe("PiAgentBrain", () => {
+  beforeEach(() => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("brainType is pi-agent", () => {
+    const brain = new PiAgentBrain(makeFakeSession());
+    expect(brain.brainType).toBe("pi-agent");
+  });
+
+  it("subscribe subscribes to session and allows unsub", () => {
+    const session = makeFakeSession();
+    const brain = new PiAgentBrain(session);
+    const listener = vi.fn();
+    const unsub = brain.subscribe(listener);
+    expect(session.subscribe).toHaveBeenCalledWith(expect.any(Function));
+    unsub();
+  });
+
+  it("adds the resolved toolset to tool start/end events and leaves unknown tools untagged", () => {
+    const session = makeFakeSession();
+    const brain = new PiAgentBrain(session, new Map([["bash", "cmd-exec"]]));
+    const events: any[] = [];
+    brain.subscribe((event) => events.push(event));
+
+    session.__emit({ type: "tool_execution_start", toolCallId: "a", toolName: "bash", args: {} });
+    session.__emit({ type: "tool_execution_end", toolCallId: "a", toolName: "bash", result: {} });
+    session.__emit({ type: "tool_execution_start", toolCallId: "b", toolName: "external", args: {} });
+
+    expect(events[0].toolset).toBe("cmd-exec");
+    expect(events[1].toolset).toBe("cmd-exec");
+    expect(events[2]).not.toHaveProperty("toolset");
+  });
+
+  it("prompt delegates to session.prompt for non-empty content", async () => {
+    const session = makeFakeSession();
+    // Emit a non-empty message_end so retry logic skips
+    session.prompt = vi.fn(async (_text: string) => {
+      session.__emit({ type: "message_start", message: { role: "assistant" } });
+      session.__emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "hello" }] } });
+    });
+    const brain = new PiAgentBrain(session);
+    await brain.prompt("ask something");
+    expect(session.prompt).toHaveBeenCalledTimes(1);
+  });
+
+  it("repairs one missing required result with only that tool and a forced first provider call", async () => {
+    const requiredTool = "mcp__result__submit";
+    const session = makeFakeSession();
+    const originalStreamFn = session.agent.streamFunction;
+    let promptCount = 0;
+    session.prompt = vi.fn(async (_text: string) => {
+      promptCount++;
+      session.__emit({ type: "message_start", message: { role: "assistant" } });
+      if (promptCount === 1) {
+        session.__emit({
+          type: "message_end",
+          message: { role: "assistant", content: [{ type: "text", text: "draft" }], stopReason: "stop" },
+        });
+        return;
+      }
+
+      expect(session.getActiveToolNames()).toEqual([requiredTool]);
+      session.agent.streamFunction(
+        { api: "openai-completions" },
+        { tools: [{ name: requiredTool }] },
+        { reasoning: "high" },
+      );
+      session.__emit({
+        type: "tool_execution_end",
+        toolName: requiredTool,
+        isError: false,
+        result: { details: { structuredContent: { label: false } } },
+      });
+      session.__emit({
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "final" }], stopReason: "stop" },
+      });
+    });
+
+    const brain = new PiAgentBrain(session);
+    const events: any[] = [];
+    brain.subscribe((event) => events.push(event));
+    await brain.prompt("question", undefined, { requiredResultToolName: requiredTool });
+
+    expect(session.prompt).toHaveBeenCalledTimes(2);
+    expect(originalStreamFn).toHaveBeenCalledWith(
+      { api: "openai-completions" },
+      { tools: [{ name: requiredTool }] },
+      {
+        reasoning: "high",
+        toolChoice: { type: "function", function: { name: requiredTool } },
+      },
+    );
+    expect(session.getActiveToolNames()).toEqual(["read", requiredTool]);
+    expect(session.agent.streamFunction).toBe(originalStreamFn);
+    expect(events).toContainEqual({ type: "required_result_repair_start", toolName: requiredTool });
+    expect(events).toContainEqual({ type: "required_result_repair_end", toolName: requiredTool, success: true });
+  });
+
+  it("does not repair when the required result tool already succeeded", async () => {
+    const requiredTool = "mcp__result__submit";
+    const session = makeFakeSession();
+    session.prompt = vi.fn(async () => {
+      session.__emit({
+        type: "tool_execution_end",
+        toolName: requiredTool,
+        isError: false,
+        result: { details: { structuredContent: { label: false } } },
+      });
+      session.__emit({
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "final" }], stopReason: "stop" },
+      });
+    });
+
+    const brain = new PiAgentBrain(session);
+    await brain.prompt("question", undefined, { requiredResultToolName: requiredTool });
+
+    expect(session.prompt).toHaveBeenCalledTimes(1);
+    expect(session.setActiveToolsByName).not.toHaveBeenCalled();
+  });
+
+  it("repairs a result-tool call that succeeded at transport level without structuredContent", async () => {
+    const requiredTool = "mcp__result__submit";
+    const session = makeFakeSession();
+    let promptCount = 0;
+    session.prompt = vi.fn(async () => {
+      promptCount++;
+      session.__emit({
+        type: "tool_execution_end",
+        toolName: requiredTool,
+        isError: false,
+        result: promptCount === 1
+          ? { details: {} }
+          : { details: { structuredContent: { label: false } } },
+      });
+      session.__emit({
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: promptCount === 1 ? "draft" : "final" }], stopReason: "stop" },
+      });
+    });
+
+    const brain = new PiAgentBrain(session);
+    await brain.prompt("question", undefined, { requiredResultToolName: requiredTool });
+
+    expect(session.prompt).toHaveBeenCalledTimes(2);
+  });
+
+  it("maps required tool choice to provider-specific values", () => {
+    const toolName = "mcp__result__submit";
+    expect(requiredToolChoice("anthropic-messages", toolName)).toBe("any");
+    expect(requiredToolChoice("google-generative-ai", toolName)).toBe("any");
+    expect(requiredToolChoice("openai-completions", toolName)).toEqual({
+      type: "function",
+      function: { name: toolName },
+    });
+    expect(requiredToolChoice("openai-responses", toolName)).toBe("required");
+  });
+
+  it("does not spend the repair force on pre-prompt compaction", async () => {
+    const requiredTool = "mcp__result__submit";
+    const session = makeFakeSession();
+    const originalStreamFn = session.agent.streamFunction;
+    let promptCount = 0;
+    session.prompt = vi.fn(async () => {
+      promptCount++;
+      if (promptCount === 1) {
+        session.__emit({
+          type: "message_end",
+          message: { role: "assistant", content: [{ type: "text", text: "draft" }], stopReason: "stop" },
+        });
+        return;
+      }
+
+      // AgentSession.prompt may compact before its actual agent request. That
+      // request has no tools and must pass through untouched.
+      session.agent.streamFunction({ api: "openai-completions" }, { tools: [] }, { phase: "compaction" });
+      session.agent.streamFunction(
+        { api: "openai-completions" },
+        { tools: [{ name: requiredTool }] },
+        { phase: "repair" },
+      );
+      session.__emit({
+        type: "tool_execution_end",
+        toolName: requiredTool,
+        isError: false,
+        result: { details: { structuredContent: { label: false } } },
+      });
+      session.__emit({
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "final" }], stopReason: "stop" },
+      });
+    });
+
+    const brain = new PiAgentBrain(session);
+    await brain.prompt("question", undefined, { requiredResultToolName: requiredTool });
+
+    expect(originalStreamFn.mock.calls[0][2]).toEqual({ phase: "compaction" });
+    expect(originalStreamFn.mock.calls[1][2]).toEqual({
+      phase: "repair",
+      toolChoice: { type: "function", function: { name: requiredTool } },
+    });
+  });
+
+  it("reports an inactive required result tool as an observable failed repair", async () => {
+    const session = makeFakeSession();
+    session.getActiveToolNames = vi.fn(() => ["read"]);
+    session.prompt = vi.fn(async () => {
+      session.__emit({
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "draft" }], stopReason: "stop" },
+      });
+    });
+    const brain = new PiAgentBrain(session);
+    const events: any[] = [];
+    brain.subscribe((event) => events.push(event));
+
+    await brain.prompt("question", undefined, { requiredResultToolName: "mcp__result__submit" });
+
+    expect(events).toContainEqual({
+      type: "required_result_repair_end",
+      toolName: "mcp__result__submit",
+      success: false,
+      reason: "required_tool_inactive",
+    });
+  });
+
+  it("prompt maps images to ImageContent and passes them to session.prompt", async () => {
+    const session = makeFakeSession();
+    session.prompt = vi.fn(async (_text: string, _opts?: any) => {
+      session.__emit({ type: "message_start", message: { role: "assistant" } });
+      session.__emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "ok" }] } });
+    });
+    const brain = new PiAgentBrain(session);
+    await brain.prompt("describe", { images: [{ mimeType: "image/png", data: "aW1n" }] });
+    expect(session.prompt).toHaveBeenCalledWith("describe", {
+      images: [{ type: "image", data: "aW1n", mimeType: "image/png" }],
+    });
+  });
+
+  it("prompt passes no options when there are no images", async () => {
+    const session = makeFakeSession();
+    session.prompt = vi.fn(async (_text: string, _opts?: any) => {
+      session.__emit({ type: "message_start", message: { role: "assistant" } });
+      session.__emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "ok" }] } });
+    });
+    const brain = new PiAgentBrain(session);
+    await brain.prompt("hi");
+    expect(session.prompt).toHaveBeenCalledWith("hi", undefined);
+  });
+
+  it("prompt skips retry when stopReason is aborted", async () => {
+    const session = makeFakeSession();
+    session.prompt = vi.fn(async (_text: string) => {
+      session.__emit({ type: "message_start", message: { role: "assistant" } });
+      session.__emit({
+        type: "message_end",
+        message: { role: "assistant", content: [], stopReason: "aborted" },
+      });
+    });
+    const brain = new PiAgentBrain(session);
+    await brain.prompt("q");
+    // Should NOT retry for aborted responses
+    expect(session.prompt).toHaveBeenCalledTimes(1);
+  });
+
+  it("prompt skips retry when stopReason is error", async () => {
+    // Model errors (auth/billing/network give-up after pi-agent-core's
+    // transport retries) reach the brain as stopReason="error" with empty
+    // content. The empty-response retry must NOT engage — re-prompting just
+    // hammers the same permanent failure and flickers the frontend Thinking
+    // indicator with each agent_start/agent_end retry pair.
+    const session = makeFakeSession();
+    session.prompt = vi.fn(async (_text: string) => {
+      session.__emit({ type: "message_start", message: { role: "assistant" } });
+      session.__emit({
+        type: "message_end",
+        message: { role: "assistant", content: [], stopReason: "error", errorMessage: "Connection error." },
+      });
+    });
+    const brain = new PiAgentBrain(session);
+    await brain.prompt("q");
+    expect(session.prompt).toHaveBeenCalledTimes(1);
+  });
+
+  it("prompt retries up to MAX_EMPTY_RETRIES when content is empty", async () => {
+    const session = makeFakeSession();
+    let attempt = 0;
+    session.prompt = vi.fn(async (_text: string) => {
+      attempt++;
+      session.__emit({ type: "message_start", message: { role: "assistant" } });
+      if (attempt <= 2) {
+        session.__emit({ type: "message_end", message: { role: "assistant", content: [], stopReason: "end_turn" } });
+      } else {
+        session.__emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "ok" }] } });
+      }
+    });
+    const brain = new PiAgentBrain(session);
+    // Shrink delay to keep test fast.
+    (PiAgentBrain as any).RETRY_DELAY_MS = 1;
+    await brain.prompt("q");
+    expect(session.prompt).toHaveBeenCalledTimes(3);
+  });
+
+  it("emits auto_retry_start/end events on retry", async () => {
+    const session = makeFakeSession();
+    session.prompt = vi.fn(async () => {
+      session.__emit({ type: "message_start", message: { role: "assistant" } });
+      session.__emit({ type: "message_end", message: { role: "assistant", content: [], stopReason: "end_turn" } });
+    });
+    (PiAgentBrain as any).RETRY_DELAY_MS = 1;
+    const brain = new PiAgentBrain(session);
+    const events: any[] = [];
+    brain.subscribe((e) => events.push(e));
+    await brain.prompt("q");
+    // Expect 2 retry-start + 2 retry-end events interspersed with session events
+    const starts = events.filter((e) => e.type === "auto_retry_start");
+    const ends = events.filter((e) => e.type === "auto_retry_end");
+    expect(starts.length).toBe(2);
+    expect(ends.length).toBe(2);
+    expect(starts[0].attempt).toBe(1);
+    expect(starts[1].attempt).toBe(2);
+  });
+
+  it("#10 abort cancels the retry sleep AND does not fire a fresh re-prompt after Stop", async () => {
+    const session = makeFakeSession();
+    let callCount = 0;
+    session.prompt = vi.fn(async () => {
+      callCount++;
+      session.__emit({ type: "message_start", message: { role: "assistant" } });
+      // Empty response → enters the retry backoff.
+      session.__emit({ type: "message_end", message: { role: "assistant", content: [], stopReason: "end_turn" } });
+    });
+    // Large delay so abort() resolves the sleep early.
+    (PiAgentBrain as any).RETRY_DELAY_MS = 60000;
+    const brain = new PiAgentBrain(session);
+    const p = brain.prompt("q");
+    // Wait briefly for the first prompt to complete and the retry to begin sleeping.
+    await new Promise((r) => setTimeout(r, 10));
+    await brain.abort();
+    expect(session.abort).toHaveBeenCalled();
+    await p;
+    // ONLY the initial prompt ran — the retry must NOT re-prompt after Stop (pre-fix this was 2,
+    // an un-aborted re-prompt firing after the user clicked Stop).
+    expect(callCount).toBe(1);
+  }, 3000);
+
+  it("#8 abort also cancels in-flight compaction via session.abortCompaction", async () => {
+    const abortCompaction = vi.fn();
+    const session = makeFakeSession({ abortCompaction });
+    const brain = new PiAgentBrain(session);
+    await brain.abort();
+    expect(abortCompaction).toHaveBeenCalled();
+    expect(session.abort).toHaveBeenCalled();
+  });
+
+  it("#8 abort is safe when the session has no abortCompaction (optional)", async () => {
+    const session = makeFakeSession();
+    delete (session as any).abortCompaction;
+    const brain = new PiAgentBrain(session);
+    await expect(brain.abort()).resolves.toBeUndefined();
+    expect(session.abort).toHaveBeenCalled();
+  });
+
+  it("reload delegates", async () => {
+    const session = makeFakeSession();
+    const brain = new PiAgentBrain(session);
+    await brain.reload();
+    expect(session.reload).toHaveBeenCalled();
+  });
+
+  it("steer delegates", async () => {
+    const session = makeFakeSession();
+    const brain = new PiAgentBrain(session);
+    await brain.steer("steer me");
+    expect(session.steer).toHaveBeenCalledWith("steer me");
+  });
+
+  it("rejects a steer while a required-result repair owns the session", async () => {
+    const requiredTool = "mcp__result__submit";
+    const session = makeFakeSession();
+    let promptCount = 0;
+    let releaseRepair!: () => void;
+    const repairBlocked = new Promise<void>((resolve) => { releaseRepair = resolve; });
+    session.prompt = vi.fn(async () => {
+      promptCount++;
+      if (promptCount === 1) {
+        session.__emit({
+          type: "message_end",
+          message: { role: "assistant", content: [{ type: "text", text: "draft" }], stopReason: "stop" },
+        });
+        return;
+      }
+      await repairBlocked;
+      session.__emit({
+        type: "tool_execution_end",
+        toolName: requiredTool,
+        isError: false,
+        result: { details: { structuredContent: { label: false } } },
+      });
+      session.__emit({
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "final" }], stopReason: "stop" },
+      });
+    });
+    const brain = new PiAgentBrain(session);
+
+    const prompt = brain.prompt("question", undefined, { requiredResultToolName: requiredTool });
+    while (promptCount < 2) await new Promise((resolve) => setTimeout(resolve, 0));
+    await expect(brain.steer("next query")).rejects.toMatchObject({
+      name: "RequiredResultRepairInProgress",
+    });
+    expect(session.steer).not.toHaveBeenCalled();
+    releaseRepair();
+    await prompt;
+  });
+
+  it("steer forwards images through prompt streaming steer", async () => {
+    const session = makeFakeSession();
+    const brain = new PiAgentBrain(session);
+    await brain.steer("steer image", { images: [{ mimeType: "image/png", data: "aGVsbG8=" }] });
+    expect(session.steer).not.toHaveBeenCalled();
+    expect(session.prompt).toHaveBeenCalledWith("steer image", {
+      streamingBehavior: "steer",
+      images: [{ type: "image", mimeType: "image/png", data: "aGVsbG8=" }],
+    });
+  });
+
+  it("prompt forwards PDF files through pi-agent content options", async () => {
+    const session = makeFakeSession();
+    session.prompt = vi.fn(async (_text: string) => {
+      session.__emit({ type: "message_start", message: { role: "assistant" } });
+      session.__emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "ok" }] } });
+    });
+    const brain = new PiAgentBrain(session);
+    await brain.prompt("read pdf", {
+      files: [{ mimeType: "application/pdf", filename: "runbook.pdf", data: "aGVsbG8=" }],
+    });
+    expect(session.prompt).toHaveBeenCalledWith("read pdf", {
+      images: [{ type: "file", mimeType: "application/pdf", filename: "runbook.pdf", data: "aGVsbG8=" }],
+    });
+  });
+
+  it("steer forwards PDF files through prompt streaming steer", async () => {
+    const session = makeFakeSession();
+    const brain = new PiAgentBrain(session);
+    await brain.steer("steer pdf", {
+      files: [{ mimeType: "application/pdf", filename: "runbook.pdf", data: "aGVsbG8=" }],
+    });
+    expect(session.steer).not.toHaveBeenCalled();
+    expect(session.prompt).toHaveBeenCalledWith("steer pdf", {
+      streamingBehavior: "steer",
+      images: [{ type: "file", mimeType: "application/pdf", filename: "runbook.pdf", data: "aGVsbG8=" }],
+    });
+  });
+
+  it("clearQueue delegates", () => {
+    const session = makeFakeSession({ clearQueue: vi.fn(() => ({ steering: ["a"], followUp: ["b"] })) });
+    const brain = new PiAgentBrain(session);
+    expect(brain.clearQueue()).toEqual({ steering: ["a"], followUp: ["b"] });
+  });
+
+  it("getContextUsage returns undefined when usage.tokens is nullish", () => {
+    const session = makeFakeSession({ getContextUsage: () => ({ tokens: null, contextWindow: 100, percent: 0 }) });
+    const brain = new PiAgentBrain(session);
+    expect(brain.getContextUsage()).toBeUndefined();
+  });
+
+  it("getContextUsage returns normalized usage", () => {
+    const session = makeFakeSession({ getContextUsage: () => ({ tokens: 50, contextWindow: 100 }) });
+    const brain = new PiAgentBrain(session);
+    expect(brain.getContextUsage()).toEqual({ tokens: 50, contextWindow: 100, percent: 0 });
+  });
+
+  describe("captureModelParams", () => {
+    it("reads the level back so a caller can restore it", () => {
+      // pi carries the current thinking level across a model switch whenever the
+      // target supports thinking (_getThinkingLevelForModelSwitch returns
+      // this.thinkingLevel), and applyModelParams cannot lower it — an absent
+      // effort is a no-op, not a reset. So a rejected sub-agent tier that raised
+      // the level would leave the fallback model running raised, changing the
+      // cost and latency of work nobody asked to be expensive. Capture/restore is
+      // the only way down.
+      const session = makeFakeSession({ thinkingLevel: "xhigh" });
+      const brain = new PiAgentBrain(session);
+      expect(brain.captureModelParams()).toEqual({ reasoningEffort: "xhigh" });
+    });
+
+    it("returns undefined rather than throwing when the level is unavailable", () => {
+      const session = makeFakeSession();
+      Object.defineProperty(session, "thinkingLevel", {
+        get() { throw new Error("not available"); },
+      });
+      const brain = new PiAgentBrain(session);
+      expect(() => brain.captureModelParams()).not.toThrow();
+      expect(brain.captureModelParams()).toBeUndefined();
+    });
+  });
+
+  describe("checkContextFitForModelPrompt (pure fit check)", () => {
+    it("never compacts and never prompts, whatever the verdict", async () => {
+      // This is the whole reason it exists separately from
+      // ensureContextForModelPrompt: run against a freshly created sub-agent, a
+      // compacting check would compact the one thing that child's context IS —
+      // its task briefing — and spend a model round-trip to decide whether to
+      // spend a model round-trip.
+      const session = makeFakeSession({
+        getContextUsage: vi.fn(() => ({ tokens: 100_000, contextWindow: 200_000, percent: 50 })),
+      });
+      const brain = new PiAgentBrain(session);
+
+      const result = brain.checkContextFitForModelPrompt(
+        { id: "small", provider: "p", contextWindow: 1000, maxTokens: 100, reasoning: false } as any,
+        "briefing",
+      );
+
+      expect(result.ok).toBe(false);
+      expect(result.compacted).toBe(false);
+      expect(session.compact).not.toHaveBeenCalled();
+      expect(session.prompt).not.toHaveBeenCalled();
+    });
+
+    it("counts the system prompt and tool schemas, not just the messages", async () => {
+      // A new child's message history is nearly empty while its system prompt and
+      // tool schemas are the bulk of the request. Counting messages alone passed
+      // a tier whose window the real request then overflowed — mid-stream, where
+      // nothing can fall back any more.
+      const bigPrompt = "x".repeat(40_000);
+      const withOverhead = makeFakeSession({
+        // No prior request, so pi reports no usage and the estimate falls back to
+        // messages — which are empty. Exactly the sub-agent case.
+        getContextUsage: vi.fn(() => undefined),
+        systemPrompt: bigPrompt,
+        getAllTools: vi.fn(() => [{ name: "bash", description: "y".repeat(20_000), parameters: {} }]),
+      });
+      const withoutOverhead = makeFakeSession({
+        getContextUsage: vi.fn(() => undefined),
+        systemPrompt: "",
+        getAllTools: vi.fn(() => []),
+      });
+
+      const model = { id: "m", provider: "p", contextWindow: 8000, maxTokens: 100, reasoning: false } as any;
+      const lean = new PiAgentBrain(withoutOverhead).checkContextFitForModelPrompt(model, "briefing");
+      const fat = new PiAgentBrain(withOverhead).checkContextFitForModelPrompt(model, "briefing");
+
+      expect(lean.ok).toBe(true);
+      expect(fat.ok).toBe(false);
+      expect(fat.tokens).toBeGreaterThan(lean.tokens ?? 0);
+    });
+
+    it("survives a session that exposes neither accessor", async () => {
+      // Defensive by design: it reads an SDK surface we do not own, and a fit
+      // check that throws is worse than one that guesses.
+      const session = makeFakeSession({
+        getContextUsage: vi.fn(() => ({ tokens: 10, contextWindow: 1000, percent: 1 })),
+        getAllTools: undefined,
+      });
+      // Defined AFTER construction: the factory spreads its overrides, and a
+      // spread READS a getter — so declaring it inline would throw while building
+      // the fixture instead of inside the code under test.
+      Object.defineProperty(session, "systemPrompt", {
+        get() { throw new Error("not available"); },
+      });
+      const brain = new PiAgentBrain(session);
+
+      expect(() => brain.checkContextFitForModelPrompt(
+        { id: "m", provider: "p", contextWindow: 1000, maxTokens: 100, reasoning: false } as any,
+        "briefing",
+      )).not.toThrow();
+    });
+  });
+
+  it("context preflight skips compaction when the target model window fits", async () => {
+    const session = makeFakeSession({
+      getContextUsage: vi.fn(() => ({ tokens: 10, contextWindow: 1000, percent: 1 })),
+    });
+    const brain = new PiAgentBrain(session);
+
+    const result = await brain.ensureContextForModelPrompt(
+      { id: "kimi", name: "Kimi", provider: "moonshot", contextWindow: 1000, maxTokens: 100, reasoning: false },
+      "short prompt",
+    );
+
+    expect(result).toMatchObject({ ok: true, compacted: false });
+    expect(session.compact).not.toHaveBeenCalled();
+  });
+
+  it("context preflight explains a missing or invalid model window", async () => {
+    const session = makeFakeSession();
+    const brain = new PiAgentBrain(session);
+
+    const result = await brain.ensureContextForModelPrompt(
+      { id: "gpt-5.5", name: "GPT-5.5", provider: "custom-model", contextWindow: 0, maxTokens: 100, reasoning: false },
+      "hello",
+    );
+
+    expect(result).toMatchObject({ ok: false, compacted: false, contextWindow: 0 });
+    expect(result.errorMessage).toBe(
+      "Context preflight failed for custom-model/gpt-5.5: context window must be greater than 0 tokens (received 0). Configure a positive context window for this model.",
+    );
+    expect(session.compact).not.toHaveBeenCalled();
+  });
+
+  it("context preflight reports the window and reserve when no token budget remains", async () => {
+    const session = makeFakeSession({
+      settingsManager: {
+        getCompactionSettings: vi.fn(() => ({ enabled: true, reserveTokens: 16_384, keepRecentTokens: 20_000 })),
+      },
+    });
+    const brain = new PiAgentBrain(session);
+
+    const result = await brain.ensureContextForModelPrompt(
+      { id: "DeepSeek-V4-Pro", name: "DeepSeek V4 Pro", provider: "custom-model", contextWindow: 10_000, maxTokens: 8172, reasoning: true },
+      "hello",
+    );
+
+    expect(result).toMatchObject({ ok: false, compacted: false, contextWindow: 10_000 });
+    expect(result.errorMessage).toBe(
+      "Context preflight failed for custom-model/DeepSeek-V4-Pro: context window 10000 tokens must exceed compaction reserve 16384 tokens. Increase the model context window or lower compaction.reserveTokens.",
+    );
+    expect(session.compact).not.toHaveBeenCalled();
+  });
+
+  it("context preflight does not compact when fallback target has a larger window", async () => {
+    const session = makeFakeSession({
+      getContextUsage: vi.fn(() => ({ tokens: 1_000_000, contextWindow: 1_000_000, percent: 100 })),
+    });
+    const brain = new PiAgentBrain(session);
+
+    const result = await brain.ensureContextForModelPrompt(
+      { id: "bigger", name: "Bigger", provider: "p", contextWindow: 1_250_000, maxTokens: 100, reasoning: false },
+      "continue",
+    );
+
+    expect(result).toMatchObject({ ok: true, compacted: false });
+    expect(session.compact).not.toHaveBeenCalled();
+  });
+
+  it("context preflight compacts before prompting on a smaller target window", async () => {
+    const session = makeFakeSession({
+      getContextUsage: vi.fn()
+        .mockReturnValueOnce({ tokens: 990, contextWindow: 1000, percent: 99 })
+        .mockReturnValueOnce({ tokens: 100, contextWindow: 1000, percent: 10 }),
+    });
+    const brain = new PiAgentBrain(session);
+
+    const result = await brain.ensureContextForModelPrompt(
+      { id: "kimi", name: "Kimi", provider: "moonshot", contextWindow: 1000, maxTokens: 100, reasoning: false },
+      "continue",
+    );
+
+    expect(result).toMatchObject({ ok: true, compacted: true });
+    expect(session.compact).toHaveBeenCalledWith(expect.stringContaining("moonshot/kimi"));
+  });
+
+  it("context preflight fails closed when compaction cannot fit the target window", async () => {
+    const session = makeFakeSession({
+      getContextUsage: vi.fn(() => ({ tokens: 990, contextWindow: 1000, percent: 99 })),
+    });
+    const brain = new PiAgentBrain(session);
+
+    const result = await brain.ensureContextForModelPrompt(
+      { id: "kimi", name: "Kimi", provider: "moonshot", contextWindow: 1000, maxTokens: 100, reasoning: false },
+      "continue",
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.compacted).toBe(true);
+    expect(result.errorMessage).toContain("still exceeds");
+  });
+
+  it("context preflight uses message estimation when provider usage is unavailable", async () => {
+    const session = makeFakeSession({
+      getContextUsage: vi.fn(() => undefined),
+      agent: {
+        onResponse: vi.fn(async () => {}),
+        state: { messages: [{ role: "user", content: [{ type: "text", text: "x".repeat(4000) }] }] },
+      },
+    });
+    const brain = new PiAgentBrain(session);
+
+    const result = await brain.ensureContextForModelPrompt(
+      { id: "tiny", name: "Tiny", provider: "p", contextWindow: 1000, maxTokens: 100, reasoning: false },
+      "continue",
+    );
+
+    expect(result.compacted).toBe(true);
+    expect(session.compact).toHaveBeenCalled();
+  });
+
+  it("getSessionStats returns token + cost values", () => {
+    const session = makeFakeSession();
+    const brain = new PiAgentBrain(session);
+    const stats = brain.getSessionStats();
+    expect(stats.cost).toBe(0.001);
+    expect(stats.tokens.total).toBe(3);
+  });
+
+  it("getModel returns normalized model info or undefined", () => {
+    const session = makeFakeSession();
+    const brain = new PiAgentBrain(session);
+    const m = brain.getModel();
+    expect(m?.id).toBe("m");
+    session.model = undefined;
+    expect(brain.getModel()).toBeUndefined();
+  });
+
+  it("setModel looks up via modelRuntime and calls session.setModel", async () => {
+    const session = makeFakeSession();
+    const brain = new PiAgentBrain(session);
+    await brain.setModel({ id: "m2", name: "M2", provider: "p", contextWindow: 0, maxTokens: 0, reasoning: false });
+    expect(session.modelRuntime.getModel).toHaveBeenCalledWith("p", "m2");
+    expect(session.setModel).toHaveBeenCalled();
+  });
+
+  it("setModel is a no-op when model not found", async () => {
+    const session = makeFakeSession({
+      modelRuntime: { getModel: vi.fn(() => undefined), registerProvider: vi.fn() },
+    });
+    const brain = new PiAgentBrain(session);
+    await brain.setModel({ id: "x", name: "x", provider: "x", contextWindow: 0, maxTokens: 0, reasoning: false });
+    expect(session.setModel).not.toHaveBeenCalled();
+  });
+
+  it("findModel returns undefined when registry returns undefined", () => {
+    const session = makeFakeSession({
+      modelRuntime: { getModel: vi.fn(() => undefined), registerProvider: vi.fn() },
+    });
+    const brain = new PiAgentBrain(session);
+    expect(brain.findModel("p", "id")).toBeUndefined();
+  });
+
+  it("findModel returns normalized info when found", () => {
+    const session = makeFakeSession();
+    const brain = new PiAgentBrain(session);
+    const info = brain.findModel("prov", "id");
+    expect(info).toMatchObject({ id: "id", provider: "prov" });
+  });
+
+  it("registerProvider delegates to modelRuntime", () => {
+    const session = makeFakeSession();
+    const brain = new PiAgentBrain(session);
+    brain.registerProvider!("name", { baseUrl: "u", models: [] });
+    expect(session.modelRuntime.registerProvider).toHaveBeenCalledWith("name", { baseUrl: "u", models: [] });
+  });
+
+  it("restores a checkpoint by branching the session leaf and rebuilding agent messages", () => {
+    const checkpointMessages = [
+      { role: "user", content: [{ type: "text", text: "diagnose" }] },
+    ];
+    const partialFailedAttempt = {
+      role: "assistant",
+      content: [{ type: "tool_use", id: "call-1", name: "bash", input: { command: "kubectl get pods" } }],
+    };
+    const sessionManager = {
+      getLeafId: vi.fn(() => "leaf-before-attempt"),
+      getEntry: vi.fn((id: string) => (id === "leaf-before-attempt" ? { id } : undefined)),
+      branch: vi.fn(),
+      resetLeaf: vi.fn(),
+      buildSessionContext: vi.fn(() => ({ messages: checkpointMessages })),
+    };
+    const session = makeFakeSession({
+      agent: {
+        onResponse: vi.fn(async () => {}),
+        state: { messages: [...checkpointMessages, partialFailedAttempt] },
+      },
+      sessionManager,
+    });
+    const brain = new PiAgentBrain(session);
+
+    expect(brain.createPromptCheckpoint()).toBe("leaf-before-attempt");
+
+    brain.restorePromptCheckpoint("leaf-before-attempt");
+
+    expect(sessionManager.getEntry).toHaveBeenCalledWith("leaf-before-attempt");
+    expect(sessionManager.branch).toHaveBeenCalledWith("leaf-before-attempt");
+    expect(sessionManager.resetLeaf).not.toHaveBeenCalled();
+    expect(session.agent.state.messages).toBe(checkpointMessages);
+    expect(session.agent.state.messages).not.toContain(partialFailedAttempt);
+  });
+
+  it("refuses to restore a missing string checkpoint", () => {
+    const sessionManager = {
+      getLeafId: vi.fn(() => "leaf-before-attempt"),
+      getEntry: vi.fn(() => undefined),
+      branch: vi.fn(),
+      resetLeaf: vi.fn(),
+      buildSessionContext: vi.fn(() => ({ messages: [] })),
+    };
+    const session = makeFakeSession({
+      agent: {
+        onResponse: vi.fn(async () => {}),
+        state: { messages: [] },
+      },
+      sessionManager,
+    });
+    const brain = new PiAgentBrain(session);
+
+    expect(() => brain.restorePromptCheckpoint("missing-leaf")).toThrow(
+      "Prompt checkpoint entry not found: missing-leaf",
+    );
+    expect(sessionManager.branch).not.toHaveBeenCalled();
+    expect(sessionManager.buildSessionContext).not.toHaveBeenCalled();
+  });
+
+  it("captureProviderResponse wraps pi-agent onResponse and restores it", async () => {
+    const previous = vi.fn(async () => "ok");
+    const session = makeFakeSession({ agent: { onResponse: previous } });
+    const brain = new PiAgentBrain(session);
+    const seen: any[] = [];
+
+    const unsubscribe = brain.captureProviderResponse((response) => seen.push(response));
+    const result = await session.agent.onResponse(
+      { status: 429, headers: { "Retry-After": "5", "x-ratelimit-reset": "10" } },
+      { provider: "openai", id: "gpt-4" },
+    );
+
+    expect(result).toBe("ok");
+    expect(previous).toHaveBeenCalled();
+    expect(seen).toEqual([{
+      status: 429,
+      headers: { "retry-after": "5", "x-ratelimit-reset": "10" },
+      provider: "openai",
+      modelId: "gpt-4",
+    }]);
+
+    unsubscribe();
+    expect(session.agent.onResponse).toBe(previous);
+  });
+
+  it("captureProviderResponse normalizes Web Headers objects", async () => {
+    const previous = vi.fn(async () => undefined);
+    const session = makeFakeSession({ agent: { onResponse: previous } });
+    const brain = new PiAgentBrain(session);
+    const seen: any[] = [];
+
+    brain.captureProviderResponse((response) => seen.push(response));
+    await session.agent.onResponse(
+      { status: 503, headers: new Headers([["Retry-After", "7"], ["X-RateLimit-Reset-Tokens", "9s"]]) },
+      { provider: "anthropic", id: "claude" },
+    );
+
+    expect(seen).toEqual([{
+      status: 503,
+      headers: { "retry-after": "7", "x-ratelimit-reset-tokens": "9s" },
+      provider: "anthropic",
+      modelId: "claude",
+    }]);
+  });
+
+  describe("applyModelParams", () => {
+    it("sets a valid reasoning effort as the thinking level", () => {
+      const session = makeFakeSession();
+      new PiAgentBrain(session).applyModelParams({ reasoningEffort: "xhigh" });
+      expect(session.setThinkingLevel).toHaveBeenCalledWith("xhigh");
+    });
+
+    it("ignores an invalid reasoning effort (no throw, no call)", () => {
+      const session = makeFakeSession();
+      new PiAgentBrain(session).applyModelParams({ reasoningEffort: "ultra" });
+      expect(session.setThinkingLevel).not.toHaveBeenCalled();
+    });
+
+    it("is a no-op when no effort is provided", () => {
+      const session = makeFakeSession();
+      new PiAgentBrain(session).applyModelParams({});
+      expect(session.setThinkingLevel).not.toHaveBeenCalled();
+    });
+  });
+});
+
+
+describe("handoff execution boundary", () => {
+  it("does not retry a successful terminal transfer even without final assistant text", async () => {
+    const session = makeFakeSession();
+    session.prompt = vi.fn(async () => {
+      session.__emit({ type: "message_end", message: { role: "assistant", content: [], stopReason: "stop" } });
+      session.__emit({ type: "tool_execution_end", toolName: "transfer_to_agent", result: { terminate: true, details: { transferred: true } } });
+    });
+    await new PiAgentBrain(session).prompt("count nodes");
+    expect(session.prompt).toHaveBeenCalledTimes(1);
+  });
+  it("blocks every call in a batch mixing handoff and work before execution", async () => {
+    const session = makeFakeSession();
+    const previous = vi.fn();
+    session.agent.beforeToolCall = previous;
+    new PiAgentBrain(session);
+    const calls = [{ type: "toolCall", name: "bash" }, { type: "toolCall", name: "transfer_to_agent" }];
+    for (const toolCall of calls) {
+      expect(await session.agent.beforeToolCall({ assistantMessage: { content: calls }, toolCall })).toMatchObject({ block: true });
+    }
+    expect(previous).not.toHaveBeenCalled();
+    await session.agent.beforeToolCall({ assistantMessage: { content: [calls[0]] }, toolCall: calls[0] });
+    expect(previous).toHaveBeenCalledTimes(1);
+  });
+});
+
+it("processes already queued input before transfer and rejects input during the reserved handoff", async () => {
+  const session = makeFakeSession({ pendingMessageCount: 1 });
+  const brain = new PiAgentBrain(session);
+  const call = { type: "toolCall", name: "transfer_to_agent" };
+  const ctx = { assistantMessage: { content: [call] }, toolCall: call };
+  expect(await session.agent.beforeToolCall(ctx)).toMatchObject({ block: true });
+  session.pendingMessageCount = 0;
+  expect(await session.agent.beforeToolCall(ctx)).toBeUndefined();
+  await expect(brain.steer("new instruction")).rejects.toThrow("HANDOFF_IN_PROGRESS");
+  expect(session.steer).not.toHaveBeenCalled();
+});
+
+
+it("preserves tool arguments without interpreting them as narration", () => {
+  const session = makeFakeSession();
+  const brain = new PiAgentBrain(session, new Map([["lookup", "query"]]));
+  const seen: any[] = []; brain.subscribe(event => seen.push(event));
+  const args = Object.freeze({ name: "demo", description: "domain value" });
+  session.__emit(Object.freeze({ type: "tool_execution_start", toolName: "lookup", args }));
+  expect(seen[0].args).toBe(args);
+  expect(seen[0]).not.toHaveProperty("publicProgress");
+});
+
+
+describe("task completion assessment", () => {
+  it("checks the existing context without tools and restores the tool set", async () => {
+    const session = makeFakeSession();
+    session.prompt.mockImplementation(async () => {
+      expect(session.getActiveToolNames()).toEqual([]);
+      session.__emit({ type: "message_end", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: JSON.stringify({ status: "incomplete", reason: "Only a promise, no findings" }) }] } });
+    });
+    const brain = new PiAgentBrain(session);
+    expect(await brain.assessTaskCompletion("Check node")).toEqual({ status: "incomplete", reason: "Only a promise, no findings" });
+    expect(session.getActiveToolNames()).toEqual(["read", "mcp__result__submit"]);
+  });
+  it("restores tools after malformed review output", async () => {
+    const session = makeFakeSession();
+    session.prompt.mockImplementation(async () => session.__emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Looks good" }] } }));
+    await expect(new PiAgentBrain(session).assessTaskCompletion("Check node")).rejects.toThrow();
+    expect(session.getActiveToolNames()).toEqual(["read", "mcp__result__submit"]);
+  });
+});

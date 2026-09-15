@@ -1,0 +1,85 @@
+---
+title: "Getting Started"
+sidebarTitle: "Quick Start"
+description: "Install Siclaw and run your first investigation in under 5 minutes."
+---
+
+## Prerequisites
+
+- **Node.js** >= 22.19.0
+- An **LLM API key** (Anthropic, OpenAI, or any OpenAI-compatible provider)
+
+## Install
+
+```bash
+mkdir -p ~/siclaw-work
+cd ~/siclaw-work
+npm install -g siclaw
+```
+
+### Local Web UI (recommended)
+
+```bash
+siclaw local
+```
+
+Launches the Web UI at `http://localhost:3000`.
+
+A fresh local workspace creates **admin / admin**. Sign in and change its password in **Account**.
+
+### From Source
+
+```bash
+git clone https://github.com/scitix/siclaw.git
+cd siclaw
+npm ci
+make build-portal-web
+npm run build
+node siclaw.mjs local
+```
+
+## Configure Your LLM
+
+Open **Models** in the Web UI, add your provider's endpoint and API key, and select a model for your agent.
+
+<Note>
+Siclaw supports any OpenAI-compatible API. See [LLM Providers](/configuration/providers) for Ollama, vLLM, Azure, and other setups.
+</Note>
+
+## Run Your First Investigation
+
+Open an agent's chat in the Web UI and describe an issue:
+
+```text
+Pod CrashLoopBackOff in production cluster after deployment
+```
+
+For complex issues, enable [Deep Investigation](/features/deep-investigation) with the magnifying-glass toggle next to the message input. The agent gathers evidence, tests hypotheses, and explains its findings and confidence.
+
+Investigation traces are saved to `.siclaw/traces/` (relative to where Siclaw was launched).
+
+## Add Cluster Access
+
+To investigate Kubernetes issues, import a kubeconfig into Siclaw:
+
+Use **Clusters** / **Hosts** in the Web UI, then bind the resources to the agent you use.
+
+Siclaw uses its stored credentials when running diagnostic tools.
+
+## Run from a Script
+
+For a non-interactive diagnostic, open another terminal in the same workspace:
+
+```bash
+siclaw agents
+siclaw --agent sre-oncall --prompt "Check recent pod events"
+```
+
+Use an agent name from the listing. Each invocation prints an answer and exits. See [CLI & Local Server](/install/cli) for standalone file configuration, continuation, and the migration from terminal sessions to the Web UI.
+
+## What's Next?
+
+- [Core Concepts](/start/core-concepts) — understand the investigation engine
+- [Your First Investigation](/start/first-investigation) — walk through a complete diagnosis
+- [LLM Providers](/configuration/providers) — detailed provider configuration
+- [Deploy for your team](/install/kubernetes) — production multi-user deployment

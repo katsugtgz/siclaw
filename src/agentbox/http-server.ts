@@ -1,0 +1,2207 @@
+import { AGENT_RETIRED_STATUS, agentRetiredDetail } from "../shared/agent-retirement.js";
+import { SandboxToolError } from "../script-sandbox/errors.js";
+import { parseHandoffPolicy } from "../shared/agent-handoff.js";
+/**
+ * AgentBox HTTP Server
+ *
+ * Provides HTTP API for Gateway to call, with SSE streaming support.
+ */
+
+import { assistantTextBlocks } from "../shared/assistant-items.js";
+import { BackgroundWorkTurn, decorateBackgroundWorkEvent } from "./background-work-turn.js";
+import { normalizeHandoffTrace, handoffParentSpan } from "../shared/handoff-trace.js";
+import fs from "node:fs";
+import { randomUUID } from "node:crypto";
+import path from "node:path";
+import http from "node:http";
+import https from "node:https";
+import { isAuthenticatedRuntime } from "./runtime-auth.js";
+import { record } from "../script-sandbox/validation.js";
+import type { TLSSocket } from "node:tls";
+import type { AgentBoxSessionManager, ManagedSession } from "./session.js";
+import type { SessionMode, OriginKind } from "../core/types.js";
+import type { AgentMode } from "../core/tool-registry.js";
+import { loadConfig, resolveTracingEnvironment } from "../core/config.js";
+import type { SiclawConfig } from "../core/config.js";
+import { emitDiagnostic } from "../shared/diagnostic-events.js";
+import { tracingRecorder } from "../shared/tracing/agent-trace-recorder.js";
+import { reinitTracing } from "../shared/tracing/otel-provider.js";
+import { checkMetricsAuth } from "../shared/metrics.js"; // also registers metrics subscriber (side-effect)
+import { GatewayClient } from "./gateway-client.js";
+import { CredentialBroker } from "./credential-broker.js";
+import { HttpTransport } from "./credential-transport.js";
+import {
+  getSyncHandler,
+  createClusterHandler,
+  createHostHandler,
+  createKnowledgeHandler,
+  createMcpHandler,
+  createSkillsHandler,
+  createToolsHandler,
+  readBoxSyncStatus,
+  type KnowledgeSyncHandler,
+} from "./sync-handlers.js";
+import type { ObservedMcpServer } from "../shared/agentbox-sync-status.js";
+import { GATEWAY_SYNC_DESCRIPTORS, type AgentBoxSyncHandler, type GatewaySyncType } from "../shared/gateway-sync.js";
+import { detectLanguage } from "../shared/detect-language.js";
+import { stripLanguageDirective } from "../shared/strip-language-directive.js";
+import {
+  candidateSupportsPromptMedia,
+  candidateKey,
+  clearModelRouteUserSelectionIfDifferent,
+  filterCandidatesForPromptMedia,
+  markModelRouteUserSelection,
+  normalizeCandidates,
+  normalizeModelRoutePolicy,
+  requiredInputsForPromptMedia,
+  runPromptWithModelRouting,
+  resolveEffectivePolicy,
+  shouldUseModelRouteRunner,
+  unsupportedPromptMediaMessage,
+  withResolvedCandidateCompat,
+  applyModelParamsForCandidate,
+  type ModelRouteCandidate,
+  type ModelRouteEvent,
+  type ModelRoutePolicy,
+} from "../core/model-routing.js";
+import { withResolvedModelCompat } from "../core/model-compat.js";
+import {
+  isTierPayloadCleared,
+  normalizeSubagentTierCandidates,
+  type SubagentTierCandidates,
+} from "../core/subagent-models.js";
+import type { BrainSession, PromptFile, PromptImage, PromptMedia } from "../core/brain-session.js";
+import { compactDispatchLogMessage } from "../shared/dispatch-observability.js";
+import { SESSION_CONTEXT_UNAVAILABLE_CODE, SESSION_CONTEXT_UNAVAILABLE_STATUS } from "../shared/session-context.js";
+
+type RequestHandler = (
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  params: Record<string, string>,
+) => Promise<void>;
+
+interface Route {
+  method: string;
+  pattern: RegExp;
+  paramNames: string[];
+  handler: RequestHandler;
+}
+
+interface PromptRequestBody {
+  /** Trusted Runtime continuation context; per-request, never session-cached. */
+  handoffTrace?: unknown;
+  sessionId?: string;
+  /** User who initiated this prompt (per-request), forwarded to the trace
+   *  recorder as the root span's user.id. */
+  userId?: string;
+  text?: string;
+  mode?: SessionMode;
+  /** Entry-form of this prompt (audit categorization). */
+  origin?: OriginKind;
+  /** Expose `request_input` to a top-level machine-driven turn. */
+  allowInputRequest?: boolean;
+  /** Control plane owns this logical turn and will dispatch authorized handoffs. */
+  handoffSupported?: boolean;
+  handoffPolicy?: import("../shared/agent-handoff.js").HandoffPolicy;
+  /**
+   * Control-plane segment / task this turn belongs to. Carried so the turn can
+   * be correlated back to the control plane's ledger.
+   */
+  segmentId?: string;
+  taskId?: string;
+  /** Reject if `sessionId` has no in-memory or persisted conversation context. */
+  requireExistingSession?: boolean;
+  modelProvider?: string;
+  modelId?: string;
+  releaseId?: string;
+  modelFingerprint?: string;
+  systemPromptTemplate?: string;
+  modelConfig?: Record<string, unknown>;
+  modelRouting?: ModelRoutePolicy;
+  /**
+   * Sub-agent tier CANDIDATES for this turn — `{revision, candidates:[…]}`, each
+   * carrying its own `modelConfig` (credentials included).
+   *
+   * Per-turn and never cached: an absent field means "no tiers this turn" and MUST
+   * clear whatever the session held, or a withdrawn model stays reachable and
+   * outlives a credential rotation.
+   */
+  subagentTiers?: unknown;
+  /** Image attachments forwarded as vision input (vision-capable models only). */
+  images?: PromptImage[];
+  /** PDF attachments forwarded as native file input (PDF-capable models only). */
+  files?: PromptFile[];
+  /**
+   * Caller's identity for THIS turn. Optional: a caller that does not send one
+   * keeps the old session-wide abort semantics. Echoed in the ack so a caller that
+   * lets the box mint nothing can still correlate.
+   */
+  turnId?: string;
+  /** Trusted control-plane contract for one required structured result tool. */
+  requiredResultToolName?: string;
+}
+
+/**
+ * Enrich an `agent_end` event with per-turn context/token usage so the
+ * frontend can render token + cost badges. Shared by the live SSE path and the
+ * model-routing flush path — when routing buffers brain events and replays
+ * them after a winning attempt, the live path is bypassed, so without this the
+ * routed session would emit a bare `agent_end` and lose its token stats.
+ * Non-`agent_end` events (and the case where the brain exposes no usage yet)
+ * pass through untouched.
+ */
+function enrichAgentEndEvent(brain: BrainSession, event: any): any {
+  if (event?.type !== "agent_end") return event;
+  const usage = brain.getContextUsage?.();
+  const stats = brain.getSessionStats?.();
+  if (!usage && !stats) return event;
+  return {
+    ...event,
+    contextUsage: {
+      tokens: usage?.tokens ?? 0,
+      contextWindow: usage?.contextWindow ?? 0,
+      percent: usage?.percent ?? 0,
+      inputTokens: stats?.tokens?.input ?? 0,
+      outputTokens: stats?.tokens?.output ?? 0,
+      cacheReadTokens: stats?.tokens?.cacheRead ?? 0,
+      cacheWriteTokens: stats?.tokens?.cacheWrite ?? 0,
+      cost: stats?.cost ?? 0,
+    },
+  };
+}
+
+/**
+ * Parse JSON body
+ */
+const MAX_PROMPT_MEDIA_ITEMS = 4;
+const MAX_PROMPT_MEDIA_BASE64_CHARS = 8 * 1024 * 1024;
+const MAX_BODY_SIZE = MAX_PROMPT_MEDIA_ITEMS * MAX_PROMPT_MEDIA_BASE64_CHARS + 512 * 1024;
+const BODY_TIMEOUT_MS = 30_000; // 30s
+const DP_ACTIVATION_MARKER = "[Deep Investigation]\n";
+const DP_EXIT_MARKER = "[DP_EXIT]";
+
+// We prepend a `[System: respond in X]` language directive to the user's prompt so
+// the model follows the input language. pi-agent records that as the user turn and
+// re-emits it as a `message_start`/`message_end` brain event, which is streamed LIVE
+// to the frontend (and forwarded to a connected portal as chat.event) — leaking the
+// internal directive into the displayed user bubble. The user message persisted by
+// the gateway is the original text, so this only affects the live render. Strip the
+// directive from the first text block of any user-role message event before it leaves
+// the agentbox; the model already saw it, and consumers see the clean text.
+export function stripUserDirectiveFromEvent(event: unknown): unknown {
+  const e = event as { message?: { role?: string; content?: unknown } } | null;
+  const msg = e?.message;
+  if (!msg || msg.role !== "user") return event;
+  const content = msg.content;
+  if (typeof content === "string") {
+    const stripped = stripLanguageDirective(content);
+    return stripped === content ? event : { ...e, message: { ...msg, content: stripped } };
+  }
+  if (Array.isArray(content)) {
+    const idx = content.findIndex((b) => (b as { type?: string })?.type === "text");
+    if (idx < 0) return event;
+    const block = content[idx] as { type: string; text?: unknown };
+    if (typeof block.text !== "string") return event;
+    const stripped = stripLanguageDirective(block.text);
+    if (stripped === block.text) return event;
+    const newContent = content.slice();
+    newContent[idx] = { ...block, text: stripped };
+    return { ...e, message: { ...msg, content: newContent } };
+  }
+  return event;
+}
+const MAX_PROMPT_IMAGES = MAX_PROMPT_MEDIA_ITEMS;
+const MAX_PROMPT_IMAGE_BASE64_CHARS = MAX_PROMPT_MEDIA_BASE64_CHARS;
+const SUPPORTED_PROMPT_IMAGE_MIMES = new Set(["image/png", "image/jpeg", "image/webp"]);
+const MAX_PROMPT_FILES = MAX_PROMPT_MEDIA_ITEMS;
+const MAX_PROMPT_FILE_BASE64_CHARS = MAX_PROMPT_MEDIA_BASE64_CHARS;
+const SUPPORTED_PROMPT_FILE_MIMES = new Set(["application/pdf"]);
+const BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
+
+class HttpRequestError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+  ) {
+    super(message);
+    this.name = "HttpRequestError";
+  }
+}
+
+interface PromptMediaValidationResult<T> {
+  items?: T[];
+  error?: string;
+}
+
+interface PromptMediaValidation {
+  images?: PromptImage[];
+  files?: PromptFile[];
+  error?: string;
+}
+
+function validatePromptMedia(imagesRaw: unknown, filesRaw: unknown): PromptMediaValidation {
+  const imagesResult = validatePromptImages(imagesRaw);
+  if (imagesResult.error) return { error: imagesResult.error };
+
+  const filesResult = validatePromptFiles(filesRaw);
+  if (filesResult.error) return { error: filesResult.error };
+
+  const totalItems = (imagesResult.items?.length ?? 0) + (filesResult.items?.length ?? 0);
+  if (totalItems > MAX_PROMPT_MEDIA_ITEMS) {
+    return { error: `prompt media supports at most ${MAX_PROMPT_MEDIA_ITEMS} item(s)` };
+  }
+
+  return {
+    images: imagesResult.items,
+    files: filesResult.items,
+  };
+}
+
+function validatePromptImages(raw: unknown): PromptMediaValidationResult<PromptImage> {
+  if (raw === undefined || raw === null) return {};
+  if (!Array.isArray(raw)) return { error: "images must be an array" };
+  if (raw.length > MAX_PROMPT_IMAGES) {
+    return { error: `images supports at most ${MAX_PROMPT_IMAGES} item(s)` };
+  }
+
+  const out: PromptImage[] = [];
+  for (const [index, item] of raw.entries()) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      return { error: `images[${index}] must be an object` };
+    }
+
+    const mimeType = (item as { mimeType?: unknown }).mimeType;
+    const data = (item as { data?: unknown }).data;
+    if (typeof mimeType !== "string") {
+      return { error: `images[${index}].mimeType must be a string` };
+    }
+    if (typeof data !== "string") {
+      return { error: `images[${index}].data must be a base64 string` };
+    }
+
+    const normalizedMime = normalizePromptImageMime(mimeType);
+    if (!SUPPORTED_PROMPT_IMAGE_MIMES.has(normalizedMime)) {
+      return { error: `images[${index}].mimeType must be one of: image/png, image/jpeg, image/webp` };
+    }
+    const dataError = validateBase64Data(`images[${index}].data`, data, MAX_PROMPT_IMAGE_BASE64_CHARS);
+    if (dataError) return { error: dataError };
+
+    out.push({ mimeType: normalizedMime, data });
+  }
+  return out.length > 0 ? { items: out } : {};
+}
+
+function validatePromptFiles(raw: unknown): PromptMediaValidationResult<PromptFile> {
+  if (raw === undefined || raw === null) return {};
+  if (!Array.isArray(raw)) return { error: "files must be an array" };
+  if (raw.length > MAX_PROMPT_FILES) {
+    return { error: `files supports at most ${MAX_PROMPT_FILES} item(s)` };
+  }
+
+  const out: PromptFile[] = [];
+  for (const [index, item] of raw.entries()) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      return { error: `files[${index}] must be an object` };
+    }
+
+    const mimeType = (item as { mimeType?: unknown }).mimeType;
+    const filename = (item as { filename?: unknown }).filename;
+    const data = (item as { data?: unknown }).data;
+    if (typeof mimeType !== "string") {
+      return { error: `files[${index}].mimeType must be a string` };
+    }
+    if (typeof filename !== "string") {
+      return { error: `files[${index}].filename must be a string` };
+    }
+    if (typeof data !== "string") {
+      return { error: `files[${index}].data must be a base64 string` };
+    }
+
+    const normalizedMime = mimeType.trim().toLowerCase();
+    if (!SUPPORTED_PROMPT_FILE_MIMES.has(normalizedMime)) {
+      return { error: `files[${index}].mimeType must be application/pdf` };
+    }
+    if (filename.trim() === "") {
+      return { error: `files[${index}].filename must not be empty` };
+    }
+    const dataError = validateBase64Data(`files[${index}].data`, data, MAX_PROMPT_FILE_BASE64_CHARS);
+    if (dataError) return { error: dataError };
+
+    out.push({ mimeType: normalizedMime, filename: sanitizePromptFilename(filename), data });
+  }
+  return out.length > 0 ? { items: out } : {};
+}
+
+function normalizePromptImageMime(value: string): string {
+  const normalized = value.trim().toLowerCase();
+  return normalized === "image/jpg" ? "image/jpeg" : normalized;
+}
+
+function validateBase64Data(field: string, data: string, maxChars: number): string | undefined {
+  if (data.length === 0) return `${field} must not be empty`;
+  if (data.length > maxChars) {
+    return `${field} exceeds ${formatBytes(maxChars)} base64 character limit`;
+  }
+  if (data.length % 4 !== 0 || !BASE64_RE.test(data)) {
+    return `${field} must be valid base64`;
+  }
+  return undefined;
+}
+
+function formatBytes(value: number): string {
+  const mib = value / (1024 * 1024);
+  return `${Number.isInteger(mib) ? mib : mib.toFixed(1)} MiB`;
+}
+
+function sanitizePromptFilename(value: string): string {
+  const basename = value.split(/[\\/]/).filter(Boolean).pop()?.trim() || "attachment.pdf";
+  return basename.replace(/[\r\n\t]/g, "_").slice(0, 160) || "attachment.pdf";
+}
+
+function buildPromptMedia(images?: PromptImage[], files?: PromptFile[]): PromptMedia | undefined {
+  if ((!images || images.length === 0) && (!files || files.length === 0)) return undefined;
+  return {
+    ...(images && images.length > 0 ? { images } : {}),
+    ...(files && files.length > 0 ? { files } : {}),
+  };
+}
+
+function defaultPromptTextForMedia(media?: PromptMedia): string {
+  const hasImages = !!media?.images?.length;
+  const hasFiles = !!media?.files?.length;
+  if (hasImages && hasFiles) return "Please analyze the attached image and PDF.";
+  if (hasFiles) return "Please analyze the attached PDF.";
+  if (hasImages) return "Please analyze the attached image.";
+  return "";
+}
+
+/**
+ * Drop this turn's tier state. Called on EVERY terminal path — normal finish,
+ * setup failure, and abort (which funnels through `actuallyFinish`).
+ *
+ * Both fields are turn-scoped and one of them holds credentials, so leaving them
+ * behind is not merely untidy: a later SYNTHETIC turn (a background-work
+ * notification prompting the parent) runs without an HTTP body, so it would
+ * install nothing and silently inherit whatever the previous turn left — its
+ * model, and its apiKey, past a rotation.
+ *
+ * A background sub-agent group is unaffected: it carries the plan it captured at
+ * dispatch as a value, not a reference to session state.
+ */
+function clearTurnTierState(managed: ManagedSession): void {
+  managed.subagentTierCandidates = null;
+  managed.effectiveModelCandidate = null;
+  managed.effectiveModelParams = null;
+}
+
+/**
+ * Normalize this turn's tier candidates and resolve wire-compat on each one.
+ *
+ * Returns null for an absent payload (no tiers this turn) AND for a malformed one:
+ * a bad tier list disables tiering for the turn but must never fail it, because a
+ * configuration problem is not worth losing the user's work over.
+ */
+function resolveTurnTierCandidates(raw: unknown): SubagentTierCandidates | null {
+  if (isTierPayloadCleared(raw)) return null;
+  const normalized = normalizeSubagentTierCandidates(raw);
+  if (!normalized.ok) {
+    console.warn(`[agentbox] ignoring invalid subagent tier candidates: ${normalized.reason}`);
+    return null;
+  }
+  return {
+    revision: normalized.value.revision,
+    candidates: normalized.value.candidates.map((candidate) => ({
+      ...candidate,
+      modelConfig: withResolvedModelCompat(candidate.modelConfig),
+    })),
+  };
+}
+
+/**
+ * The model this turn's caller asked to run on, shaped as a routing candidate so
+ * that registering its config and looking it up stay inside `runAttempt`.
+ */
+function requestBindingCandidate(body: PromptRequestBody): ModelRouteCandidate | undefined {
+  if (!body.modelProvider || !body.modelId) return undefined;
+  return {
+    provider: body.modelProvider,
+    modelId: body.modelId,
+    modelConfig: body.modelConfig,
+  };
+}
+
+/**
+ * The binding to actually route this turn on.
+ *
+ * A binding WITH a `modelConfig` is always handed through: registering it is
+ * `runAttempt`'s job, and if the model is still absent afterwards that is a real
+ * `model_not_found` — a fallback candidate gets its turn, and with no fallback the
+ * run exhausts and reports it, rather than silently answering on whichever model
+ * the session happened to be on.
+ *
+ * A binding WITHOUT one is different in kind: there is nothing to register, so the
+ * caller is naming a model it expects to already exist. If it does not, the
+ * session stays on its current model — a tolerance that predates routing and that
+ * callers of the plain `modelProvider`/`modelId` form rely on. Only that case is
+ * tolerated, and only here; it is deliberately not extended to a binding whose
+ * config was supposed to create the model.
+ */
+function bindingCandidateForRun(
+  body: PromptRequestBody,
+  brain: { findModel: (provider: string, modelId: string) => unknown },
+): ModelRouteCandidate | undefined {
+  const binding = requestBindingCandidate(body);
+  if (!binding) return undefined;
+  if (binding.modelConfig) return binding;
+  return brain.findModel(binding.provider, binding.modelId) ? binding : undefined;
+}
+
+function singleCandidateForMediaPreflight(
+  body: PromptRequestBody,
+  policy: ModelRoutePolicy | undefined,
+): ModelRouteCandidate | undefined {
+  const binding = requestBindingCandidate(body);
+  if (binding) return binding;
+  const candidates = normalizeCandidates(policy?.candidates);
+  return candidates.length === 1 ? candidates[0] : undefined;
+}
+
+/**
+ * Resolve the session's active operating mode for this prompt, so getOrCreate can
+ * build (or rebuild) the agent with mode-scoped tools (e.g. the plan tools are
+ * hidden in DP). Mirrors the DP on/off rules: an explicit marker wins, otherwise
+ * fall back to the live then persisted DP state.
+ */
+function resolveActiveMode(
+  text: string,
+  sessionId: string | undefined,
+  sessionManager: AgentBoxSessionManager,
+): AgentMode {
+  if (text.startsWith(DP_EXIT_MARKER)) return "normal";
+  if (text.startsWith(DP_ACTIVATION_MARKER)) return "dp";
+  if (!sessionId) return "normal";
+  if (sessionManager.get(sessionId)?.dpStateRef?.active === true) return "dp";
+  return sessionManager.getPersistedDpState(sessionId)?.active === true ? "dp" : "normal";
+}
+
+async function parseJsonBody(req: http.IncomingMessage): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    // UTF-8 decoding belongs to the stream, not to each data event: a character
+    // split across two chunks decoded per event becomes two U+FFFD. Prompts arrive
+    // through here, so that would silently rewrite a user's text at a chunk
+    // boundary (see background-bash-runner.ts for the same fix on child output).
+    req.setEncoding("utf8");
+    let body = "";
+    let size = 0;
+    let timedOut = false;
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      req.destroy();
+      reject(new HttpRequestError(408, "Body read timeout"));
+    }, BODY_TIMEOUT_MS);
+
+    req.on("data", (chunk: Buffer | string) => {
+      if (timedOut) return;
+      size += typeof chunk === "string" ? Buffer.byteLength(chunk) : chunk.length;
+      if (size > MAX_BODY_SIZE) {
+        clearTimeout(timer);
+        req.destroy();
+        reject(new HttpRequestError(413, `Body exceeds ${formatBytes(MAX_BODY_SIZE)} limit`));
+        return;
+      }
+      body += chunk;
+    });
+    req.on("end", () => {
+      clearTimeout(timer);
+      if (timedOut) return;
+      try {
+        resolve(body ? JSON.parse(body) : {});
+      } catch (e) {
+        reject(new HttpRequestError(400, "Invalid JSON"));
+      }
+    });
+    req.on("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+  });
+}
+
+/**
+ * Send JSON response
+ */
+function sendJson(res: http.ServerResponse, status: number, data: unknown): void {
+  res.writeHead(status, { "Content-Type": "application/json" });
+  res.end(JSON.stringify(data));
+}
+
+const ABORT_ENDPOINT_TIMEOUT_MS = 2_000;
+
+function waitMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function abortBrainForHttp(
+  brain: { abort: () => Promise<void> | void },
+  sessionId: string,
+): Promise<"done" | "failed" | "timeout"> {
+  const abortPromise = Promise.resolve()
+    .then(() => brain.abort())
+    .then(() => "done" as const)
+    .catch((err) => {
+      console.error(`[agentbox-http] Abort error for session ${sessionId}:`, err);
+      return "failed" as const;
+    });
+
+  const outcome = await Promise.race([
+    abortPromise,
+    waitMs(ABORT_ENDPOINT_TIMEOUT_MS).then(() => "timeout" as const),
+  ]);
+  if (outcome === "timeout") {
+    console.warn(`[agentbox-http] Abort for session ${sessionId} did not settle within ${ABORT_ENDPOINT_TIMEOUT_MS}ms`);
+  }
+  return outcome;
+}
+
+export interface CreateHttpServerOptions {
+  /**
+   * Knowledge handler already bound to this box's target directory. LocalSpawner
+   * supplies the same instance used by its initial sync so status and reloads
+   * share one per-box lifecycle. Other entrypoints create their handler here.
+   */
+  knowledgeHandler?: KnowledgeSyncHandler;
+
+  /** Per-Agent handlers supplied by LocalSpawner to avoid process-global MCP/Skill state. */
+  mcpHandler?: AgentBoxSyncHandler<any>;
+  skillsHandler?: AgentBoxSyncHandler<any>;
+
+  /**
+   * If true, skip the idle self-destruct entirely. Intended for LocalSpawner,
+   * which runs AgentBox in-process with the Portal — shutting down from
+   * the idle timer would take the whole `siclaw local` process down with it.
+   * K8s mode must keep the default so idle pods get recycled.
+   */
+  disableIdleShutdown?: boolean;
+
+  /**
+   * Idle self-destruct window in milliseconds. When omitted, resolved from
+   * `config.server.idleTimeoutSec` (env: SICLAW_AGENTBOX_IDLE_TIMEOUT),
+   * defaulting to 5 minutes. A value ≤ 0 makes the pod resident (never
+   * auto-destroy) — equivalent to `disableIdleShutdown`.
+   */
+  idleTimeoutMs?: number;
+
+  /**
+   * Invoked instead of `process.exit(0)` when the idle window elapses. Lets
+   * the caller route idle teardown through the same graceful shutdown as
+   * SIGTERM (flush metrics, evict debug pods, close sessions) rather than a
+   * raw exit that orphans those resources. Defaults to `process.exit(0)`.
+   */
+  onIdleShutdown?: () => void;
+}
+
+/**
+ * Create HTTP or HTTPS server (auto-detects certificates)
+ */
+export function createHttpServer(
+  sessionManager: AgentBoxSessionManager,
+  options: CreateHttpServerOptions = {},
+): http.Server | https.Server {
+  // Initialize credential broker synchronously before any session is created.
+  // The broker reference is captured by value into each session's KubeconfigRef,
+  // so we cannot defer initialization — a late-arriving broker would never be
+  // seen by sessions created before it landed.
+  // Credential broker: both K8s and Local mode use HTTP to call gateway.
+  // SICLAW_GATEWAY_URL is set by K8s env or LocalSpawner process.env injection.
+  {
+    const credentialsDir = sessionManager.credentialsDir;
+    const gatewayUrl = process.env.SICLAW_GATEWAY_URL;
+    if (gatewayUrl && !sessionManager.gatewayClient) {
+      sessionManager.gatewayClient = new GatewayClient({ gatewayUrl });
+    }
+    if (gatewayUrl && !sessionManager.credentialBroker && sessionManager.gatewayClient) {
+      const client = sessionManager.gatewayClient;
+      sessionManager.credentialBroker = new CredentialBroker(new HttpTransport(client), credentialsDir);
+      console.log(`[agentbox-http] Credential broker initialized (${gatewayUrl})`);
+    }
+  }
+
+  // cluster/host handlers close over this server's broker. In Local mode,
+  // LocalSpawner runs multiple AgentBoxes in the SAME process — if we had
+  // used the module-level sync-handlers registry (as mcp/skills do), each
+  // spawn() would overwrite the previous registration and cross-tenant
+  // request routing would silently pick the wrong broker. We instead bind
+  // these handlers per-httpServer and hand them to the route loop below.
+  const perServerHandlers: Partial<Record<GatewaySyncType, AgentBoxSyncHandler<any>>> = {};
+  // Updated only after a turn completes successfully. A reload ACK means the
+  // next turn is prepared; this state is the stronger evidence that a box has
+  // actually run with the published model binding.
+  let observedModel: { releaseId: string; modelFingerprint: string; observedAt: string } | null = null;
+  let observedHarness: {
+    agentType: string;
+    /** Request-scoped Agent prompt; the resource loader adds platform instructions. */
+    systemPromptTemplate: string | null;
+    skillNames: string[];
+    skillDigests: Record<string, string>;
+    toolNames: string[];
+    observedAt: string;
+  } | null = null;
+  /**
+   * Sub-agent tiering as the last successful turn actually held it. See
+   * `BoxSyncStatus.tiers` for what each combination of the two revisions means.
+   */
+  let observedTiers: {
+    menuRevision: string | null;
+    candidatesRevision: string | null;
+    observedAt: string;
+  } | null = null;
+  /**
+   * Per-server MCP connection outcome from the most recent session that
+   * initialized MCP in this box. Recorded when the session is CREATED, not when
+   * a turn succeeds: a server that fails to connect is exactly the observation
+   * a developer needs, and it must not disappear because the turn that followed
+   * also failed (e.g. the model rejecting an oversized tool list).
+   */
+  let observedMcpServers: ObservedMcpServer[] | null = null;
+  if (sessionManager.credentialBroker) {
+    perServerHandlers.cluster = createClusterHandler(sessionManager.credentialBroker);
+    perServerHandlers.host = createHostHandler(sessionManager.credentialBroker);
+  }
+  // The knowledge handler is per-server UNCONDITIONALLY — never gated on
+  // sessionManager.knowledgeDir. K8s boxes leave the dir unset (materialize
+  // falls back to config.paths.knowledgeDir, identical to the module-level
+  // handler's resolution), but only this closure carries the afterMaterialize
+  // hook that re-syncs the shared label index. Behind the gate, a K8s
+  // knowledge hot update landed on disk while knowledge_search kept serving
+  // the index built at pod start until the pod recycled.
+  const perServerKnowledgeHandler = options.knowledgeHandler
+    ?? createKnowledgeHandler({
+      knowledgeDir: sessionManager.knowledgeDir,
+      afterMaterialize: () => sessionManager.syncKnowledgeIndex(),
+    });
+  perServerHandlers.knowledge = perServerKnowledgeHandler;
+  if (options.mcpHandler) {
+    perServerHandlers.mcp = options.mcpHandler;
+  } else if (sessionManager.mcpServersState !== undefined) {
+    perServerHandlers.mcp = createMcpHandler(
+      sessionManager,
+      sessionManager.gatewayClient ? sessionManager.gatewayClient.toClientLike() : null,
+    );
+  }
+  if (options.skillsHandler) {
+    perServerHandlers.skills = options.skillsHandler;
+  } else if (sessionManager.skillsDir) {
+    perServerHandlers.skills = createSkillsHandler({
+      skillsDir: sessionManager.skillsDir,
+      boxClient: sessionManager.gatewayClient ? sessionManager.gatewayClient.toClientLike() : null,
+    });
+  }
+  // tools handler — same per-box rationale as cluster/host. It writes the
+  // resolved allowedTools into THIS box's sessionManager and fetches with THIS
+  // box's GatewayClient (correct mTLS cert → correct agentId), avoiding the
+  // route loop's last-spawn-wins SICLAW_CERT_PATH client. Bound even when
+  // gatewayClient is absent (CLI/no-gateway): the reload route gates on
+  // requiresGatewayClient and skips before fetch in that case.
+  perServerHandlers.tools = createToolsHandler(
+    sessionManager,
+    sessionManager.gatewayClient ? sessionManager.gatewayClient.toClientLike() : null,
+  );
+
+  // ── Idle self-destruct: shut down when no SSE connections and no sessions ──
+  // Window is configurable (config.server.idleTimeoutSec / SICLAW_AGENTBOX_IDLE_TIMEOUT).
+  // A non-positive window (or disableIdleShutdown) makes the pod resident.
+  const resolvedIdleMs =
+    options.idleTimeoutMs ?? (loadConfig().server?.idleTimeoutSec ?? 300) * 1000;
+  const idleDisabled = options.disableIdleShutdown || resolvedIdleMs <= 0;
+  const triggerIdleShutdown = options.onIdleShutdown ?? (() => process.exit(0));
+  let activeSseCount = 0;
+  let idleTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function resetIdleTimer(): void {
+    if (idleTimer) {
+      clearTimeout(idleTimer);
+      idleTimer = null;
+    }
+  }
+
+  /**
+   * Nothing left in this box that would be lost by removing it.
+   *
+   * Deliberately the SAME predicate the idle self-destruct uses, so a drain decision and a
+   * self-destruct decision can never disagree. Both a resident session and an open SSE
+   * stream count as work: a session holding a background sub-agent is not released (its
+   * `_backgroundWorkCount` defers the release), so residency already covers background work
+   * without a separate term.
+   */
+  function isDrained(): boolean {
+    return activeSseCount === 0 && sessionManager.activeCount() === 0;
+  }
+
+  function checkIdle(): void {
+    if (idleDisabled) return;
+    if (isDrained()) {
+      if (idleTimer) return; // already scheduled
+      idleTimer = setTimeout(() => {
+        idleTimer = null;
+        // Re-check before tearing down (new connection may have arrived)
+        if (isDrained()) {
+          console.log(`[agentbox] No connections for ${resolvedIdleMs / 1000}s, shutting down`);
+          triggerIdleShutdown();
+        }
+      }, resolvedIdleMs);
+      // Don't let the idle timer alone keep the event loop alive.
+      idleTimer.unref?.();
+      console.log(`[agentbox] Idle detected, will shut down in ${resolvedIdleMs / 1000}s if no activity`);
+    }
+  }
+
+  if (idleDisabled) {
+    console.log("[agentbox] Idle self-destruct disabled — pod is resident");
+  }
+
+  // Start initial idle check (pod may never receive any connections)
+  checkIdle();
+
+  // Wire session release → idle check (session released after TTL)
+  sessionManager.onSessionRelease = () => checkIdle();
+
+  const routes: Route[] = [];
+
+  // Route registration helper
+  function addRoute(method: string, path: string, handler: RequestHandler): void {
+    const paramNames: string[] = [];
+    const patternStr = path.replace(/:(\w+)/g, (_, name) => {
+      paramNames.push(name);
+      return "([^/]+)";
+    });
+    routes.push({
+      method,
+      pattern: new RegExp(`^${patternStr}$`),
+      paramNames,
+      handler,
+    });
+  }
+
+  // ==================== Routes ====================
+
+  /**
+   * GET /metrics - Prometheus metrics endpoint
+   */
+  addRoute("GET", "/metrics", async (req, res) => {
+    if (!checkMetricsAuth(req, res)) return;
+    const { metricsRegistry } = await import("../shared/metrics.js");
+    res.writeHead(200, { "Content-Type": metricsRegistry.contentType });
+    res.end(await metricsRegistry.metrics());
+  });
+
+  /**
+   * GET /api/internal/metrics-snapshot - export this process's cumulative prom-client
+   * snapshot for the Gateway's 30s federation pull (K8s mode). Mirrors the SIGTERM
+   * /api/internal/metrics-flush push: both carry { incarnation, prom }.
+   */
+  addRoute("GET", "/api/internal/metrics-snapshot", async (_req, res) => {
+    const { getMetricsAsJSON, processIncarnation } = await import("../shared/metrics.js");
+    sendJson(res, 200, {
+      incarnation: processIncarnation,
+      prom: await getMetricsAsJSON(),
+      // See MetricsFlushPayload: a claim, authorized against the mTLS cert on arrival.
+      ...(process.env.SICLAW_POD_NAME ? { boxId: process.env.SICLAW_POD_NAME } : {}),
+    });
+  });
+
+  /**
+   * GET /api/sync-status — observed inventory after materialize.
+   *
+   * Kept next to box-status because both expose box-observed state. This list
+   * is what a developer console can show after a test deploy: which knowledge
+   * libraries, skills, and MCP servers are actually on disk, not what ControlPlane
+   * intended to send.
+   */
+  addRoute("GET", "/api/sync-status", async (_req, res) => {
+    const inventory = readBoxSyncStatus({
+      knowledgeDir: sessionManager.knowledgeDir,
+      knowledgeHandler: perServerKnowledgeHandler,
+    });
+    // Prefer a live session's manager over the last recorded snapshot: an MCP
+    // reload invalidates sessions, so the newest session is the one built from
+    // the current config. Fall back to the snapshot when every session has been
+    // released, and to "no servers field" when this box never initialized MCP.
+    const liveManager = sessionManager.list()
+      .filter((session) => session.mcpManager)
+      .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())[0]?.mcpManager;
+    const servers = liveManager ? liveManager.getServerConnections() : observedMcpServers;
+    sendJson(res, 200, {
+      ...inventory,
+      mcp: { ...inventory.mcp, ...(servers ? { servers } : {}) },
+      model: observedModel,
+      harness: observedHarness,
+      tiers: observedTiers,
+    });
+  });
+
+  /**
+   * GET /api/internal/box-status — what this box is currently holding.
+   *
+   * The Runtime routes a session to a box and keeps it there, so it needs to know what a
+   * box would lose if it were removed. `drained` is reported BY the box and never inferred
+   * from the outside: a session can have no in-flight turn while a background sub-agent
+   * still runs under it, and only the box can see that.
+   */
+  addRoute("GET", "/api/internal/box-status", async (_req, res) => {
+    const sessions = sessionManager.list();
+    sendJson(res, 200, {
+      boxId: process.env.SICLAW_POD_NAME ?? null,
+      sessionIds: sessions.map((s) => s.id),
+      sessionCount: sessions.length,
+      // What placement scores on: sessions resident is not load, turns running is.
+      turnsInFlight: sessionManager.inFlightCount(),
+      backgroundWork: sessions.reduce((n, s) => n + s._backgroundWorkCount, 0),
+      activeStreams: activeSseCount,
+      drained: isDrained(),
+      subagents: sessionManager.subagentStats(),
+    });
+  });
+
+  /**
+   * GET /health - health check
+   */
+  addRoute("GET", "/health", async (_req, res) => {
+    sendJson(res, 200, {
+      status: "ok",
+      sessions: sessionManager.list().length,
+      timestamp: new Date().toISOString(),
+    });
+  });
+
+  /**
+   * GET /api/sessions - list all sessions
+   */
+  addRoute("GET", "/api/sessions", async (_req, res) => {
+    const sessions = sessionManager.list().map((s) => ({
+      id: s.id,
+      createdAt: s.createdAt.toISOString(),
+      lastActiveAt: s.lastActiveAt.toISOString(),
+    }));
+    sendJson(res, 200, { sessions });
+  });
+
+  /**
+   * POST /api/prompt - send a message
+   *
+   * Body: { sessionId?: string, text: string }
+   * Response: { ok: true, sessionId: string }
+   *
+   * The message is sent to the Agent, and responses are returned via SSE stream.
+   */
+  // Dedicated callback; bypasses the prompt queue to avoid deadlocking run_script.
+  // The unguessable per-invocation grant is required in BOTH local and mTLS modes.
+  addRoute("POST", "/api/internal/sandbox-tool", async (req, res) => {
+    if (!useTls && !["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(req.socket.remoteAddress ?? "")) {
+      sendJson(res, 403, { error: "Sandbox callback denied" }); return;
+    }
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    res.once("close", abort);
+    let dispatched = false;
+    try {
+      const body = await parseJsonBody(req);
+      if (!record(body) || Object.keys(body).some(k => !["session_id", "callback_token", "arguments", "approval"].includes(k)) ||
+          !record(body.approval) || Buffer.byteLength(JSON.stringify(body.approval)) > 256 * 1024 ||
+          typeof body.session_id !== "string" || typeof body.callback_token !== "string" || !/^[a-f0-9]{64}$/.test(body.callback_token)) throw new Error();
+      const managed = sessionManager.get(body.session_id);
+      const invocations = sessionManager.gatewayClient?.sandboxInvocations;
+      if (!managed || managed.mode !== "web" || !invocations) throw new Error();
+      const { executeSandboxBuiltin } = await import("./sandbox-tools.js");
+      const approval = body.approval as unknown as import("../shared/sandbox-tool-types.js").SandboxBuiltinApproval;
+      if (!Number.isSafeInteger(approval.deadlineMs) || Number(approval.deadlineMs) <= Date.now()) throw new Error();
+      if (typeof approval.callId !== "string" || !approval.callId || approval.callId.length > 64) throw new Error();
+      const result = await invocations.execute(body.callback_token, body.session_id,
+        { id: approval.callId, tool: approval.tool, arguments: body.arguments as Record<string, unknown> }, controller.signal,
+        (request, signal) => { dispatched = true; return executeSandboxBuiltin(request, approval, managed.kubeconfigRef.credentialsDir, signal); });
+      sendJson(res, 200, { protocol: 1, ok: true, result });
+    } catch (error) {
+      const failure = error instanceof SandboxToolError ? error : new SandboxToolError(
+        dispatched ? "EXECUTION_UNKNOWN" : "UNAUTHORIZED", dispatched ? "UNKNOWN" : "NOT_DISPATCHED");
+      sendJson(res, 200, { protocol: 1, ok: false, ...failure.wire() });
+    }
+    finally { res.off("close", abort); }
+  });
+
+  addRoute("POST", "/api/prompt", async (req, res) => {
+    const promptStartedAt = Date.now();
+    const body = (await parseJsonBody(req)) as PromptRequestBody;
+    const logPromptResponse = (status: number, outcome: string, message?: unknown, sessionId = body.sessionId): void => {
+      const suffix = message === undefined ? "" : ` error=${JSON.stringify(compactDispatchLogMessage(message))}`;
+      console.log(`[agentbox-http] /api/prompt result boxId=${process.env.SICLAW_POD_NAME ?? "unknown"} sessionId=${sessionId ?? "pending"} turnId=${body.turnId ?? "unknown"} status=${status} outcome=${outcome} durationMs=${Date.now() - promptStartedAt}${suffix}`);
+    };
+
+    if (body.requiredResultToolName !== undefined && typeof body.requiredResultToolName !== "string") {
+      logPromptResponse(400, "rejected", "'requiredResultToolName' must be a string");
+      sendJson(res, 400, { error: "'requiredResultToolName' must be a string" });
+      return;
+    }
+    const requiredResultToolName = body.requiredResultToolName?.trim() || undefined;
+
+    const promptMediaValidation = validatePromptMedia(body.images, body.files);
+    if (promptMediaValidation.error) {
+      logPromptResponse(400, "rejected", promptMediaValidation.error);
+      sendJson(res, 400, { error: promptMediaValidation.error });
+      return;
+    }
+    const promptMedia = buildPromptMedia(promptMediaValidation.images, promptMediaValidation.files);
+
+    // Media-only messages are valid; reject only when there is neither text nor
+    // usable image/PDF media after validation.
+    if (!body.text && !promptMedia) {
+      logPromptResponse(400, "rejected", "Missing 'text' field");
+      sendJson(res, 400, { error: "Missing 'text' field" });
+      return;
+    }
+
+    const activeMode = resolveActiveMode(body.text ?? "", body.sessionId, sessionManager);
+    if ((body as Record<string, unknown>).delegation || String(body.origin) === "delegation") {
+      sendJson(res, AGENT_RETIRED_STATUS, { error: agentRetiredDetail() });
+      return;
+    }
+    // Cross-restart dispatch idempotency. The Runtime de-duplicates a retried
+    // dispatch in process memory only, so after a Runtime restart the same turn
+    // would execute twice. This box ran it and outlived that Runtime, so it is
+    // the authority: a turnId already in this session's ledger is answered
+    // WITHOUT starting anything. (See turn-ledger.ts.)
+    if (body.sessionId && body.turnId && sessionManager.hasAcceptedTurn(body.sessionId, body.turnId)) {
+      logPromptResponse(200, "duplicate", undefined, body.sessionId);
+      sendJson(res, 200, { ok: true, sessionId: body.sessionId, turnId: body.turnId, duplicate: true });
+      return;
+    }
+    // The checkpointer read runs BEFORE the strict check, or the check would judge
+    // a session this box has never seen — and refuse it — while the control plane
+    // holds its whole transcript. For a brand-new session the load is one cheap
+    // empty round-trip.
+    const resumed = await sessionManager.ensureSessionContext(body.sessionId);
+    if (body.requireExistingSession === true && !resumed) {
+      const detail = {
+        code: SESSION_CONTEXT_UNAVAILABLE_CODE,
+        message: "The requested session context is unavailable and cannot be resumed",
+        retriable: false,
+        status: SESSION_CONTEXT_UNAVAILABLE_STATUS,
+      };
+      logPromptResponse(SESSION_CONTEXT_UNAVAILABLE_STATUS, "context_unavailable", detail.message);
+      sendJson(res, SESSION_CONTEXT_UNAVAILABLE_STATUS, { error: detail });
+      return;
+    }
+    const managed = await sessionManager.getOrCreate(
+      body.sessionId,
+      body.mode,
+      body.systemPromptTemplate,
+      activeMode,
+      body.userId,
+      body.allowInputRequest === true,
+      body.handoffSupported === true,
+      parseHandoffPolicy(body.handoffPolicy),
+    );
+    sessionManager.setUsageRole(managed.id, String(body.origin) === "delegation" ? "delegated" : "root");
+    if (managed.mcpManager) {
+      observedMcpServers = managed.mcpManager.getServerConnections();
+    }
+    if (!managed._promptDone || managed._promptInflight) {
+      // _promptInflight covers the synthetic-parent-prompt path that may
+      // be holding the brain even when _promptDone has already flipped
+      // back to true momentarily during synth setup. Both must be clear
+      // before a fresh HTTP /prompt can claim brain.prompt().
+      logPromptResponse(409, "busy", "Session is already running", managed.id);
+      sendJson(res, 409, {
+        error: "Session is already running. Use the steer endpoint to add input to the active prompt.",
+        sessionId: managed.id,
+      });
+      return;
+    }
+
+    // Fill in wire-compat keys the caller left unstated, for THIS turn's binding
+    // and for every routing candidate, before any of them reaches
+    // registerProvider. A control plane that answers config.getModelBinding
+    // itself supplies the whole modelConfig and the runtime forwards it verbatim,
+    // so the descriptor-side resolution never runs on that path — which is how
+    // the adaptive-thinking 400 survived being fixed there. Mutating our own
+    // parsed body is deliberate: every later use (the binding candidate,
+    // setDelegationModel, the params lookup) then sees the same resolved config.
+    if (body.modelConfig) body.modelConfig = withResolvedModelCompat(body.modelConfig);
+    const configuredModelRouting = withResolvedCandidateCompat(normalizeModelRoutePolicy(
+      body.modelRouting !== undefined ? body.modelRouting : loadConfig().modelRouting,
+    ));
+    if (body.modelProvider && body.modelId) {
+      const clearedUserSelection = clearModelRouteUserSelectionIfDifferent(managed.modelRouteState, {
+        provider: body.modelProvider,
+        modelId: body.modelId,
+      });
+      if (clearedUserSelection) {
+        sessionManager.persistModelRouteState(managed.id, managed.modelRouteState);
+      }
+    }
+    // Every prompt flows through the single routing-runner entry below (see
+    // resolveEffectivePolicy): real multi-candidate routing when a fallback
+    // target exists, otherwise a single-candidate run built from the current
+    // model. Both stream the primary live and emit model_route_* on the extra
+    // event channel, so brain events route through it for every turn.
+    managed.modelRoutePolicy = configuredModelRouting;
+    // Mark the session busy before model setup so a refresh, second tab, or
+    // fast double-submit cannot start a second prompt on the same brain.
+    managed._promptDone = false;
+    managed._aborted = false;
+    // LLM-call timeline: the prompt is accepted NOW. Everything between here and
+    // the first provider request (model setup, media preflight, language
+    // detection, routing preflight) is round 1's `since_prev_ms` (= setup).
+    managed.brain.llmCalls?.beginPrompt(Date.now(), { explicit: true });
+    // Pre-spawn Stop: a /abort that arrived before this session existed recorded a pending abort.
+    // Consume it HERE — AFTER the unconditional `_aborted = false` reset above (placing it before
+    // would be wiped by that reset) — so the pre-prompt latch below short-circuits this turn.
+    managed._currentTurnId = body.turnId;
+    // Accepted: the session is claimed and this turn is going to run. Recorded
+    // BEFORE the ack, because a record that landed after it would leave open
+    // exactly the window it exists to close. A 409/412 above returns earlier and
+    // deliberately records nothing — that turn did not run.
+    if (body.turnId) sessionManager.recordAcceptedTurn(managed.id, body.turnId);
+    if (sessionManager.consumePendingAbort(managed.id, body.turnId)) {
+      managed._aborted = true;
+      managed._backgroundWorkTurn?.cancel();
+      console.log(`[agentbox-http] Consumed pre-spawn pending abort for session ${managed.id}`);
+    }
+    // Default to the extra channel; refined to false only for the no-current-model
+    // edge before the run kicks off (see effectivePolicy below). No brain prompt
+    // events fire during model setup, so this default is never observed wrongly.
+    managed._routeBrainEventsThroughExtra = true;
+    // Acquire the brain.prompt mutex synchronously before any await so the
+    // synth notify path (which polls _promptDone via waitForParentIdle)
+    // cannot race in and call brain.prompt() concurrently — see jacoblee
+    // #2/#3 in the PR review thread.
+    let releasePromptInflight!: () => void;
+    managed._promptInflight = new Promise<void>((resolve) => { releasePromptInflight = resolve; });
+    // New turn: lets tools retire per-attempt state (see ToolRefs.turnRef).
+    if (managed.turnRef) managed.turnRef.current += 1;
+    managed._eventBuffer = [];
+    // Unsubscribe previous buffer listener if any
+    if (managed._bufferUnsub) {
+      managed._bufferUnsub();
+    }
+    // Subscribe to buffer events so SSE can replay them even if it connects late
+    const brainUnsub = managed.brain.subscribe((event) => {
+      if (!managed._promptDone && !managed._routeBrainEventsThroughExtra) {
+        managed._eventBuffer.push(decorateBackgroundWorkEvent(event, managed._backgroundWorkTurn));
+      }
+    });
+
+    managed._bufferUnsub = () => {
+      brainUnsub();
+    };
+
+    // If any setup step throws (setModel network blip, registerProvider edge
+    // case, fs write in profile sync, etc.) before brain.prompt() is kicked
+    // off, _promptDone stays false forever and every subsequent prompt
+    // returns 409 — the session is permanently locked. Run cleanup that
+    // mirrors actuallyFinish (minus diagnostics + scheduleRelease, since the
+    // prompt never actually started) and surface as 500.
+    const releasePromptLockOnSetupFailure = (err: unknown): void => {
+      console.error(`[agentbox-http] Prompt setup failed for session ${managed.id}:`, err);
+      managed._promptDone = true;
+      managed._routeBrainEventsThroughExtra = false;
+      managed.brain.llmCalls?.endPrompt({ explicit: true });
+      if (managed._bufferUnsub) {
+        managed._bufferUnsub();
+        managed._bufferUnsub = null;
+      }
+      for (const cb of managed._promptDoneCallbacks) {
+        try { cb(); } catch { /* swallow — best-effort signal */ }
+      }
+      managed._promptDoneCallbacks.clear();
+      // Release the brain.prompt mutex so a follow-up prompt isn't blocked.
+      managed._promptInflight = null;
+      releasePromptInflight();
+      // Cleanup before the response is logged and sent: a setup failure leaves the
+      // turn's credential-bearing tier state installed, and a later synthetic turn
+      // carries no HTTP body to overwrite it.
+      clearTurnTierState(managed);
+      logPromptResponse(500, "setup_failed", err, managed.id);
+      sendJson(res, 500, { error: err instanceof Error ? err.message : String(err) });
+    };
+
+    let promptText: string;
+    try {
+      if (body.modelProvider || body.modelId || body.modelConfig) {
+        sessionManager.setDelegationModel({
+          provider: body.modelProvider,
+          modelId: body.modelId,
+          config: body.modelConfig,
+        });
+      }
+
+      // Tier candidates are TURN state and are installed unconditionally —
+      // including being cleared. Skipping the assignment when the field is absent
+      // would let the previous turn's credentials stay live on this session.
+      //
+      // Compat resolution matters here for the same reason it does for routing
+      // candidates: a descriptor without `api` is dropped by pi's `parseModels`
+      // and surfaces as "model not found" rather than as a protocol error.
+      managed.subagentTierCandidates = resolveTurnTierCandidates(body.subagentTiers);
+
+      // Provider registration and model lookup for this turn's binding are NOT
+      // done here — they belong to `runAttempt`, per candidate. See
+      // `resolveEffectivePolicy` for why, and `requestBindingCandidate` below for
+      // how the binding reaches it.
+
+      // Runtime tunables (modelConfig.params) are applied per candidate, AFTER
+      // that candidate's setModel — see applyCandidateModelParams at the runner
+      // call below. Applying them here would be before the model switch, which
+      // pi silently discards.
+
+      if (requiredInputsForPromptMedia(promptMedia).length > 0) {
+        if (shouldUseModelRouteRunner(configuredModelRouting, managed.modelRouteState)) {
+          const candidates = normalizeCandidates(configuredModelRouting?.candidates);
+          if (filterCandidatesForPromptMedia(candidates, promptMedia).length === 0) {
+            throw new Error(unsupportedPromptMediaMessage(promptMedia));
+          }
+        } else {
+          const candidate = singleCandidateForMediaPreflight(body, configuredModelRouting);
+          if (!candidate || !candidateSupportsPromptMedia(candidate, promptMedia)) {
+            throw new Error(unsupportedPromptMediaMessage(promptMedia));
+          }
+        }
+      }
+
+      promptText = body.text && body.text.length > 0
+        ? body.text
+        : defaultPromptTextForMedia(promptMedia);
+    } catch (err) {
+      releasePromptLockOnSetupFailure(err);
+      return;
+    }
+
+    // --- Language detection: inject explicit instruction so model doesn't guess ---
+    // IMPORTANT: append after DP markers, not prepend before them.
+    // Prepending would break marker detection in pi-agent extension input handlers
+    // (e.g., [System: respond in Chinese]\n[Deep Investigation]\n... fails startsWith check).
+    //
+    // The directive is injected UNCONDITIONALLY (not gated on memory): following the
+    // user's language is a baseline behaviour every agent needs, independent of whether
+    // it has long-term memory. Only the PROFILE.md persistence below is a memory concern.
+    // (Previously this was accidentally gated on isMemoryEnabled() as a side effect of
+    // "disable memory by default", which left memory-off agents — e.g. the GPU-cloud
+    // sales-guide — with no language enforcement, so they drifted to the model's bias.)
+    const detectedLang = detectLanguage(promptText);
+    if (detectedLang !== "English") {
+      // Only two DP markers remain after the refactor: activation and exit.
+      const dpMarkers = [DP_ACTIVATION_MARKER, `${DP_EXIT_MARKER}\n`];
+      const matchedMarker = dpMarkers.find(m => promptText.startsWith(m));
+      if (matchedMarker) {
+        // Insert language hint after the marker: [Deep Investigation]\n[System: respond in Chinese]\n...
+        promptText = matchedMarker + `[System: respond in ${detectedLang}]\n` + promptText.slice(matchedMarker.length);
+      } else {
+        promptText = `[System: respond in ${detectedLang}]\n${promptText}`;
+      }
+    }
+
+    // Programmatically update PROFILE.md Language field (code-level, not model-dependent).
+    // Only update on non-English detection to avoid flapping: English is the default,
+    // so we only persist when the user actively uses another language.
+    if (detectedLang !== "English") {
+      try {
+        const cfg = loadConfig();
+        const userDataDir = process.env.SICLAW_USER_DATA_DIR || cfg.paths.userDataDir;
+        const profilePath = path.resolve(userDataDir, "memory", "PROFILE.md");
+        if (fs.existsSync(profilePath)) {
+          const content = fs.readFileSync(profilePath, "utf-8");
+          const currentLangMatch = content.match(/\*\*Language\*\*:\s*(.+)/i);
+          const currentLang = currentLangMatch?.[1]?.trim();
+          if (currentLang !== detectedLang) {
+            const updated = content.replace(
+              /(\*\*Language\*\*:\s*).+/i,
+              `$1${detectedLang}`,
+            );
+            fs.writeFileSync(profilePath, updated);
+          }
+        }
+      } catch { /* best-effort, don't block prompt */ }
+    }
+
+    // Execute prompt asynchronously; notify SSE to close on completion
+    console.log(`[agentbox-http] Starting prompt for session ${managed.id} [lang=${detectedLang}]`);
+
+    // Metrics: snapshot stats before prompt for delta calculation
+    const prevStats = managed.brain.getSessionStats();
+    const promptStartTime = Date.now();
+    let promptOutcome: "completed" | "error" = "completed";
+
+    // Open the trace ROOT for this user prompt (no-op when tracing disabled).
+    // Explicit prompt boundary — NOT agent_start — so auto-retry / model-routing
+    // (which emit multiple agent_start/end pairs) stay inside one ROOT. Placed
+    // after model setup so a setModel switch is not captured as prompt activity;
+    // closed in actuallyFinish, which every terminal path funnels through.
+    const handoffTrace = normalizeHandoffTrace(body.handoffTrace);
+    tracingRecorder.startPrompt(managed.id, promptText, body.userId, handoffTrace?.traceId, handoffParentSpan(handoffTrace));
+
+    const backgroundWorkTurn = new BackgroundWorkTurn();
+    managed._backgroundWorkTurn = backgroundWorkTurn;
+    let parentReportSeen = false;
+    const reportUnsubscribe = managed.brain.subscribe((event: any) => {
+      if ((event.type !== "message_end" && event.type !== "turn_end") || event.message?.role !== "assistant") return;
+      parentReportSeen = !backgroundWorkTurn.pending && event.message.stopReason !== "toolUse"
+        && event.message.stopReason !== "error" && event.message.stopReason !== "aborted"
+        && assistantTextBlocks(event.message).some(block => block.text.trim() && block.phase !== "commentary");
+    });
+
+    const actuallyFinish = () => {
+      backgroundWorkTurn.cancel();
+      reportUnsubscribe();
+      managed._promptDone = true;
+      managed._routeBrainEventsThroughExtra = false;
+      managed.brain.llmCalls?.endPrompt({ explicit: true });
+      clearTurnTierState(managed);
+
+      // Emit prompt metrics via diagnostic event bus
+      const currStats = managed.brain.getSessionStats();
+      const model = managed.brain.getModel();
+      emitDiagnostic({
+        type: "prompt_complete",
+        sessionId: managed.id,
+        prev: prevStats,
+        curr: currStats,
+        model,
+        durationMs: Date.now() - promptStartTime,
+        outcome: promptOutcome,
+        userId: sessionManager.userId,
+      });
+
+      // Stop buffering
+      if (managed._bufferUnsub) {
+        managed._bufferUnsub();
+        managed._bufferUnsub = null;
+      }
+      for (const cb of managed._promptDoneCallbacks) {
+        cb();
+      }
+      managed._promptDoneCallbacks.clear();
+
+      // Release the brain.prompt mutex so any queued synth notify or the
+      // next HTTP /prompt can proceed. Promise.resolve() is idempotent
+      // per spec — re-calling on an already-resolved promise is a no-op.
+      managed._promptInflight = null;
+      releasePromptInflight();
+
+      // Close the trace ROOT, attaching authoritative token/cost deltas
+      // (getSessionStats post − pre). No-op when tracing disabled.
+      tracingRecorder.endPrompt(managed.id, promptOutcome);
+
+      // Schedule delayed release — gives frontend time to query context/model
+      // after SSE closes. If a new prompt arrives before the TTL, the timer is
+      // cancelled in getOrCreate() and the session stays alive.
+      sessionManager.scheduleRelease(managed.id);
+    };
+    const onPromptFinish = () => {
+      // If the agent is still active, auto-compaction is in progress, or an
+      // auto-retry is pending, defer SSE close until the agent is truly done —
+      // otherwise the frontend misses events.
+      if (managed.isAgentActive || managed.isCompacting || managed.isRetrying) {
+        console.log(`[agentbox-http] Prompt resolved but agent still busy for session ${managed.id} (active=${managed.isAgentActive} compacting=${managed.isCompacting} retrying=${managed.isRetrying}), deferring SSE close`);
+        // Re-open the live path for THIS window. Brain events are diverted to the
+        // routing runner only while an attempt could still be discarded by a
+        // fallback; the prompt has resolved, so no further attempt can run and
+        // there is nothing left to discard. Leaving the diversion in place makes
+        // the work this branch waits for invisible: `runAttempt` unsubscribes
+        // when `brain.prompt()` returns, so events after that reach the runner
+        // either — and `auto_compaction_end` in particular is the ONLY thing that
+        // clears the frontend's compacting state (`setIsCompacting(false)` has no
+        // other caller), so losing it pins the UI in "compacting" for good.
+        managed._routeBrainEventsThroughExtra = false;
+        const unsub = managed.brain.subscribe((event: any) => {
+          if (event.type === "agent_end" || event.type === "auto_compaction_end" || event.type === "auto_retry_end") {
+            // Use setTimeout to let synchronous follow-up events (e.g.
+            // auto_compaction_start right after agent_end, or agent_start
+            // right after auto_retry_end) fire first.
+            setTimeout(() => {
+              if (!managed.isCompacting && !managed.isAgentActive && !managed.isRetrying) {
+                unsub();
+                actuallyFinish();
+              }
+            }, 50);
+          }
+        });
+        return;
+      }
+      actuallyFinish();
+    };
+
+    const emitSessionExtraEvent = (event: unknown): void => {
+      const payload: Record<string, unknown> =
+        event && typeof event === "object" && !Array.isArray(event)
+          ? event as Record<string, unknown>
+          : { type: "model_route_event", value: event };
+      // Feed the trace recorder before the SSE fan-out, and unconditionally —
+      // this is the routing path's brain-event + model_route_* source, and it
+      // must reach the recorder even when no SSE client is connected yet.
+      tracingRecorder.handleEvent(managed.id, payload);
+      if (managed._extraEventSubs.size === 0) {
+        managed._extraEventBuffer.push(payload);
+        return;
+      }
+      for (const sub of managed._extraEventSubs) {
+        try { sub(payload); } catch { /* best-effort SSE bridge */ }
+      }
+    };
+
+    const emitRouteEvent = (event: ModelRouteEvent): void => {
+      // Round numbering must survive a live-primary rollback: the discarded
+      // attempt's rounds are rewound so the surviving candidate's first call is
+      // round 1 again (attempt +1). See LlmCallRecorder.rollbackAttempt.
+      if (event.type === "model_route_attempt" && event.status === "started") {
+        managed.brain.llmCalls?.beginAttempt(event.attempt);
+      } else if (
+        (event.type === "model_route_attempt" && event.status === "failed") ||
+        event.type === "model_route_rollback"
+      ) {
+        managed.brain.llmCalls?.rollbackAttempt();
+      }
+      emitSessionExtraEvent({ ...event, sessionId: managed.id });
+    };
+
+    // Pre-prompt latch: a Stop that landed during model setup (or a consumed pre-spawn pending
+    // abort) set `_aborted` true. Do NOT start the run — finish cleanly so the session unlocks
+    // and the SSE stream closes. Reset `_aborted` so the NEXT prompt isn't wrongly skipped.
+    if (managed._aborted) {
+      console.log(`[agentbox-http] Prompt for ${managed.id} aborted before start (pre-prompt latch)`);
+      managed._aborted = false;
+      // Use actuallyFinish (NOT onPromptFinish): no brain run started, so there is no
+      // agent_end/auto_*_end event coming. onPromptFinish would take its deferred branch and
+      // wait forever if isAgentActive/isCompacting/isRetrying were left stale-true by a prior
+      // abnormal turn — permanently locking the session at 409. actuallyFinish unlocks now.
+      actuallyFinish();
+      logPromptResponse(200, "aborted_before_start", undefined, managed.id);
+      sendJson(res, 200, { ok: true, sessionId: managed.id, turnId: body.turnId, resumed, aborted: true });
+      return;
+    }
+
+    // Single entry: every prompt goes through the routing runner. With no real
+    // fallback target it runs one candidate live — identical UX to a bare prompt,
+    // but still emitting model_route_* so every turn carries its model identity on
+    // one channel. That candidate is this turn's BINDING when the request carried
+    // one (the runner registers its config and looks it up), else the current model.
+    const effectivePolicy = resolveEffectivePolicy(
+      configuredModelRouting,
+      managed.modelRouteState,
+      managed.brain.getModel?.(),
+      bindingCandidateForRun(body, managed.brain),
+    );
+    // Only the no-current-model edge falls back to a bare brain.prompt (runner
+    // guard) whose events flow through the live _eventBuffer subscription.
+    managed._routeBrainEventsThroughExtra = effectivePolicy !== undefined;
+    const runPrompt = (text: string, media?: typeof promptMedia) => runPromptWithModelRouting(
+      managed.brain,
+      text,
+      effectivePolicy,
+      managed.modelRouteState,
+      {
+        emitEvent: emitRouteEvent,
+        // The runner streams/replays brain events through this callback instead
+        // of the live SSE subscription that enriches agent_end — re-apply the
+        // same enrichment so token/cost stats survive on every turn.
+        emitBrainEvent: (event) => emitSessionExtraEvent(decorateBackgroundWorkEvent(enrichAgentEndEvent(managed.brain, event), backgroundWorkTurn)),
+        onStateChange: () => sessionManager.persistModelRouteState(managed.id, managed.modelRouteState),
+        shouldAbort: () => managed._aborted,
+        applyCandidateModelParams: (candidate) => {
+          applyModelParamsForCandidate(managed.brain, candidate, body.modelConfig);
+        },
+        // Publish the candidate this turn is actually running on, so a
+        // spawn_subagent issued DURING the prompt can fall back to it. Nothing
+        // else can answer that mid-turn: activeCandidateKey is only written after
+        // an attempt succeeds, and getModel() carries no credentials or params.
+        onAttemptReady: (candidate) => {
+          managed.effectiveModelCandidate = candidate;
+          // Captured HERE, after the runner applied this candidate's params, so it
+          // is the parent's real level rather than a clamped or default-shaped
+          // guess. A child that falls back from a tier restores to this.
+          managed.effectiveModelParams = managed.brain.captureModelParams?.() ?? null;
+        },
+        // The runner owns this flag for the duration of the run, because only it
+        // can flip it in the same synchronous block as its own subscribe /
+        // unsubscribe. Doing it here off the promise instead left a microtask in
+        // which neither the runner nor the live subscription below was
+        // listening — long enough to lose an `auto_compaction_end`, which is the
+        // only thing that clears the frontend's compacting state.
+        onEventCaptureChange: (capturing) => {
+          managed._routeBrainEventsThroughExtra = capturing;
+        },
+      },
+      media,
+      requiredResultToolName
+        ? { requiredResultToolName }
+        : undefined,
+    );
+
+    // Keep the original stream, prompt mutex, trace and persistence consumer alive
+    // through required child completion and parent synthesis. No detached reply path.
+    const promptPromise = (async () => {
+      let result = await runPrompt(promptText, promptMedia);
+      while (!managed._aborted && result?.success !== false) {
+        const notifications = await backgroundWorkTurn.next();
+        if (managed._aborted) break;
+        const steer = backgroundWorkTurn.takeSteer();
+        if (steer) {
+          parentReportSeen = false;
+          result = await runPrompt(steer.text, steer.media);
+          continue;
+        }
+        if (notifications.length === 0) {
+          if (backgroundWorkTurn.jobIds.length && !backgroundWorkTurn.isCancelled && !parentReportSeen) {
+            throw new Error("Required background work finished without a parent report");
+          }
+          break;
+        }
+        parentReportSeen = false;
+        result = await runPrompt(backgroundWorkTurn.resultPrompt(notifications));
+      }
+      return result;
+    })();
+
+    promptPromise.then((result) => {
+      // The routing runner reports exhaustion (and user aborts) as a result,
+      // not a rejection — logging those as "completed" hid silent-failure
+      // turns during incident triage.
+      if (result && result.success === false) {
+        console.warn(`[agentbox-http] Prompt finished without success for session ${managed.id} (${result.finalFailureKind ?? "unknown"}: ${result.finalErrorMessage ?? "no error message"})`);
+        promptOutcome = "error";
+        if (!managed._aborted && backgroundWorkTurn.jobIds.length) sessionManager.stopSessionJobs(managed.id, backgroundWorkTurn.jobIds);
+      } else {
+        console.log(`[agentbox-http] Prompt completed for session ${managed.id}`);
+        promptOutcome = "completed";
+        const latestSkills = managed.getSkillSnapshot?.();
+        if (latestSkills) {
+          managed.skillNames = [...latestSkills.skillNames].sort();
+          managed.skillDigests = { ...latestSkills.skillDigests };
+        }
+        observedHarness = {
+          agentType: sessionManager.agentTypeState,
+          // Preserve the configured Agent prompt that completed this turn. This
+          // is deliberately not labelled as the final compiled system prompt.
+          systemPromptTemplate: body.systemPromptTemplate ?? null,
+          skillNames: [...managed.skillNames],
+          skillDigests: { ...managed.skillDigests },
+          toolNames: [...managed.toolNames],
+          observedAt: new Date().toISOString(),
+        };
+        // Read BEFORE onPromptFinish below: that funnels into `actuallyFinish`,
+        // which calls `clearTurnTierState` and nulls the candidates. Recording
+        // after it would report `candidatesRevision: null` on every turn — a field
+        // that always says the feature is broken is worse than no field.
+        //
+        // Recorded unconditionally, unlike `model` just below, which only records
+        // when the box confirms it ran the INTENDED model. There is no equivalent
+        // intent to check here: "this turn carried no tiers" is a real and useful
+        // observation, and suppressing it is what makes a box that lost its tiers
+        // look like a box too old to report.
+        observedTiers = {
+          menuRevision: managed.subagentTierMenu?.revision ?? null,
+          candidatesRevision: managed.subagentTierCandidates?.revision ?? null,
+          observedAt: new Date().toISOString(),
+        };
+        const intendedCandidate = body.modelProvider && body.modelId
+          ? candidateKey({ provider: body.modelProvider, modelId: body.modelId })
+          : undefined;
+        const ranIntendedModel = intendedCandidate !== undefined
+          && result?.activeCandidateKey === intendedCandidate;
+        if (ranIntendedModel && body.releaseId && body.modelFingerprint) {
+          observedModel = {
+            releaseId: body.releaseId,
+            modelFingerprint: body.modelFingerprint,
+            observedAt: new Date().toISOString(),
+          };
+        }
+      }
+      onPromptFinish();
+    }).catch((err) => {
+      console.error(`[agentbox-http] Prompt error for session ${managed.id}:`, err);
+      promptOutcome = "error";
+      if (backgroundWorkTurn.jobIds.length) sessionManager.stopSessionJobs(managed.id, backgroundWorkTurn.jobIds);
+      emitSessionExtraEvent({ type: "message_end", message: { role: "assistant", stopReason: "error", errorMessage: backgroundWorkTurn.jobIds.length ? "Parent task could not finish its background-work report" : "Agent execution failed", content: [] } });
+      onPromptFinish();
+    });
+
+    logPromptResponse(200, "accepted", undefined, managed.id);
+    sendJson(res, 200, { ok: true, sessionId: managed.id, turnId: body.turnId, resumed, traceId: tracingRecorder.getRootTraceId(managed.id) });
+  });
+
+  /**
+   * GET /api/stream/:sessionId - SSE event stream
+   *
+   * Subscribe to the event stream of the specified session.
+   */
+  addRoute("GET", "/api/stream/:sessionId", async (req, res, params) => {
+    const { sessionId } = params;
+    console.log(`[agentbox-http] SSE stream request for session ${sessionId}`);
+    const managed = sessionManager.get(sessionId);
+
+    if (!managed) {
+      console.log(`[agentbox-http] Session ${sessionId} not found`);
+      sendJson(res, 404, { error: "Session not found" });
+      return;
+    }
+
+    console.log(`[agentbox-http] Starting SSE stream for session ${sessionId}`);
+
+    // Track active SSE connections for idle self-destruct
+    activeSseCount++;
+    resetIdleTimer();
+
+    // Set SSE response headers
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+      "Access-Control-Allow-Origin": "*",
+    });
+
+    // Track connection state
+    let closed = false;
+    let sseEventCount = 0;
+
+    // Write a single SSE event
+    const writeEvent = (event: unknown) => {
+      if (closed || res.writableEnded) return;
+      try {
+        sseEventCount++;
+        const data = JSON.stringify(stripUserDirectiveFromEvent(event));
+        res.write(`data: ${data}\n\n`);
+      } catch (err) {
+        console.warn(`[agentbox-http] SSE write error for session ${sessionId}:`, err);
+        closed = true;
+      }
+    };
+
+    // Close SSE helper
+    const closeSSE = () => {
+      if (!closed && !res.writableEnded) {
+        closed = true;
+        res.end();
+      }
+    };
+
+    // Replay any buffered events (emitted before SSE connected)
+    for (const event of managed._eventBuffer) {
+      writeEvent(event);
+    }
+    // Replay extra (tool-pushed) events that arrived before SSE connected.
+    // These are tagged events like { type: "subagent_event", ... } from
+    // the spawn_subagent bridge — and, for routed prompts, ALL brain events
+    // (routing replays them through the extra channel, bypassing _eventBuffer).
+    const extraReplayCount = managed._extraEventBuffer.length;
+    for (const event of managed._extraEventBuffer) {
+      writeEvent(event);
+    }
+    managed._extraEventBuffer.length = 0;
+
+    // If prompt already finished before SSE connected, close immediately
+    if (managed._promptDone) {
+      console.log(`[agentbox-http] Prompt already done for session ${sessionId}, closing SSE after replay (${managed._eventBuffer.length} brain + ${extraReplayCount} extra events)`);
+      closeSSE();
+      return;
+    }
+
+    // Subscribe to the session's extra event bus (tool-pushed events — see
+    // ToolRefs.sessionEventEmitter). Unsubscribed alongside the brain
+    // subscription in unsubAll below.
+    const extraSub = (event: Record<string, unknown>) => writeEvent(event);
+    managed._extraEventSubs.add(extraSub);
+
+    // Subscribe to Agent events (live, after buffer replay)
+    const unsubscribe = managed.brain.subscribe((event: any) => {
+      if (managed._routeBrainEventsThroughExtra) return;
+      // Enrich agent_end with context usage so frontend can display token stats
+      writeEvent(decorateBackgroundWorkEvent(enrichAgentEndEvent(managed.brain, event), managed._backgroundWorkTurn));
+    });
+
+    // Heartbeat: send SSE comment every 30s to keep connection alive
+    // during long agent thinking periods (prevents proxy/fetch body timeouts)
+    const heartbeat = setInterval(() => {
+      if (closed || res.writableEnded) {
+        clearInterval(heartbeat);
+        return;
+      }
+      try {
+        res.write(": heartbeat\n\n");
+      } catch {
+        clearInterval(heartbeat);
+      }
+    }, 30_000);
+
+    // Cleanup helper: unsubscribe from all event sources
+    const unsubAll = () => {
+      unsubscribe();
+      managed._extraEventSubs.delete(extraSub);
+    };
+
+    // Decrement SSE counter and check idle (called once per SSE lifecycle)
+    let sseCountDecremented = false;
+    const decrementSse = () => {
+      if (!sseCountDecremented) {
+        sseCountDecremented = true;
+        activeSseCount--;
+        checkIdle();
+      }
+    };
+
+    // Close SSE when prompt completes
+    const cleanup = () => {
+      console.log(`[agentbox-http] SSE closing for session ${sessionId} (prompt done, ${sseEventCount} events sent)`);
+      clearInterval(heartbeat);
+      unsubAll();
+      closeSSE();
+      decrementSse();
+    };
+    managed._promptDoneCallbacks.add(cleanup);
+
+    // Unsubscribe when client disconnects
+    req.on("close", () => {
+      console.log(`[agentbox-http] SSE client disconnected for session ${sessionId} (${sseEventCount} events sent)`);
+      closed = true;
+      clearInterval(heartbeat);
+      managed._promptDoneCallbacks.delete(cleanup);
+      unsubAll();
+      decrementSse();
+    });
+
+    // Handle response errors
+    res.on("error", (err) => {
+      console.warn(`[agentbox-http] SSE response error for session ${sessionId}:`, err);
+      closed = true;
+      clearInterval(heartbeat);
+      managed._promptDoneCallbacks.delete(cleanup);
+      unsubAll();
+      decrementSse();
+    });
+  });
+
+  /**
+   * POST /api/sessions/:sessionId/steer - send a steer instruction (insert user message after current tool is interrupted)
+   */
+  addRoute("POST", "/api/sessions/:sessionId/steer", async (req, res, params) => {
+    const { sessionId } = params;
+    const managed = sessionManager.get(sessionId);
+
+    if (!managed) {
+      sendJson(res, 404, { error: "Session not found" });
+      return;
+    }
+
+    const body = (await parseJsonBody(req)) as { text?: string; images?: PromptImage[]; files?: PromptFile[] };
+    const promptMediaValidation = validatePromptMedia(body.images, body.files);
+    if (promptMediaValidation.error) {
+      sendJson(res, 400, { error: promptMediaValidation.error });
+      return;
+    }
+    const promptMedia = buildPromptMedia(promptMediaValidation.images, promptMediaValidation.files);
+    if (!body.text && !promptMedia) {
+      sendJson(res, 400, { error: "Missing 'text' field" });
+      return;
+    }
+
+    const steerText = body.text && body.text.length > 0
+      ? body.text
+      : defaultPromptTextForMedia(promptMedia);
+    console.log(`[agentbox-http] Steering session ${sessionId}: ${steerText.slice(0, 80)}`);
+    // Capture before awaiting brain.steer(): the active prompt may finish and
+    // clear the recorder while the steer call is being accepted. A steer is an
+    // addition to that active prompt, so it inherits this existing trace.
+    const traceId = tracingRecorder.getRootTraceId(sessionId);
+    try {
+      if (managed._backgroundWorkTurn?.queueSteer(steerText, promptMedia)) {
+        // The original request loop resumes this real input with normal persistence.
+      } else if (promptMedia) {
+        await managed.brain.steer(steerText, promptMedia);
+      } else {
+        await managed.brain.steer(steerText);
+      }
+      sendJson(res, 200, { ok: true, traceId });
+    } catch (err) {
+      console.error(`[agentbox-http] Steer error for session ${sessionId}:`, err);
+      const message = err instanceof Error ? err.message : "Steer failed";
+      const handingOff = message.includes("HANDOFF_IN_PROGRESS");
+      sendJson(res, handingOff ? 409 : 500, {
+        error: { code: handingOff ? "HANDOFF_IN_PROGRESS" : "INTERNAL_ERROR", message, retriable: true },
+      });
+    }
+  });
+
+  /**
+   * GET /api/sessions/:sessionId/dp-state — read DP mode flag for recovery.
+   *
+   * Simplified after the DP refactor: returns just `{active: boolean}` (or
+   * the legacy `{dpStatus}` shape if the session was persisted before the
+   * refactor, for one-migration transparency).
+   */
+  addRoute("GET", "/api/sessions/:sessionId/dp-state", async (_req, res, params) => {
+    const { sessionId } = params;
+    const managed = sessionManager.get(sessionId);
+
+    if (managed?.dpStateRef) {
+      sendJson(res, 200, { active: managed.dpStateRef.active });
+      return;
+    }
+
+    const persisted = sessionManager.getPersistedDpState(sessionId);
+    if (persisted) {
+      sendJson(res, 200, persisted);
+      return;
+    }
+
+    sendJson(res, 200, { active: false });
+  });
+
+  /**
+   * GET /api/sessions/:sessionId/status — explicit liveness for the in-progress turn.
+   *
+   * Source of truth for "is this session's turn still running" used by the Portal
+   * reconnect-after-refresh flow. MUST be the agentbox's own activity flags, NOT inferred
+   * from persisted chat rows: siclaw is end-only persistence, so a turn that is thinking or
+   * streaming text with no tool in flight has no "running" row — a row heuristic would miss
+   * it and the page would stop following a live turn. A not-yet-created / already-released
+   * session has no managed entry → not running.
+   */
+  addRoute("GET", "/api/sessions/:sessionId/status", async (_req, res, params) => {
+    const { sessionId } = params;
+    const managed = sessionManager.get(sessionId);
+    const running = !!managed && (managed.isAgentActive || managed.isCompacting || managed.isRetrying);
+    sendJson(res, 200, { running });
+  });
+
+  /**
+   * POST /api/sessions/:sessionId/clear-queue - clear queued steer/followUp messages
+   */
+  addRoute("POST", "/api/sessions/:sessionId/clear-queue", async (_req, res, params) => {
+    const { sessionId } = params;
+    const managed = sessionManager.get(sessionId);
+
+    if (!managed) {
+      sendJson(res, 404, { error: "Session not found" });
+      return;
+    }
+
+    console.log(`[agentbox-http] Clearing queue for session ${sessionId}`);
+    const cleared = managed.brain.clearQueue();
+    sendJson(res, 200, { ok: true, ...cleared });
+  });
+
+  /**
+   * POST /api/sessions/:sessionId/abort - abort the current prompt
+   */
+  addRoute("POST", "/api/sessions/:sessionId/abort", async (req, res, params) => {
+    const { sessionId } = params;
+    // Optional: a caller that knows WHICH turn it wants stopped names it, and a
+    // mismatch is answered as already-finished instead of stopping a successor. A
+    // caller that names nothing keeps the session-wide "stop what is running"
+    // meaning the Stop button needs.
+    const turnId = ((await parseJsonBody(req)) as { turnId?: string } | undefined)?.turnId;
+    const managed = sessionManager.get(sessionId);
+
+    // A named turn that is not the one running is EITHER already finished OR not
+    // started yet — a prompt still in flight, or a session being rebuilt. Doing
+    // nothing would silently lose the second case, so record the intent instead: a
+    // turn-scoped latch only ever short-circuits that turn's own prompt, and expires
+    // harmlessly if it never arrives.
+    if (managed && turnId !== undefined && managed._currentTurnId !== undefined && managed._currentTurnId !== turnId) {
+      sessionManager.markPendingAbort(sessionId, turnId);
+      console.log(`[agentbox-http] Abort for session ${sessionId} names turn ${turnId}, but ${managed._currentTurnId} is current; recorded a pending abort for it`);
+      sendJson(res, 200, { ok: true, pending: true, stoppedJobs: 0 });
+      return;
+    }
+
+    if (!managed) {
+      // Pre-spawn Stop: the session doesn't exist yet (Stop clicked before the prompt's
+      // getOrCreate ran). Record the intent so the imminent /api/prompt short-circuits instead
+      // of running the turn the user already cancelled. Return 200 (not 404) so the UI/gateway
+      // treats Stop as accepted. Consumed one-shot by the next /api/prompt (TTL backstop guards
+      // a Stop that never gets a following prompt).
+      sessionManager.markPendingAbort(sessionId, turnId);
+      console.log(`[agentbox-http] Abort for not-yet-created session ${sessionId}; recorded pending abort`);
+      sendJson(res, 200, { ok: true, pending: true, stoppedJobs: 0 });
+      return;
+    }
+
+    console.log(`[agentbox-http] Aborting session ${sessionId} (abort endpoint called)`);
+    managed._aborted = true;
+    managed._backgroundWorkTurn?.cancel();
+
+    // Stop is terminal: drop any queued steer/followUp so it does NOT replay on the next prompt.
+    try {
+      const cleared = managed.brain.clearQueue();
+      if (cleared.steering.length || cleared.followUp.length) {
+        console.log(`[agentbox-http] Stop cleared queue for ${sessionId}: ${cleared.steering.length} steer, ${cleared.followUp.length} followUp`);
+      }
+    } catch (err) {
+      console.warn(`[agentbox-http] clearQueue on abort failed for ${sessionId}:`, err);
+    }
+
+    // Discard buffered background-job completion notifications + cancel the coalesce timer:
+    // a job that completed moments BEFORE Stop is already past the stopSessionJobs "running"
+    // filter, and its armed coalesce timer would otherwise fire flushPendingNotifications →
+    // runSyntheticPrompt → brain.prompt() AFTER the Stop = the model "comes back to life".
+    sessionManager.discardPendingNotifications(sessionId);
+
+    // Foreground sub-agents are cancelled via the parent brain's abort signal
+    // (threaded into runSpawnedSubagent). The user's Stop should also halt the session's
+    // DETACHED background jobs (background exec + background sub-agents), which are decoupled
+    // from the turn — stop them all here so one Stop click halts everything the session runs.
+    const stoppedJobs = sessionManager.stopSessionJobs(sessionId);
+    if (stoppedJobs > 0) {
+      console.log(`[agentbox-http] Stop also halted ${stoppedJobs} background job(s) for session ${sessionId}`);
+    }
+    const outcome = await abortBrainForHttp(managed.brain, sessionId);
+    // Re-sweep AFTER brain.abort() resolves: it resolves only once the run loop fully drains
+    // (every in-flight tool call returned), so a tool call that launched a background job DURING
+    // the drain registered it AFTER the first sweep. Catch it now — this is the fix for the
+    // "background job launched mid-abort escapes Stop" bug. (On a 2s-timeout outcome the run may
+    // not have drained; the per-launch _aborted latch in createBackgroundExecExecutor is the
+    // backstop there.)
+    const reSwept = sessionManager.stopSessionJobs(sessionId);
+    if (reSwept > 0) {
+      console.log(`[agentbox-http] Re-sweep after brain.abort halted ${reSwept} background job(s) for session ${sessionId}`);
+    }
+    const totalStopped = stoppedJobs + reSwept;
+    if (outcome === "failed") {
+      sendJson(res, 500, { error: "Abort failed", stoppedJobs: totalStopped });
+      return;
+    }
+    sendJson(res, 200, { ok: true, stoppedJobs: totalStopped, ...(outcome === "timeout" ? { pending: true } : {}) });
+  });
+
+  /**
+   * POST /api/reload-{mcp,skills} — unified resource reload endpoints
+   *
+   * Each endpoint delegates to the matching AgentBoxSyncHandler:
+   * fetch → materialize → postReload.
+   * URL paths are preserved for backward compatibility.
+   */
+  let _reloadGatewayClient: GatewayClient | null = null;
+  function getReloadGatewayClient(): GatewayClient | null {
+    const gatewayUrl = process.env.SICLAW_GATEWAY_URL;
+    if (!gatewayUrl) return null;
+    if (!_reloadGatewayClient) _reloadGatewayClient = new GatewayClient({ gatewayUrl });
+    return _reloadGatewayClient;
+  }
+
+  for (const descriptor of Object.values(GATEWAY_SYNC_DESCRIPTORS)) {
+    addRoute("POST", descriptor.reloadPath, async (_req, res) => {
+      const resourceType = descriptor.type;
+      console.log(`[agentbox-http] Reloading ${resourceType} configuration`);
+
+      const client = getReloadGatewayClient();
+      // Only skip for handlers that actually need the HTTP client. Handlers
+      // with requiresGatewayClient=false (cluster/host) bring their own
+      // transport via the broker and run fine even when SICLAW_GATEWAY_URL
+      // is unset (Local mode).
+      if (descriptor.requiresGatewayClient && !client) {
+        console.warn(`[agentbox-http] No SICLAW_GATEWAY_URL configured, skipping ${resourceType} reload`);
+        sendJson(res, 200, { ok: true, count: 0, type: resourceType });
+        return;
+      }
+
+      // Prefer the per-server handler (cluster/host) to guarantee the
+      // closure binds to THIS httpServer's broker (Local mode isolation);
+      // fall back to the module-level registry for mcp/skills which are
+      // process-global and carry no per-session state.
+      const handler = perServerHandlers[resourceType] ?? getSyncHandler(resourceType);
+      if (!handler) {
+        sendJson(res, 500, { error: `No handler for sync type "${resourceType}"` });
+        return;
+      }
+
+      try {
+        const payload = await handler.fetch(client ? client.toClientLike() : null);
+        const count = await handler.materialize(payload);
+
+        // Materialization above takes effect immediately. Session refresh uses
+        // invalidate(), including skills/knowledge: brain.reload() replaces Pi's
+        // extension contexts and would break in-flight tool result delivery.
+        // Invalidation defers teardown until the session's work has drained.
+        const sessions = sessionManager.list().map((s) => ({
+          id: s.id,
+          brain: s.brain,
+          invalidate: () => sessionManager.invalidate(s.id),
+        }));
+
+        if (handler.postReload) {
+          await handler.postReload({ sessions });
+        }
+
+        console.log(`[agentbox-http] ${resourceType} reloaded: ${count} items`);
+        sendJson(res, 200, { ok: true, count, type: resourceType });
+      } catch (err: any) {
+        console.error(`[agentbox-http] Failed to reload ${resourceType}: ${err.message}`);
+        sendJson(res, 500, { error: `${resourceType} reload failed: ${err.message}` });
+      }
+    });
+  }
+
+  /**
+   * POST /api/reload-tracing — GLOBAL tracing hot-reload.
+   *
+   * Deliberately registered standalone, OUTSIDE the GATEWAY_SYNC_DESCRIPTORS
+   * loop above: tracing config never lands on disk, so the generic
+   * fetch→materialize→postReload contract does not apply. Instead we pull the
+   * latest TracingConfig from the Gateway (config.getTracingConfig, no agentId)
+   * and rebuild the in-process OTel provider via reinitTracing (serialised so
+   * concurrent local-mode boxes can't interleave shutdown+init).
+   */
+  addRoute("POST", "/api/reload-tracing", async (_req, res) => {
+    const client = getReloadGatewayClient();
+    if (!client) {
+      // Local mode without a Gateway URL: tracing is config-file driven, there
+      // is nothing to pull. Treat as a clean no-op rather than an error.
+      console.warn("[agentbox-http] No SICLAW_GATEWAY_URL configured, skipping tracing reload");
+      sendJson(res, 200, { ok: true, skipped: true });
+      return;
+    }
+    try {
+      const tracing = await client.fetchTracingConfig();
+      // `environment` is pod-env-sourced (SICLAW_TRACING_ENVIRONMENT), NOT part of
+      // the DB-only fetchTracingConfig payload. Re-merge it so the reload rebuilds
+      // the provider WITH the deployment.environment.name — matching the startup
+      // path (loadConfig). Without this, any exporter CRUD → reload → every span
+      // silently lands in Langfuse's `default` until the pod cold-restarts.
+      const environment = resolveTracingEnvironment();
+      const merged = environment ? { ...tracing, environment } : tracing;
+      // Close any in-flight traces on the CURRENT provider BEFORE the swap, so
+      // reinitTracing's teardown doesn't orphan their open spans onto a dead
+      // provider (reinit forceFlushes, so the closed spans still export).
+      tracingRecorder.abortAll();
+      await reinitTracing({ tracing: merged } as SiclawConfig);
+      console.log("[agentbox-http] tracing config reloaded");
+      sendJson(res, 200, { ok: true });
+    } catch (err: any) {
+      console.error(`[agentbox-http] Failed to reload tracing: ${err.message}`);
+      sendJson(res, 500, { error: `tracing reload failed: ${err.message}` });
+    }
+  });
+
+  /**
+   * GET /api/models - list available models (read from settings.json)
+   */
+  addRoute("GET", "/api/models", async (_req, res) => {
+    const config = loadConfig();
+    const models: Array<{ id: string; name: string; provider: string; contextWindow: number; maxTokens: number; reasoning: boolean }> = [];
+    for (const [provider, providerConfig] of Object.entries(config.providers)) {
+      for (const m of providerConfig.models) {
+        models.push({
+          id: m.id,
+          name: m.name,
+          provider,
+          contextWindow: m.contextWindow ?? 0,
+          maxTokens: m.maxTokens ?? 0,
+          reasoning: m.reasoning ?? false,
+        });
+      }
+    }
+    sendJson(res, 200, { models });
+  });
+
+  /**
+   * GET /api/sessions/:sessionId/model - get current model
+   */
+  addRoute("GET", "/api/sessions/:sessionId/model", async (_req, res, params) => {
+    const { sessionId } = params;
+    const managed = sessionManager.get(sessionId);
+
+    if (!managed) {
+      sendJson(res, 404, { error: "Session not found" });
+      return;
+    }
+
+    const model = managed.brain.getModel();
+    sendJson(res, 200, {
+      model: model ?? null,
+    });
+  });
+
+  /**
+   * PUT /api/sessions/:sessionId/model - switch model
+   */
+  addRoute("PUT", "/api/sessions/:sessionId/model", async (req, res, params) => {
+    const { sessionId } = params;
+    const managed = sessionManager.get(sessionId);
+
+    if (!managed) {
+      sendJson(res, 404, { error: "Session not found" });
+      return;
+    }
+
+    const body = (await parseJsonBody(req)) as { provider?: string; modelId?: string };
+    if (!body.provider || !body.modelId) {
+      sendJson(res, 400, { error: "Missing 'provider' and/or 'modelId'" });
+      return;
+    }
+
+    const model = managed.brain.findModel(body.provider, body.modelId);
+    if (!model) {
+      sendJson(res, 404, { error: "Model not found" });
+      return;
+    }
+
+    console.log(`[agentbox-http] Switching model for session ${sessionId}: ${model.provider}/${model.id}`);
+    await managed.brain.setModel(model);
+    markModelRouteUserSelection(managed.modelRouteState, { provider: model.provider, modelId: model.id });
+    sessionManager.persistModelRouteState(managed.id, managed.modelRouteState);
+    sendJson(res, 200, { ok: true, model });
+  });
+
+  /**
+   * GET /api/sessions/:sessionId/context - get context usage
+   */
+  addRoute("GET", "/api/sessions/:sessionId/context", async (_req, res, params) => {
+    const { sessionId } = params;
+    const managed = sessionManager.get(sessionId);
+
+    if (!managed) {
+      sendJson(res, 404, { error: "Session not found" });
+      return;
+    }
+
+    const usage = managed.brain.getContextUsage();
+    const stats = managed.brain.getSessionStats();
+    sendJson(res, 200, {
+      tokens: usage?.tokens ?? 0,
+      contextWindow: usage?.contextWindow ?? 0,
+      percent: usage?.percent ?? 0,
+      isCompacting: managed.isCompacting,
+      inputTokens: stats.tokens.input,
+      outputTokens: stats.tokens.output,
+      cacheReadTokens: stats.tokens.cacheRead,
+      cacheWriteTokens: stats.tokens.cacheWrite,
+      cost: stats.cost,
+    });
+  });
+
+  /**
+   * GET /api/sessions/:sessionId/prompt-inspection — explicit sensitive audit.
+   *
+   * Unlike sync-status and ordinary manifests this returns the exact effective
+   * system prompt. It stays behind the AgentBox's Gateway/Runtime mTLS boundary,
+   * is generated only on demand, and is never written to routine logs.
+   */
+  addRoute("GET", "/api/sessions/:sessionId/prompt-inspection", async (_req, res, params) => {
+    const managed = sessionManager.get(params.sessionId);
+    if (!managed) {
+      sendJson(res, 404, { error: "Session not found" });
+      return;
+    }
+    res.setHeader("Cache-Control", "no-store");
+    sendJson(res, 200, managed.getPromptInspection());
+  });
+
+  /**
+   * DELETE /api/sessions/:sessionId - close session
+   */
+  addRoute("DELETE", "/api/sessions/:sessionId", async (_req, res, params) => {
+    const { sessionId } = params;
+    await sessionManager.close(sessionId);
+    sendJson(res, 200, { ok: true });
+  });
+
+  /**
+   * DELETE /api/memory - reset memory indexer after Gateway clears PVC files
+   */
+  addRoute("DELETE", "/api/memory", async (_req, res) => {
+    console.log(`[agentbox-http] Resetting memory indexer`);
+    try {
+      await sessionManager.resetMemory();
+      sendJson(res, 200, { ok: true });
+    } catch (err: any) {
+      console.error(`[agentbox-http] Memory reset failed: ${err.message}`);
+      sendJson(res, 500, { error: `Memory reset failed: ${err.message}` });
+    }
+  });
+
+  // ==================== Server ====================
+
+  /** Main request handler shared by HTTP and HTTPS servers */
+  const requestHandler = async (req: http.IncomingMessage, res: http.ServerResponse) => {
+    const method = req.method || "GET";
+    const url = new URL(req.url || "/", `http://${req.headers.host}`);
+    const pathname = url.pathname;
+
+    // CORS preflight
+    if (method === "OPTIONS") {
+      res.writeHead(200, {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type, Authorization",
+      });
+      res.end();
+      return;
+    }
+
+    // mTLS Gateway identity check (HTTPS only, skip /health for K8s probes)
+    if (useTls && pathname !== "/health") {
+      if (!isAuthenticatedRuntime(req.socket as TLSSocket)) {
+        sendJson(res, 403, { error: "Trusted Gateway/Runtime certificate required" });
+        return;
+      }
+    }
+
+    // Match route
+    for (const route of routes) {
+      if (route.method !== method) continue;
+
+      const match = pathname.match(route.pattern);
+      if (!match) continue;
+
+      // Extract path parameters
+      const params: Record<string, string> = {};
+      route.paramNames.forEach((name, i) => {
+        params[name] = match[i + 1];
+      });
+
+      try {
+        await route.handler(req, res, params);
+      } catch (err) {
+        if (err instanceof HttpRequestError) {
+          console.warn(`[agentbox-http] Rejected ${method} ${pathname}: ${err.message}`);
+          if (!res.headersSent) {
+            sendJson(res, err.status, { error: err.message });
+          }
+          return;
+        }
+
+        console.error(`[agentbox-http] Error handling ${method} ${pathname}:`, err);
+        if (!res.headersSent) {
+          sendJson(res, 500, { error: "Internal server error" });
+        }
+      }
+      return;
+    }
+
+    // 404
+    sendJson(res, 404, { error: "Not found" });
+  };
+
+  // Detect TLS certificates
+  const certPath = process.env.SICLAW_CERT_PATH || "/etc/siclaw/certs";
+  const certFile = path.join(certPath, "tls.crt");
+  const keyFile = path.join(certPath, "tls.key");
+  const caFile = path.join(certPath, "ca.crt");
+  const useTls = fs.existsSync(certFile) && fs.existsSync(keyFile) && fs.existsSync(caFile);
+
+  if (useTls) {
+    console.log(`[agentbox-http] TLS certificates found at ${certPath}, starting HTTPS server`);
+    const server = https.createServer(
+      {
+        cert: fs.readFileSync(certFile),
+        key: fs.readFileSync(keyFile),
+        ca: fs.readFileSync(caFile),
+        requestCert: true,
+        rejectUnauthorized: false, // Health probes are public; other routes verify CA authorization AND OU
+      },
+      requestHandler,
+    );
+    return server;
+  }
+
+  console.log("[agentbox-http] No TLS certificates found, starting HTTP server (dev mode)");
+  const server = http.createServer(requestHandler);
+  return server;
+}

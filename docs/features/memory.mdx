@@ -1,0 +1,36 @@
+---
+title: "Investigation Memory"
+sidebarTitle: "Memory"
+description: "How Siclaw learns from past investigations to improve future diagnoses."
+---
+
+## Overview
+
+Every deep investigation helps Siclaw get better at future investigations.
+
+Siclaw stores:
+
+- a human-readable investigation report
+- a structured summary of the incident
+- searchable memory used to improve future hypothesis generation
+
+## How It Works
+
+### Writing Memory
+
+After an investigation finishes, Siclaw saves key facts such as:
+
+- likely root cause
+- affected services or resources
+- important evidence
+- recommended next steps
+
+### Reading Memory
+
+When a new investigation starts, Siclaw can look up similar past incidents and use them to improve hypothesis quality.
+
+This makes repeated incident patterns easier to recognize over time.
+
+<Warning>
+Memory search works best with an [embedding provider](/configuration/providers#embedding). Without one, Siclaw still saves investigation history, but semantic recall is reduced.
+</Warning>

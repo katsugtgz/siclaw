@@ -1,0 +1,467 @@
+import { describe, it, expect, vi } from "vitest";
+import { createSpawnSubagentTool, registration } from "./spawn-subagent.js";
+import { RUN_IN_BACKGROUND_ENABLED } from "../../core/subagent-registry.js";
+import { ToolRegistry } from "../../core/tool-registry.js";
+import type {
+  ToolRefs,
+  SpawnSubagentGroupRequest,
+  SpawnSubagentResult,
+  SubagentGroupProgress,
+  SubagentGroupResult,
+} from "../../core/tool-registry.js";
+
+function makeRefs(executor: ToolRefs["spawnSubagentExecutor"]): ToolRefs {
+  return {
+    kubeconfigRef: {} as any,
+    userId: "user-1",
+    agentId: "agent-1",
+    sessionIdRef: { current: "sess-1" },
+    taskListId: "tl-1",
+    memoryRef: {} as any,
+    dpStateRef: {} as any,
+    spawnSubagentExecutor: executor,
+  };
+}
+
+const text = (r: any) => (r.content[0] as any).text as string;
+
+describe("spawn_subagent tool — availability & registration", () => {
+  // Recursion guard: a child session is created WITHOUT a spawnSubagentExecutor, so the
+  // registration's `available` guard hides spawn_subagent from it — a sub-agent cannot spawn
+  // another. (This is the real enforcement, not a deny-list constant.)
+  it("is unavailable without an executor (no recursion — children get no spawn_subagent)", () => {
+    expect(registration.available?.(makeRefs(undefined))).toBe(false);
+    expect(registration.available?.(makeRefs(vi.fn() as any))).toBe(true);
+  });
+  it("requires user approval and is a workflow tool", () => {
+    expect(registration.requiresUserApproval).toBe(true);
+    expect(registration.category).toBe("workflow");
+  });
+});
+
+describe("spawn_subagent tool — single-task collapse path", () => {
+  it("renders one item, defaults to foreground, and surfaces the child summary as item_results[0]", async () => {
+    let captured: SpawnSubagentGroupRequest | undefined;
+    const executor = vi.fn(async (req: SpawnSubagentGroupRequest): Promise<SpawnSubagentResult> => {
+      captured = req;
+      return { status: "done", summary: "node-01 disk 92% full", childSessionId: "child-1", toolCalls: 3, durationMs: 1200 };
+    });
+    const tool = createSpawnSubagentTool(makeRefs(executor));
+    const r = await tool.execute("call-1", { description: "check node-01", items: ["Check disk usage on node-01"] });
+
+    // The tool hands the executor a batch plan (one rendered task) — never a lone `prompt`.
+    expect(captured).toMatchObject({
+      description: "check node-01",
+      subagentType: "general-purpose",
+      runInBackground: false, // single item → foreground by default
+      parentSessionId: "sess-1",
+      parentAgentId: "agent-1",
+      userId: "user-1",
+      taskListId: "tl-1",
+      spawnId: "call-1",
+    });
+    expect(captured?.renderedTasks).toEqual([
+      { item: "Check disk usage on node-01", prompt: "Check disk usage on node-01" },
+    ]);
+    expect(captured?.reducePrompt).toBeUndefined();
+
+    // Uniform model-visible envelope: always item_results[] (design decision #18).
+    const mv = JSON.parse(text(r));
+    expect(mv.status).toBe("done");
+    expect(mv.item_results).toEqual([
+      { item: "Check disk usage on node-01", status: "done", summary: "node-01 disk 92% full", child_session_id: "child-1" },
+    ]);
+    expect(mv.reduce_summary).toBeUndefined();
+    // details keep the legacy single-spawn fields the AgentWorkCard renders.
+    expect((r.details as any).child_session_id).toBe("child-1");
+    expect((r.details as any).summary).toBe("node-01 disk 92% full");
+    expect((r.details as any).tool_calls).toBe(3);
+    expect((r.details as any).item_results[0].child_session_id).toBe("child-1");
+  });
+
+  // Background is gated by RUN_IN_BACKGROUND_ENABLED (subagent-registry). While OFF, a
+  // run_in_background:true request must NOT reach the executor as a background launch — the param
+  // isn't advertised and execute() hard-forces runInBackground:false. One test covers both states.
+  it("gates run_in_background behind RUN_IN_BACKGROUND_ENABLED", async () => {
+    let captured: SpawnSubagentGroupRequest | undefined;
+    const executor = vi.fn(async (req: SpawnSubagentGroupRequest): Promise<SpawnSubagentResult> => {
+      captured = req;
+      return req.runInBackground
+        ? { status: "launched", childSessionId: "child-9", jobId: "job-9" }
+        : { status: "done", summary: "probed", childSessionId: "child-9", toolCalls: 1, durationMs: 5 };
+    });
+    const tool = createSpawnSubagentTool(makeRefs(executor));
+    const r = await tool.execute("call-bg", { description: "probe net", items: ["probe all nodes"], run_in_background: true });
+
+    if (RUN_IN_BACKGROUND_ENABLED) {
+      expect(captured?.runInBackground).toBe(true);
+      expect((r.details as any).status).toBe("launched");
+      expect((r.details as any).job_id).toBe("job-9");
+      expect(text(r)).toMatch(/do NOT poll/i);
+    } else {
+      expect(captured?.runInBackground).toBe(false);
+    }
+  });
+});
+
+describe("spawn_subagent tool — availability by session mode (real ToolRegistry.resolve)", () => {
+  // The tool's registration limits it to modes ["web","channel"]. Resolve the REAL tool
+  // list per entry path (not a hand-built tool) so we assert what each session actually gets:
+  // only `channel` (of the modes that have the tool) needs the foreground gate; a2a/api/task
+  // don't expose spawn_subagent at all, so foregrounding them would be a no-op.
+  const reg = new ToolRegistry();
+  reg.register(registration);
+  const names = (mode: string): string[] =>
+    reg.resolve({ mode: mode as any, refs: makeRefs(vi.fn() as any) }).map((t) => t.name);
+
+  it("exposes spawn_subagent in web/channel, and NOT in cli/task/api/a2a", () => {
+    expect(names("channel")).toContain("spawn_subagent");
+    expect(names("web")).toContain("spawn_subagent");
+    expect(names("cli")).not.toContain("spawn_subagent");
+    expect(names("task")).not.toContain("spawn_subagent");
+    expect(names("api")).not.toContain("spawn_subagent");
+    expect(names("a2a")).not.toContain("spawn_subagent");
+  });
+});
+
+describe("spawn_subagent tool — foregroundSubagentOnly (channel)", () => {
+  it("hides run_in_background and forces a multi-item batch to foreground", async () => {
+    let captured: SpawnSubagentGroupRequest | undefined;
+    const executor = vi.fn(async (req: SpawnSubagentGroupRequest): Promise<SpawnSubagentResult> => {
+      captured = req;
+      return { status: "done", summary: "all checked", childSessionId: "c", toolCalls: 1, durationMs: 5 };
+    });
+    const tool = createSpawnSubagentTool({ ...makeRefs(executor), foregroundSubagentOnly: true });
+
+    expect((tool.parameters as any).properties.run_in_background).toBeUndefined();
+
+    await tool.execute("call-fg", {
+      description: "triage 3 nodes",
+      items: ["check node-a", "check node-b", "check node-c"],
+    });
+    expect(captured?.runInBackground).toBe(false);
+  });
+
+  it("leaves the multi-item background default intact when NOT foregroundSubagentOnly (web/cli)", async () => {
+    let captured: SpawnSubagentGroupRequest | undefined;
+    const executor = vi.fn(async (req: SpawnSubagentGroupRequest): Promise<SpawnSubagentResult> => {
+      captured = req;
+      return req.runInBackground
+        ? { status: "launched", childSessionId: "c", jobId: "j" }
+        : { status: "done", summary: "x", childSessionId: "c", toolCalls: 1, durationMs: 5 };
+    });
+    const tool = createSpawnSubagentTool(makeRefs(executor)); // foregroundSubagentOnly unset
+    await tool.execute("call-web", {
+      description: "triage 3 nodes",
+      items: ["check node-a", "check node-b", "check node-c"],
+    });
+    expect(captured?.runInBackground).toBe(RUN_IN_BACKGROUND_ENABLED);
+  });
+});
+
+describe("spawn_subagent tool — validation fail-fast (zero executor calls)", () => {
+  it("rejects an empty items list before calling the executor", async () => {
+    const executor = vi.fn();
+    const tool = createSpawnSubagentTool(makeRefs(executor as any));
+    const r = await tool.execute("v0", { description: "x", items: [] });
+    expect(executor).not.toHaveBeenCalled();
+    expect((r.details as any).error).toBe(true);
+  });
+
+  it("rejects a bad template BEFORE calling the executor", async () => {
+    const executor = vi.fn();
+    const tool = createSpawnSubagentTool(makeRefs(executor as any));
+    const r = await tool.execute("v1", {
+      description: "diagnose pods",
+      task_template: "Investigate {{pod}} in {{ns}}",
+      items: [{ pod: "web-1" }], // missing ns
+    });
+    expect(executor).not.toHaveBeenCalled();
+    expect(text(r)).toMatch(/missing key/i);
+  });
+
+  it("rejects mixed items before calling the executor", async () => {
+    const executor = vi.fn();
+    const tool = createSpawnSubagentTool(makeRefs(executor as any));
+    const r = await tool.execute("v2", { description: "x", task_template: "{{item}}", items: ["a", { k: "v" }] as any });
+    expect(executor).not.toHaveBeenCalled();
+    expect(text(r)).toMatch(/homogeneous/i);
+  });
+
+  it("rejects an unknown subagent_type without calling the executor", async () => {
+    const executor = vi.fn();
+    const tool = createSpawnSubagentTool(makeRefs(executor as any));
+    const r = await tool.execute("v3", { description: "x", items: ["a"], subagent_type: "nope" });
+    expect(executor).not.toHaveBeenCalled();
+    expect(text(r)).toMatch(/unknown subagent_type/i);
+  });
+
+  it("errors clearly when no executor is available", async () => {
+    const tool = createSpawnSubagentTool(makeRefs(undefined));
+    const r = await tool.execute("v4", { description: "x", items: ["a"] });
+    expect(text(r)).toMatch(/not available/i);
+    expect((r.details as any).error).toBe(true);
+  });
+});
+
+describe("spawn_subagent tool — batch (map→reduce) path", () => {
+  it("passes context selection and rejects invalid modes or resume overrides before dispatch", async () => {
+    const executor = vi.fn(async (_req: SpawnSubagentGroupRequest): Promise<SubagentGroupResult> => ({ status: "launched", jobId: "job" }));
+    const tool = createSpawnSubagentTool(makeRefs(executor));
+    for (const fork_turns of ["none", "all", 2]) {
+      await tool.execute("context", { description: "Inspect node", items: ["Inspect node"], fork_turns });
+      expect(executor.mock.calls.at(-1)?.[0].forkTurns).toBe(fork_turns);
+    }
+    executor.mockClear();
+    for (const fork_turns of [0, -1, 1.5, "recent", null]) {
+      const result = await tool.execute("context", { description: "Inspect node", items: ["Inspect node"], fork_turns });
+      expect((result.details as any).error).toBe(true);
+    }
+    const result = await tool.execute("resume", { description: "Inspect node", items: ["Inspect node"], resume: "ticket", fork_turns: "none" });
+    expect((result.details as any).error).toBe(true);
+    expect(executor).not.toHaveBeenCalled();
+  });
+
+  it("preserves different complete assignments without a shared template or forced synthesis", async () => {
+    const executor = vi.fn(async (_req: SpawnSubagentGroupRequest): Promise<SubagentGroupResult> => ({
+      status: "launched", jobId: "independent-work",
+    }));
+    const prompts = [
+      "Investigate node-01 memory pressure. Report evidence and unresolved causes.",
+      "Review the supplied rollout plan for availability risks. Do not execute it.",
+    ];
+    const result = await createSpawnSubagentTool(makeRefs(executor)).execute("independent", {
+      description: "Investigate availability risks", items: prompts,
+    });
+    expect((result.details as any).error).not.toBe(true);
+    expect(executor).toHaveBeenCalledOnce();
+    expect(executor.mock.calls[0][0].renderedTasks).toEqual(prompts.map(prompt => ({ item: prompt, prompt })));
+    expect(executor.mock.calls[0][0].reducePrompt).toBeUndefined();
+  });
+
+  it("renders items, passes renderedTasks through, and defaults a multi-item batch to background", async () => {
+    let captured: SpawnSubagentGroupRequest | undefined;
+    const executor = vi.fn(async (req: SpawnSubagentGroupRequest): Promise<SubagentGroupResult> => {
+      captured = req;
+      return { status: "launched", jobId: "job-g" };
+    });
+    const tool = createSpawnSubagentTool(makeRefs(executor));
+    const r = await tool.execute("g5", {
+      description: "diagnose crashing pods",
+      task_template: "Find the root cause of {{item}} crashing.",
+      items: ["pod-a", "pod-b"],
+      reduce_prompt: "Group the causes into network/storage/other.",
+    });
+
+    expect(captured).toMatchObject({
+      description: "diagnose crashing pods",
+      subagentType: "general-purpose",
+      reducePrompt: "Group the causes into network/storage/other.",
+      spawnId: "g5",
+    });
+    expect(captured?.renderedTasks).toEqual([
+      { item: "pod-a", prompt: "Find the root cause of pod-a crashing." },
+      { item: "pod-b", prompt: "Find the root cause of pod-b crashing." },
+    ]);
+    // Conditional default: >1 item → background (only while the master switch is on).
+    if (RUN_IN_BACKGROUND_ENABLED) {
+      expect(captured?.runInBackground).toBe(true);
+      expect((r.details as any).status).toBe("launched");
+      expect((r.details as any).job_id).toBe("job-g");
+      expect(text(r)).toMatch(/do NOT poll|END YOUR TURN/i);
+    } else {
+      expect(captured?.runInBackground).toBe(false);
+    }
+  });
+
+  it("honours run_in_background:false (explicit foreground) and returns the uniform reduce envelope", async () => {
+    let captured: SpawnSubagentGroupRequest | undefined;
+    const executor = vi.fn(async (req: SpawnSubagentGroupRequest): Promise<SubagentGroupResult> => {
+      captured = req;
+      return {
+        status: "partial",
+        durationMs: 10,
+        reduceSummary: "All pods hit OOM.",
+        reduceChildSessionId: "reduce-1",
+        itemResults: [
+          { item: "pod-a", status: "done", summary: "OOM", childSessionId: "c1" },
+          { item: "pod-b", status: "failed", summary: "unreachable", childSessionId: "c2" },
+        ],
+      };
+    });
+    const tool = createSpawnSubagentTool(makeRefs(executor));
+    const r = await tool.execute("g6", {
+      description: "x",
+      items: ["pod-a", "pod-b"],
+      reduce_prompt: "summarize",
+      run_in_background: false,
+    });
+    expect(captured?.runInBackground).toBe(false);
+    const mv = JSON.parse(text(r));
+    // With a reduce stage: the model sees the reduce summary + item statuses (capsules omitted to
+    // preserve the reduce's context savings), all under the uniform `item_results` key.
+    expect(mv.reduce_summary).toBe("All pods hit OOM.");
+    expect(mv.item_results).toEqual([
+      { item: "pod-a", status: "done", summary: "OOM", child_session_id: "c1" },
+      { item: "pod-b", status: "failed", summary: "unreachable", child_session_id: "c2" },
+    ]);
+    expect(mv.status).toBe("partial");
+    // details carries the full per-item drill-in data.
+    expect((r.details as any).item_results[0].child_session_id).toBe("c1");
+    expect((r.details as any).reduce_child_session_id).toBe("reduce-1");
+  });
+
+  it("forwards live foreground child session ids with the wire-format field names", async () => {
+    const executor = vi.fn(async (
+      _req: SpawnSubagentGroupRequest,
+      onProgress?: (progress: SubagentGroupProgress) => void,
+    ): Promise<SubagentGroupResult> => {
+      onProgress?.({
+        phase: "map",
+        items: [
+          { index: 0, status: "running", childSessionId: "child-0", activity: "Running kubectl…" },
+          { index: 1, status: "queued" },
+        ],
+      });
+      onProgress?.({
+        phase: "reduce",
+        items: [
+          { index: 0, status: "done", childSessionId: "child-0" },
+          { index: 1, status: "done", childSessionId: "child-1" },
+        ],
+        reduceChildSessionId: "reduce-1",
+      });
+      return {
+        status: "done",
+        durationMs: 10,
+        reduceSummary: "done",
+        reduceChildSessionId: "reduce-1",
+        itemResults: [
+          { item: "pod-a", status: "done", summary: "ok", childSessionId: "child-0" },
+          { item: "pod-b", status: "done", summary: "ok", childSessionId: "child-1" },
+        ],
+      };
+    });
+    const updates: any[] = [];
+    const tool = createSpawnSubagentTool(makeRefs(executor));
+
+    await tool.execute(
+      "g-live",
+      { description: "x", items: ["pod-a", "pod-b"], reduce_prompt: "summarize", run_in_background: false },
+      undefined,
+      (update) => updates.push(update),
+    );
+
+    expect(updates[0].details).toEqual({
+      phase: "map",
+      items: [
+        { index: 0, status: "running", child_session_id: "child-0", activity: "Running kubectl…" },
+        { index: 1, status: "queued" },
+      ],
+    });
+    expect(updates[1].details).toEqual({
+      phase: "reduce",
+      items: [
+        { index: 0, status: "done", child_session_id: "child-0" },
+        { index: 1, status: "done", child_session_id: "child-1" },
+      ],
+      reduce_child_session_id: "reduce-1",
+    });
+  });
+
+  it("exposes per-item capsules to the model when there is NO reduce stage", async () => {
+    const executor = vi.fn(async (): Promise<SubagentGroupResult> => ({
+      status: "done",
+      durationMs: 5,
+      itemResults: [
+        { item: "pod-a", status: "done", summary: "capsule-a", childSessionId: "c1" },
+        { item: "pod-b", status: "done", summary: "capsule-b", childSessionId: "c2" },
+      ],
+    }));
+    const tool = createSpawnSubagentTool(makeRefs(executor));
+    const r = await tool.execute("g7", { description: "x", items: ["pod-a", "pod-b"] });
+    const mv = JSON.parse(text(r));
+    expect(mv.reduce_summary).toBeUndefined();
+    expect(mv.item_results).toEqual([
+      { item: "pod-a", status: "done", summary: "capsule-a", child_session_id: "c1" },
+      { item: "pod-b", status: "done", summary: "capsule-b", child_session_id: "c2" },
+    ]);
+  });
+
+  it("surfaces a tripped circuit breaker flag AND its reason via group_summary (no reduce)", async () => {
+    const executor = vi.fn(async (): Promise<SubagentGroupResult> => ({
+      status: "failed",
+      durationMs: 5,
+      circuitBroken: true,
+      groupSummary: "Circuit breaker: the first 5 sub-agents all failed with no success — likely a template error.",
+      itemResults: [
+        { item: "a", status: "failed", summary: "boom", childSessionId: "c1" },
+        { item: "b", status: "skipped", summary: "skipped", childSessionId: "" },
+      ],
+    }));
+    const tool = createSpawnSubagentTool(makeRefs(executor));
+    const r = await tool.execute("g8", { description: "x", items: ["a", "b"] });
+    const mv = JSON.parse(text(r));
+    expect(mv.circuit_broken).toBe(true);
+    expect(mv.status).toBe("failed");
+    // #7: with no reduce child, the breaker reason must still reach the model (group_summary),
+    // not be discarded. reduce_summary stays absent (no reduce ran).
+    expect(mv.reduce_summary).toBeUndefined();
+    expect(mv.group_summary).toMatch(/circuit breaker/i);
+  });
+
+  // Ops rollback lever: batch mode is now env-gated (SICLAW_SUBAGENT_GROUP_ENABLED). Default ON
+  // runs the batch; explicit false rejects a multi-item plan before any child starts and points
+  // the model at N single-item calls.
+  it("runs batch mode when enabled (default)", async () => {
+    const executor = vi.fn(async (): Promise<SubagentGroupResult> => ({ status: "launched", jobId: "j" }));
+    const tool = createSpawnSubagentTool(makeRefs(executor));
+    await tool.execute("gg", { description: "x", task_template: "{{item}}", items: ["a", "b"] });
+    expect(executor).toHaveBeenCalled();
+  });
+
+  it("rejects a batch and hints N single calls when SICLAW_SUBAGENT_GROUP_ENABLED=false", async () => {
+    const prev = process.env.SICLAW_SUBAGENT_GROUP_ENABLED;
+    process.env.SICLAW_SUBAGENT_GROUP_ENABLED = "false";
+    try {
+      const executor = vi.fn(async (): Promise<SubagentGroupResult> => ({ status: "launched", jobId: "j" }));
+      const tool = createSpawnSubagentTool(makeRefs(executor));
+      const r = await tool.execute("gg", { description: "x", task_template: "{{item}}", items: ["a", "b"] });
+      expect(executor).not.toHaveBeenCalled();
+      expect(text(r)).toMatch(/batch mode is disabled/i);
+      expect(text(r)).toMatch(/one spawn_subagent call per target/i);
+    } finally {
+      if (prev === undefined) delete process.env.SICLAW_SUBAGENT_GROUP_ENABLED;
+      else process.env.SICLAW_SUBAGENT_GROUP_ENABLED = prev;
+    }
+  });
+});
+
+describe("spawn_subagent follow-ups and target snapshots", () => {
+  it("sends one follow-up message and exposes its guidance acknowledgement without a ghost running card", async () => {
+    const executor = vi.fn(async () => ({ status: "launched" as const, jobId: "original-job", childSessionId: "child", resumeHandle: "ticket", steered: true }));
+    const tool = createSpawnSubagentTool(makeRefs(executor));
+    const result = await tool.execute("new-call", { description: "Verify interfaces", items: ["Also check eth1"], resume: "ticket" });
+    expect(executor.mock.calls[0][0]).toMatchObject({ resumeHandle: "ticket", renderedTasks: [{ prompt: "Also check eth1" }] });
+    expect(JSON.parse(text(result))).toMatchObject({ status: "steered", resume: "ticket" });
+    expect(result.details).toMatchObject({ status: "done", action: "steer" });
+  });
+  it("rejects batch or role overrides when resuming before invoking the executor", async () => {
+    const executor = vi.fn();
+    const tool = createSpawnSubagentTool(makeRefs(executor));
+    for (const extra of [{ items: ["a", "b"] }, { subagent_type: "general-purpose" }, { reduce_prompt: "merge" }, { model_tier: "large" }]) {
+      const result = await tool.execute("x", { description: "Follow up", resume: "ticket", items: ["a"], ...extra });
+      expect(JSON.parse(text(result)).error).toBe(true);
+    }
+    expect(executor).not.toHaveBeenCalled();
+  });
+  it("extracts the inventory in the runtime, passing every selected ID and coverage to the executor", async () => {
+    const executor = vi.fn(async () => ({ status: "launched" as const, jobId: "batch" }));
+    const refs = makeRefs(executor);
+    refs.readToolResult = vi.fn(async () => JSON.stringify({ total: 2, nodes: [{ uid: "u1", name: "node1" }, { uid: "u2", name: "node2" }] }));
+    const tool = createSpawnSubagentTool(refs);
+    const result = await tool.execute("batch", { description: "Inspect all nodes", task_template: "Inspect {{name}} ({{uid}})", items_from: { artifact_id: "inventory", array_pointer: "/nodes", total_pointer: "/total", fields: { name: "/name", uid: "/uid" }, identity_field: "uid" } });
+    expect(executor.mock.calls[0][0]).toMatchObject({ renderedTasks: [{ prompt: "Inspect node1 (u1)" }, { prompt: "Inspect node2 (u2)" }], targetCoverage: { total: 2, target_ids: ["u1", "u2"] } });
+    expect(JSON.parse(text(result)).coverage).toMatchObject({ total: 2, selected: 2, next_offset: null });
+  });
+});

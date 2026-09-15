@@ -1,0 +1,72 @@
+{
+  "report_summary": {
+    "desc": "Report a slice of compile progress (pages produced / contradictions auto-merged / pending), one sentence to one paragraph."
+  },
+  "source_inventory": {
+    "desc": "List bounded metadata for files in the complete frozen Raw snapshot. Optional globs are path-segment aware: * stays within one directory and ** crosses directories. The current batch list is an accountability boundary, not a visibility boundary; use this to discover neighbouring code, configuration, tests, and deployment sources without compiling sources owned by another batch."
+  },
+  "source_read": {
+    "desc": "Read a bounded UTF-8 line range from any permitted file in the complete frozen Raw snapshot. Paths are Raw-relative (with or without raw/). This tool is read-only and preserves the original source identity for evidence."
+  },
+  "source_search": {
+    "desc": "Search a literal string across permitted UTF-8 files in the complete frozen Raw snapshot, optionally narrowed by a path-segment-aware Raw-relative glob. Search has cumulative file and byte budgets; inspect truncated and budget_exhausted in the result and narrow the glob when needed. Use it for cross-component facts, symbols, configuration keys, and deployment links."
+  },
+  "propose_plan": {
+    "desc": "Call after Plan-phase alignment: submit a short, readable, reviewable compile plan (the plan argument, markdown) for the owner's approval, then stop and wait. Do not write candidate/ pages before approval arrives.",
+    "ack": "Plan submitted to the owner (the UI now shows the plan and the approve control); awaiting approval. Do not write candidate/ pages until the approval message arrives.",
+    "reminder": " (Reminder: while you are at it, maintain the candidate-page list as `- [ ] page — one line` in the ## Next Pages section of authoring/PLAN.md as your working state, to make progress easy to track; this does not affect the plan you just submitted.)"
+  },
+  "delete_candidate_page": {
+    "desc": "Delete exactly one genuinely dead Markdown page below candidate/ after merging duplicate or orphan content. Pass a path relative to candidate/ (for example `guide/old.md`). This tool cannot delete index.md/log.md, directories, non-Markdown files, symlinks, or anything outside candidate/. Fix incoming links before deleting the page.",
+    "invalid": "refused unsafe candidate path: {path}",
+    "markdown_only": "only candidate Markdown pages may be deleted: {path}",
+    "reserved": "reserved routing pages cannot be deleted: {path}",
+    "not_found": "candidate page does not exist: {path}",
+    "not_file": "candidate path is not a regular file: {path}",
+    "failed": "failed to delete candidate page {path}: {e}",
+    "deleted": "deleted candidate page: {path}"
+  },
+  "file_ticket": {
+    "desc": "Open a contradiction ticket. Always file through this tool rather than writing authoring/CONTRADICTIONS.json by hand: a hand-written row has no ticket_kind, lands as 'unclassified' at turn end, and must be re-filed. Call once per unsettled question, after you have already written your best guess into the page and marked it ⚠️. Pass: `ticket_kind` — `source_conflict` when two or more DIFFERENT raw documents genuinely disagree (the fix belongs to the source owner; the wiki only projects it), or `model_gap` when only the owner can settle it: a single source, a tone/scope call based on BRIEF.json, an illegible figure, something you could not understand. The system checks the kind against your `sources`: two+ distinct raw docs with quotes must be source_conflict; anything less must be model_gap — a mismatch is refused and you resubmit with the kind named. `title` (short), `question` (one plain-language line), `sources` ([{doc, quote}] — the passages that disagree or the basis for your call), `options` (2–4 clean candidate values, no 'use X as authoritative' phrasing), `current_value` (what you wrote into the page), `affected_pages` (candidate files carrying the ⚠️). The id is computed from the question + documents: filing the same claim again updates that ticket instead of duplicating it.",
+    "bad_kind": "file_ticket needs `ticket_kind` = one of: {kinds}",
+    "need_args": "file_ticket needs `title`, `question`, non-empty `sources` (each with `doc`), `current_value` and `affected_pages`.",
+    "kind_needs_conflict": "refused: {n} distinct raw documents are quoted ({docs}) — that is a source_conflict (the documents disagree; the source owner must settle it), not a model_gap. Resubmit with ticket_kind=source_conflict.",
+    "kind_needs_gap": "refused: only {n} raw document(s) carry a quote ({docs}) — nothing is in dispute between sources, so this is a model_gap (only the owner can settle it), not a source_conflict. Resubmit with ticket_kind=model_gap.",
+    "failed": "ticket could not be written: {e}",
+    "filed": "ticket {tid} filed ({kind}); keep compiling — do not wait for a ruling",
+    "superseded": "ticket {tid} already existed for this claim and was updated ({kind}); no duplicate was created"
+  },
+  "resolve_ticket": {
+    "desc": "Call once per contradiction ticket you have patched (one call per ticket, no batching): register which ticket (ticket_id), the value you applied (applied_value), the candidate files you actually edited (pages_edited — must cover the ticket's affected_pages), and a one-line note. This marks the ticket as patched and writes an auditable agent_report — the basis for the contradiction view showing 'AI patched' for the owner to verify. `dispatch_nonce` is stamped by the runtime for the current apply round — pass any string or omit it; the box overwrites it. Outside an apply-rulings turn the runtime stores an empty nonce so the receipt is not matched to a ruling round.",
+    "need_id": "resolve_ticket requires ticket_id",
+    "read_failed": "failed to read CONTRADICTIONS.json: {e}",
+    "not_found": "ticket {tid} not found; existing ids: {ids}",
+    "write_failed": "failed to write CONTRADICTIONS.json: {e}",
+    "registered": "ticket {tid} registered as patched (agent_report written)"
+  },
+  "exclude_source": {
+    "desc": "Declare that one raw source will NOT be compiled, or CORRECT an exclusion you already recorded. Pass `path` (relative to raw/, exact file path — no globs) and `reason` (one line the owner can understand, in the KB's language). The system validates the path against the source inventory, writes the exclusion ledger entry canonically, and de-duplicates. Calling it again for the same path with a different reason updates that row; with the same reason it is a no-op. Use remove_exclusion to lift an exclusion. These tools are the normal way to maintain authoring/EXCLUSIONS.json; editing that file by hand is permitted only as a last resort when no tool can express the fix, and the system re-canonicalizes the ledger after every turn either way.",
+    "need_args": "exclude_source needs both `path` and `reason`.",
+    "not_in_inventory": "not a raw source on record: {path}{hint}",
+    "hint_close": " — did you mean: {close}?",
+    "already": "already excluded with that same reason (nothing to do): {path}",
+    "updated": "exclusion reason updated: {path}",
+    "failed": "exclusion could not be written: {e}",
+    "done": "excluded with reason on record: {path}"
+  },
+  "remove_exclusion": {
+    "desc": "Lift an exclusion — use it when a source was excluded by mistake and should be compiled after all, or when a wrong row has to go. Pass `path`: the exact raw-relative source path, or, for a legacy hand-written row, that row's pattern string verbatim (for example `logs/**`). Matching is by exact pattern, never by what the pattern would match, so neighbouring rows are never taken out with it; it reports how many rows were removed. To only change an exclusion's REASON, call exclude_source again with the new reason instead.",
+    "need_args": "remove_exclusion needs `path`.",
+    "not_found": "no exclusion row matches: {path}{hint}",
+    "hint_close": " — did you mean: {close}?",
+    "failed": "exclusion could not be removed: {e}",
+    "done": "exclusion lifted ({count} row(s) removed): {path}"
+  },
+  "report_domain": {
+    "desc": "One **complete** sentence naming the DOMAIN this knowledge base covers and the kind of question it can answer. It exists so another agent can decide whether to open this library at all — not an inventory, not prose. **Shape**: one topic sentence; aim ~55 characters, hard max 100; over the max is refused and you must rewrite — the system will **not** truncate for you. Do not write \"domain: A, B, C\", a colon followed by a list, page names, or counts — an inventory goes stale every compile, and omitting a topic makes a router SKIP the library that had the answer; a slightly broad domain only costs one extra open. Good: \"GPU cluster hardware health checks and fault diagnosis\". Bad: \"Cluster operations: node troubleshooting, network diagnosis, storage expansion, alert handling\". It matters most when the library's name is vague (\"general knowledge base\").",
+    "need_args": "domain is required: one sentence naming the field this library covers.",
+    "done": "domain recorded: {domain}",
+    "too_long": "not recorded: domain exceeds {limit} characters. Shorten to one complete topic sentence and call again (aim ~{target} chars; no inventory, no half sentence). The system will not truncate for you.",
+    "failed": "domain could not be written to disk: {e}. Do not resubmit the same sentence until the workspace is writable."
+  }
+}

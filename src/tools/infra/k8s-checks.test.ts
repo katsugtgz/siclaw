@@ -1,0 +1,204 @@
+import { describe, it, expect, vi, beforeEach } from "vitest";
+
+// Use vi.hoisted so the mock target is available when vi.mock's factory runs.
+const { mockExecFile } = vi.hoisted(() => ({ mockExecFile: vi.fn() }));
+
+vi.mock("node:child_process", async () => {
+  const util = await import("node:util");
+  const execFileMock = Object.assign(
+    () => { throw new Error("raw execFile not supported in test; use promisified"); },
+    {
+      [util.promisify.custom]: async (cmd: string, args: string[], opts?: any) => {
+        try {
+          return await mockExecFile(cmd, args, opts);
+        } catch (err: any) {
+          const e = err instanceof Error ? err : new Error(String(err));
+          if (err?.stdout !== undefined) (e as any).stdout = err.stdout;
+          if (err?.stderr !== undefined) (e as any).stderr = err.stderr;
+          throw e;
+        }
+      },
+    },
+  );
+  return { execFile: execFileMock };
+});
+
+import { checkNodeReady, checkPodRunning, waitForPodDone } from "./k8s-checks.js";
+
+beforeEach(() => {
+  mockExecFile.mockReset();
+});
+
+describe("checkNodeReady", () => {
+  it("returns null when status is True", async () => {
+    mockExecFile.mockResolvedValueOnce({ stdout: "True" });
+    expect(await checkNodeReady("node-1")).toBeNull();
+  });
+
+  it("returns error message when status is not True", async () => {
+    mockExecFile.mockResolvedValueOnce({ stdout: "False" });
+    const err = await checkNodeReady("node-1");
+    expect(err).toContain("not Ready");
+    expect(err).toContain("status: False");
+  });
+
+  it("does not send the reader to a field that cannot produce this condition", async () => {
+    // The old message offered "down, cordoned, or experiencing issues". Cordoning sets
+    // spec.unschedulable and leaves Ready=True, so it can never be the cause of a non-True Ready —
+    // naming it costs a wasted `kubectl get node -o yaml` on the wrong field. A non-True Ready comes
+    // from the kubelet: not reporting, or reporting a problem.
+    //
+    // Reverting this message failed nothing in the whole suite, which is why the guard is here.
+    mockExecFile.mockResolvedValueOnce({ stdout: "False" });
+    const err = (await checkNodeReady("node-1")) ?? "";
+    expect(err).not.toMatch(/cordon/i);
+    expect(err).toMatch(/kubelet/i);
+    // and it names the command that actually shows the cause
+    expect(err).toContain("kubectl describe node node-1");
+  });
+
+  it("returns 'unknown' when status empty", async () => {
+    mockExecFile.mockResolvedValueOnce({ stdout: "" });
+    const err = await checkNodeReady("node-1");
+    expect(err).toContain("unknown");
+  });
+
+  it("returns node-not-found message when kubectl says 'not found'", async () => {
+    const err = Object.assign(new Error("kubectl fail"), { stderr: 'Error: nodes "bad" not found' });
+    mockExecFile.mockRejectedValueOnce(err);
+    const result = await checkNodeReady("bad");
+    expect(result).toContain("does not exist");
+  });
+
+  it("returns generic failure message on other errors", async () => {
+    const err = Object.assign(new Error("boom"), { stderr: "random error" });
+    mockExecFile.mockRejectedValueOnce(err);
+    const result = await checkNodeReady("bad");
+    expect(result).toContain("Failed to check node");
+  });
+
+  it("passes kubeconfig flag when supplied", async () => {
+    mockExecFile.mockResolvedValueOnce({ stdout: "True" });
+    await checkNodeReady("node-1", undefined, "/tmp/kc");
+    const argsArray = mockExecFile.mock.calls[0][1] as string[];
+    expect(argsArray[0]).toBe("--kubeconfig=/tmp/kc");
+  });
+});
+
+describe("checkPodRunning", () => {
+  it("returns null when phase is Running", async () => {
+    mockExecFile.mockResolvedValueOnce({ stdout: "Running" });
+    expect(await checkPodRunning("p", "ns")).toBeNull();
+  });
+
+  it("returns non-running error with phase info", async () => {
+    mockExecFile.mockResolvedValueOnce({ stdout: "Pending" });
+    const err = await checkPodRunning("p", "ns");
+    expect(err).toContain("not Running");
+    expect(err).toContain("Pending");
+  });
+
+  it("returns pod-not-found message on 'not found'", async () => {
+    const err = Object.assign(new Error("x"), { stderr: 'pods "p" not found' });
+    mockExecFile.mockRejectedValueOnce(err);
+    const result = await checkPodRunning("p", "ns");
+    expect(result).toContain("not found in namespace");
+  });
+});
+
+describe("waitForPodDone", () => {
+  // waitForPodDone reads `kubectl get pod -o json`; build a minimal pod status.
+  const podJson = (phase: string, status: Record<string, unknown> = {}) =>
+    ({ stdout: JSON.stringify({ status: { phase, ...status } }) });
+
+  it("returns when Running target phase is reached", async () => {
+    mockExecFile.mockResolvedValueOnce(podJson("Running"));
+    const phase = await waitForPodDone("p", 5_000, undefined, undefined, undefined, "ns", "Running");
+    expect(phase).toBe("Running");
+  });
+
+  it("returns terminal phase when target is 'terminal'", async () => {
+    mockExecFile.mockResolvedValueOnce(podJson("Succeeded"));
+    const phase = await waitForPodDone("p", 5_000, undefined, undefined, undefined, "ns", "terminal");
+    expect(phase).toBe("Succeeded");
+  });
+
+  it("considers Running-target with terminal phase as done (fail fast)", async () => {
+    mockExecFile.mockResolvedValueOnce(podJson("Failed"));
+    const phase = await waitForPodDone("p", 5_000, undefined, undefined, undefined, "ns", "Running");
+    expect(phase).toBe("Failed");
+  });
+
+  it("fails fast on an unpullable image instead of waiting out the timeout", async () => {
+    mockExecFile.mockResolvedValue(podJson("Pending", {
+      containerStatuses: [{ state: { waiting: { reason: "ImagePullBackOff", message: "Back-off pulling image \"x\"" } } }],
+    }));
+    // Large timeout: if it didn't fail fast, this would hang ~10s and time out instead.
+    await expect(waitForPodDone("p", 10_000, undefined, undefined, undefined, "ns", "Running"))
+      .rejects.toThrow(/cannot start: ImagePullBackOff/);
+  }, 3000);
+
+  it("fails fast when the pod is unschedulable", async () => {
+    mockExecFile.mockResolvedValue(podJson("Pending", {
+      conditions: [{ type: "PodScheduled", status: "False", reason: "Unschedulable", message: "0/3 nodes available" }],
+    }));
+    await expect(waitForPodDone("p", 10_000, undefined, undefined, undefined, "ns", "Running"))
+      .rejects.toThrow(/cannot start: Unschedulable/);
+  }, 3000);
+
+  it("throws on timeout", async () => {
+    // Resolve with a plain Pending (still starting, no fatal reason) forever.
+    mockExecFile.mockResolvedValue(podJson("Pending"));
+    await expect(waitForPodDone("p", 10, undefined, undefined, undefined, "ns", "terminal"))
+      .rejects.toThrow(/Timed out/);
+  }, 5000);
+
+  it("respects abort signal", async () => {
+    mockExecFile.mockResolvedValue(podJson("Pending"));
+    const controller = new AbortController();
+    const promise = waitForPodDone("p", 5_000, undefined, controller.signal, undefined, "ns", "terminal");
+    controller.abort();
+    await expect(promise).rejects.toThrow(/Aborted|Timed out/);
+  });
+});
+
+describe("a Pod that is not Running may still hold a running container", () => {
+  // pod_exec-4 (high): the Pod sat at Pending while the named startup-delay init container was already
+  // Running, and exec into it was refused on the POD-level phase. The investigation fell back to
+  // node_exec + CRI + host PIDs for a check that would have worked.
+  const pod = (phase: string, running: string[], init: string[] = []) => JSON.stringify({
+    status: {
+      phase,
+      initContainerStatuses: init.map((name) => ({ name, state: { running: {} } })),
+      containerStatuses: running.map((name) => ({ name, state: { running: {} } })),
+    },
+  });
+
+  it("admits the container the caller named", async () => {
+    mockExecFile.mockResolvedValueOnce({ stdout: "Pending" });
+    mockExecFile.mockResolvedValueOnce({ stdout: pod("Pending", [], ["startup-delay"]) });
+    expect(await checkPodRunning("p", "ns", undefined, undefined, "startup-delay")).toBeNull();
+  });
+
+  it("refuses a container that is not running, and says which are", async () => {
+    mockExecFile.mockResolvedValueOnce({ stdout: "Pending" });
+    mockExecFile.mockResolvedValueOnce({ stdout: pod("Pending", [], ["startup-delay"]) });
+    const err = await checkPodRunning("p", "ns", undefined, undefined, "app");
+    expect(err).toContain("startup-delay");
+    expect(err, "a refusal that names the runnable option").toMatch(/container parameter/);
+  });
+
+  it("still refuses when nothing at all is running", async () => {
+    mockExecFile.mockResolvedValueOnce({ stdout: "Pending" });
+    mockExecFile.mockResolvedValueOnce({ stdout: pod("Pending", []) });
+    const err = await checkPodRunning("p", "ns", undefined, undefined, "app");
+    expect(err).toMatch(/No container/);
+  });
+
+  it("costs nothing on the happy path", async () => {
+    mockExecFile.mockReset();
+    mockExecFile.mockResolvedValueOnce({ stdout: "Running" });
+    expect(await checkPodRunning("p", "ns")).toBeNull();
+    expect(mockExecFile, "one call, not two").toHaveBeenCalledTimes(1);
+  });
+});

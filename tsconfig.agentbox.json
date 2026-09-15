@@ -1,0 +1,14 @@
+{
+  "extends": "./tsconfig.json",
+  "include": [
+    "src/agentbox-main.ts",
+    "src/agentbox/**/*.ts",
+    "src/core/**/*.ts",
+    "src/cron/**/*.ts",
+    "src/knowledge/**/*.ts",
+    "src/memory/**/*.ts",
+    "src/shared/**/*.ts",
+    "src/tools/**/*.ts"
+  ],
+  "exclude": ["node_modules", "dist", "**/*.test.ts"]
+}

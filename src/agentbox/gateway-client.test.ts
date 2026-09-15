@@ -1,0 +1,427 @@
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from "vitest";
+import http from "node:http";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import type { AddressInfo } from "node:net";
+import { GatewayClient } from "./gateway-client.js";
+
+/**
+ * Tests for GatewayClient — the AgentBox-side HTTP client that talks to the
+ * Gateway's internal APIs. We spin up a real http.Server on an ephemeral port
+ * and drive the client against it. TLS/mTLS is exercised indirectly via the
+ * cert-loading branch; the wire-level TLS is part of invariant §3 (K8s-only)
+ * and is covered there rather than here.
+ */
+
+// ── Utility: local http server used as a gateway stand-in ─────────────
+
+interface TestServer {
+  server: http.Server;
+  port: number;
+  requests: Array<{ method: string; url: string; body: unknown }>;
+  close: () => Promise<void>;
+}
+
+async function startServer(handler: (req: http.IncomingMessage, res: http.ServerResponse, body: unknown) => void): Promise<TestServer> {
+  const requests: TestServer["requests"] = [];
+  const server = http.createServer(async (req, res) => {
+    let body = "";
+    req.on("data", (c) => { body += c; });
+    req.on("end", () => {
+      let parsed: unknown = undefined;
+      if (body) {
+        try { parsed = JSON.parse(body); } catch { parsed = body; }
+      }
+      requests.push({ method: req.method || "", url: req.url || "", body: parsed });
+      handler(req, res, parsed);
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = (server.address() as AddressInfo).port;
+  return {
+    server,
+    port,
+    requests,
+    close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+  };
+}
+
+// ── Silence log noise ──────────────────────────────────────────────────
+
+beforeEach(() => {
+  vi.spyOn(console, "log").mockImplementation(() => {});
+  vi.spyOn(console, "warn").mockImplementation(() => {});
+  vi.spyOn(console, "error").mockImplementation(() => {});
+});
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
+
+// ── Tests ──────────────────────────────────────────────────────────────
+
+describe("GatewayClient — construction & mTLS scope (invariant §3)", () => {
+  it("does NOT load cert files when certPath is missing (plain HTTP fallback)", () => {
+    const emptyDir = fs.mkdtempSync(path.join(os.tmpdir(), "gwc-"));
+    try {
+      // No tls.crt/tls.key/ca.crt present — client should skip TLS setup.
+      const client = new GatewayClient({ gatewayUrl: "http://localhost:1", certPath: emptyDir });
+      expect(client).toBeDefined();
+      // If we got here without throwing, the branch is "cert not found".
+    } finally {
+      fs.rmSync(emptyDir, { recursive: true, force: true });
+    }
+  });
+
+  it("loads cert files from certPath when all three exist", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gwc-"));
+    try {
+      fs.writeFileSync(path.join(dir, "tls.crt"), "-----BEGIN CERTIFICATE-----\nFAKE\n-----END CERTIFICATE-----");
+      fs.writeFileSync(path.join(dir, "tls.key"), "-----BEGIN PRIVATE KEY-----\nFAKE\n-----END PRIVATE KEY-----");
+      fs.writeFileSync(path.join(dir, "ca.crt"), "-----BEGIN CERTIFICATE-----\nFAKECA\n-----END CERTIFICATE-----");
+      // Construction should not throw — we only validate the path-read branch.
+      const client = new GatewayClient({ gatewayUrl: "https://gw.example:3002", certPath: dir });
+      expect(client).toBeDefined();
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("strips trailing slash from gatewayUrl", async () => {
+    const srv = await startServer((_req, res) => { res.end(JSON.stringify({ ok: true })); });
+    try {
+      const certPath = fs.mkdtempSync(path.join(os.tmpdir(), "gwc-"));
+      const client = new GatewayClient({ gatewayUrl: `http://127.0.0.1:${srv.port}/`, certPath });
+      fs.rmSync(certPath, { recursive: true, force: true });
+      await client.fetchSettings();
+      expect(srv.requests[0].url).toBe("/api/internal/settings");
+    } finally {
+      await srv.close();
+    }
+  });
+});
+
+describe("GatewayClient — public sandbox metadata", () => {
+  const limits = { default_timeout_seconds: 30, max_timeout_seconds: 120, max_tool_calls: 12, max_output_bytes: 8192 };
+  async function info(body: unknown, status = 200) {
+    const srv = await startServer((_req, res) => {
+      res.writeHead(status, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(body));
+    });
+    const certPath = fs.mkdtempSync(path.join(os.tmpdir(), "gwc-sandbox-"));
+    try {
+      const client = new GatewayClient({ gatewayUrl: `http://127.0.0.1:${srv.port}`, certPath });
+      const result = await client.scriptSandboxInfo();
+      expect(srv.requests).toEqual([{ method: "GET", url: "/api/internal/script-runs", body: undefined }]);
+      return result;
+    } finally {
+      fs.rmSync(certPath, { recursive: true, force: true });
+      await srv.close();
+    }
+  }
+
+  it("passes the public budgets and removes unrelated service configuration", async () => {
+    expect(await info({ enabled: true, network_isolation: true, require_network_isolation: false,
+      limits: { ...limits, token: "private-fixture" }, image: "private-image", credentials: "private-fixture" }))
+      .toEqual({ enabled: true, network_isolation: true, require_network_isolation: false, limits });
+  });
+
+  it.each([undefined, {}, { ...limits, max_timeout_seconds: 0 }, { ...limits, max_tool_calls: "12" },
+    { ...limits, max_tool_calls: 1.5 }, { ...limits, max_output_bytes: Number.MAX_SAFE_INTEGER + 1 },
+    { ...limits, default_timeout_seconds: 121 }])("omits absent or invalid budgets: %j", async invalid => {
+    expect(await info({ enabled: true, limits: invalid }))
+      .toEqual({ enabled: true, network_isolation: false, require_network_isolation: false });
+  });
+
+  it.each([200, 403, 503])("fails closed on disabled or unavailable metadata (HTTP %s)", async status => {
+    expect(await info({ enabled: false, network_isolation: true, limits }, status))
+      .toEqual({ enabled: false, network_isolation: false, require_network_isolation: false });
+  });
+});
+
+describe("GatewayClient — fetchSettings (GET JSON)", () => {
+  let srv: TestServer;
+  let client: GatewayClient;
+
+  beforeAll(async () => {
+    srv = await startServer((req, res) => {
+      if (req.url === "/api/internal/settings") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ providers: {}, models: [] }));
+      } else {
+        res.writeHead(404);
+        res.end();
+      }
+    });
+    const certPath = fs.mkdtempSync(path.join(os.tmpdir(), "gwc-"));
+    client = new GatewayClient({ gatewayUrl: `http://127.0.0.1:${srv.port}`, certPath });
+    fs.rmSync(certPath, { recursive: true, force: true });
+  });
+
+  afterAll(async () => { await srv.close(); });
+
+  it("returns parsed JSON response", async () => {
+    const settings = await client.fetchSettings();
+    expect(settings).toEqual({ providers: {}, models: [] });
+  });
+});
+
+describe("GatewayClient — fetchTracingConfig (GET JSON)", () => {
+  let srv: TestServer;
+  let client: GatewayClient;
+
+  beforeAll(async () => {
+    srv = await startServer((req, res) => {
+      if (req.url === "/api/internal/tracing-config") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ enabled: true, serviceName: "siclaw-agentbox", exporters: [] }));
+      } else {
+        res.writeHead(404);
+        res.end();
+      }
+    });
+    const certPath = fs.mkdtempSync(path.join(os.tmpdir(), "gwc-"));
+    client = new GatewayClient({ gatewayUrl: `http://127.0.0.1:${srv.port}`, certPath });
+    fs.rmSync(certPath, { recursive: true, force: true });
+  });
+
+  afterAll(async () => { await srv.close(); });
+
+  it("GETs /api/internal/tracing-config and returns the parsed TracingConfig", async () => {
+    const tracing = await client.fetchTracingConfig();
+    expect(tracing).toEqual({ enabled: true, serviceName: "siclaw-agentbox", exporters: [] });
+    expect(srv.requests.some((r) => r.method === "GET" && r.url === "/api/internal/tracing-config")).toBe(true);
+  });
+});
+
+describe("GatewayClient — agent task CRUD", () => {
+  let srv: TestServer;
+  let client: GatewayClient;
+
+  beforeAll(async () => {
+    srv = await startServer((req, res) => {
+      const url = req.url || "";
+      if (req.method === "GET" && url === "/api/internal/agent-tasks") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ tasks: [{ id: "t1", name: "cron1", schedule: "* * * * *", status: "active" }] }));
+      } else if (req.method === "POST" && url === "/api/internal/agent-tasks") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ id: "t2", name: "new", schedule: "* * * * *", status: "active" }));
+      } else if (req.method === "PUT" && url.startsWith("/api/internal/agent-tasks/")) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ id: "t1", name: "renamed", schedule: "* * * * *", status: "active" }));
+      } else if (req.method === "DELETE" && url.startsWith("/api/internal/agent-tasks/")) {
+        res.writeHead(204);
+        res.end();
+      } else {
+        res.writeHead(404);
+        res.end();
+      }
+    });
+    const certPath = fs.mkdtempSync(path.join(os.tmpdir(), "gwc-"));
+    client = new GatewayClient({ gatewayUrl: `http://127.0.0.1:${srv.port}`, certPath });
+    fs.rmSync(certPath, { recursive: true, force: true });
+  });
+
+  afterAll(async () => { await srv.close(); });
+
+  it("listAgentTasks returns empty array when gateway omits 'tasks' field", async () => {
+    // Probe a non-existent endpoint that returns {}
+    const sep = await startServer((req, res) => {
+      if (req.url === "/api/internal/agent-tasks") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({})); // no `tasks`
+      } else { res.writeHead(404); res.end(); }
+    });
+    try {
+      const certPath = fs.mkdtempSync(path.join(os.tmpdir(), "gwc-"));
+      const c = new GatewayClient({ gatewayUrl: `http://127.0.0.1:${sep.port}`, certPath });
+      fs.rmSync(certPath, { recursive: true, force: true });
+      const tasks = await c.listAgentTasks();
+      expect(tasks).toEqual([]);
+    } finally {
+      await sep.close();
+    }
+  });
+
+  it("listAgentTasks returns the tasks array", async () => {
+    const tasks = await client.listAgentTasks();
+    expect(tasks).toEqual([{ id: "t1", name: "cron1", schedule: "* * * * *", status: "active" }]);
+  });
+
+  it("createAgentTask POSTs the input and returns the response", async () => {
+    const created = await client.createAgentTask({ name: "new", schedule: "* * * * *", prompt: "p" });
+    expect(created.id).toBe("t2");
+    const lastReq = srv.requests[srv.requests.length - 1];
+    expect(lastReq.method).toBe("POST");
+    expect(lastReq.body).toEqual({ name: "new", schedule: "* * * * *", prompt: "p" });
+  });
+
+  it("updateAgentTask URL-encodes the task id", async () => {
+    await client.updateAgentTask("task/with/slash", { name: "renamed" });
+    const lastReq = srv.requests[srv.requests.length - 1];
+    expect(lastReq.url).toBe("/api/internal/agent-tasks/task%2Fwith%2Fslash");
+    expect(lastReq.method).toBe("PUT");
+  });
+
+  it("deleteAgentTask resolves without returning a body", async () => {
+    await expect(client.deleteAgentTask("t1")).resolves.toBeUndefined();
+    const lastReq = srv.requests[srv.requests.length - 1];
+    expect(lastReq.method).toBe("DELETE");
+  });
+});
+
+describe("GatewayClient — toClientLike adapter", () => {
+  it("exposes a request(path, method, body) function", async () => {
+    const srv = await startServer((req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ saw: req.method }));
+    });
+    try {
+      const certPath = fs.mkdtempSync(path.join(os.tmpdir(), "gwc-"));
+      const client = new GatewayClient({ gatewayUrl: `http://127.0.0.1:${srv.port}`, certPath });
+      fs.rmSync(certPath, { recursive: true, force: true });
+      const like = client.toClientLike();
+      const res = await like.request("/x", "POST", { a: 1 }) as { saw: string };
+      expect(res.saw).toBe("POST");
+      expect(srv.requests[0].body).toEqual({ a: 1 });
+    } finally {
+      await srv.close();
+    }
+  });
+});
+
+describe("GatewayClient — delegation persistence", () => {
+  it("POSTs delegation persistence events to the Runtime internal API", async () => {
+    const srv = await startServer((req, res) => {
+      if (req.method === "POST" && req.url === "/api/internal/delegation-events") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, id: "msg-1" }));
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+    try {
+      const certPath = fs.mkdtempSync(path.join(os.tmpdir(), "gwc-"));
+      const client = new GatewayClient({ gatewayUrl: `http://127.0.0.1:${srv.port}`, certPath });
+      fs.rmSync(certPath, { recursive: true, force: true });
+
+      const result = await client.sendDelegationPersistenceEvent({
+        type: "delegation.append_message",
+        message: {
+          sessionId: "parent-session",
+          role: "assistant",
+          content: "Delegated result synthesized.",
+          delegationId: "delegation-1",
+        },
+      });
+
+      expect(result).toEqual({ ok: true, id: "msg-1" });
+      expect(srv.requests[0]).toMatchObject({
+        method: "POST",
+        url: "/api/internal/delegation-events",
+      });
+      expect(srv.requests[0].body).toMatchObject({
+        type: "delegation.append_message",
+        message: {
+          sessionId: "parent-session",
+          role: "assistant",
+          content: "Delegated result synthesized.",
+          delegationId: "delegation-1",
+        },
+      });
+    } finally {
+      await srv.close();
+    }
+  });
+});
+
+describe("GatewayClient — UTF-8 across chunk boundaries", () => {
+  it("keeps a multibyte character intact when the response is split mid-character", async () => {
+    // Every sync payload (skills, knowledge, tools, credentials) is parsed by this
+    // client. It used to accumulate `chunk.toString()` per data event, which decodes
+    // each fragment on its own — a character straddling the boundary came out as two
+    // U+FFFD. That is how an em dash inside a synced SKILL.md reached an agent
+    // corrupted while the DB row was byte-exact.
+    const settings = { greeting: "查一下 kubelet — 日志", nested: { emoji: "🚀" } };
+    const payload = Buffer.from(JSON.stringify(settings), "utf8");
+    const emDashAt = payload.indexOf(Buffer.from("—", "utf8"));
+    expect(emDashAt).toBeGreaterThan(0);
+    const splitAt = emDashAt + 1; // one byte of the em dash lands in the first write
+
+    const srv = await startServer((_req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json", "Content-Length": String(payload.length) });
+      res.write(payload.subarray(0, splitAt));
+      // A gap the client cannot coalesce — two data events, boundary mid-character.
+      setTimeout(() => res.end(payload.subarray(splitAt)), 20);
+    });
+    try {
+      const certPath = fs.mkdtempSync(path.join(os.tmpdir(), "gwc-"));
+      const client = new GatewayClient({ gatewayUrl: `http://127.0.0.1:${srv.port}`, certPath });
+      fs.rmSync(certPath, { recursive: true, force: true });
+      const got = (await client.fetchSettings()) as typeof settings;
+      expect(got).toEqual(settings);
+      expect(JSON.stringify(got)).not.toContain("�");
+    } finally {
+      await srv.close();
+    }
+  });
+});
+
+describe("GatewayClient — error handling", () => {
+  it("rejects with helpful message on non-2xx status", async () => {
+    const srv = await startServer((_req, res) => {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "boom" }));
+    });
+    try {
+      const certPath = fs.mkdtempSync(path.join(os.tmpdir(), "gwc-"));
+      const client = new GatewayClient({ gatewayUrl: `http://127.0.0.1:${srv.port}`, certPath });
+      fs.rmSync(certPath, { recursive: true, force: true });
+      await expect(client.fetchSettings()).rejects.toThrow(/Gateway returned 500/);
+    } finally {
+      await srv.close();
+    }
+  });
+
+  it("rejects when the response is not valid JSON (only on 2xx)", async () => {
+    const srv = await startServer((_req, res) => {
+      res.writeHead(200, { "Content-Type": "text/plain" });
+      res.end("not json");
+    });
+    try {
+      const certPath = fs.mkdtempSync(path.join(os.tmpdir(), "gwc-"));
+      const client = new GatewayClient({ gatewayUrl: `http://127.0.0.1:${srv.port}`, certPath });
+      fs.rmSync(certPath, { recursive: true, force: true });
+      await expect(client.fetchSettings()).rejects.toThrow(/Failed to parse JSON/);
+    } finally {
+      await srv.close();
+    }
+  });
+
+  it("rejects on connection refused", async () => {
+    const certPath = fs.mkdtempSync(path.join(os.tmpdir(), "gwc-"));
+    // Port 1 is almost guaranteed to refuse.
+    const client = new GatewayClient({ gatewayUrl: "http://127.0.0.1:1", certPath });
+    fs.rmSync(certPath, { recursive: true, force: true });
+    await expect(client.fetchSettings()).rejects.toThrow(/Gateway request failed/);
+  });
+
+  it("returns undefined on 204 No Content", async () => {
+    const srv = await startServer((_req, res) => {
+      res.writeHead(204);
+      res.end();
+    });
+    try {
+      const certPath = fs.mkdtempSync(path.join(os.tmpdir(), "gwc-"));
+      const client = new GatewayClient({ gatewayUrl: `http://127.0.0.1:${srv.port}`, certPath });
+      fs.rmSync(certPath, { recursive: true, force: true });
+      // DELETE-style call returns undefined on 204
+      await expect(client.deleteAgentTask("t1")).resolves.toBeUndefined();
+    } finally {
+      await srv.close();
+    }
+  });
+});

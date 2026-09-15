@@ -1,0 +1,711 @@
+import { SandboxCallbackUncertainError } from "../../shared/sandbox-tool-types.js";
+import { readSandboxToolError } from "../../script-sandbox/errors.js";
+/**
+ * AgentBox HTTP Client
+ *
+ * Client used by the Gateway to call the AgentBox HTTP API.
+ * Supports mTLS when TLS options are provided.
+ */
+
+import { SCRIPT_FILE_RESULT_BYTES } from "../../script-sandbox/result-transfer.js";
+import http from "node:http";
+import https from "node:https";
+import { GATEWAY_SYNC_DESCRIPTORS, type GatewaySyncType } from "../../shared/gateway-sync.js";
+import { modelOptionsSupportImageInput, type ModelRoutePolicy } from "../../core/model-routing.js";
+import type { OriginKind } from "../../core/types.js";
+import { enrichImagesFromText, redactImageUrlsInText } from "./image-url-ingest.js";
+import { RpcResponseError, wrapRpcError } from "../../lib/error-envelope.js";
+
+export interface AgentBoxTlsOptions {
+  cert: string;
+  key: string;
+  ca: string;
+}
+
+export interface PromptOptions {
+  /** Source AgentBox context for an authorized conversation handoff only. */
+  handoffTrace?: import("../../shared/handoff-trace.js").HandoffTraceContext;
+  sessionId?: string;
+  /**
+   * Identity of THIS turn, so a later abort can name the turn it means rather than
+   * the session it ran in. A conversation session is reused across turns, so an
+   * abort addressed by session alone can land on a successor.
+   */
+  turnId?: string;
+  /** Exact result tool required by a strict control-plane turn. */
+  requiredResultToolName?: string;
+  /** User who initiated this prompt. Forwarded per-request to the trace
+   *  recorder as the root span's user.id (mirrors sessionId's per-request
+   *  path), so tracing carries the user dimension in every deployment mode. */
+  userId?: string;
+  text: string;
+  /** string = use this env, null = explicitly no env, undefined = keep current */
+  kubeconfigPath?: string | null;
+  /** Session mode — "web" | "channel" */
+  mode?: string;
+  /** Entry-form of this prompt (audit categorization). */
+  origin?: OriginKind;
+  /** Expose `request_input` to a top-level machine-driven turn. */
+  allowInputRequest?: boolean;
+  /** Control plane owns this logical turn and will dispatch authorized handoffs. */
+  handoffSupported?: boolean;
+  handoffPolicy?: import("../../shared/agent-handoff.js").HandoffPolicy;
+  /**
+   * The control-plane segment / task this turn belongs to. They travel with the
+   * dispatch so the turn can be correlated back to the ledger, and so a retried
+   * dispatch is recognizable as the same turn rather than a new one.
+   */
+  segmentId?: string;
+  taskId?: string;
+  /** Fail instead of creating a fresh conversation when `sessionId` cannot be restored. */
+  requireExistingSession?: boolean;
+  /** Model provider to use for this prompt */
+  modelProvider?: string;
+  /** Model ID to use for this prompt */
+  modelId?: string;
+  /** Effective immutable release identity for runtime observation. */
+  releaseId?: string;
+  /** Fingerprint of the release model snapshot for runtime observation. */
+  modelFingerprint?: string;
+  /** Agent ID (for logging/context) */
+  agentId?: string;
+  /** Agent-owned Addendum (legacy wire field name). */
+  systemPromptTemplate?: string;
+  /** Full provider config for dynamic registration (from gateway DB) */
+  modelConfig?: {
+    name: string;
+    baseUrl: string;
+    apiKey: string;
+    api: string;
+    authHeader: boolean;
+    models: Array<{
+      id: string;
+      name: string;
+      /** Per-model protocol override; absent = inherit the provider's `api`. */
+      api?: string;
+      reasoning: boolean;
+      input: string[];
+      cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
+      contextWindow: number;
+      maxTokens: number;
+      compat?: Record<string, unknown>;
+    }>;
+  };
+  /** Optional ordered model fallback policy. Omitted means legacy single-model behavior. */
+  modelRouting?: ModelRoutePolicy;
+  /**
+   * Sub-agent model tier CANDIDATES for this turn (credentials included).
+   * Passthrough — the AgentBox normalizes on arrival, since nothing validates it
+   * here. `undefined` means "no tiers this turn" and CLEARS any the session held.
+   *
+   * ⚠️ REQUIRED, alone among the optional fields on this interface, and not for
+   * symmetry: every field here is a field-by-field copy at each call site, and one
+   * that is merely optional lets a site compile while silently disabling tiering
+   * for that entire entry path. That is not hypothetical — `server.ts`, i.e. the
+   * `chat.send` path every control-plane turn takes, shipped without it. The menu
+   * arrives on a different channel, so the lead still advertised `model_tier` and
+   * every child fell back; nothing errored and the whole suite stayed green.
+   *
+   * Required makes each site STATE its answer. Write `undefined` where a path has
+   * no tiers to forward (the CLI, which builds no sub-agents at all) — that is a
+   * decision recorded, not a field forgotten.
+   */
+  subagentTiers: unknown;
+  /** Image attachments (raw base64, no data: prefix) forwarded as vision input. */
+  images?: Array<{ mimeType: string; data: string }>;
+  /** File attachments forwarded as native model file input. */
+  files?: Array<{ mimeType: string; filename: string; data: string }>;
+}
+
+export type PromptMediaOptions = Pick<PromptOptions, "images" | "files">;
+
+export interface PromptResponse {
+  ok: boolean;
+  sessionId: string;
+  /** True when this prompt continued an in-memory or persisted conversation. */
+  resumed?: boolean;
+  /** per-prompt root trace id (OTel 32-hex) echoed from the /api/prompt ack, for
+   *  stamping chat_messages.trace_id on this turn's persisted rows. */
+  traceId?: string;
+}
+
+export interface SteerResponse {
+  ok: boolean;
+  /** Trace of the active prompt that accepted this additional user input. */
+  traceId?: string;
+}
+
+export interface SessionInfo {
+  id: string;
+  createdAt: string;
+  lastActiveAt: string;
+}
+
+export interface HealthResponse {
+  status: string;
+  sessions: number;
+  timestamp: string;
+}
+
+export interface ModelInfo {
+  id: string;
+  name: string;
+  provider: string;
+  contextWindow: number;
+  maxTokens: number;
+  reasoning: boolean;
+}
+
+export interface ContextUsageResponse {
+  tokens: number;
+  contextWindow: number;
+  percent: number;
+  isCompacting: boolean;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  cost: number;
+}
+
+function agentBoxResponseError(status: number, body: string): RpcResponseError {
+  const metadata: Record<string, unknown> = { status };
+  let structuredMessage: string | undefined;
+  try {
+    const parsed = JSON.parse(body) as Record<string, unknown>;
+    const nested = parsed?.error && typeof parsed.error === "object"
+      ? parsed.error as Record<string, unknown>
+      : parsed;
+    if (typeof nested.message === "string" && nested.message.trim()) structuredMessage = nested.message;
+    if (typeof nested.code === "string") metadata.code = nested.code;
+    if (typeof nested.retriable === "boolean") metadata.retriable = nested.retriable;
+    if (typeof nested.retryAfterMs === "number") metadata.retryAfterMs = nested.retryAfterMs;
+    if (nested.details !== undefined) metadata.details = nested.details;
+  } catch {
+    // Non-JSON error bodies still retain their HTTP-derived classification.
+  }
+  const message = structuredMessage ?? `AgentBox request failed: ${status}${body ? ` ${body}` : ""}`;
+  return new RpcResponseError(wrapRpcError(Object.assign(new Error(message), metadata)));
+}
+
+export class AgentBoxClient {
+  private endpoint: string;
+  private timeoutMs: number;
+  private httpsAgent: https.Agent | null = null;
+
+  constructor(endpoint: string, timeoutMs = 30000, tlsOptions?: AgentBoxTlsOptions) {
+    this.endpoint = endpoint.replace(/\/$/, ""); // Remove trailing slash
+    this.timeoutMs = timeoutMs;
+
+    if (tlsOptions) {
+      this.httpsAgent = new https.Agent({
+        cert: tlsOptions.cert,
+        key: tlsOptions.key,
+        ca: tlsOptions.ca,
+        checkServerIdentity: () => undefined, // Skip hostname verification (cert CN=userId, not hostname)
+        rejectUnauthorized: true,
+      });
+    }
+  }
+
+  /** A bounded, cancellable callback. Neither response bodies nor grants enter error logs. */
+  async sandboxTool(body: unknown, signal: AbortSignal): Promise<unknown> {
+    const url = new URL("/api/internal/sandbox-tool", this.endpoint);
+    if (url.protocol === "https:" && !this.httpsAgent) throw new Error("Sandbox callback requires mTLS");
+    if (url.protocol !== "https:" && (url.protocol !== "http:" || !["localhost", "127.0.0.1", "[::1]"].includes(url.hostname))) {
+      throw new Error("Local sandbox callback requires loopback");
+    }
+    const bounded = AbortSignal.any([signal, AbortSignal.timeout(95_000)]);
+    return new Promise((resolve, reject) => {
+      const client = url.protocol === "https:" ? https : http;
+      const req = client.request(url, { method: "POST", signal: bounded,
+        ...(url.protocol === "https:" ? { agent: this.httpsAgent! } : {}),
+        headers: { "Content-Type": "application/json" } }, res => {
+        const chunks: Buffer[] = []; let size = 0;
+        res.on("data", (chunk: Buffer) => {
+          size += chunk.length;
+          if (size > SCRIPT_FILE_RESULT_BYTES) req.destroy(new Error("Sandbox callback response too large"));
+          else chunks.push(chunk);
+        });
+        res.on("error", () => reject(new SandboxCallbackUncertainError()));
+        res.on("end", () => {
+          try {
+            const envelope = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+            if (envelope?.protocol !== 1) throw new Error();
+            const failure = readSandboxToolError(envelope);
+            if (failure) { reject(failure); return; }
+            if (res.statusCode !== 200 || envelope.ok !== true) throw new Error();
+            resolve(envelope.result);
+          } catch { reject(new SandboxCallbackUncertainError()); }
+        });
+      });
+      req.on("error", () => reject(new SandboxCallbackUncertainError()));
+      req.end(JSON.stringify(body));
+    });
+  }
+
+  /**
+   * Generic GET request returning parsed JSON (used by metrics snapshot pull, etc.)
+   */
+  async getJson<T = unknown>(path: string): Promise<T> {
+    const resp = await this.fetch(path);
+    return resp.json();
+  }
+
+  /**
+   * Health check
+   */
+  async health(): Promise<HealthResponse> {
+    const resp = await this.fetch("/health");
+    return resp.json();
+  }
+
+  /**
+   * Resolve image URLs in the prompt text into vision `images`, but ONLY when the
+   * prompt's model/route can take image input (see DESIGN decision 1). Non-vision:
+   * the URL is left as plain text — the model replies it can't open it; no
+   * fail-closed turn.
+   *
+   * This is the SINGLE backend place text-URL images are resolved, covering ALL
+   * front-ends that reach AgentBox via this client — Feishu, DingTalk, Web chat,
+   * a2a, and cron (every `client.prompt` caller). Only user→agent prompts
+   * flow through THIS client; system/synthetic prompts run inside the AgentBox
+   * process and never reach here, so this never scans system text. The fetch +
+   * SSRF allowlist stay in the Gateway process (the AgentBox pod is
+   * network-isolated and must not fetch arbitrary user URLs).
+   *
+   * The text forwarded to AgentBox (model context + session history) has any
+   * signed-URL credentials stripped — the fetch above already used the full URL,
+   * so resolution is unaffected, but `Signature`/`AccessKeyId` don't get
+   * persisted/sent in plaintext.
+   */
+  async #withResolvedImageUrls(opts: PromptOptions): Promise<PromptOptions> {
+    const images = modelOptionsSupportImageInput(opts)
+      ? await enrichImagesFromText(opts.text, opts.images ?? [])
+      : opts.images;
+    const text = redactImageUrlsInText(opts.text);
+    if (text === opts.text && images === opts.images) return opts;
+    const next: PromptOptions = { ...opts, text };
+    if (images && images.length) next.images = images;
+    return next;
+  }
+
+  /**
+   * Send a prompt
+   */
+  async prompt(opts: PromptOptions): Promise<PromptResponse> {
+    const sendOpts = await this.#withResolvedImageUrls(opts);
+    console.log(`[agentbox-client] prompt sessionId=${sendOpts.sessionId ?? "new"}`);
+    const resp = await this.fetch("/api/prompt", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(sendOpts),
+    });
+    const result: PromptResponse = await resp.json();
+    console.log(`[agentbox-client] prompt → ok=${result.ok} sessionId=${result.sessionId}`);
+    return result;
+  }
+
+  /**
+   * Get session list
+   */
+  async listSessions(): Promise<{ sessions: SessionInfo[] }> {
+    const resp = await this.fetch("/api/sessions");
+    return resp.json();
+  }
+
+  /**
+   * Generic sync reload — POST to the descriptor's reloadPath.
+   */
+  async reloadResource(type: GatewaySyncType): Promise<unknown> {
+    const descriptor = GATEWAY_SYNC_DESCRIPTORS[type];
+    const resp = await this.fetch(descriptor.reloadPath, {
+      method: "POST",
+    });
+    return resp.json();
+  }
+
+  /**
+   * POST to an arbitrary path on the AgentBox.
+   */
+  async post(path: string): Promise<unknown> {
+    const resp = await this.fetch(path, { method: "POST" });
+    return resp.json();
+  }
+
+  /**
+   * POST a JSON body to an arbitrary path, returning parsed JSON.
+   * Used by the capability session driver (POST /sources, /session, /message).
+   */
+  async postJson<T = unknown>(path: string, body: unknown, timeoutMs?: number): Promise<T> {
+    const resp = await this.fetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }, timeoutMs);
+    return resp.json();
+  }
+
+  /**
+   * Get context usage
+   */
+  async getContextUsage(sessionId: string): Promise<ContextUsageResponse> {
+    const resp = await this.fetch(`/api/sessions/${sessionId}/context`);
+    return resp.json();
+  }
+
+  /**
+   * Send a steer instruction (inserts a user message after interrupting the current tool)
+   */
+  async steerSession(sessionId: string, text: string, media?: PromptMediaOptions): Promise<SteerResponse> {
+    const images = media?.images;
+    const files = media?.files;
+    const resp = await this.fetch(`/api/sessions/${sessionId}/steer`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        text,
+        ...(images && images.length > 0 ? { images } : {}),
+        ...(files && files.length > 0 ? { files } : {}),
+      }),
+    });
+    return resp.json();
+  }
+
+  /**
+   * Clear queued steer/followUp messages
+   */
+  async clearQueue(sessionId: string): Promise<{ steering: string[]; followUp: string[] }> {
+    const resp = await this.fetch(`/api/sessions/${sessionId}/clear-queue`, {
+      method: "POST",
+    });
+    return resp.json();
+  }
+
+  /**
+   * Abort a prompt execution.
+   *
+   * Pass turnId to stop ONE specific turn: the box answers a mismatch as already
+   * stopped rather than aborting whatever is running now. Omit it for the user's
+   * Stop button, which does mean "stop the current turn".
+   */
+  async abortSession(sessionId: string, turnId?: string): Promise<{ ok?: boolean; pending?: boolean }> {
+    console.log(`[agentbox-client] abort sessionId=${sessionId}${turnId ? ` turnId=${turnId}` : ""}`);
+    const response = await this.fetch(`/api/sessions/${sessionId}/abort`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(turnId ? { turnId } : {}),
+    });
+    return response.json();
+  }
+
+  /**
+   * Close a session
+   */
+  async closeSession(sessionId: string): Promise<void> {
+    await this.fetch(`/api/sessions/${sessionId}`, {
+      method: "DELETE",
+    });
+  }
+
+  /**
+   * Reset memory indexer after Gateway has cleared PVC files.
+   */
+  async resetMemory(): Promise<{ ok: boolean }> {
+    const resp = await this.fetch("/api/memory", {
+      method: "DELETE",
+    });
+    return resp.json();
+  }
+
+  /**
+   * Get DP mode flag for recovery.
+   * Returns { active } — the session's current DP on/off state.
+   */
+  async getDpState(sessionId: string): Promise<{ active: boolean }> {
+    const resp = await this.fetch(`/api/sessions/${sessionId}/dp-state`);
+    return resp.json();
+  }
+
+  /**
+   * Liveness of a session's in-progress turn (agentbox activity flags). Used by the Portal
+   * reconnect-after-refresh flow to decide whether to re-attach to the live event stream.
+   */
+  async sessionStatus(sessionId: string): Promise<{ running: boolean }> {
+    const resp = await this.fetch(`/api/sessions/${sessionId}/status`);
+    return resp.json();
+  }
+
+  /**
+   * List available models
+   */
+  async listModels(): Promise<{ models: ModelInfo[] }> {
+    const resp = await this.fetch("/api/models");
+    return resp.json();
+  }
+
+  /**
+   * Get the current model
+   */
+  async getModel(sessionId: string): Promise<{ model: ModelInfo | null }> {
+    const resp = await this.fetch(`/api/sessions/${sessionId}/model`);
+    return resp.json();
+  }
+
+  /**
+   * Switch model
+   */
+  async setModel(sessionId: string, provider: string, modelId: string): Promise<{ ok: boolean; model: ModelInfo }> {
+    const resp = await this.fetch(`/api/sessions/${sessionId}/model`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ provider, modelId }),
+    });
+    return resp.json();
+  }
+
+  /**
+   * Subscribe to a session's SSE event stream.
+   *
+   * Returns an AsyncIterable that can be iterated with for-await-of.
+   */
+  async *streamEvents(sessionId: string): AsyncIterable<unknown> {
+    yield* this.streamPath(`/api/stream/${sessionId}`);
+  }
+
+  /**
+   * Subscribe to an SSE event stream on an arbitrary path. The kb box
+   * streams structured events on /events/:runId; agentbox uses /api/stream/:id.
+   * Both speak `data: <json>\n\n` with `: heartbeat` comment lines.
+   */
+  async *streamPath(path: string, opts?: { onComment?: () => void }): AsyncIterable<unknown> {
+    const url = `${this.endpoint}${path}`;
+
+    // Use https.request for HTTPS with mTLS
+    if (this.httpsAgent && this.endpoint.startsWith("https://")) {
+      yield* this.streamPathHttps(path, opts);
+      return;
+    }
+
+    const resp = await fetch(url, {
+      headers: { Accept: "text/event-stream" },
+    });
+
+    if (!resp.ok) {
+      throw new Error(`Stream request failed: ${resp.status}`);
+    }
+
+    const reader = resp.body?.getReader();
+    if (!reader) {
+      throw new Error("No response body");
+    }
+
+    console.log(`[agentbox-client] SSE open path=${path}`);
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let eventCount = 0;
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+
+        // Parse SSE events
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || ""; // Retain incomplete line
+
+        for (const line of lines) {
+          if (line.startsWith("data:")) {
+            // SSE spec: the value is everything after the colon, minus ONE
+            // optional leading space — "data:x" is as valid as "data: x".
+            const data = line.slice(5).replace(/^ /, "");
+            try {
+              eventCount++;
+              yield JSON.parse(data);
+            } catch {
+              console.warn(`[agentbox-client] SSE parse error path=${path}: ${data.slice(0, 100)}`);
+            }
+          } else if (line.startsWith(":")) {
+            // SSE comment — the box's keep-alive. Callers that watchdog on data
+            // events can opt in to hear it (a healthy-but-quiet compile must not
+            // be reaped as stale); it is never yielded as an event.
+            opts?.onComment?.();
+          }
+        }
+      }
+    } catch (err) {
+      console.error(`[agentbox-client] SSE stream error path=${path}:`, err instanceof Error ? err.message : err);
+      throw err;
+    } finally {
+      console.log(`[agentbox-client] SSE closed path=${path} (${eventCount} events)`);
+      reader.releaseLock();
+    }
+  }
+
+  /**
+   * SSE stream over HTTPS with mTLS, on an arbitrary path.
+   */
+  private async *streamPathHttps(path: string, opts?: { onComment?: () => void }): AsyncIterable<unknown> {
+    const urlObj = new URL(path, this.endpoint);
+
+    const res = await new Promise<import("node:http").IncomingMessage>((resolve, reject) => {
+      const req = https.request(
+        {
+          hostname: urlObj.hostname,
+          port: urlObj.port,
+          path: urlObj.pathname + urlObj.search,
+          method: "GET",
+          headers: { Accept: "text/event-stream" },
+          agent: this.httpsAgent!,
+        },
+        resolve,
+      );
+      req.on("error", reject);
+      req.end();
+    });
+
+    if (res.statusCode !== 200) {
+      throw new Error(`Stream request failed: ${res.statusCode}`);
+    }
+
+    console.log(`[agentbox-client] SSE open (HTTPS) path=${path}`);
+    const decoder = new TextDecoder();
+    let buffer = "";
+    // The replay frame can be one large data line. Remember the prefix already
+    // checked for a newline so each chunk scans only newly-decoded text instead
+    // of repeatedly splitting the entire accumulated frame.
+    let newlineSearchFrom = 0;
+    let eventCount = 0;
+
+    try {
+      for await (const chunk of res) {
+        // TLS chunks are arbitrary byte boundaries. A stateful decoder preserves
+        // multi-byte UTF-8 characters that straddle two chunks.
+        buffer += decoder.decode(chunk, { stream: true });
+
+        let newlineIndex = buffer.indexOf("\n", newlineSearchFrom);
+        while (newlineIndex !== -1) {
+          const line = buffer.slice(0, newlineIndex);
+          buffer = buffer.slice(newlineIndex + 1);
+          newlineSearchFrom = 0;
+
+          if (line.startsWith("data:")) {
+            // SSE spec: the value is everything after the colon, minus ONE
+            // optional leading space — "data:x" is as valid as "data: x".
+            const data = line.slice(5).replace(/^ /, "");
+            try {
+              eventCount++;
+              yield JSON.parse(data);
+            } catch {
+              console.warn(`[agentbox-client] SSE parse error path=${path}: ${data.slice(0, 100)}`);
+            }
+          } else if (line.startsWith(":")) {
+            // SSE comment — the box's keep-alive. Callers that watchdog on data
+            // events can opt in to hear it (a healthy-but-quiet compile must not
+            // be reaped as stale); it is never yielded as an event.
+            opts?.onComment?.();
+          }
+
+          newlineIndex = buffer.indexOf("\n", newlineSearchFrom);
+        }
+        newlineSearchFrom = buffer.length;
+      }
+      // Flush decoder state at EOF. SSE dispatch requires a terminating newline,
+      // so any remaining unterminated text stays buffered as before.
+      buffer += decoder.decode();
+    } catch (err) {
+      console.error(`[agentbox-client] SSE stream error path=${path}:`, err instanceof Error ? err.message : err);
+      throw err;
+    } finally {
+      console.log(`[agentbox-client] SSE closed (HTTPS) path=${path} (${eventCount} events)`);
+    }
+  }
+
+  /**
+   * Base fetch wrapper (supports both HTTP and HTTPS with mTLS)
+   */
+  private async fetch(path: string, init?: RequestInit, timeoutMs = this.timeoutMs): Promise<Response> {
+    const url = `${this.endpoint}${path}`;
+    const method = init?.method ?? "GET";
+
+    // Use https.request for HTTPS with mTLS
+    if (this.httpsAgent && this.endpoint.startsWith("https://")) {
+      return this.httpsRequest(path, init, timeoutMs);
+    }
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      const resp = await fetch(url, {
+        ...init,
+        signal: controller.signal,
+      });
+
+      if (!resp.ok) {
+        const text = await resp.text().catch(() => "");
+        console.error(`[agentbox-client] HTTP error: ${method} ${path} → ${resp.status} ${text.slice(0, 200)}`);
+        throw agentBoxResponseError(resp.status, text);
+      }
+
+      return resp;
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") {
+        console.error(`[agentbox-client] HTTP timeout: ${method} ${path} (${timeoutMs}ms)`);
+      }
+      throw err;
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
+
+  /**
+   * HTTPS request with mTLS (returns a Response-compatible object)
+   */
+  private httpsRequest(path: string, init?: RequestInit, timeoutMs = this.timeoutMs): Promise<Response> {
+    const method = init?.method ?? "GET";
+    const urlObj = new URL(path, this.endpoint);
+
+    return new Promise((resolve, reject) => {
+      const req = https.request(
+        {
+          hostname: urlObj.hostname,
+          port: urlObj.port,
+          path: urlObj.pathname + urlObj.search,
+          method,
+          headers: init?.headers as Record<string, string>,
+          agent: this.httpsAgent!,
+        },
+        (res) => {
+          // Decode once on the stream — per-chunk decoding turns a multibyte
+          // character split across two chunks into two U+FFFD.
+          res.setEncoding("utf8");
+          let body = "";
+          res.on("data", (chunk) => (body += chunk));
+          res.on("end", () => {
+            const status = res.statusCode ?? 500;
+            if (status >= 200 && status < 300) {
+              resolve(new Response(body, { status, statusText: res.statusMessage }));
+            } else {
+              console.error(`[agentbox-client] HTTPS error: ${method} ${path} → ${status} ${body.slice(0, 200)}`);
+              reject(agentBoxResponseError(status, body));
+            }
+          });
+        },
+      );
+
+      req.on("error", reject);
+      req.setTimeout(timeoutMs, () => {
+        req.destroy();
+        reject(new Error(`AgentBox HTTPS request timeout: ${method} ${path} (${timeoutMs}ms)`));
+      });
+
+      if (init?.body) {
+        req.write(init.body);
+      }
+      req.end();
+    });
+  }
+}

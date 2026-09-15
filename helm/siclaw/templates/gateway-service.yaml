@@ -1,0 +1,22 @@
+{{- if eq (include "siclaw.runtime.enabled" .) "true" }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "siclaw.fullname" . }}-runtime
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "siclaw.labels" (dict "ctx" . "component" "runtime") | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - port: 3001
+      targetPort: http
+      protocol: TCP
+      name: http
+    - port: 3002
+      targetPort: https-internal
+      protocol: TCP
+      name: https-internal
+  selector:
+    {{- include "siclaw.selectorLabels" (dict "ctx" . "component" "runtime") | nindent 4 }}
+{{- end }}

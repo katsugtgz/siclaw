@@ -1,0 +1,281 @@
+import { describe, it, expect, beforeEach, vi } from "vitest";
+import { EventEmitter } from "node:events";
+import { StringDecoder } from "node:string_decoder";
+import http from "node:http";
+import { handleCredentialRequest, handleCredentialList } from "./credential-proxy.js";
+import { CredentialService, CredentialNotFoundError, SessionOwnershipError } from "./credential-service.js";
+import type { CertificateIdentity } from "./security/cert-manager.js";
+
+// ── Fakes ──────────────────────────────────────────────────
+
+class FakeReq extends EventEmitter {
+  [Symbol.asyncIterator](): AsyncIterator<Buffer | string> {
+    return (async function* (self: FakeReq): AsyncGenerator<Buffer | string> {
+      if (!self._encoding) {
+        for (const chunk of self._chunks) yield chunk;
+        return;
+      }
+      // Mirror what a real stream does with an encoding set: ONE decoder across
+      // all chunks, holding the partial bytes of a character split by a chunk
+      // boundary. Decoding each chunk on its own here would make the double
+      // corrupt the text no matter what the production code does, so the test
+      // would prove nothing.
+      const decoder = new StringDecoder(self._encoding);
+      for (const chunk of self._chunks) {
+        const text = decoder.write(chunk);
+        if (text) yield text;
+      }
+      const tail = decoder.end();
+      if (tail) yield tail;
+    })(this);
+  }
+  _chunks: Buffer[] = [];
+  _encoding: BufferEncoding | null = null;
+  constructor(body: string | Buffer[]) {
+    super();
+    if (Array.isArray(body)) this._chunks.push(...body);
+    else if (body) this._chunks.push(Buffer.from(body));
+  }
+  setEncoding(encoding: BufferEncoding): this {
+    this._encoding = encoding;
+    return this;
+  }
+}
+
+class FakeRes {
+  statusCode = 0;
+  headers: Record<string, string | number> = {};
+  body = "";
+  writeHead(status: number, headers: Record<string, string | number>): this {
+    this.statusCode = status;
+    this.headers = headers;
+    return this;
+  }
+  end(data?: string): void { if (data) this.body = data; }
+}
+
+function asHttpReq(r: FakeReq): http.IncomingMessage {
+  return r as unknown as http.IncomingMessage;
+}
+function asHttpRes(r: FakeRes): http.ServerResponse {
+  return r as unknown as http.ServerResponse;
+}
+
+const goodIdentity: CertificateIdentity = {
+  agentId: "a1",
+  orgId: "o1",
+  boxId: "b1",
+  env: "dev",
+  issuedAt: new Date(),
+  expiresAt: new Date(),
+};
+
+class FakeService {
+  getClusterCredential = vi.fn();
+  getHostCredential = vi.fn();
+  listClusters = vi.fn();
+  listHosts = vi.fn();
+  queryHosts = vi.fn();
+}
+
+let service: FakeService;
+
+beforeEach(() => {
+  service = new FakeService();
+});
+
+// ── handleCredentialRequest ────────────────────────────────
+
+describe("handleCredentialRequest", () => {
+  it("200 with cluster payload when body.source=cluster", async () => {
+    service.getClusterCredential.mockResolvedValue({ credential: { name: "c1", type: "kubeconfig", files: [] } });
+    const req = new FakeReq(JSON.stringify({ source: "cluster", source_id: "c1", purpose: "diag" }));
+    const res = new FakeRes();
+    await handleCredentialRequest(asHttpReq(req), asHttpRes(res), goodIdentity, service as unknown as CredentialService);
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body).credential.name).toBe("c1");
+    expect(service.getClusterCredential).toHaveBeenCalled();
+  });
+
+  it("keeps a multibyte character split across two chunks intact", async () => {
+    // Same defect the other two readers had: `chunk.toString()` per chunk decodes
+    // each fragment on its own, so a character straddling the boundary becomes two
+    // U+FFFD. Here it would corrupt the source_id / purpose a credential is
+    // requested for. The split lands one byte into the em dash, leaving neither
+    // half a valid sequence.
+    const purpose = "诊断 kubelet — 日志";
+    const payload = Buffer.from(JSON.stringify({ source: "cluster", source_id: "c1", purpose }), "utf8");
+    const splitAt = payload.indexOf(Buffer.from("—", "utf8")) + 1;
+    expect(splitAt).toBeGreaterThan(1);
+
+    service.getClusterCredential.mockResolvedValue({ credential: { name: "c1", type: "kubeconfig", files: [] } });
+    const req = new FakeReq([payload.subarray(0, splitAt), payload.subarray(splitAt)]);
+    const res = new FakeRes();
+    await handleCredentialRequest(asHttpReq(req), asHttpRes(res), goodIdentity, service as unknown as CredentialService);
+
+    expect(res.statusCode).toBe(200);
+    // getClusterCredential(identity, source_id, purpose)
+    const seenPurpose = service.getClusterCredential.mock.calls[0][2];
+    expect(seenPurpose).toBe(purpose);
+    expect(seenPurpose).not.toContain("�");
+  });
+
+  it("200 with host payload when body.source=host", async () => {
+    service.getHostCredential.mockResolvedValue({ credential: { name: "h1", type: "ssh", files: [] } });
+    const req = new FakeReq(JSON.stringify({ source: "host", source_id: "h1" }));
+    const res = new FakeRes();
+    await handleCredentialRequest(asHttpReq(req), asHttpRes(res), goodIdentity, service as unknown as CredentialService);
+    expect(res.statusCode).toBe(200);
+    expect(service.getHostCredential).toHaveBeenCalled();
+  });
+
+  it("400 for unsupported source", async () => {
+    const req = new FakeReq(JSON.stringify({ source: "bogus", source_id: "x" }));
+    const res = new FakeRes();
+    await handleCredentialRequest(asHttpReq(req), asHttpRes(res), goodIdentity, service as unknown as CredentialService);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toMatch(/Unsupported source/);
+  });
+
+  it("400 for missing source_id", async () => {
+    const req = new FakeReq(JSON.stringify({ source: "cluster" }));
+    const res = new FakeRes();
+    await handleCredentialRequest(asHttpReq(req), asHttpRes(res), goodIdentity, service as unknown as CredentialService);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toMatch(/source_id is required/);
+  });
+
+  it("400 for malformed JSON body", async () => {
+    const req = new FakeReq("not-json-at-all");
+    const res = new FakeRes();
+    await handleCredentialRequest(asHttpReq(req), asHttpRes(res), goodIdentity, service as unknown as CredentialService);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toBe("Invalid JSON body");
+  });
+
+  it("404 when service throws CredentialNotFoundError", async () => {
+    service.getClusterCredential.mockRejectedValue(new CredentialNotFoundError("cluster x missing"));
+    const req = new FakeReq(JSON.stringify({ source: "cluster", source_id: "x" }));
+    const res = new FakeRes();
+    await handleCredentialRequest(asHttpReq(req), asHttpRes(res), goodIdentity, service as unknown as CredentialService);
+    expect(res.statusCode).toBe(404);
+  });
+
+  it("403 when service throws SessionOwnershipError — request never reaches upstream", async () => {
+    service.getClusterCredential.mockRejectedValue(new SessionOwnershipError("session sess-x belongs to agent other, not a1"));
+    const req = new FakeReq(JSON.stringify({ source: "cluster", source_id: "x" }));
+    const res = new FakeRes();
+    await handleCredentialRequest(asHttpReq(req), asHttpRes(res), goodIdentity, service as unknown as CredentialService);
+    expect(res.statusCode).toBe(403);
+    expect(JSON.parse(res.body).error).toMatch(/belongs to agent/);
+  });
+
+  it("502 when service throws some other error", async () => {
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    service.getClusterCredential.mockRejectedValue(new Error("upstream is burning"));
+    const req = new FakeReq(JSON.stringify({ source: "cluster", source_id: "x" }));
+    const res = new FakeRes();
+    await handleCredentialRequest(asHttpReq(req), asHttpRes(res), goodIdentity, service as unknown as CredentialService);
+    expect(res.statusCode).toBe(502);
+    expect(JSON.parse(res.body).error).toBe("upstream is burning");
+    errSpy.mockRestore();
+  });
+
+  it("rejects a sessionId containing control characters (charset whitelist)", async () => {
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const req = new FakeReq(JSON.stringify({ source: "cluster", source_id: "x", session_id: "s\r\nX" }));
+    const res = new FakeRes();
+    await handleCredentialRequest(asHttpReq(req), asHttpRes(res), goodIdentity, service as unknown as CredentialService);
+    expect(res.statusCode).toBe(502);
+    expect(JSON.parse(res.body).error).toMatch(/Invalid sessionId/);
+    errSpy.mockRestore();
+  });
+
+  it("rejects an identity with control characters in agentId", async () => {
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const bad: CertificateIdentity = { ...goodIdentity, agentId: "a; rm -rf /" };
+    const req = new FakeReq(JSON.stringify({ source: "cluster", source_id: "x" }));
+    const res = new FakeRes();
+    await handleCredentialRequest(asHttpReq(req), asHttpRes(res), bad, service as unknown as CredentialService);
+    expect(res.statusCode).toBe(502);
+    expect(JSON.parse(res.body).error).toMatch(/Invalid agentId/);
+    errSpy.mockRestore();
+  });
+});
+
+// ── handleCredentialList ───────────────────────────────────
+
+describe("handleCredentialList", () => {
+  it("200 with clusters array", async () => {
+    service.listClusters.mockResolvedValue([{ name: "c", is_production: true }]);
+    const req = new FakeReq(JSON.stringify({ kind: "cluster" }));
+    const res = new FakeRes();
+    await handleCredentialList(asHttpReq(req), asHttpRes(res), goodIdentity, service as unknown as CredentialService);
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body).clusters).toHaveLength(1);
+  });
+
+  it("200 with hosts array", async () => {
+    service.listHosts.mockResolvedValue([{ name: "h", ip: "1.2.3.4", port: 22, username: "u", auth_type: "key", is_production: true }]);
+    const req = new FakeReq(JSON.stringify({ kind: "host" }));
+    const res = new FakeRes();
+    await handleCredentialList(asHttpReq(req), asHttpRes(res), goodIdentity, service as unknown as CredentialService);
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body).hosts).toHaveLength(1);
+  });
+
+  it("routes a host list WITH a query to queryHosts (filtered path), not listHosts", async () => {
+    service.queryHosts.mockResolvedValue({ hosts: [{ name: "gpu-1", ip: "10.0.0.9", port: 22, username: "root", auth_type: "key", is_production: true }], total: 1, next_cursor: null });
+    const req = new FakeReq(JSON.stringify({ kind: "host", query: "gpu", limit: 10 }));
+    const res = new FakeRes();
+    await handleCredentialList(asHttpReq(req), asHttpRes(res), goodIdentity, service as unknown as CredentialService);
+    expect(res.statusCode).toBe(200);
+    const parsed = JSON.parse(res.body);
+    expect(parsed.hosts).toHaveLength(1);
+    expect(parsed.total).toBe(1);
+    expect(service.queryHosts).toHaveBeenCalledWith(expect.objectContaining({ agentId: "a1" }), "gpu", expect.objectContaining({ limit: 10 }));
+    expect(service.listHosts).not.toHaveBeenCalled();
+  });
+
+  it("routes a host list WITHOUT a query to the full listHosts path", async () => {
+    service.listHosts.mockResolvedValue([]);
+    const req = new FakeReq(JSON.stringify({ kind: "host" }));
+    const res = new FakeRes();
+    await handleCredentialList(asHttpReq(req), asHttpRes(res), goodIdentity, service as unknown as CredentialService);
+    expect(service.listHosts).toHaveBeenCalled();
+    expect(service.queryHosts).not.toHaveBeenCalled();
+  });
+
+  it("400 when kind is unsupported", async () => {
+    const req = new FakeReq(JSON.stringify({ kind: "pizza" }));
+    const res = new FakeRes();
+    await handleCredentialList(asHttpReq(req), asHttpRes(res), goodIdentity, service as unknown as CredentialService);
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("400 when body is not JSON", async () => {
+    const req = new FakeReq("{no");
+    const res = new FakeRes();
+    await handleCredentialList(asHttpReq(req), asHttpRes(res), goodIdentity, service as unknown as CredentialService);
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("403 when service throws SessionOwnershipError on list — request never reaches upstream", async () => {
+    service.listClusters.mockRejectedValue(new SessionOwnershipError("session sess-x belongs to agent other, not a1"));
+    const req = new FakeReq(JSON.stringify({ kind: "cluster" }));
+    const res = new FakeRes();
+    await handleCredentialList(asHttpReq(req), asHttpRes(res), goodIdentity, service as unknown as CredentialService);
+    expect(res.statusCode).toBe(403);
+    expect(JSON.parse(res.body).error).toMatch(/belongs to agent/);
+  });
+
+  it("502 on service error", async () => {
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    service.listClusters.mockRejectedValue(new Error("boom"));
+    const req = new FakeReq(JSON.stringify({ kind: "cluster" }));
+    const res = new FakeRes();
+    await handleCredentialList(asHttpReq(req), asHttpRes(res), goodIdentity, service as unknown as CredentialService);
+    expect(res.statusCode).toBe(502);
+    errSpy.mockRestore();
+  });
+});

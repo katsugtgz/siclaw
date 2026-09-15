@@ -1,0 +1,424 @@
+/**
+ * PromFederationAggregator — application-layer Prometheus federation (K8s mode).
+ *
+ * The Gateway pulls each AgentBox's prom-client snapshot (cumulative current values)
+ * every 30s and, on SIGTERM, receives a final push. This aggregator turns those
+ * per-process snapshots into ONE stable, monotonic set of series exported from the
+ * Gateway's own /metrics — surviving the AgentBox pods being recycled.
+ *
+ * Core invariants (see metrics-federation-DESIGN.md module 2):
+ *
+ *  - **Delta accumulation** for counters & histograms: each round only the increase
+ *    since this instance's last-seen value is added to the Gateway-side cumulative
+ *    total. A pod disappearing can never make a federated counter go down.
+ *
+ *  - **lastSeen keyed on (boxId, incarnation)**: boxId is derived from agentId and is
+ *    REUSED when a pod is rebuilt, so it cannot by itself distinguish two process
+ *    incarnations. The per-process `incarnation` nonce does. A rebuilt pod is a new
+ *    instance key → its counters are counted in full rather than diffed against the
+ *    previous incarnation's stale (higher) values.
+ *
+ *  - **Reset detection**: within one incarnation, `cur < lastSeen` means an in-process
+ *    counter reset → the delta is `cur` (count the whole post-reset value).
+ *
+ *  - **Idempotent ingest**: pull and final-flush share this same entry point. Ingesting
+ *    the same frame twice yields `delta = max(0, cur - lastSeen) = 0`. Correctness does
+ *    not depend on the arrival order of pull vs flush.
+ *
+ *  - **Gauge whitelists**: a gauge is federated only if it is on one of two lists.
+ *    `FEDERATABLE_GAUGES` are meaningful to sum across pods (currently just
+ *    sessions_active) and are recomputed each round as the sum over live instances.
+ *    `PER_BOX_GAUGES` are capacity readings that must NOT be summed; they carry an
+ *    injected `box_id` label so each instance keeps its own series. Everything else
+ *    (per-session context windows, etc.) is skipped.
+ *
+ *  - **Export admission**: counters/histograms are federated only if `siclaw_`-prefixed,
+ *    so a future debug/third-party metric can't silently leak into the long-lived
+ *    federated series set.
+ *
+ * This module holds pure aggregation logic + structured export (`exportGroups()`).
+ * Rendering the structured output to Prometheus text (real Registry + custom histogram
+ * collector) is wired in server.ts (module 3).
+ */
+
+import type { PromSampleGroup } from "../shared/metrics-types.js";
+
+/**
+ * Gauges that are meaningful to sum across pods. Everything else is skipped.
+ *
+ * NOTE on labeled gauges: `ingestGauge` overwrites only the gauge series present in
+ * the current frame, so if a future federatable gauge carries labels, a label combo
+ * that stops being reported would retain its last value and keep inflating the
+ * cross-pod sum until its instance is gauge-evicted. The only current entry,
+ * `siclaw_sessions_active`, is label-less (prom-client always emits exactly one
+ * series), so this cannot happen today. Before adding a LABELED gauge here, also
+ * reconcile per-frame disappearance of label combos.
+ */
+export const FEDERATABLE_GAUGES = new Set<string>(["siclaw_sessions_active"]);
+
+/**
+ * Gauges federated PER BOX rather than summed: each instance keeps its own series,
+ * distinguished by an injected `box_id` label.
+ *
+ * Summing these would destroy their meaning — the mean of two boxes' event-loop lag
+ * is not a lag, and an RSS total says nothing about whether any single box is near
+ * its limit. Keeping them per-box also makes the cross-box total available where it
+ * IS meaningful (`sum(siclaw_box_turns_in_flight)`) while never taking it implicitly.
+ *
+ * Cardinality is bounded by the live pod count, not by churn: a departed box's series
+ * leave with its grace eviction in `retainInstances`, unlike counter baselines.
+ *
+ * The labeled-gauge caveat above applies — a label combo that stops being reported by
+ * a still-live instance would retain its last value. These families are emitted
+ * unconditionally on every scrape by capacity-metrics.ts (a `collect` hook always
+ * sets a value), so no combo can disappear while the box lives.
+ */
+export const PER_BOX_GAUGES = new Set<string>([
+  "siclaw_box_turns_in_flight",
+  "siclaw_box_subagent_active",
+  "siclaw_box_subagent_pending",
+  "siclaw_box_subagent_limit",
+  "siclaw_box_rss_bytes",
+  "siclaw_box_heap_used_bytes",
+  "siclaw_box_event_loop_lag_mean_ms",
+  "siclaw_box_event_loop_lag_max_ms",
+]);
+
+/** Only families with this prefix are federated (admission control). */
+const FEDERATION_PREFIX = "siclaw_";
+
+/** Separator that cannot appear in box ids, incarnations, metric names, or label values. */
+const NUL = "\0";
+
+function instanceKey(boxId: string, incarnation: string): string {
+  return `${boxId}${NUL}${incarnation}`;
+}
+
+/**
+ * Stable key for a single series: sample name + sorted business labels.
+ *
+ * Every field is joined with NUL, which cannot appear in a metric name, label
+ * name, or label value. Using `=`/`,` here would let label VALUES collide —
+ * e.g. {a:"1,b=2"} and {a:"1",b:"2"} would both render `a=1,b=2` and the two
+ * distinct series would silently merge and sum. NUL separation prevents that.
+ */
+function seriesKey(sampleName: string, labels: Record<string, string | number>): string {
+  let key = sampleName;
+  for (const k of Object.keys(labels).sort()) {
+    key += `${NUL}${k}${NUL}${labels[k]}`;
+  }
+  return key;
+}
+
+/** Escape a label value per Prometheus text format: backslash, double-quote, newline. */
+function escapeLabelValue(v: string | number): string {
+  return String(v).replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n");
+}
+
+/** Escape HELP text: backslash and newline (not double-quote). */
+function escapeHelp(help: string): string {
+  return help.replace(/\\/g, "\\\\").replace(/\n/g, "\\n");
+}
+
+/** Render `{k="v",...}` with sorted keys, or "" when there are no labels. */
+function renderLabels(labels: Record<string, string | number>): string {
+  const keys = Object.keys(labels).sort();
+  if (keys.length === 0) return "";
+  const inner = keys.map((k) => `${k}="${escapeLabelValue(labels[k])}"`).join(",");
+  return `{${inner}}`;
+}
+
+/** A counter/histogram series accumulated on the Gateway side. */
+interface AccumulatedSeries {
+  /** Metric family name (group name), e.g. "siclaw_prompt_duration_ms". */
+  family: string;
+  type: "counter" | "histogram";
+  /** Histogram sub-sample name (_bucket/_sum/_count); undefined for plain counters. */
+  metricName?: string;
+  labels: Record<string, string | number>;
+  /** Running cumulative total (monotonic). */
+  value: number;
+}
+
+/** A whitelisted gauge sample as last reported by one instance. */
+interface GaugeSample {
+  family: string;
+  labels: Record<string, string | number>;
+  value: number;
+}
+
+/**
+ * Cap on retained per-instance counter baselines (`lastSeen`). Bounds memory under
+ * pod churn while staying far above any realistic concurrent agentbox fleet, so a
+ * still-live instance is never pruned. Pruned LRU (least-recently-ingested first).
+ */
+const MAX_TRACKED_INSTANCES = 4096;
+
+export class PromFederationAggregator {
+  /**
+   * (boxId,incarnation) → seriesKey → last raw value seen (counters/histograms).
+   *
+   * Retained for the instance's lifetime AND beyond eviction (LRU-capped), NOT deleted
+   * when the pod leaves the live set. This is what keeps counter accumulation correct
+   * against a late or reordered frame: if the baseline were dropped, a returning frame
+   * would be treated as first-seen and re-counted in full, inflating a monotonic
+   * counter. Gauge contributions (below) are reconciled promptly; counter baselines
+   * are not — they only ever feed `max(0, cur - last)` deltas, so keeping a stale
+   * baseline is harmless, while dropping one is not.
+   */
+  private lastSeen = new Map<string, Map<string, number>>();
+
+  /** seriesKey → accumulated counter/histogram series. */
+  private cumulative = new Map<string, AccumulatedSeries>();
+
+  /**
+   * (boxId,incarnation) → seriesKey → current whitelisted gauge value. Reconciled
+   * PROMPTLY (grace eviction + stale-incarnation eviction) so the cross-pod sum drops
+   * a dead pod's contribution quickly — unlike lastSeen, which is retained.
+   */
+  private gauges = new Map<string, Map<string, GaugeSample>>();
+
+  /** Instances whose gauges were absent from the live set for one round, awaiting eviction. */
+  private pendingEviction = new Set<string>();
+
+  /** Family name → {type, help} metadata, for rendering # HELP / # TYPE. */
+  private familyMeta = new Map<string, { type: PromSampleGroup["type"]; help: string }>();
+
+  /**
+   * Ingest one process's cumulative snapshot. Shared by the pull loop and the
+   * SIGTERM final-flush route (idempotent — see class docs).
+   *
+   * @param boxId       The pod/process box id (pull: from PodLister; flush: from the mTLS cert identity).
+   * @param incarnation The per-process start nonce from the snapshot.
+   * @param groups      `getMetricsAsJSON()` output for this process.
+   */
+  ingest(boxId: string, incarnation: string, groups: PromSampleGroup[]): void {
+    const ikey = instanceKey(boxId, incarnation);
+
+    // A new incarnation for an existing boxId means the previous process was replaced
+    // (pod rebuild). Drop the old incarnation's GAUGE contribution immediately so the
+    // cross-pod sum doesn't double-count both incarnations; its counter baseline is
+    // retained (LRU) so a reordered old-incarnation frame still computes a correct
+    // delta rather than being re-counted in full.
+    this.evictStaleIncarnations(boxId, incarnation);
+
+    // NOTE: ingest deliberately does NOT cancel a pending gauge eviction. A flush is
+    // the pod's dying breath, not a sign of life — treating it as "resurrected" would
+    // reset the grace counter forever. Gauge liveness is decided solely by
+    // retainInstances against the K8s pod list.
+
+    let seen = this.lastSeen.get(ikey);
+    if (!seen) {
+      seen = new Map<string, number>();
+    } else {
+      // Re-insert at the tail so this instance counts as most-recently-used for the
+      // LRU cap (a still-pulled instance is never the one pruned).
+      this.lastSeen.delete(ikey);
+    }
+    this.lastSeen.set(ikey, seen);
+    // Bound memory: prune the least-recently-ingested instances past the cap.
+    while (this.lastSeen.size > MAX_TRACKED_INSTANCES) {
+      const oldest = this.lastSeen.keys().next().value;
+      if (oldest === undefined) break;
+      this.lastSeen.delete(oldest);
+    }
+
+    for (const group of groups) {
+      if (group.type === "gauge") {
+        this.ingestGauge(ikey, boxId, group);
+        continue;
+      }
+      if (group.type !== "counter" && group.type !== "histogram") {
+        continue; // summary unsupported for now
+      }
+      // Admission: only siclaw_-prefixed counter/histogram families are federated.
+      if (!group.name.startsWith(FEDERATION_PREFIX)) continue;
+      this.recordMeta(group);
+
+      for (const sample of group.values) {
+        const sampleName = sample.metricName ?? group.name;
+        const sk = seriesKey(sampleName, sample.labels);
+        const cur = sample.value;
+        const last = seen.get(sk);
+        // New series for this instance → count it in full. Reset (cur<last) → count cur.
+        const delta = last === undefined ? cur : cur >= last ? cur - last : cur;
+        seen.set(sk, cur);
+
+        if (delta === 0) continue;
+        const acc = this.cumulative.get(sk);
+        if (acc) {
+          acc.value += delta;
+        } else {
+          this.cumulative.set(sk, {
+            family: group.name,
+            type: group.type,
+            metricName: sample.metricName,
+            labels: sample.labels,
+            value: delta,
+          });
+        }
+      }
+    }
+  }
+
+  private recordMeta(group: PromSampleGroup): void {
+    if (!this.familyMeta.has(group.name)) {
+      this.familyMeta.set(group.name, { type: group.type, help: group.help ?? "" });
+    }
+  }
+
+  private ingestGauge(ikey: string, boxId: string, group: PromSampleGroup): void {
+    const perBox = PER_BOX_GAUGES.has(group.name);
+    // Not summable and not per-box → the value has no cross-pod meaning at all.
+    if (!perBox && !FEDERATABLE_GAUGES.has(group.name)) return;
+    this.recordMeta(group);
+    let g = this.gauges.get(ikey);
+    if (!g) {
+      g = new Map<string, GaugeSample>();
+      this.gauges.set(ikey, g);
+    }
+    for (const sample of group.values) {
+      // The box_id label is what keeps per-box gauges apart in exportGroups' sum:
+      // distinct labels → distinct seriesKey → nothing to add together.
+      const labels = perBox ? { ...sample.labels, box_id: boxId } : sample.labels;
+      const sk = seriesKey(group.name, labels);
+      g.set(sk, { family: group.name, labels, value: sample.value });
+    }
+  }
+
+  /**
+   * Drop the GAUGE contribution of any instance that shares this boxId but has a
+   * different incarnation (the previous process of a rebuilt pod). Immediate, because
+   * the old incarnation's `sessions_active` must leave the cross-pod sum the instant
+   * the replacement reports, otherwise both would be summed (a transient doubling).
+   *
+   * The old incarnation's counter baseline (`lastSeen`) is deliberately NOT dropped
+   * here — it is retained (LRU) so a reordered old-incarnation frame computes a correct
+   * `max(0, cur - last)` delta instead of being re-counted in full.
+   */
+  private evictStaleIncarnations(boxId: string, incarnation: string): void {
+    const prefix = `${boxId}${NUL}`;
+    const keep = instanceKey(boxId, incarnation);
+    for (const ikey of this.gauges.keys()) {
+      if (ikey.startsWith(prefix) && ikey !== keep) this.evictGauges(ikey);
+    }
+  }
+
+  /** Remove an instance's gauge contribution (counter baseline is retained — see lastSeen). */
+  private evictGauges(ikey: string): void {
+    this.gauges.delete(ikey);
+    this.pendingEviction.delete(ikey);
+  }
+
+  /**
+   * Reconcile GAUGE contributions against the set of live box ids (running pods from
+   * the K8s pod list). Gauge eviction is delayed by one round (grace): a pod must be
+   * absent for two consecutive reconciliations before its gauges are dropped.
+   *
+   * Counter baselines (`lastSeen`) are intentionally NOT reconciled here — they are
+   * retained (LRU-capped) so late/reordered counter frames never re-count in full.
+   * Only gauges need prompt eviction, for cross-pod sum correctness.
+   *
+   * Keyed on boxId (not instanceKey) because the pod list only knows box ids; a
+   * transient metrics-fetch failure does not remove a running pod from the list, so
+   * it won't evict a live instance.
+   */
+  retainInstances(liveBoxIds: Set<string>): void {
+    for (const ikey of [...this.gauges.keys()]) {
+      const boxId = ikey.slice(0, ikey.indexOf(NUL));
+      if (liveBoxIds.has(boxId)) {
+        this.pendingEviction.delete(ikey); // alive → reset grace
+        continue;
+      }
+      if (this.pendingEviction.has(ikey)) {
+        this.evictGauges(ikey); // absent a second round → evict gauges
+      } else {
+        this.pendingEviction.add(ikey); // first absence → grace
+      }
+    }
+  }
+
+  /**
+   * Structured federated output: accumulated counters/histograms plus summed
+   * whitelisted gauges, regrouped into prom-client metric families. `metrics()`
+   * renders this to Prometheus text.
+   */
+  exportGroups(): PromSampleGroup[] {
+    const families = new Map<string, PromSampleGroup>();
+
+    const familyOf = (name: string, type: PromSampleGroup["type"]): PromSampleGroup => {
+      let fam = families.get(name);
+      if (!fam) {
+        fam = { name, type, help: this.familyMeta.get(name)?.help ?? "", values: [] };
+        families.set(name, fam);
+      }
+      return fam;
+    };
+
+    // Counters & histograms (accumulated).
+    for (const acc of this.cumulative.values()) {
+      const fam = familyOf(acc.family, acc.type);
+      fam.values.push({ labels: acc.labels, value: acc.value, metricName: acc.metricName });
+    }
+
+    // Whitelisted gauges: sum current values across live instances per series. Per-box
+    // gauges carry a box_id label, so each instance is its own series and nothing is
+    // added together — the sum below is a no-op for them by construction.
+    const gaugeSums = new Map<string, { family: string; labels: Record<string, string | number>; value: number }>();
+    for (const perInstance of this.gauges.values()) {
+      for (const [sk, sample] of perInstance) {
+        const existing = gaugeSums.get(sk);
+        if (existing) existing.value += sample.value;
+        else gaugeSums.set(sk, { family: sample.family, labels: sample.labels, value: sample.value });
+      }
+    }
+    for (const g of gaugeSums.values()) {
+      const fam = familyOf(g.family, "gauge");
+      fam.values.push({ labels: g.labels, value: g.value });
+    }
+
+    return [...families.values()];
+  }
+
+  /**
+   * Render the federated series as Prometheus text-exposition format.
+   *
+   * Rendered directly from the accumulated structured values rather than re-feeding
+   * them through prom-client Counter/Gauge objects: histogram bucket counts cannot be
+   * set on a prom-client Histogram (no per-bucket API — the reason a custom path is
+   * needed at all), and the accumulated values are already exact, so a small direct
+   * renderer is both simpler and loses no precision. One `# HELP`/`# TYPE` header per
+   * family guarantees no duplicate-TYPE parse errors.
+   */
+  metrics(): string {
+    const lines: string[] = [];
+    for (const fam of this.exportGroups()) {
+      if (fam.values.length === 0) continue;
+      if (fam.help) lines.push(`# HELP ${fam.name} ${escapeHelp(fam.help)}`);
+      lines.push(`# TYPE ${fam.name} ${fam.type}`);
+      for (const sample of fam.values) {
+        const name = sample.metricName ?? fam.name;
+        lines.push(`${name}${renderLabels(sample.labels)} ${sample.value}`);
+      }
+    }
+    return lines.length ? lines.join("\n") + "\n" : "";
+  }
+
+  /**
+   * Number of instances whose counter baselines are currently retained, for the
+   * `siclaw_federation_tracked_instances` self-monitoring gauge (module 4).
+   *
+   * This counts retained delta-state (live + recently-departed, up to the LRU cap),
+   * NOT only live pods — which makes it the better churn/cardinality-leak signal. It
+   * plateaus near MAX_TRACKED_INSTANCES under heavy churn rather than tracking the
+   * live pod count exactly.
+   */
+  trackedInstanceCount(): number {
+    return this.lastSeen.size;
+  }
+
+  /** Number of distinct federated series currently held (for self-monitoring, module 4). */
+  seriesCount(): number {
+    return this.cumulative.size;
+  }
+}

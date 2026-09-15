@@ -1,0 +1,91 @@
+{{- if .Values.portal.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "siclaw.fullname" . }}-portal
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "siclaw.labels" (dict "ctx" . "component" "portal") | nindent 4 }}
+spec:
+  replicas: {{ .Values.portal.replicas }}
+  selector:
+    matchLabels:
+      {{- include "siclaw.selectorLabels" (dict "ctx" . "component" "portal") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "siclaw.selectorLabels" (dict "ctx" . "component" "portal") | nindent 8 }}
+    spec:
+      containers:
+        - name: portal
+          image: {{ include "siclaw.image" (dict "component" "portal" "ctx" .) }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 3003
+              protocol: TCP
+          env:
+            {{- if .Values.scriptSandbox.enabled }}
+            {{- if .Values.scriptSandbox.publicUrl }}
+            - name: SICLAW_SANDBOX_PUBLIC_URL
+              value: {{ .Values.scriptSandbox.publicUrl | quote }}
+            {{- end }}
+            - name: SICLAW_SANDBOX_TARGET_CONCURRENCY
+              value: {{ (.Values.scriptSandbox.traffic | default dict).targetConcurrency | default 10 | quote }}
+            - name: SICLAW_SANDBOX_TARGET_RPS
+              value: {{ (.Values.scriptSandbox.traffic | default dict).targetRps | default 10 | quote }}
+            - name: SICLAW_SANDBOX_TARGET_BURST
+              value: {{ (.Values.scriptSandbox.traffic | default dict).targetBurst | default 20 | quote }}
+            {{- end }}
+            - name: NODE_ENV
+              value: "production"
+            - name: PORTAL_PORT
+              value: "3003"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "siclaw.fullname" . }}-portal
+                  key: database-url
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "siclaw.fullname" . }}-portal
+                  key: jwt-secret
+            - name: SICLAW_PORTAL_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "siclaw.fullname" . }}-portal
+                  key: portal-secret
+            {{- $ocr := .Values.ocr | default dict }}
+            {{- $ocrService := $ocr.service | default dict }}
+            {{- $ocrPort := $ocrService.port | default 8088 }}
+            {{- if or $ocr.enabled $ocr.externalUrl }}
+            - name: SICLAW_OCR_BACKEND_URL
+              value: {{ default (printf "http://%s:%v/parse" (include "siclaw.ocrServiceName" .) $ocrPort) $ocr.externalUrl | quote }}
+            - name: SICLAW_OCR_TIMEOUT_MS
+              value: {{ $ocr.timeoutMs | quote }}
+            - name: SICLAW_OCR_MAX_EVIDENCE_TEXT_CHARS
+              value: {{ $ocr.maxEvidenceTextChars | quote }}
+            - name: SICLAW_OCR_MAX_TOTAL_EVIDENCE_TEXT_CHARS
+              value: {{ $ocr.maxTotalEvidenceTextChars | default 65536 | quote }}
+            {{- end }}
+            {{- $portalEnv := omit (.Values.portal.env | default dict) "SICLAW_OCR_BACKEND_URL" "SICLAW_OCR_TIMEOUT_MS" "SICLAW_OCR_MAX_EVIDENCE_TEXT_CHARS" "SICLAW_OCR_MAX_TOTAL_EVIDENCE_TEXT_CHARS" }}
+            {{- range $key, $value := $portalEnv }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
+          resources:
+            {{- toYaml .Values.portal.resources | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+{{- end }}

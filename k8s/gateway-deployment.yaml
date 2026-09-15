@@ -1,0 +1,159 @@
+# Siclaw Agent Runtime Deployment
+# Stateless process that manages AgentBox pods.
+#
+# Prerequisites:
+# 1. Create namespace: kubectl create namespace siclaw
+# 2. Create secrets:
+#    kubectl create secret generic siclaw-runtime-secrets \
+#      --from-literal=proxy-secret='<shared-secret>' \
+#      -n siclaw
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: siclaw-runtime
+  namespace: siclaw
+  labels:
+    app: siclaw-runtime
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: siclaw-runtime
+  template:
+    metadata:
+      labels:
+        app: siclaw-runtime
+    spec:
+      serviceAccountName: siclaw-runtime
+      containers:
+      - name: runtime
+        image: siclaw-runtime:latest
+        imagePullPolicy: Always
+        ports:
+        - name: http
+          containerPort: 3001
+          protocol: TCP
+        - name: mtls
+          containerPort: 3002
+          protocol: TCP
+        env:
+        - name: NODE_ENV
+          value: "production"
+        - name: SICLAW_PORT
+          value: "3001"
+        - name: SICLAW_INTERNAL_PORT
+          value: "3002"
+        - name: SICLAW_HOST
+          value: "0.0.0.0"
+        - name: SICLAW_K8S_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: SICLAW_GATEWAY_HOSTNAME
+          value: "siclaw-runtime.siclaw.svc.cluster.local"
+        - name: SICLAW_AGENTBOX_IMAGE
+          value: "siclaw-agentbox:latest"
+        - name: SICLAW_SKILLS_DIR
+          value: "/app/.siclaw/skills"
+        - name: SICLAW_PERSISTENCE_ENABLED
+          value: "true"
+        - name: SICLAW_PERSISTENCE_CLAIM_NAME
+          value: "siclaw-data"
+        - name: SICLAW_PROXY_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: siclaw-runtime-secrets
+              key: proxy-secret
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /api/health
+            port: 3001
+          initialDelaySeconds: 5
+          periodSeconds: 15
+        readinessProbe:
+          httpGet:
+            path: /api/health
+            port: 3001
+          initialDelaySeconds: 2
+          periodSeconds: 2
+        volumeMounts:
+        - name: skills-local
+          mountPath: /app/.siclaw/skills
+        - name: user-data
+          mountPath: /app/.siclaw/user-data
+      volumes:
+      - name: skills-local
+        emptyDir: {}
+      - name: user-data
+        persistentVolumeClaim:
+          claimName: siclaw-data
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: siclaw-runtime
+  namespace: siclaw
+spec:
+  type: ClusterIP
+  selector:
+    app: siclaw-runtime
+  ports:
+  - name: http
+    port: 3001
+    targetPort: 3001
+    protocol: TCP
+  - name: mtls
+    port: 3002
+    targetPort: 3002
+    protocol: TCP
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: siclaw-runtime
+  namespace: siclaw
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: siclaw-runtime
+  namespace: siclaw
+rules:
+- apiGroups: [""]
+  resources: ["pods", "services"]
+  verbs: ["get", "list", "watch", "create", "delete"]
+- apiGroups: [""]
+  resources: ["pods/log"]
+  verbs: ["get"]
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get", "list", "create", "delete"]
+- apiGroups: [""]
+  resources: ["persistentvolumeclaims"]
+  verbs: ["get", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: siclaw-runtime
+  namespace: siclaw
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: siclaw-runtime
+subjects:
+- kind: ServiceAccount
+  name: siclaw-runtime
+  namespace: siclaw

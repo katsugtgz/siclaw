@@ -1,0 +1,86 @@
+---
+title: "Skill System"
+sidebarTitle: "Skills"
+description: "Extend Siclaw with reusable diagnostic playbooks and custom scripts."
+---
+
+## What Are Skills?
+
+Skills are reusable diagnostic playbooks. They let your team package recurring investigation steps into a named capability that Siclaw can run on demand.
+
+Typical examples:
+
+- Check why a deployment rollout is stuck
+- Review GPU health across training nodes
+- Validate a service's DNS and network path
+- Collect the same evidence bundle every time an alert fires
+
+## How Teams Use Skills
+
+Siclaw ships with built-in skills, and teams can add their own through the Web UI.
+
+- **Core skills**: built-in and maintained by Siclaw
+- **Team skills**: shared across your organization after review
+- **Personal skills**: private to one user unless promoted later
+
+## Creating a Skill
+
+```markdown
+# GPU Health Check
+
+Check NVIDIA GPU health status across cluster nodes.
+
+## Parameters
+
+- `namespace` (optional): Target namespace. Default: all namespaces.
+- `node` (optional): Specific node to check.
+
+## Usage
+
+Check all GPUs: `local_script gpu-health-check`
+Check specific node: `local_script gpu-health-check --node gpu-worker-01`
+```
+
+You can create and edit skills in the Web UI, then describe:
+
+- what the skill is for
+- which parameters it accepts
+- how Siclaw should use it during an investigation
+- optional scripts when a structured workflow needs custom execution
+
+## Review and Approval
+
+Skills with scripts go through a mandatory review workflow before they become available:
+
+```
+draft → request review → pending → AI + static analysis → approved/rejected
+```
+
+The review process checks for risky behavior such as destructive shell commands, unsafe script patterns, or actions that would violate Siclaw's read-only model.
+
+Only approved skills can be used in shared environments.
+
+<Note>
+Siclaw is designed for read-only diagnostics. Team skills should follow the same model: investigate, summarize, and recommend actions rather than change production systems directly.
+</Note>
+
+## Running Skills
+
+Skills can be used in several ways:
+
+- directly during a conversation
+- as part of a deeper investigation
+- from scheduled patrols
+- from webhook-triggered workflows
+
+This makes them a good fit for turning repeated incident response habits into reusable, reviewable runbooks.
+
+
+## Reading Skill Instructions
+
+Skill files and their references use pi-coding-agent's native `read` behavior.
+Each text read returns up to 2,000 lines or 50 KiB, with a line offset for continuing
+when more content remains. Siclaw preserves these pages and continuation notices;
+it does not replace them with an 8,000-character head/tail preview. Existing file
+access restrictions still apply. A successful first page does not imply that the
+entire file or its references have been read.

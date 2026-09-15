@@ -1,0 +1,62 @@
+name: KBC Box CI
+
+# Exercise the Python domain harness and the shared, pinned Pi worker together.
+on:
+  push:
+    branches: [main]
+    paths: ["kbc/**", "src/core/**", "src/kbc/**", "package*.json", "patches/**", "scripts/install/**", "tsconfig.json", ".dockerignore", ".github/workflows/kbc-ci.yml"]
+  pull_request:
+    branches: [main]
+    paths: ["kbc/**", "src/core/**", "src/kbc/**", "package*.json", "patches/**", "scripts/install/**", "tsconfig.json", ".dockerignore", ".github/workflows/kbc-ci.yml"]
+
+# Least-privilege: this job only reads the repo (no PR writes, no packages).
+permissions:
+  contents: read
+
+jobs:
+  box-test:
+    name: KBC Box Test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.19.0"
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: sudo apt-get update && sudo apt-get install -y poppler-utils ripgrep
+      - run: pip install -r kbc/platform/pod/requirements.txt pytest pytest-asyncio
+      - run: python -m pytest -q -p pytest_asyncio.plugin -o asyncio_mode=auto test_pi_engine.py test_pi_file_tools.py test_pi_harness.py test_pi_responses.py test_claude_engine.py test_pi_review_regressions.py test_event_relay.py test_resume_routing.py
+        env:
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+        working-directory: kbc/platform/pod
+      - run: python test_compile_box.py
+        working-directory: kbc/platform/pod
+      - run: python test_destream.py
+        working-directory: kbc/platform/pod
+      - run: python test_office_ingest.py
+        working-directory: kbc/platform/pod
+      - run: python test_selfcheck.py
+        working-directory: kbc/platform/pod
+      - run: python test_okf_package.py
+        working-directory: kbc/platform/pod
+      - run: python test_incremental.py
+        working-directory: kbc/platform/pod
+      - run: python test_batching.py
+        working-directory: kbc/platform/pod
+      - run: python test_mediaverify.py
+        working-directory: kbc/platform/pod
+      - run: python test_source_snapshot.py
+        working-directory: kbc/platform/pod
+      - run: python test_redblue.py
+        working-directory: kbc/platform/pod
+      - run: python test_mtls_auth.py
+        working-directory: kbc/platform/pod
+      - run: python test_emit.py
+        working-directory: kbc/tools
+      - name: Build and start the KBC image as its default non-root user
+        run: sh kbc/platform/pod/test_image_permissions.sh

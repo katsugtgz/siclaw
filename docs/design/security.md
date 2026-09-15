@@ -1,0 +1,780 @@
+---
+title: "AgentBox Security Architecture"
+sidebarTitle: "Security"
+description: "Defense-in-depth security model for LLM agent command execution in AgentBox containers."
+---
+
+The opt-in `run_script` container, broker authorization, network profiles and
+one-use warm pool are specified in [Disposable script sandbox](script-sandbox.md).
+
+# AgentBox Security Architecture
+
+> **Purpose**: Document the multi-layer security model that constrains what an LLM agent
+> can do inside an AgentBox container. Every layer is independent — compromising one does
+> not disable the others.
+>
+> **Audience**: Contributors modifying execution tools, Dockerfile, or K8s manifests.
+
+---
+
+## 1. Threat Model
+
+### 1.1 Core Assumption
+
+**The LLM agent is untrusted code.** It generates shell commands that execute in a
+container with access to Kubernetes clusters. The security model must assume the agent
+will attempt — intentionally or via prompt injection — to:
+
+1. **Read credentials**: kubeconfig, mTLS certificates, API keys, tokens
+2. **Exfiltrate data**: Send sensitive information to external endpoints
+3. **Escalate privileges**: Gain access beyond read-only K8s operations
+4. **Escape the container**: Exploit kernel or runtime vulnerabilities
+
+### 1.2 Trust Boundaries
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ AgentBox Container                                       │
+│                                                          │
+│   ┌──────────────────────┐   ┌────────────────────────┐ │
+│   │ Main Process          │   │ Child Processes         │ │
+│   │ (agentbox user)       │   │ (sandbox user)          │ │
+│   │                       │   │                         │ │
+│   │ • Node.js runtime     │   │ • kubectl (setgid)      │ │
+│   │ • LLM API client      │   │ • grep, jq, sort, ...   │ │
+│   │ • Tool validation     │   │   (via restricted_bash) │ │
+│   │ • Reads kubeconfig    │   │ • NO credential access   │ │
+│   │ • Skill scripts       │   │                         │ │
+│   │   (local_script)      │   │                         │ │
+│   └──────────────────────┘   └────────────────────────┘ │
+│                                                          │
+│   Trust boundary: sandbox user cannot read agentbox's    │
+│   files (kubeconfig, mTLS certs, .siclaw/config/)        │
+└──────────────────────────────────────────────────────────┘
+```
+
+**Skill scripts are NOT in the sandbox.** `restricted_bash` is the only tool that drops privileges
+(`sudo -E -u sandbox`); `local_script` spawns the interpreter directly, so a skill runs as `agentbox` —
+the credential owner. This diagram claimed otherwise, which mattered once "sandbox is in no credential
+group" became the foundation of the isolation: it made Layer 1 look like it covered skills.
+
+That placement is deliberate, not an oversight to fix by wrapping skills in `sudo -u sandbox`: skills
+legitimately run `kubectl` against a bound cluster and read their own files, and a skill is repository
+content reviewed before it ships, not model-authored text. The control on skills is review plus the
+command whitelist their `restricted_bash` calls still go through — not OS-level user separation. Moving
+them into the sandbox would be a separate change with its own migration.
+
+### 1.3 What We Protect
+
+| Asset | Location | Risk | Protection |
+|-------|----------|------|------------|
+| Kubeconfig | `.siclaw/credentials/` | Full cluster access | File permissions + setgid kubectl |
+| mTLS certs | `/etc/siclaw/certs/` | Gateway impersonation | File permissions (agentbox:agentbox 0600) |
+| API keys | `.siclaw/config/settings.json` | LLM API abuse, cost | File permissions + sensitive path patterns |
+| Environment vars | Process memory | Token leakage via /proc | `sanitizeEnv()` strips secrets before child spawn |
+| K8s service account | Pod metadata API | Cluster API access | `automountServiceAccountToken: false` |
+
+### 1.4 Browser-Engine Attack Surface (visual export)
+
+The `mcp/create-chart` tools (`render_chart`, `render_mermaid`) launch headless
+Chromium **inside the AgentBox container** (`Dockerfile.agentbox` installs
+`chromium`) to rasterize LLM-generated chart JSON and Mermaid source into PNGs
+for IM channel replies. Visuals are optional attachments; final conclusions
+remain natural-language answers.
+
+Chromium runs with `--no-sandbox --disable-setuid-sandbox`
+(`mcp/create-chart/src/visual-export.ts`). This is the standard workaround for
+running Chromium in a container without `CAP_SYS_ADMIN` or a custom seccomp
+profile, but it disables Chromium's own process sandbox — so a Chromium 0-day
+reached via crafted render input would get **process-level access at sandbox-user
+privileges inside one AgentBox pod**.
+
+This is a deliberate trust-boundary expansion: the AgentBox sandbox previously only
+had to contain tool *output* going wrong; it now also has to contain LLM *content*
+driving a browser engine. It is acceptable because Chromium runs as the **sandbox
+user** (Layer 1) and the container drops ALL capabilities, uses `RuntimeDefault`
+seccomp, and runs `readOnlyRootFilesystem` (Layer 3) — so the blast radius stays
+"one pod, sandbox-user privileges, no credential access."
+
+**Invariant**: the AgentBox Pod Security Standard must stay *restricted*
+(`allowPrivilegeEscalation: false`, no added capabilities, no host networking).
+Relaxing it would turn this browser surface from contained into dangerous. See
+[§5 Layer 3: Container Hardening](#5-layer-3-container-hardening).
+
+---
+
+## 2. Defense-in-Depth Overview
+
+Six independent layers, each providing protection even if others are bypassed:
+
+```
+Layer 1 — OS User Isolation       sandbox user cannot read credential files
+Layer 2 — Command Validation      6-pass whitelist pipeline blocks disallowed binaries
+Layer 3 — Container Hardening     drop ALL capabilities, seccomp, readOnlyRootFilesystem
+Layer 4 — File I/O Restrictions   assertPathAllowed() scopes agent file tools
+Layer 5 — Environment Sanitization  sanitizeEnv() strips API keys/tokens from child env
+Layer 6 — kubectl Access Control  read-only subcommands, exec binary whitelist
+```
+
+**Design principle**: Each layer is justified independently. Removing one layer must not
+create a viable attack path. The OS layer (Layer 1) is the **primary defense** for
+credential protection; application layers (2-6) are **secondary defense-in-depth**.
+
+---
+
+## 3. Layer 1: OS-Level User Isolation
+
+### 3.1 Dual-User Model
+
+Two users exist inside the AgentBox container:
+
+| User | UID | Groups | Purpose |
+|------|-----|--------|---------|
+| `agentbox` | 1000 | `agentbox`, `kubecred`, `hostcred` | Main Node.js process. Owns the credential tree. |
+| `sandbox` | 1001 | `sandbox` | All child processes (shell commands). No credential access. |
+
+`sandbox` holds **no** credential group, and that is the property everything else in this document
+rests on: a command that gets past the whitelist meets `Permission denied` rather than a kubeconfig.
+The one sandbox-side reader is `kubectl`, which reaches the cluster credentials through its setgid bit
+(§3.2) — a group membership on `sandbox` would give every other binary in the image the same access and
+leave that bit decorative.
+
+Host credentials need no sandbox-side reader at all: `ssh` is not in the command registry, so no child
+can dial one, and `host_exec` connects from the node process (running as `agentbox`, the owner) through
+the ssh2 library.
+
+> This was not true between 2026-04 and 2026-08. `sandbox` was granted both credential groups for a
+> setgid `ssh` reader that was never built, and the entrypoint's `chown -R agentbox:kubecred` over the
+> whole tree — correct when written in 2026-03, when the parent WAS a kubecred directory and no
+> low-privilege user was in that group — then re-opened at runtime the traversal the image itself
+> denied. The baked image looked correct; every running container had no isolation. Two guards now make
+> that state unreachable: the build fails (`agentbox-capability-check.sh`) and the container refuses to
+> start (`agentbox-entrypoint.sh`).
+
+The main process runs as `agentbox`. When executing shell commands, it uses
+`sudo -E -u sandbox -- bash -c '<command>'` to drop to the `sandbox` user. The `-E` flag
+preserves the sanitized environment (allowed by `SETENV` in sudoers). That drop happens in exactly one
+place — `restricted-bash.ts` — so `node_exec`, `pod_exec`, `host_exec` and the script tools run in the
+node process, as `agentbox`; their safety comes from argument validation and credential brokering
+(§4, §7), not from this layer.
+
+### 3.2 setgid kubectl
+
+The `kubectl` binary has the setgid bit set for the `kubecred` group:
+
+```
+-rwxr-sr-x 1 root kubecred  kubectl
+```
+
+This allows `kubectl` to read kubeconfig files owned by `agentbox:kubecred` with mode
+`0640`, while other commands (grep, cut, cat) running as `sandbox` cannot.
+
+**Why setgid and not SUID**: setgid only changes the effective group ID, not the user ID.
+The process remains `sandbox` (UID 1001) but temporarily gains `kubecred` group membership.
+This is the minimum privilege needed for kubectl to read the kubeconfig.
+
+### 3.3 File Permission Matrix
+
+**Design principle**: OS-level permissions are the source of truth for access control.
+Application-level restrictions (`assertPathAllowed`, `writeAllowedDirs`) are a secondary
+defense — they prevent the agent from misusing its own file tools, but cannot constrain
+shell commands. The `sandbox` user's filesystem permissions must independently enforce
+the correct access boundaries.
+
+#### Credentials & secrets (sandbox: no access)
+
+The parent directory is group `kubecred`, mode 0750 — it must be traversable by the group setgid
+`kubectl` runs with, or the one legitimate sandbox-side reader cannot reach a kubeconfig at all. What
+makes that safe is not the mode but the membership: `sandbox` is in no credential group, so kubecred
+traversal means "kubectl and the owner" rather than "every child process". Each credential type below it
+then keeps its own group, setgid, so material written into it inherits the right one — `hosts/` stays
+`hostcred` instead of being flattened into `kubecred` by a recursive chown.
+
+**The permission fix is verified, not assumed.** Every chown in the entrypoint ends in `|| true`, so a
+standalone Docker run without `CAP_CHOWN` is not bricked — but that also means the isolation can fail to
+apply in silence. `/app/.siclaw/credentials` is an emptyDir, mounted root-owned, so a chown that does not
+land leaves the tree readable by every child process. The group guard does not cover this case: it checks
+`sandbox`'s group membership, a property of the image, not the directory's owner — so the tree could be
+world-readable with that guard passing.
+
+The entrypoint therefore re-reads owner and mode afterwards and refuses to start unless they are
+`agentbox:kubecred` mode `0750`. The realistic way to reach that refusal is a spec change rather than a
+bug — `runAsNonRoot: true`, a restricted Pod Security Standard on the namespace, or `CHOWN` dropped from
+the capability list — and without the check the pod would come up looking healthy.
+
+This is a contract with the spawner, which is where the dependency actually lives: the AgentBox pod sets
+no `runAsUser`, so it starts as root, and explicitly adds `CHOWN`, `FOWNER`, `SETUID`, `SETGID`. Both
+halves are asserted by `credential-isolation-invariants.test.ts`, because neither file states the pairing
+on its own.
+
+| `.siclaw/credentials/*.kubeconfig` | agentbox:kubecred | 0640 | rw | -- | r- (via group) |
+| `/etc/siclaw/certs/` | agentbox:agentbox | 0600 | rw | -- | -- |
+| `.siclaw/config/settings.json` | agentbox:agentbox | 0600 | rw | -- | -- |
+| `.siclaw/data.sqlite` | agentbox:agentbox | 0600 | rw | -- | -- |
+
+#### Skills & application code (sandbox: read-only)
+
+| Path | Owner | Mode | Volume | agentbox | sandbox | Notes |
+|------|-------|------|--------|----------|---------|-------|
+| `skills/core/` | agentbox:agentbox | 0755/0644 | rootfs (baked) | rwx/rw | r-x/r- | Built-in diagnostic skills. Baked into image. |
+| `.siclaw/skills/` | agentbox:agentbox | 0755/0644 | emptyDir | rwx/rw | r-x/r- | Global + skillset + personal skills synced from DB via `skillsHandler.materialize()`. |
+| `/app/` (application code) | agentbox:agentbox | 0755/0644 | rootfs | rwx/rw | r-x/r- | Node.js dist, package.json, etc. |
+
+**Skills write flow in K8s mode**: `skill.create` → DB → `notifySkillReload` → AgentBox main
+process (agentbox user) calls `skillsHandler.materialize()` → writes to emptyDir at
+`.siclaw/skills/`. The sandbox user (child processes) only reads from this directory.
+
+Agent needs to **read** skills (SKILL.md, scripts/) to understand and execute them.
+Agent must **never write** to skills — that goes through the skill review gate
+(WebUI → DB → resource sync → main process materialize).
+The `sandbox` user has no write permission on any of these by OS permission alone.
+
+#### User data (sandbox: read-write)
+
+| Path | Owner | Mode | agentbox | sandbox | Notes |
+|------|-------|------|----------|---------|-------|
+| `.siclaw/user-data/` | agentbox:agentbox | 0777 | rwx | rwx | Memory files, PROFILE.md, investigation notes. |
+| `.siclaw/user-data/agent/sessions/<session>/.tool-results/` | agentbox:agentbox | 0700 dirs, 0600 files | rw | -- | Session-scoped MCP output artifacts; opaque tool access only. File tools and `restricted_bash` both refuse any `.tool-results` tree. |
+| `/tmp/` | (any) | 1777 | rw | rw | Temporary files. Sticky bit prevents cross-user deletion. |
+
+The `user-data` directory is the **only** writable area for the sandbox user (besides /tmp).
+This matches the application-level `writeAllowedDirs = [userDataDir]` — but enforced at OS level.
+
+**Critical**: No sensitive files should be placed directly in `/tmp/` or the
+world-writable part of `user-data/`. A private subtree below `user-data/` must be
+created by the agentbox process before tool execution, use `0700` directories
+and `0600` files, and remain inaccessible through generic file tools.
+
+### 3.4 Pipeline Compatibility
+
+The dual-user model preserves natural shell pipeline syntax:
+
+```bash
+# sandbox runs the entire pipeline; kubectl gains kubecred via setgid
+sudo -E -u sandbox -- bash -c 'kubectl get pods -A | grep Error | wc -l'
+```
+
+`kubectl` (setgid kubecred) reads the kubeconfig. `grep` and `wc` (plain sandbox) cannot.
+The pipe passes stdout data, not file access permissions.
+
+### 3.5 Dockerfile Changes
+
+Key excerpts from `Dockerfile.agentbox` (see full file for build stage and other details):
+
+```dockerfile
+FROM node:22.19-slim
+
+# System deps including sudo (for agentbox→sandbox user switching)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl jq python3 ca-certificates sudo && rm -rf /var/lib/apt/lists/*
+
+# Pin UIDs/GIDs for K8s securityContext compatibility
+RUN userdel -r node 2>/dev/null || true \
+    && groupadd --gid 1002 kubecred \
+    && useradd --uid 1000 -m -s /bin/bash -G kubecred agentbox \
+    && useradd --uid 1001 -M -s /bin/false sandbox
+
+# sudoers: agentbox can run commands as sandbox (child process isolation)
+# SETENV allows -E flag to preserve sanitized environment
+RUN echo 'agentbox ALL=(sandbox) NOPASSWD:SETENV: ALL' > /etc/sudoers.d/sandbox-exec \
+    && chmod 440 /etc/sudoers.d/sandbox-exec
+
+# kubectl setgid: sandbox user gains kubecred group when running kubectl
+RUN chgrp kubecred /usr/local/bin/kubectl && chmod 2755 /usr/local/bin/kubectl
+
+# Directory structure & permissions
+RUN mkdir -p .siclaw/skills .siclaw/credentials .siclaw/config .siclaw/user-data \
+    && chown -R agentbox:agentbox . \
+    && chown agentbox:kubecred .siclaw/credentials \
+    && chmod 0750 .siclaw/credentials \
+    && chmod 0700 .siclaw/config \
+    && chmod 0755 .siclaw/skills \
+    && chmod 0777 .siclaw/user-data
+
+# Strip all SUID except sudo; verify only kubectl has SGID
+RUN find / -perm /4000 -type f ! -path '/proc/*' 2>/dev/null | while read -r f; do \
+      case "$f" in /usr/bin/sudo) ;; *) chmod u-s "$f" ;; esac; done
+
+# Container starts as root — entrypoint fixes volume permissions then drops to agentbox
+ENTRYPOINT ["/usr/local/bin/agentbox-entrypoint.sh"]
+CMD ["node", "dist/agentbox-main.js"]
+```
+
+**Why no `USER agentbox` directive**: The entrypoint must run as root to fix emptyDir volume
+permissions (chown/chmod), then drops to agentbox via `exec runuser -u agentbox -- "$@"`.
+The agentbox user then uses `sudo` (with its SUID bit) to run child processes as sandbox.
+
+### 3.6 Code Changes
+
+In `src/tools/shell/restricted-bash.ts`, the `exec()` call wraps commands with `sudo` in production:
+
+```typescript
+// In production (K8s pods), run child processes as sandbox user.
+// sudo's SUID elevates to root, then drops to sandbox.
+// -E preserves our sanitized env (allowed by SETENV in sudoers).
+let execCommand = finalCommand;
+if (process.env.NODE_ENV === "production") {
+  const escaped = finalCommand.replace(/'/g, "'\\''");
+  execCommand = `sudo -E -u sandbox -- bash -c '${escaped}'`;
+}
+```
+
+The `KUBECONFIG` environment variable is still set (kubectl reads it), but the kubeconfig
+file itself is only readable by `kubecred` group members.
+
+---
+
+## 4. Layer 2: Application-Level Command Validation
+
+### 4.1 The 6-Pass Validation Pipeline
+
+Every command passes through `validateCommand()` in `src/tools/infra/command-validator.ts`:
+
+```
+Pass 1 — Shell Operators      Block: $(), backticks, <(), >(), file redirections, newlines
+Pass 2 — Pipeline Extraction   extractPipeline() with pipe-position tracking
+Pass 3 — Binary Whitelist      Context-based: local | node | pod | nsenter | ssh
+Pass 4 — Pipeline Validators   kubectl subcommand checks
+Pass 5 — COMMAND_RULES         Per-command: pipeOnly, noFilePaths, blockedFlags, allowedFlags
+Pass 6 — Sensitive Paths       Block commands targeting credential/config file paths
+```
+
+### 4.2 Pass 6: Sensitive Path Patterns
+
+Pass 6 blocks commands that target known credential or configuration file paths.
+These are paths whose content **cannot be reliably sanitized post-execution**
+(binary data, unstructured secrets, password hashes). Commands that produce
+sanitizable output (env, printenv, crictl inspect) are handled by
+`output-sanitizer.ts` instead — see `docs/design/sanitization.md`.
+
+| Category | Patterns | Examples |
+|----------|----------|---------|
+| K8s SA tokens & mounted secrets | `/run/secrets/`, `/var/run/secrets/` | Service account tokens |
+| Process info | `/proc/*/environ`, `/proc/*/cmdline`, `/proc/*/fd/`, `/proc/*/mem`, `/proc/*/maps`, `/proc/*/smaps`, `/proc/kcore` | Process memory, file descriptors |
+| System credentials | `/etc/shadow`, `/etc/gshadow`, `/etc/master.passwd` | Password hashes |
+| SSH | `/.ssh/`, `id_rsa`, `id_ed25519`, `id_ecdsa` | SSH private keys |
+| TLS key material | `*.key`, `*.p12`, `*.pfx`, `*.jks` | Private keys, keystores (`.pem` excluded — CA certs are public and needed for diagnostics) |
+| Cloud providers | `/.aws/`, `/.gcp/`, `/.azure/`, `/.docker/config.json` | Cloud credentials |
+| K8s control plane | `/etc/kubernetes/pki/`, `/etc/kubernetes/admin.conf`, `/var/lib/kubelet/`, `/var/lib/etcd/` | Cluster PKI, etcd data |
+| Shell/DB history | `.bash_history`, `.zsh_history`, `.mysql_history`, `.psql_history`, `.node_repl_history` | Command history with potential secrets |
+
+**Source**: `CONTAINER_SENSITIVE_PATHS` in `src/tools/infra/command-sets.ts:1262-1304`
+
+**What the patterns are matched against.** The raw command text *and* every quote-stripped argument
+containing `/`. Raw text alone is not enough: many of the patterns are end-anchored (`/etc/shadow$`,
+`\.key$`, `/proc/*/environ$`), and a closing quote breaks the anchor — `cat /etc/shadow` was refused
+while `cat "/etc/shadow"` was not. Measured across the list, 11 of 13 representative paths were
+reachable that way, including every TLS key form; the two that held did so because an unanchored rule
+(`/.ssh/`) happened to cover them.
+
+Only arguments containing `/` are re-checked, and the restriction is load-bearing rather than
+conservatism: several patterns (`id_rsa$`, `\.key$`) also match a bare word, so checking every argument
+would refuse `grep id_rsa /var/log/x` — searching for the string names no path and is a legitimate
+diagnostic. A bare relative filename (`cat "id_rsa"`) therefore still passes this text layer; widening
+it needs per-command operand knowledge, not a broader text rule.
+
+The pass is deliberately **command-agnostic** — it screens any command carrying the path, not a list of
+readers — so whitelisting a new tool cannot open a hole here.
+
+**Globs.** An argument containing `*`, `?`, `[` or `{` is compiled to the regex of the paths it can
+expand to and tested against `SENSITIVE_PATH_EXAMPLES`. `cat /etc/*` is refused because that regex
+matches `/etc/shadow`; `cat /etc/*release*` is not, because it matches no example. Screening the glob's
+literal prefix instead would refuse the second, which names no secret — so the intersection is computed,
+not approximated.
+
+Two shell semantics are load-bearing, and both were confirmed by running a shell rather than recalled:
+
+- `*` and `?` do not cross `/`, so `/etc/*` cannot reach `/etc/kubernetes/admin.conf`;
+- `*` and `?` do not match a leading `.`, so `ls /root/*` must stay permitted even though
+  `/root/.bash_history` is on the example list — the shell can never expand it there.
+
+`**` is read as crossing separators. That is the permissive direction: it can only make the compiled
+regex match more examples, so a shell without globstar is refused slightly more often, never less.
+
+The examples exist because the patterns are regexes and a glob cannot be intersected with a regex at
+validation time. They are pinned in both directions — every pattern must match an example, every example
+must be matched by a pattern — so adding a pattern without an example fails a test instead of silently
+leaving globs unscreened for it. The patterns remain authoritative for literal paths; the examples are
+only what globs are compared against.
+
+Residual, stated rather than implied: a suffix-only pattern (`\.key$`) is not reachable through a glob
+in an arbitrary directory — `cat /app/certs/*` is permitted even if a key lives there, because no example
+is under that path. Covering it would mean refusing every `dir/*`.
+
+### 4.3 Context-Based Whitelisting
+
+Different execution contexts allow different command sets:
+
+| Context | Used By | Scope |
+|---------|---------|-------|
+| `local` | `restricted-bash.ts` | AgentBox container — text processing + kubectl |
+| `node` | `node-exec.ts` | Remote node (via debug pod) — full diagnostics. Also handles pod netns when `netns` param is set (via `ip netns exec`). |
+| `pod` | `pod-exec.ts` | Target pod — full diagnostics (single commands only, no pipes) |
+
+The `local` context is the most restrictive: only text-processing commands (grep, jq, sort,
+etc.), flow control (echo, printf), and kubectl. File-reading commands (cat, ls, find) are
+blocked — agents use dedicated file tools instead.
+
+**Source**: `src/tools/infra/command-sets.ts` — `CONTEXT_CATEGORIES`, `COMMAND_CATEGORIES`
+
+### 4.4 COMMAND_RULES Declarative Engine
+
+Per-command restrictions are defined declaratively in `COMMAND_RULES`:
+
+```typescript
+interface CommandRule {
+  command: string;
+  contexts?: string[];      // execution contexts where rule applies
+  pipeOnly?: boolean;       // must appear after pipe |
+  noFilePaths?: boolean;    // block /, ./, ../, ~ positional args
+  blockedFlags?: string[];  // explicitly forbidden flags
+  allowedFlags?: string[];  // only these flags allowed
+  allowedSubcommands?: { position: number; allowed: string[] };
+  positionals?: "allow" | "block" | number;
+  requiredFlags?: string[];
+  customValidator?: string;
+}
+```
+
+Example: In the `local` context, `grep` is pipe-only with no file paths and no recursive flags:
+
+```typescript
+grep: { command: "grep", contexts: ["local"], pipeOnly: true, noFilePaths: true,
+         blockedFlags: ["-r", "-R", "--recursive"] }
+```
+
+This prevents `kubectl get pods | grep -rl "" /app/.siclaw` from reading credential files
+even though `grep` appears after a pipe.
+
+A path check runs before the shell expands anything, so a literal-prefix rule is only as good as
+the literal: `printf x | column "$SICLAW_CREDENTIALS_DIR"/clusters/*` contains no credential path
+for either that rule or the sensitive-path patterns to match. **A file operand of a stdin-only text
+command therefore rejects a path separator and everything the shell rewrites** — globs included. An
+earlier revision permitted globs, arguing that `*` cannot match `..` and so cannot climb out of the
+workdir; true, and irrelevant, because the credentials live BELOW the workdir (`WORKDIR /app`,
+credentials at `/app/.siclaw/credentials/`), so `head .siclaw/*/*/*` reaches them without naming them.
+
+Args that are not file operands — the grep pattern, the jq/yq expression, `tr`'s SETs — are exempt,
+since a regex legitimately contains `$` and `/`. Getting that exemption right is where the bypasses
+were: the pattern may arrive attached inside a short-option cluster (`-ie.` is `-i -e '.'`), and an
+empty quoted pattern must survive tokenisation, or the operand after it is mistaken for the pattern.
+
+Screening argv is not always enough to bound a command. `yq`'s expression language reads files and
+the environment by itself (`load_str(env(X) + "/y")`), with no flag and no path argument, so `yq`
+carries an expression screen that rejects those operators — plus `eval`, without which a blocked
+operator can be reassembled from string fragments. The AgentBox image reinforces this outside the
+validator by exposing only a wrapper that forces yq's `--security-disable-file-ops` and
+`--security-disable-env-ops`; in the node/pod/host contexts the binary is the customer's, and the
+expression screen is the only layer that applies.
+
+**Source**: `src/tools/infra/command-sets.ts` — `COMMAND_RULES`
+
+### 4.5 Explicitly Excluded Binaries
+
+| Command | Reason |
+|---------|--------|
+| `sed` | `-i` in-place write, `-e`/`r`/`w` file ops, `e` command execution |
+| `awk`/`gawk` | `system()`, `getline`, pipe-to-shell execution |
+| `bc` | `!command` shell escape |
+| `nc`/`netcat`/`ncat` | Arbitrary TCP, exfiltration |
+| `wget` | File write, recursive crawl |
+| `bash`/`sh` (direct) | Unrestricted shell — `restricted-bash` wraps with validation |
+
+### 4.6 Role After OS Isolation
+
+With OS-level user isolation (Layer 1), the application-level command validation becomes a
+**secondary defense layer**. It still provides value:
+
+- Blocks commands with dangerous side effects (network exfiltration via `curl -d`)
+- Restricts kubectl to read-only subcommands (OS isolation doesn't help here)
+- Prevents shell injection via `$()`, backticks, redirections
+- Provides audit trail of blocked commands
+
+These `local`-context rules (pipeOnly, noFilePaths, blockedFlags) are defense-in-depth, as ADR-010
+intends — but do not read that as licence to relax them. They are what turns a parser bug into a
+refusal rather than a disclosure, and this whitelist is a TEXT match performed before the shell expands
+anything, so it cannot be complete by construction. One review cycle on this file found six bypasses of
+it (`$VAR` expansion, downward globs, `--flag=value`, an attached short-option value, a value-taking
+letter later in an option cluster, and an empty quoted pattern). Each was a full credential disclosure
+only because the OS layer was absent at the time; each is now merely a refused attempt.
+
+The reason ADR-010 made OS isolation primary is exactly this asymmetry: the incident that motivated it
+(`kubectl get pods | cut -c1-2000 ~/.siclaw/credentials/kubeconfig`) was fixed at the application layer
+first, and the conclusion recorded there was that "the attack surface is fundamentally too large for
+application-level-only defense". Keep both layers.
+
+---
+
+## 5. Layer 3: Container Hardening
+
+### 5.1 K8s SecurityContext
+
+```yaml
+spec:
+  securityContext:
+    seccompProfile:
+      type: RuntimeDefault
+  initContainers:
+  - name: init-permissions         # Fixes emptyDir ownership as root
+    securityContext:
+      runAsUser: 0
+  containers:
+  - name: agentbox
+    securityContext:
+      capabilities:
+        drop: ["ALL"]
+        add: ["SETUID", "SETGID", "CHOWN", "FOWNER", "AUDIT_WRITE"]  # SETUID/SETGID for sudo; CHOWN/FOWNER for entrypoint volume permissions; AUDIT_WRITE for sudo audit
+      readOnlyRootFilesystem: true
+    volumeMounts:
+    - name: tmp
+      mountPath: /tmp
+    - name: credentials
+      mountPath: /app/.siclaw/credentials
+    - name: skills-local
+      mountPath: /app/.siclaw/skills
+    - name: user-data
+      mountPath: /app/.siclaw/user-data
+  volumes:
+  - name: tmp
+    emptyDir:
+      sizeLimit: 100Mi
+  - name: credentials
+    emptyDir: {}
+  - name: skills-local
+    emptyDir: {}
+  - name: user-data
+    emptyDir: {}
+```
+
+The Codex KB writer is the one profile-scoped exception to the outer
+`RuntimeDefault` seccomp/AppArmor policy. `kb-compile-codex` must let the
+non-root process create the user/PID/network namespaces and private mounts used
+by Bubblewrap; the inner `kbc_writer` profile then exposes only the compile
+workspace and disables network access. The Pod still drops all capabilities,
+uses a read-only root filesystem, and mounts no service-account token. A
+Bubblewrap preflight fails the run before model execution if that narrower
+inner boundary cannot be installed. Ordinary AgentBoxes, Claude `kb-compile`,
+and read-only `kb-test` retain `RuntimeDefault`.
+
+**Why `readOnlyRootFilesystem`**: Prevents filesystem tampering if the agent process is
+compromised. All writable paths are explicit emptyDir mounts. `sudo` with `NOPASSWD`
+does not need timestamp caching, so no additional writable paths are needed for it.
+
+### 5.2 Capability Justification
+
+| Capability | Why needed | Risk |
+|------------|-----------|------|
+| `SETUID` | `sudo`'s SUID bit requires this cap to switch effective UID (agentbox → sandbox) | Low — only used to drop privileges, not gain them |
+| `SETGID` | `sudo` also switches GID; kubectl's setgid bit requires kernel enforcement | Low — setgid only grants kubecred group |
+| `CHOWN` | Entrypoint fixes volume mount ownership (runs as root before `runuser`) | Low — kernel clears effective/permitted caps on UID transition via `runuser` |
+| `FOWNER` | Entrypoint fixes volume mount permissions regardless of ownership | Low — same as CHOWN, cleared after `runuser` |
+| `AUDIT_WRITE` | Required by `sudo` to write kernel audit records; without it every command emits stderr noise (`unable to send audit message`) | Low — only grants write to kernel audit log, no privilege escalation path; included in Docker default cap set |
+| All others | Dropped | N/A |
+
+### 5.3 What Is Blocked
+
+With `drop: ALL` + only SETUID/SETGID/CHOWN/FOWNER/AUDIT_WRITE (CHOWN/FOWNER used only during root entrypoint, cleared after `runuser`):
+
+- `CAP_NET_RAW` dropped — no raw sockets, no packet sniffing
+- `CAP_SYS_PTRACE` dropped — no debugging/attaching to other processes
+- `CAP_SYS_ADMIN` dropped — no mount, no namespace manipulation
+- `CAP_SYS_MODULE` dropped — no kernel module loading
+- `CAP_DAC_OVERRIDE` dropped — cannot bypass file permission checks
+- `CAP_NET_ADMIN` dropped — no network config changes
+
+### 5.4 Additional Hardening
+
+```yaml
+# Already in place
+automountServiceAccountToken: false   # No K8s API access via service account
+
+# Recommended additions
+spec:
+  hostNetwork: false
+  hostPID: false
+  hostIPC: false
+```
+
+---
+
+## 6. Layer 4: File I/O Path Restrictions (Application-Level)
+
+Agent file tools (`read`, `edit`, `write`, `grep`, `find`, `ls`) are scoped by
+`assertPathAllowed()` in `src/core/agent-factory.ts`:
+
+```
+Read allowed:  builtin skills, dynamic skills, userDataDir, reports
+Write allowed: userDataDir ONLY
+Blocked:       credentials, config, system dirs, anything outside allowed paths
+```
+
+**Relationship to OS permissions**: This layer does NOT protect against bash commands —
+that is the job of Layer 1 (OS user isolation). `assertPathAllowed` restricts **which
+directories the agent's own file tools can see**, providing a curated view of the filesystem.
+Even if the sandbox user can `r-x` skills directories, the agent's `write` tool still refuses
+to write there because `writeAllowedDirs = [userDataDir]`.
+
+Both layers are needed:
+- **OS permissions** (Layer 1): Enforces that `sandbox` cannot write to skills, credentials, app code — regardless of what commands are used
+- **assertPathAllowed** (Layer 4): Restricts the agent's file tool **scope** to diagnostic-relevant directories only — prevents the agent from browsing `/etc`, `/proc`, or other irrelevant areas
+
+**Source**: `src/core/agent-factory.ts` — `assertPathAllowed()`
+
+---
+
+## 7. Layer 5: Environment Sanitization
+
+`sanitizeEnv()` in `src/tools/infra/sanitize-env.ts` strips sensitive variables before
+spawning child processes:
+
+```
+Stripped patterns:
+  *_API_KEY, *_SECRET, *_TOKEN, *_PASSWORD, *_CREDENTIAL
+  ANTHROPIC_*, OPENAI_*, SICLAW_LLM_*
+  SICLAW_GATEWAY_URL (prevents AgentBox → Gateway API calls)
+```
+
+**Why this layer persists with OS isolation**: Environment variables live in process memory
+(`/proc/self/environ`), not in files. Even if the sandbox user cannot read credential files,
+`cat /proc/self/environ` in a child process could leak API keys if they were inherited.
+`sanitizeEnv()` prevents this.
+
+**Source**: `src/tools/infra/sanitize-env.ts`
+
+---
+
+## 8. Layer 6: kubectl Access Control
+
+### 8.1 Read-Only Subcommands
+
+```
+Allowed: get, describe, logs, top, events, api-resources, api-versions,
+         cluster-info, config, version, explain, auth
+```
+
+**All write operations permanently blocked**: apply, create, delete, patch, scale, drain,
+cordon, edit, replace, label, taint, rollout undo.
+
+`kubectl exec` is **not** allowed as a subcommand — use the dedicated `pod_exec` or
+`node_exec` tools instead, which provide their own security validation pipeline.
+
+### 8.2 kubectl config view --raw Blocked
+
+`kubectl config view --raw` is explicitly blocked — it outputs kubeconfig with embedded
+certificates and tokens in plaintext.
+
+**Source**: `src/tools/infra/command-sets.ts` — `SAFE_SUBCOMMANDS`
+
+---
+
+## 9. Container Escape Risk Assessment
+
+### 9.1 Attack Surface Analysis
+
+| Vector | Feasibility | Mitigation |
+|--------|-------------|------------|
+| Kernel exploit (e.g., CVE-2024-1086) | Low — requires specific unpatched kernel | Keep nodes updated; seccomp blocks most exploit syscalls |
+| Node.js RCE (prototype pollution) | Medium — if LLM triggers Node.js vulnerability, gains agentbox user | agentbox can read kubeconfig (by design), but K8s RBAC limits cluster access |
+| kubectl vulnerability | Low — static Go binary, read-only ops, limited subcommands | Keep kubectl updated |
+| `/proc/self/environ` in child | Blocked — `sanitizeEnv()` strips secrets | Layer 5 |
+| SUID/SGID binary exploitation | Mitigated — `readOnlyRootFilesystem: true`, only `/usr/bin/sudo` retains SUID (required for user switching), all others stripped | Layer 3 |
+| Container runtime escape | Very low — standard containerd/runc, non-root child processes | Infrastructure concern, not app-level |
+| Network exfiltration | Medium — sandbox can reach network | `curl -d` blocked (Layer 2); Network Policy recommended |
+| Mount namespace manipulation | Blocked — `CAP_SYS_ADMIN` dropped | Layer 3 |
+
+### 9.2 Residual Risks
+
+1. **Node.js process compromise**: If the LLM exploits a Node.js vulnerability, it gains
+   `agentbox` user privileges (can read kubeconfig). Mitigation: K8s RBAC should scope the
+   kubeconfig to read-only cluster access.
+
+2. **Network-level exfiltration**: The sandbox user can make network connections (DNS, HTTP)
+   unless restricted by NetworkPolicy. Recommendation: deploy NetworkPolicy to limit egress
+   to the K8s API server and required endpoints only.
+
+3. **Shared /tmp**: Both agentbox and sandbox can read/write `/tmp`. Do not store sensitive
+   data in `/tmp`. Use `mktemp` with restrictive permissions if temporary files are needed.
+
+### 9.3 Recommended NetworkPolicy
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: agentbox-egress
+spec:
+  podSelector:
+    matchLabels:
+      app: agentbox
+  policyTypes:
+  - Egress
+  egress:
+  - to:
+    - ipBlock:
+        cidr: <k8s-api-server-cidr>/32
+    ports:
+    - port: 6443
+      protocol: TCP
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          app: siclaw-runtime
+    ports:
+    - port: 3002
+      protocol: TCP
+  - to:                          # DNS
+    - namespaceSelector: {}
+    ports:
+    - port: 53
+      protocol: UDP
+```
+
+---
+
+## 10. Implementation Checklist
+
+### 10.1 Dockerfile
+
+- [x] Create `kubecred` (GID 1002), `agentbox` (UID 1000), `sandbox` (UID 1001)
+- [x] Install `sudo` + sudoers: `agentbox ALL=(sandbox) NOPASSWD:SETENV: ALL`
+- [x] Install kubectl with `chmod 2755` + `chgrp kubecred`
+- [x] Credential dirs: `agentbox:kubecred 0750` (sandbox: no access, kubectl: read via group)
+- [x] Config: `agentbox:agentbox 0700` (sandbox: no access)
+- [x] Skills dirs: `agentbox:agentbox 0755/0644` (sandbox: read-only)
+- [x] App code: `agentbox:agentbox 0755/0644` (sandbox: read-only via `chmod -R o+rX`)
+- [x] User data dir: `agentbox:agentbox 0777` (sandbox: read-write — the only writable area)
+- [x] Strip all SUID except `/usr/bin/sudo`; verify only kubectl has SGID
+- [x] Entrypoint: fixes volume permissions as root, drops to agentbox via `runuser`
+
+### 10.2 K8s Manifests
+
+- [x] Add `capabilities: { drop: ["ALL"], add: ["SETUID", "SETGID", "CHOWN", "FOWNER", "AUDIT_WRITE"] }`
+- [x] Add `seccompProfile: { type: RuntimeDefault }`
+- [x] Entrypoint handles volume permission fixing (no init container needed; CHOWN/FOWNER cleared after `runuser`)
+- [x] Keep `automountServiceAccountToken: false`
+- [x] Add `readOnlyRootFilesystem: true` with emptyDir for `/tmp`
+- [ ] Deploy NetworkPolicy for egress restriction
+
+### 10.3 Application Code
+
+- [x] `restricted-bash.ts`: Wrap commands with `sudo -E -u sandbox --` in production
+- [x] Verify `sanitizeEnv()` still strips all sensitive vars (Layer 5 remains)
+- [x] Verify `assertPathAllowed()` still scopes file tools (Layer 4 remains)
+- [x] Entrypoint script: enforce file permissions on startup (best-effort in K8s, full in standalone Docker)
+
+### 10.4 Validation
+
+File permission verification (run inside agentbox container):
+- [ ] Sandbox cannot read credentials: `sudo -u sandbox cat .siclaw/credentials/*.kubeconfig` → Permission denied
+- [ ] Sandbox cannot read config: `sudo -u sandbox cat .siclaw/config/settings.json` → Permission denied
+- [ ] Sandbox cannot write skills: `sudo -u sandbox touch skills/core/test` → Permission denied
+- [ ] Sandbox cannot write app code: `sudo -u sandbox touch /app/test` → Permission denied
+- [ ] Sandbox **can** read skills: `sudo -u sandbox cat skills/core/cluster-events/SKILL.md` → Success
+- [ ] Sandbox **can** write user-data: `sudo -u sandbox touch .siclaw/user-data/test` → Success
+
+Functional verification:
+- [ ] kubectl can read kubeconfig (setgid): `sudo -u sandbox kubectl get pods` → Success
+- [ ] grep cannot read kubeconfig: `sudo -u sandbox grep "" .siclaw/credentials/*.kubeconfig` → Permission denied
+- [ ] Pipeline works: `sudo -E -u sandbox bash -c 'kubectl get pods | grep Error'` → Success
+- [ ] Only sudo has SUID: `find / -perm /4000 -type f ! -path '/proc/*'` → `/usr/bin/sudo`
+- [ ] Run full test suite: `npm test`

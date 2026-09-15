@@ -1,0 +1,227 @@
+import { describe, it, expect, beforeEach, vi } from "vitest";
+
+vi.mock("../infra/ssh-client.js", () => ({
+  acquireSshTarget: vi.fn(),
+  sshExec: vi.fn(),
+}));
+
+import { createHostExecTool } from "./host-exec.js";
+import { acquireSshTarget, sshExec } from "../infra/ssh-client.js";
+import type { CredentialBroker } from "../../agentbox/credential-broker.js";
+
+const fakeBroker = {} as CredentialBroker;
+const tool = createHostExecTool({ credentialBroker: fakeBroker } as any);
+
+beforeEach(() => {
+  vi.mocked(acquireSshTarget).mockReset();
+  vi.mocked(sshExec).mockReset();
+});
+
+describe("host_exec", () => {
+  it.each([0, 1])("provides separate sanitized SDK channels for exit %s", async exitCode => {
+    vi.mocked(acquireSshTarget).mockResolvedValueOnce({
+      host: "192.0.2.1", port: 22, username: "readonly",
+      auth: { type: "key", privateKeyPath: "/tmp/fixture.key" },
+    });
+    vi.mocked(sshExec).mockResolvedValueOnce({ stdout: '{"password":"fixture-secret","ready":true}', stderr: "query warning", exitCode });
+    const capture = vi.fn();
+    const dataTool = createHostExecTool({ credentialBroker: fakeBroker } as any, undefined, { outputMode: "data", onOutputData: capture });
+    const result = await dataTool.execute("data", { host: "h1", command: "cat /etc/example.json" }, undefined, {} as any);
+    expect(capture).toHaveBeenCalledOnce();
+    const data = capture.mock.calls[0][0];
+    expect(JSON.parse(data.text)).toEqual({ password: "**REDACTED**", ready: true });
+    expect(data.stderr).toBe("query warning");
+    expect(data.notices.join("\n")).toContain("redacted");
+    expect(result.content[0].text).toBe(data.text);
+    expect((result.details as any).exitCode).toBe(exitCode);
+  });
+
+  it("rejects invalid host name", async () => {
+    const result = await tool.execute("id", { host: "bad name with spaces", command: "true" }, undefined, {} as any);
+    const text = result.content[0].text as string;
+    expect(text).toMatch(/Invalid|invalid/);
+    expect((result.details as any).blocked).toBe(true);
+  });
+
+  it("rejects when command is blocked by preExecSecurity", async () => {
+    const result = await tool.execute("id", { host: "h1", command: "rm -rf /" }, undefined, {} as any);
+    expect((result.details as any).blocked).toBe(true);
+    expect((result.details as any).reason).toBe("command_blocked");
+  });
+
+  it("returns acquire failure with reason=host_acquire_failed", async () => {
+    vi.mocked(acquireSshTarget).mockRejectedValueOnce(new Error("Host \"h1\" not bound to this agent"));
+    const result = await tool.execute("id", { host: "h1", command: "uptime" }, undefined, {} as any);
+    expect((result.details as any).reason).toBe("host_acquire_failed");
+    expect(result.content[0].text).toContain("not bound to this agent");
+  });
+
+  it("happy path: returns stdout when sshExec succeeds", async () => {
+    vi.mocked(acquireSshTarget).mockResolvedValueOnce({
+      host: "10.0.0.1", port: 22, username: "root",
+      auth: { type: "key", privateKeyPath: "/tmp/h1.key" },
+    });
+    vi.mocked(sshExec).mockResolvedValueOnce({
+      stdout: "load avg 0.5 0.4 0.3\n",
+      stderr: "",
+      exitCode: 0,
+    });
+    const result = await tool.execute("id", { host: "h1", command: "uptime" }, undefined, {} as any);
+    expect(result.content[0].text).toContain("load avg 0.5");
+    expect((result.details as any).exitCode).toBe(0);
+    expect((result.details as any).host).toBe("h1");
+    expect((result.details as any).error).toBeUndefined();
+  });
+
+  it("names WHAT a non-zero exit means, not just that there was one", async () => {
+    vi.mocked(acquireSshTarget).mockResolvedValueOnce({
+      host: "10.0.0.1", port: 22, username: "root",
+      auth: { type: "key", privateKeyPath: "/tmp/h1.key" },
+    });
+    vi.mocked(sshExec).mockResolvedValueOnce({
+      stdout: "",
+      stderr: "command not found",
+      exitCode: 127,
+    });
+    const result = await tool.execute("id", { host: "h1", command: "cat /nope" }, undefined, {} as any);
+    // Both halves: the code is rendered by postExecSecurity, the class rides in notes. The class has
+    // to be in the TEXT because details is stripped before the model sees the result.
+    expect(result.content[0].text).toContain("[exit code: 127]");
+    expect(result.content[0].text).toContain("dependency_missing");
+    expect((result.details as any).error).toBe(true);
+    expect((result.details as any).exit_class).toBe("dependency_missing");
+  });
+
+  it("does not report a no-match as a failed command", async () => {
+    vi.mocked(acquireSshTarget).mockResolvedValueOnce({
+      host: "10.0.0.1", port: 22, username: "root",
+      auth: { type: "key", privateKeyPath: "/tmp/h1.key" },
+    });
+    vi.mocked(sshExec).mockResolvedValueOnce({ stdout: "", stderr: "", exitCode: 1 });
+    const result = await tool.execute(
+      "id", { host: "h1", command: "journalctl -u kubelet | grep -i oom" }, undefined, {} as any,
+    );
+    expect((result.details as any).exit_class).toBe("no_match");
+    expect((result.details as any).error).toBeUndefined();
+    expect(result.content[0].text).toContain("no_match");
+  });
+
+  it("appends the annotation after the output instead of pushing the answer down", async () => {
+    vi.mocked(acquireSshTarget).mockResolvedValueOnce({
+      host: "10.0.0.1", port: 22, username: "root",
+      auth: { type: "key", privateKeyPath: "/tmp/h1.key" },
+    });
+    vi.mocked(sshExec).mockResolvedValueOnce({ stdout: "inactive", stderr: "", exitCode: 3 });
+    const result = await tool.execute(
+      "id", { host: "h1", command: "systemctl is-active kubelet" }, undefined, {} as any,
+    );
+    const text = result.content[0].text as string;
+    expect(text.indexOf("inactive")).toBeLessThan(text.indexOf("exit code: 3"));
+    expect((result.details as any).exit_class).toBe("target_reported_failure");
+  });
+
+  it("foreground: wraps the command as a killable timeout-bounded session and reaps it on abort", async () => {
+    const controller = new AbortController();
+    vi.mocked(acquireSshTarget).mockResolvedValueOnce({
+      host: "10.0.0.1", port: 22, username: "root",
+      auth: { type: "key", privateKeyPath: "/tmp/h1.key" },
+    });
+    // First sshExec = the wrapped foreground command; abort mid-flight to trip the reap.
+    vi.mocked(sshExec).mockImplementation(async (_t: any, cmd: any) => {
+      if (typeof cmd === "string" && cmd.includes("setsid")) controller.abort();
+      return { stdout: "", stderr: "", exitCode: null, signal: "SIGKILL" } as any;
+    });
+
+    const result = await tool.execute(
+      "tc1", { host: "h1", command: "ib_write_bw -D 60 -F", timeout_seconds: 90 }, controller.signal, {} as any,
+    );
+
+    // (1) The foreground command ran as a setsid session, `timeout`-bounded at the cap, recording a .pgid.
+    const fgCmd = vi.mocked(sshExec).mock.calls[0][1] as string;
+    expect(fgCmd).toContain("setsid sh -c");
+    expect(fgCmd).not.toContain("setsid -w");   // portable: no util-linux >= 2.24 dependency
+    expect(fgCmd).toContain("timeout 90 ");
+    expect(fgCmd).toMatch(/\.pgid/);
+    expect(fgCmd).toContain("ib_write_bw -D 60 -F");
+    // (2) Abort fired a SECOND sshExec carrying the reap script over a fresh, time-boxed connection.
+    expect(vi.mocked(sshExec).mock.calls.length).toBeGreaterThanOrEqual(2);
+    const killCmd = vi.mocked(sshExec).mock.calls[1][1] as string;
+    expect(killCmd).toContain("pkill -TERM -s");
+    expect(vi.mocked(sshExec).mock.calls[1][2]).toEqual({ timeoutMs: 20_000 });
+    expect((result.details as any).error).toBe(true); // "Aborted."
+  });
+
+  it("foreground: an SSH reject AFTER abort returns a clean 'Aborted.' (not ssh_exec_failed)", async () => {
+    const controller = new AbortController();
+    vi.mocked(acquireSshTarget).mockResolvedValueOnce({
+      host: "10.0.0.1", port: 22, username: "root",
+      auth: { type: "key", privateKeyPath: "/tmp/h1.key" },
+    });
+    // Real SSH path: rejects with Error("Aborted") once the signal fires (the reject path the
+    // earlier resolve-mock missed). The catch must recognize signal.aborted, not report a
+    // connection failure.
+    vi.mocked(sshExec).mockImplementation(async (_t: any, cmd: any) => {
+      if (typeof cmd === "string" && cmd.includes("setsid")) { controller.abort(); throw new Error("Aborted"); }
+      return { stdout: "", stderr: "", exitCode: 0 } as any;
+    });
+    const result = await tool.execute(
+      "tc2", { host: "h1", command: "ping -c 100 10.0.0.254" }, controller.signal, {} as any,
+    );
+    expect(result.content[0].text).toBe("Aborted.");
+    expect((result.details as any).reason).not.toBe("ssh_exec_failed");
+  });
+
+  it("signal-killed with stdout is NOT treated as error (mirrors node_exec)", async () => {
+    vi.mocked(acquireSshTarget).mockResolvedValueOnce({
+      host: "10.0.0.1", port: 22, username: "root",
+      auth: { type: "key", privateKeyPath: "/tmp/h1.key" },
+    });
+    vi.mocked(sshExec).mockResolvedValueOnce({
+      stdout: "partial output",
+      stderr: "",
+      exitCode: null,
+      signal: "SIGTERM",
+    });
+    const result = await tool.execute("id", { host: "h1", command: "cat /var/log/messages" }, undefined, {} as any);
+    expect((result.details as any).error).toBeUndefined();
+    expect((result.details as any).signal).toBe("SIGTERM");
+  });
+});
+
+describe("an SSH failure says WHICH layer failed", () => {
+  // "SSH connection failed" was the whole answer, and the three cases call for different next steps.
+  // Two are readable straight out of the client's text — a review captured
+  // `forwardOut from … failed: (SSH) Channel open failure: No route to host`, where `forwardOut` means
+  // the bastion was reached and could not reach the target.
+  const run = async (message: string, host = "h1") => {
+    vi.mocked(acquireSshTarget).mockResolvedValue({ host: "10.0.0.9", port: 22, username: "u",
+      auth: { type: "password", password: "p" } } as never);
+    vi.mocked(sshExec).mockRejectedValue(new Error(message));
+    const res = await createHostExecTool({ credentialBroker: fakeBroker } as any)
+      .execute("id", { host, command: "uptime" }, undefined, {} as any);
+    return { text: res.content[0].text as string, details: res.details as Record<string, unknown> };
+  };
+
+  it("names the jump hop rather than blaming the bastion", async () => {
+    const r = await run("forwardOut from 214.31.43.1 to 214.31.40.77:22 failed: (SSH) Channel open failure: No route to host");
+    expect(r.details.ssh_stage).toBe("jump_hop");
+    expect(r.text).toMatch(/bastion was reached/);
+  });
+
+  it("separates a rejected credential from an unreachable host", async () => {
+    expect((await run("All configured authentication methods failed")).details.ssh_stage).toBe("authentication");
+    expect((await run("SSH chain connect timeout after 10000ms")).details.ssh_stage).toBe("network");
+  });
+
+  it("says the same host just failed, without refusing to try again", async () => {
+    // Deliberately not a negative cache: the attempt still happens, because a cache would keep a host
+    // that has just recovered locked out. A review reports two ten-second waits — worth reporting, not
+    // worth a state machine that can be wrong.
+    const host = `repeat-${Date.now()}`;
+    const first = await run("SSH chain connect timeout after 10000ms", host);
+    expect(first.text, "nothing to report on the first failure").not.toMatch(/also failed/);
+    const second = await run("SSH chain connect timeout after 10000ms", host);
+    expect(second.text).toMatch(/also failed to connect/);
+    expect(vi.mocked(sshExec).mock.calls.length, "the second attempt was still made").toBeGreaterThan(1);
+  });
+});
