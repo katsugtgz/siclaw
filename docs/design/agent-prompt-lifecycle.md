@@ -65,7 +65,7 @@ The two availability axes remain independent:
 | Agent type | Built-in capability groups | Explicitly configured resources |
 |---|---|---|
 | SRE | infrastructure, commands, scripts, files, memory, planning, sub-agents, session output | Skills, knowledge, MCP |
-| Knowledge QA | knowledge search/citations, files, local Skill scripts, planning, sub-agents, session output | knowledge, Skills, MCP |
+| Knowledge QA | knowledge search/citations, files, local Skill scripts, planning, session output | knowledge, Skills, MCP |
 | Custom | Portal selection, or legacy unrestricted built-ins only when an explicit Custom type has no selection | Skills, knowledge, MCP |
 
 `allowedTools` controls built-in tools, not dynamically named MCP tools. In
@@ -90,11 +90,19 @@ Agent-scoped Skill filtering is active before the first materialization for all
 types. Bundled and platform roots remain eligible without admitting ambient
 user-global Skills. Older read-only QA tool lists keep this same scope filter.
 
-QA planning is parent-owned. Spawned children inherit the QA tool/resource scope
-and Skill bindings, while child construction omits parent ledger and recursive
-spawn tools. Background work retains result inspection and cancellation through
-`task_output` and `job_stop`. Existing channel foreground and session-mode delivery
-rules also apply to QA.
+QA planning is parent-owned and QA does not delegate. A child of this type would
+inherit exactly the same read-only research tools, so it can reach no source the
+parent could not read itself; a delegated "independent check" can only come back
+as model recall, re-entering the parent context as a tool result that reads like
+verified evidence. That is what this type's contract forbids. Concurrency belongs
+in batched retrieval, not in a second agent.
+
+Dropping the `spawn_subagents` group also drops `task_output` and `job_stop`, so
+`allowsBackgroundExec` (`src/core/background-execution-policy.ts`) refuses
+background execution for QA and `local_script` runs in the foreground. That is the
+consistent outcome rather than a gap: a background job this agent can neither read
+nor stop would be worse than no background job. Existing channel foreground and
+session-mode delivery rules also apply to QA.
 
 For Knowledge QA, the complete root `index.md` is the primary navigation map.
 `knowledge_search` resolves typed page labels and aliases only when catalog

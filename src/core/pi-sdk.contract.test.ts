@@ -152,9 +152,9 @@ describe("installed Pi SDK contract", () => {
     const names = requests[0].body.tools.map((tool: any) => tool.function.name);
     expect(names).toEqual(expect.arrayContaining([
       "read", "write", "edit", "local_script", "task_create", "task_update", "task_list", "task_get",
-      "spawn_subagent", "task_output", "job_stop", "skill_preview", "request_input", "save_feedback",
+      "skill_preview", "request_input", "save_feedback",
     ]));
-    for (const name of ["memory_search", "memory_get", "bash", "node_exec", "pod_exec", "host_exec", "node_script", "pod_script", "host_script"]) {
+    for (const name of ["spawn_subagent", "task_output", "job_stop", "memory_search", "memory_get", "bash", "node_exec", "pod_exec", "host_exec", "node_script", "pod_script", "host_script"]) {
       expect(names).not.toContain(name);
     }
     expect(await fs.readFile(outputPath, "utf8")).toBe("# Research result\n");

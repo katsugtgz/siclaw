@@ -20,8 +20,11 @@ describe("agent-types", () => {
     expect(AGENT_TYPES.sre.capabilities).toBeTruthy();
     expect(AGENT_TYPES.sre.defaultPrompt).toBeTruthy();
     expect(AGENT_TYPES.knowledge_qa.capabilities).toEqual([
-      "read_files", "run_local_scripts", "write_sandbox", "plan_tasks", "spawn_subagents", "session_output",
+      "read_files", "run_local_scripts", "write_sandbox", "plan_tasks", "session_output",
     ]);
+    // Research is not delegated: a child of this type inherits the same read-only tools
+    // and can only return model recall dressed as a verified result.
+    expect(AGENT_TYPES.knowledge_qa.capabilities).not.toContain("spawn_subagents");
     expect(AGENT_TYPES.knowledge_qa.defaultPrompt).toBeTruthy();
     expect(AGENT_TYPES.knowledge_qa.defaultNoSkills).toBe(false);
     expect(AGENT_TYPES.product_support.capabilities).toEqual(["read_files"]);

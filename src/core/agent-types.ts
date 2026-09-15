@@ -204,7 +204,20 @@ export const AGENT_TYPES: Record<AgentType, AgentTypeDef> = {
   knowledge_qa: {
     label: "Knowledge Q&A Agent",
     description: "Researches bound knowledge bases and answers with synthesized, source-backed information.",
-    capabilities: ["read_files", "run_local_scripts", "write_sandbox", "plan_tasks", "spawn_subagents", "session_output"],
+    // No spawn_subagents, deliberately. A child inherits exactly this type's read-only
+    // research tools, so it can reach nothing the parent could not read itself: a
+    // delegated "independent check" can only come back as model recall, and it re-enters
+    // the parent context as a tool result that reads like verified evidence. That is the
+    // one thing this type's contract forbids — never fill gaps with unsupported model
+    // knowledge, never invent a source. Concurrency belongs in batched retrieval
+    // (knowledge_search / Read over several pages), not in a second agent.
+    // Dropping the group also drops task_output / job_stop (see the group's members in
+    // tool-capabilities.ts), which is the consistent outcome rather than a gap:
+    // allowsBackgroundExec() in background-execution-policy.ts requires BOTH of those
+    // tools, so local_script stays in the foreground instead of leaving a background job
+    // this agent can neither read nor stop. Nothing here special-cases QA — check that
+    // policy before changing this group, because the inference lives there, not here.
+    capabilities: ["read_files", "run_local_scripts", "write_sandbox", "plan_tasks", "session_output"],
     defaultPrompt: KNOWLEDGE_QA_DEFAULT_PROMPT,
     defaultNoSkills: false,
   },

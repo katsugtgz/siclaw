@@ -561,9 +561,9 @@ describe("GET /api/v1/cli-snapshot", () => {
     expect(body.activeAgent.agentType).toBe("knowledge_qa");
     expect(body.activeAgent.allowedTools).toEqual(expect.arrayContaining([
       "read", "grep", "find", "ls", "knowledge_search", "knowledge_cite",
-      "local_script", "write", "edit", "skill_preview", "task_create", "spawn_subagent", "task_output", "job_stop",
+      "local_script", "write", "edit", "skill_preview", "task_create",
     ]));
-    for (const name of ["bash", "node_exec", "pod_exec", "host_exec", "node_script", "pod_script", "host_script", "memory_search", "memory_get"]) {
+    for (const name of ["spawn_subagent", "task_output", "job_stop", "bash", "node_exec", "pod_exec", "host_exec", "node_script", "pod_script", "host_script", "memory_search", "memory_get"]) {
       expect(body.activeAgent.allowedTools).not.toContain(name);
     }
     expect(body.activeAgent.allowedTools).not.toContain("bash");

@@ -38,22 +38,27 @@ function fixture(mode: SessionMode = "web", isSubagent = false) {
 }
 
 describe("Knowledge QA tools", () => {
-  it("exposes research workflow tools with local Skill execution and complete background controls", () => {
+  it("exposes research workflow tools with local Skill execution and no delegation", () => {
     const { context, resolve } = fixture();
     const tools = resolve();
     const names = tools.map(tool => tool.name);
     expect(names).toEqual(expect.arrayContaining([
       "local_script", "skill_preview", "task_create", "task_update", "task_list", "task_get",
-      "spawn_subagent", "task_output", "job_stop", "request_input", "save_feedback",
+      "request_input", "save_feedback",
     ]));
     expect(context.harness.allowedTools).toEqual(expect.arrayContaining(["read", "write", "edit"]));
     expect(context.harness.memoryEnabled).toBe(false);
     expect(context.harness.includePlanningGuidance).toBe(true);
-    expect(context.harness.includeSubagentGuidance).toBe(true);
-    for (const name of ["bash", "node_exec", "pod_exec", "host_exec", "node_script", "pod_script", "host_script", "memory_search", "memory_get"]) {
+    // Research stays inside one agent: no child can reach evidence this agent cannot read,
+    // so the guidance that tells the model to fan out is not compiled either.
+    expect(context.harness.includeSubagentGuidance).toBe(false);
+    for (const name of ["spawn_subagent", "task_output", "job_stop", "bash", "node_exec", "pod_exec", "host_exec", "node_script", "pod_script", "host_script", "memory_search", "memory_get"]) {
       expect(context.harness.allowedTools).not.toContain(name);
     }
-    expect(tools.find(tool => tool.name === "local_script")!.parameters.properties.run_in_background).toBeDefined();
+    expect(names).not.toContain("spawn_subagent");
+    // Without task_output / job_stop the background-execution policy keeps scripts in the
+    // foreground, so the agent never starts work it cannot read back or stop.
+    expect(tools.find(tool => tool.name === "local_script")!.parameters.properties.run_in_background).toBeUndefined();
   });
 
   it("runs a bound Skill helper and keeps another Agent's scripts outside its resolver", async () => {
@@ -80,15 +85,11 @@ describe("Knowledge QA tools", () => {
     expect(denied.details).toMatchObject({ error: true });
   });
 
-  it("dispatches through the parent bridge and gates child registry tools when parent executors are absent", async () => {
+  it("never offers delegation and still gates child registry tools when parent executors are absent", async () => {
     const parent = fixture();
-    const tool = parent.resolve().find(tool => tool.name === "spawn_subagent");
-    expect(tool).toBeDefined();
-    const result = await tool!.execute("research", { description: "Check supporting evidence", items: ["Check the source material"] });
-    expect(vi.mocked(parent.refs.spawnSubagentExecutor!).mock.calls[0][0]).toMatchObject({
-      parentAgentId: "qa-agent", parentSessionId: "qa-session", userId: "user-a",
-    });
-    expect(result.details).toMatchObject({ child_session_id: "qa-child", summary: "Evidence checked" });
+    // A configured executor does not put the tool back: the type no longer grants it.
+    expect(parent.refs.spawnSubagentExecutor).toBeDefined();
+    expect(parent.resolve().find(tool => tool.name === "spawn_subagent")).toBeUndefined();
     const child = fixture("web", true);
     expect(child.context.harness.allowedTools).toEqual(parent.context.harness.allowedTools);
     const names = child.resolve().map(candidate => candidate.name);
@@ -104,7 +105,6 @@ describe("Knowledge QA tools", () => {
     const tools = channel.resolve();
     expect(tools.map(tool => tool.name)).toContain("channel_update");
     expect(tools.find(tool => tool.name === "local_script")!.parameters.properties.run_in_background).toBeUndefined();
-    expect(tools.find(tool => tool.name === "spawn_subagent")!.parameters.properties.run_in_background).toBeUndefined();
     expect(fixture("task").resolve().map(tool => tool.name)).toContain("task_report");
     expect(fixture("web").resolve().map(tool => tool.name)).not.toContain("task_report");
   });
