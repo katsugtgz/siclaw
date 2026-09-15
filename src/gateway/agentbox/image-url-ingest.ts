@@ -44,9 +44,14 @@ const DEFAULT_FETCH_TIMEOUT_MS = 5000;
 // whole sequential/parallel batch).
 const DEFAULT_TOTAL_TIMEOUT_MS = 8000;
 
-// Extension-anchored: an OSS signed URL keeps its `.jpg` before the `?query`.
-// Extensionless URLs are intentionally out of scope for v1 (no HEAD probe).
-const IMAGE_URL_RE = /https?:\/\/[^\s<>"']+?\.(?:jpe?g|png|webp)(?:\?[^\s<>"']*)?/gi;
+// Channel messages can contain extensionless object URLs. Select candidates
+// from text, then verify media using the existing bounded GET and byte sniff.
+// Markdown delimiters are not part of the URL (encode them in URL components).
+const URL_RE = /https?:\/\/[^\s<>"'`()\[\]，。；！？]+/gi;
+
+function trimUrlPunctuation(url: string): string {
+  return url.replace(/[.,;!]+$/, "");
+}
 
 function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
@@ -146,8 +151,19 @@ export function assertAllowedImageUrl(url: string): void {
 /** Extract dedup'd image URLs from prompt text. Exported for tests. */
 export function extractImageUrls(text: string): string[] {
   if (!text) return [];
-  const matches = text.match(IMAGE_URL_RE) ?? [];
-  return [...new Set(matches)];
+  const matches = (text.match(URL_RE) ?? []).map(trimUrlPunctuation);
+  return [...new Set(matches.filter(isImageUrlCandidate))];
+}
+
+function isImageUrlCandidate(url: string): boolean {
+  if (!URL.canParse(url)) return false;
+  const parsed = new URL(url);
+  if (/\.(?:jpe?g|png|webp)$/i.test(parsed.pathname)) return true;
+  const basename = parsed.pathname.split("/").at(-1) ?? "";
+  // Avoid probing unrelated links. Only extensionless objects on explicitly
+  // trusted hosts are candidates; known non-image extensions remain excluded.
+  return basename.length > 0 && !basename.includes(".") &&
+    hostMatchesAllowlist(parsed.hostname.toLowerCase(), imageUrlAllowlist());
 }
 
 /**
@@ -158,7 +174,10 @@ export function extractImageUrls(text: string): string[] {
  */
 export function redactImageUrlsInText(text: string): string {
   if (!text) return text;
-  return text.replace(IMAGE_URL_RE, (m) => safeUrl(m));
+  return text.replace(URL_RE, (match) => {
+    const url = trimUrlPunctuation(match);
+    return isImageUrlCandidate(url) ? safeUrl(url) + match.slice(url.length) : match;
+  });
 }
 
 /** Aggregate a readable stream into a Buffer, aborting past `maxBytes`. */

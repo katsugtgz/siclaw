@@ -653,6 +653,17 @@ describe("AgentBoxClient — prompt image URL resolution (vision-gated)", () => 
     expect(body.text).toContain("oss.example.org/a.png"); // original URL left in text
   });
 
+  it("passes extensionless screenshot bytes to AgentBox and removes signed query from text", async () => {
+    await client.prompt({
+      text: "[图片] https://oss.example.org/session_resources/41/abc123?Signature=secret",
+      modelProvider: "openai", modelId: "gpt-4o", modelConfig: mkModelConfig(["text", "image"], "gpt-4o"),
+    });
+    const req = srv.captures.filter((c) => c.url === "/api/prompt").pop()!;
+    const body = JSON.parse(req.body);
+    expect(body.images).toEqual([{ mimeType: "image/png", data: PNG.toString("base64") }]);
+    expect(body.text).toBe("[图片] https://oss.example.org/session_resources/41/abc123");
+  });
+
   it("non-vision model: does NOT resolve; no images, URL stays as plain text", async () => {
     await client.prompt({
       text: "see https://oss.example.org/a.png",

@@ -70,9 +70,20 @@ describe("extractImageUrls", () => {
     expect(extractImageUrls(`${url} ${url}`)).toEqual([url]);
     expect(extractImageUrls("https://h.cn/a.webp https://h.cn/b.jpeg")).toHaveLength(2);
   });
-  it("ignores non-image and extensionless URLs", () => {
+  it("ignores non-image and untrusted extensionless URLs", () => {
     expect(extractImageUrls("https://h.cn/page.html https://h.cn/raw")).toEqual([]);
     expect(extractImageUrls("")).toEqual([]);
+  });
+  it("extracts allowlisted extensionless object URLs in channel and Markdown text", () => {
+    process.env.SICLAW_IMAGE_URL_ALLOWLIST = "oss.example.org";
+    const url = "https://oss.example.org/session_resources/41/abc123";
+    expect(extractImageUrls(`[图片] ${url}\n[image](${url})`)).toEqual([url]);
+    expect(extractImageUrls("https://oss.example.org/manual.pdf https://other.example.org/raw")).toEqual([]);
+  });
+  it("keeps sentence punctuation outside both image and object URLs", () => {
+    process.env.SICLAW_IMAGE_URL_ALLOWLIST = "oss.example.org";
+    expect(extractImageUrls("See https://oss.example.org/abc123. 图 https://oss.example.org/a.jpg。"))
+      .toEqual(["https://oss.example.org/abc123", "https://oss.example.org/a.jpg"]);
   });
 });
 
@@ -107,6 +118,16 @@ describe("assertAllowedImageUrl", () => {
 
 // ── enrichImagesFromText (text image URLs) ─────────────────────────────────
 describe("enrichImagesFromText", () => {
+  it("fetches an extensionless screenshot and passes its bytes as native image input", async () => {
+    process.env.SICLAW_IMAGE_URL_ALLOWLIST = "oss.example.org";
+    const fetchMock = vi.fn(async (_url: unknown) => imageResponse(JPEG, "image/jpeg"));
+    vi.stubGlobal("fetch", fetchMock);
+    const url = "https://oss.example.org/session_resources/41/abc123?Signature=secret";
+    const out = await enrichImagesFromText(`[图片] ${url}`, []);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][0]).toBe(url);
+    expect(out).toEqual([{ mimeType: "image/jpeg", data: JPEG.toString("base64") }]);
+  });
   it("returns existing untouched when text has no image URL", async () => {
     const existing: InboundImage[] = [{ mimeType: "image/png", data: "AAAA" }];
     const out = await enrichImagesFromText("plain text, no urls", existing);
@@ -230,6 +251,11 @@ describe("enrichImagesFromText", () => {
 });
 
 describe("redactImageUrlsInText", () => {
+  it("redacts extensionless signed URLs while preserving Markdown and punctuation", () => {
+    process.env.SICLAW_IMAGE_URL_ALLOWLIST = "oss.example.org";
+    expect(redactImageUrlsInText("[图片](https://oss.example.org/abc123?Signature=secret)."))
+      .toBe("[图片](https://oss.example.org/abc123).");
+  });
   it("strips signed-URL query (Signature/AccessKeyId) but keeps host+path", () => {
     expect(
       redactImageUrlsInText("see https://oss.example.org/a.jpg?Signature=secret&AccessKeyId=key here"),
