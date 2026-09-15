@@ -47,7 +47,14 @@ const DEFAULT_TOTAL_TIMEOUT_MS = 8000;
 // Channel messages can contain extensionless object URLs. Select candidates
 // from text, then verify media using the existing bounded GET and byte sniff.
 // Markdown delimiters are not part of the URL (encode them in URL components).
-const URL_RE = /https?:\/\/[^\s<>"'`()\[\]，。；！？]+/gi;
+//
+// The excluded ranges are CJK and fullwidth punctuation, which cannot appear in
+// a URL but sit flush against one in Chinese text: U+3000-303F (、。「」『』〈〉
+// 《》), U+FF01-FF60 (，：；！？（）), plus — curly quotes and …. Listing only
+// ，。；！？ was not enough — 、 and 」 are just as common, and whatever was
+// swallowed into the match came back out through redactImageUrlsInText, which
+// rewrites the user's own message.
+const URL_RE = /https?:\/\/[^\s<>"'`()\[\]\u2014\u2018-\u201F\u2026\u3000-\u303F\uFF01-\uFF60]+/gi;
 
 function trimUrlPunctuation(url: string): string {
   return url.replace(/[.,;!]+$/, "");
@@ -103,20 +110,59 @@ export function sniffImageMime(buf: Buffer): string | null {
   return null;
 }
 
-function imageUrlAllowlist(): string[] {
-  const raw = process.env.SICLAW_IMAGE_URL_ALLOWLIST?.trim();
-  if (!raw) return [];
-  return raw.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+interface AllowlistEntry {
+  host: string;
+  /** Path prefix an extensionless object must sit under; "" when host-only. */
+  pathPrefix: string;
 }
 
-function hostMatchesAllowlist(host: string, allowlist: string[]): boolean {
-  return allowlist.some((entry) => {
-    if (entry.startsWith("*.")) {
-      // "*.example.org" → any subdomain (mirrors dingtalk.ts isAllowedWebhookHost).
-      return host.endsWith(entry.slice(1));
-    }
-    return host === entry;
-  });
+/**
+ * Entries are `host` or `host/path-prefix`, comma separated. The path half is
+ * optional and narrows only the EXTENSIONLESS candidate rule below; egress stays
+ * a host decision, so adding a path to an entry never widens what may be fetched.
+ */
+function imageUrlAllowlist(): AllowlistEntry[] {
+  const raw = process.env.SICLAW_IMAGE_URL_ALLOWLIST?.trim();
+  if (!raw) return [];
+  return raw.split(",").map((part) => part.trim().toLowerCase()).filter(Boolean)
+    .map((entry) => {
+      const slash = entry.indexOf("/");
+      return slash === -1
+        ? { host: entry, pathPrefix: "" }
+        : { host: entry.slice(0, slash), pathPrefix: entry.slice(slash) };
+    });
+}
+
+function hostMatches(host: string, entry: AllowlistEntry): boolean {
+  if (entry.host.startsWith("*.")) {
+    // "*.example.org" matches any subdomain (mirrors dingtalk.ts isAllowedWebhookHost).
+    return host.endsWith(entry.host.slice(1));
+  }
+  return host === entry.host;
+}
+
+function hostMatchesAllowlist(host: string, allowlist: AllowlistEntry[]): boolean {
+  return allowlist.some((entry) => hostMatches(host, entry));
+}
+
+/**
+ * Whether an EXTENSIONLESS object may be probed at all.
+ *
+ * The allowlist answers "may we make an outbound request to this host", NOT
+ * "everything on this host is an image". An object-storage domain routinely
+ * serves an API next to its files, so host alone would turn "a user mentioned a
+ * link" into "the Gateway fetched that link" - /api/v1/admin/reset included -
+ * and those candidates would also crowd real screenshots out of the
+ * MAX_INBOUND_IMAGES budget, which is filled in text order.
+ *
+ * An extensionless object therefore needs an entry that names a path prefix. A
+ * host-only entry keeps its egress meaning and admits no extensionless
+ * candidate; configure `oss.example.org/session_resources/` to opt one prefix
+ * in. URLs carrying an image extension are unaffected either way.
+ */
+function pathMatchesImageScope(host: string, pathname: string, allowlist: AllowlistEntry[]): boolean {
+  return allowlist.some((entry) =>
+    entry.pathPrefix !== "" && hostMatches(host, entry) && pathname.startsWith(entry.pathPrefix));
 }
 
 /**
@@ -155,15 +201,20 @@ export function extractImageUrls(text: string): string[] {
   return [...new Set(matches.filter(isImageUrlCandidate))];
 }
 
+function hasImageExtension(pathname: string): boolean {
+  return /\.(?:jpe?g|png|webp)$/i.test(pathname);
+}
+
 function isImageUrlCandidate(url: string): boolean {
   if (!URL.canParse(url)) return false;
   const parsed = new URL(url);
-  if (/\.(?:jpe?g|png|webp)$/i.test(parsed.pathname)) return true;
+  if (hasImageExtension(parsed.pathname)) return true;
   const basename = parsed.pathname.split("/").at(-1) ?? "";
-  // Avoid probing unrelated links. Only extensionless objects on explicitly
-  // trusted hosts are candidates; known non-image extensions remain excluded.
+  // Avoid probing unrelated links. An extensionless object must sit under a
+  // configured path prefix, not merely on an allowlisted host - see
+  // pathMatchesImageScope. Known non-image extensions remain excluded.
   return basename.length > 0 && !basename.includes(".") &&
-    hostMatchesAllowlist(parsed.hostname.toLowerCase(), imageUrlAllowlist());
+    pathMatchesImageScope(parsed.hostname.toLowerCase(), parsed.pathname, imageUrlAllowlist());
 }
 
 /**
@@ -176,7 +227,14 @@ export function redactImageUrlsInText(text: string): string {
   if (!text) return text;
   return text.replace(URL_RE, (match) => {
     const url = trimUrlPunctuation(match);
-    return isImageUrlCandidate(url) ? safeUrl(url) + match.slice(url.length) : match;
+    if (!isImageUrlCandidate(url)) return match;
+    const query = url.indexOf("?");
+    // Cut the query out of the ORIGINAL substring, and leave a URL that has no
+    // query exactly as the user typed it. Rebuilding from URL.origin +
+    // URL.pathname re-encodes the path, so anything the match absorbed came back
+    // percent-encoded - and this text is the persisted user message.
+    if (query === -1) return match;
+    return url.slice(0, query) + match.slice(url.length);
   });
 }
 
@@ -280,7 +338,11 @@ export async function enrichImagesFromText(
   // not one per extracted URL. extractImageUrls dedups but does not cap count, so
   // a message with many URLs would otherwise open N outbound connections at once
   // (transient memory / DoS / SSRF amplification).
-  const urls = extractImageUrls(text).slice(0, budget);
+  // Extension-anchored URLs are self-evidently images; take them first so an
+  // extensionless object cannot crowd a real screenshot out of the budget.
+  const urls = extractImageUrls(text)
+    .sort((a, b) => Number(hasImageExtension(new URL(b).pathname)) - Number(hasImageExtension(new URL(a).pathname)))
+    .slice(0, budget);
   if (urls.length === 0) return out;
 
   // One deadline for the whole step (a slow allowlisted host must not stall the

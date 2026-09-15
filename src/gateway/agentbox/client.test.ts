@@ -629,7 +629,9 @@ describe("AgentBoxClient — prompt image URL resolution (vision-gated)", () => 
   afterAll(async () => { await srv.close(); });
 
   beforeEach(() => {
-    process.env.SICLAW_IMAGE_URL_ALLOWLIST = "*.example.org";
+    // Host entry for extension-anchored images, plus a path-scoped entry so the
+    // extensionless screenshot case below is a candidate at all.
+    process.env.SICLAW_IMAGE_URL_ALLOWLIST = "*.example.org, oss.example.org/session_resources/";
     realFetch = globalThis.fetch.bind(globalThis);
     // Host-split: image URLs are stubbed; the agentbox POST is forwarded to the real local server.
     vi.stubGlobal("fetch", vi.fn(async (url: any, init: any) => {
