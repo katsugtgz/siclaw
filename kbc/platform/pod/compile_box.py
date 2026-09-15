@@ -630,6 +630,11 @@ class CompileStep:
     reply: str = ""
     teardown_failed: bool = False
     task: asyncio.Task | None = None
+    teardown_requested: asyncio.Future[None] = field(default_factory=lambda: asyncio.get_running_loop().create_future())
+
+    def request_teardown(self):
+        if not self.teardown_requested.done():
+            self.teardown_requested.set_result(None)
 
     def discard_reply(self):
         self.text.clear()
@@ -4010,8 +4015,6 @@ def _assert_exclusions_landed(run: "CompileRun", batch: dict) -> None:
 async def _execute_compile_step(run: "CompileRun", client: AgentClient, directive: str,
                                 *, preserve_page_baseline: bool = False) -> str:
     """Own a bounded worker through connection, result and teardown."""
-    teardown_started = asyncio.get_running_loop().create_future()
-
     async def execute(step):
         # SDK connect and disconnect must stay in the SAME task: Claude's
         # AnyIO scopes cannot be exited by a separate cleanup task.
@@ -4026,7 +4029,7 @@ async def _execute_compile_step(run: "CompileRun", client: AgentClient, directiv
             # Stop the watchdog before teardown, retaining exclusive ownership
             # until the adapter has settled its tools and disconnected.
             run._turn_active = False
-            teardown_started.set_result(None)
+            step.request_teardown()
             try:
                 await client.disconnect()
             except BaseException as exc:
@@ -4040,7 +4043,7 @@ async def _execute_compile_step(run: "CompileRun", client: AgentClient, directiv
         cancelled = False
         try:
             try:
-                await asyncio.wait({step.task, teardown_started}, return_when=asyncio.FIRST_COMPLETED)
+                await asyncio.wait({step.task, step.teardown_requested}, return_when=asyncio.FIRST_COMPLETED)
             except asyncio.CancelledError:
                 cancelled = True
                 step.task.cancel()
@@ -5653,7 +5656,9 @@ async def _reap_unrecoverable_turn(run: CompileRun, client, reason: str) -> None
             "本轮模型停滞且中断无响应——未产生结果;编译会话将在你下一条消息时自动重建,届时重发即可。")})
     if step is not None and step.task is not None:
         # Let the SDK-owning task drain its tools and exit its own scopes. The
-        # step driver bounds this drain and prevents a rebuild if it times out.
+        # deadline starts on the cancellation request, even if the SDK never
+        # acknowledges cancellation or enters its finally block.
+        step.request_teardown()
         step.task.cancel()
         return
     try:
