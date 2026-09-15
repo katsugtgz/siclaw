@@ -356,8 +356,9 @@ describe("LocalSpawner — locked agent-type policy (P1: parity with K8s)", () =
     expect(box.sessionManager.allowedToolsState.length).toBeGreaterThan(0);
     expect(box.sessionManager.allowedToolsState).toContain("read");
     expect(box.sessionManager.allowedToolsState).toEqual(expect.arrayContaining([
-      "local_script", "write", "task_create", "spawn_subagent", "task_output", "job_stop",
+      "local_script", "write", "task_create",
     ]));
+    expect(box.sessionManager.allowedToolsState).not.toContain("spawn_subagent");
     expect(box.sessionManager.allowedToolsState).not.toContain("memory_search");
     expect(box.sessionManager.allowedToolsState).not.toContain("host_exec");
     // Persona is driven by agentTypeState — must reflect the built-in type.

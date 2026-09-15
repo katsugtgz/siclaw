@@ -193,7 +193,9 @@ describe("conversation handoff across Agent types", () => {
     const baseline = resolveAgentHarness({ agentType: "knowledge_qa", allowedTools: null, mode: "web", memoryConfigured: false });
     const harness = resolveAgentHarness({ agentType: "knowledge_qa", allowedTools: null, mode: "web", memoryConfigured: false, handoffAvailable: true });
     expect(harness.allowedTools).toEqual([...baseline.allowedTools!, "transfer_to_agent", "search_handoff_targets"]);
-    expect(harness.includeSubagentGuidance).toBe(true);
+    // A roster adds ownership transfer only; it never restores delegation to this type.
+    expect(harness.includeSubagentGuidance).toBe(false);
+    expect(harness.allowedTools).not.toContain("spawn_subagent");
     expect(harness.memoryEnabled).toBe(false);
   });
   it("keeps an unresolved harness closed even with a roster", () => {
