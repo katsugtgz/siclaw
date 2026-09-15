@@ -43,6 +43,7 @@ import tempfile
 import time
 import traceback
 import uuid
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path, PurePosixPath
@@ -547,6 +548,20 @@ class PlanIntegrityError(RuntimeError):
     deterministic = True
 
 
+class WorkerTeardownError(RuntimeError):
+    """The workspace must be discarded before another worker can run."""
+
+
+# Includes host-tool drain and SDK subprocess shutdown, not model execution.
+_WORKER_TEARDOWN_TIMEOUT_S = 30
+
+
+def _observe_task_exit(task):
+    """Retrieve a late cleanup result after its failure was already reported."""
+    if not task.cancelled():
+        task.exception()
+
+
 def _batch_error_code(exc: BaseException) -> str:
     """A machine-routable code for a batch failure — the whitelist token that may
     reach pod stdout. NEVER embed the exception MESSAGE in a log line: a
@@ -555,6 +570,8 @@ def _batch_error_code(exc: BaseException) -> str:
     operator-visible, and the owner's KB content is theirs alone (it flows to the
     OWNER-facing SSE events instead). The class name + this code route the fault
     without leaking any of that."""
+    if isinstance(exc, WorkerTeardownError):
+        return "worker_teardown_failed"
     if isinstance(exc, ModelStallError):
         return "model_stall"
     if isinstance(exc, ModelResultError):
@@ -602,6 +619,43 @@ def _blocked_provenance_paths(run) -> set[str]:
         f"candidate/{rel}"
         for rel in (getattr(run, "_provenance_stamp_failures", {}) or {})
     }
+
+
+@dataclass
+class CompileStep:
+    """One internal session's client and reply, never the owner's conversation."""
+
+    client: AgentClient
+    text: list[str] = field(default_factory=list)
+    reply: str = ""
+    teardown_failed: bool = False
+    task: asyncio.Task | None = None
+
+    def discard_reply(self):
+        self.text.clear()
+        self.reply = ""
+
+
+def _step_teardown_failed(run) -> bool:
+    step = getattr(run, "_active_step", None)
+    return step is not None and step.teardown_failed
+
+
+@contextlib.contextmanager
+def _own_compile_step(run, client):
+    if run._active_step is not None or run._turn_active:
+        raise RuntimeError("another model turn already owns execution")
+    step = CompileStep(client)
+    run._active_step = step
+    try:
+        yield step
+    finally:
+        # Unconfirmed teardown retains ownership: another worker must not write
+        # into this workspace while the old process may still have live tools.
+        run._turn_active = False
+        run._stall_retrying = False
+        if not step.teardown_failed:
+            run._active_step = None
 
 
 class CompileRun:
@@ -684,13 +738,10 @@ class CompileRun:
         # Internal repair/verify/batch turns never arm this exemption.
         self._turn_format_guard: dict | None = None
         self._l1_repair_pending = False
-        # Batch mode (DESIGN-kb-batch-compile-2026-07-05): when the orchestrator
-        # drives per-batch sessions, ResultMessage must NOT emit turn_done (the
-        # whole batch run is ONE turn to the consumer); the flushed reply is parked
-        # here for the orchestrator instead. _batch_notes queues owner chat that
-        # arrives mid-batch (relayed into the next batch directive).
-        self._suppress_turn_done = False
-        self._last_turn_reply: str = ""
+        # The sequential executor owns one internal step. Its reply and client
+        # are separate from the persistent conversation; result routing is
+        # explicit at the stream call site, not a run-wide completion switch.
+        self._active_step: CompileStep | None = None
         # Media blind-verify bookkeeping: pages handed to the in-flight verify
         # task (subtracted from the due-check) — verified marks land only AFTER
         # a completed verification (failed pages retry, bounded by attempts).
@@ -813,6 +864,8 @@ class CompileRun:
         """Engine seam: push a user turn into the live session. The Claude SDK
         driver is one line; a future engine driver (e.g. Codex) reimplements
         just this method — self-check orchestration stays engine-neutral."""
+        if self._active_step is not None:
+            raise RuntimeError("an internal compile step owns execution")
         if self.client:
             self._begin_turn(text)
             await self.client.query(text)
@@ -1017,6 +1070,8 @@ async def _sync_workspace(
     enqueue and retains tombstone markers for reconnect replay;
     returns the number of changed entries."""
     async with run._sync_lock:
+        if _step_teardown_failed(run):
+            raise RuntimeError("compile worker teardown was not confirmed; recreate the session")
         if commit_input and not (Path(run.workdir) / "candidate" / "index.md").is_file():
             raise FileNotFoundError("cannot commit compile input without candidate/index.md")
         blocked_paths = _blocked_provenance_paths(run)
@@ -3204,7 +3259,7 @@ def _test_step_label(run: "TestRun", tool: str, args: dict) -> str:
     return _loc(run, "Consulting material", "查阅资料")
 
 
-async def _emit_message(run: CompileRun, msg) -> None:
+async def _emit_message(run: CompileRun, msg, *, step: CompileStep | None = None) -> None:
     """Relay one Agent SDK message to the SSE stream. Assistant text becomes the
     live chat (`log`) stream AND is accumulated for the turn; a ResultMessage
     marks the turn's end, flushing the accumulated text into `turn_done.text` so
@@ -3220,7 +3275,7 @@ async def _emit_message(run: CompileRun, msg) -> None:
             if block.get("type") == "text":
                 t = (block.get("text") or "").strip()
                 if t:
-                    run._turn_text.append(t)
+                    (step.text if step is not None else run._turn_text).append(t)
                     await run.emit({"type": "log", "text": t})
             elif block.get("type") == "toolCall" and isinstance(run, TestRun):
                 label = _test_step_label(
@@ -3230,19 +3285,19 @@ async def _emit_message(run: CompileRun, msg) -> None:
                 )
                 await run.emit({"type": "step", "text": label})
     elif name == "result":
-        if isinstance(run, CompileRun):
+        if isinstance(run, CompileRun) and step is None:
             # The nonce is a fact about one accepted apply_rulings turn, not
             # persistent session state. Tool calls for that turn have already
             # completed when its ResultMessage arrives; clearing here prevents
             # any later owner or internal turn from inheriting the old round.
             run.apply_dispatch_nonce = ""
-        reply = "\n\n".join(run._turn_text).strip()
-        run._turn_text = []
-        if getattr(run, "_suppress_turn_done", False):
-            # Batch mode: this session's turn is an INTERNAL step of one logical
-            # turn. Park the reply, keep the durability sync, skip selfcheck
-            # (the final full-corpus pass owns it) and skip turn_done.
-            run._last_turn_reply = reply
+        text = step.text if step is not None else run._turn_text
+        reply = "\n\n".join(text).strip()
+        text.clear()
+        if step is not None:
+            # Internal output belongs to the step. Stamp changed pages here;
+            # the orchestrator owns the checkpoint and final full-corpus check.
+            step.reply = reply
             turn_pages_before = getattr(run, "_turn_page_hashes", None)
             if isinstance(turn_pages_before, dict):
                 turn_pages_after = incremental.page_hashes(run.workdir)
@@ -3948,14 +4003,75 @@ def _assert_exclusions_landed(run: "CompileRun", batch: dict) -> None:
             f"({len(leftover)} source(s) could be neither cited nor excluded)")
 
 
+async def _execute_compile_step(run: "CompileRun", client: AgentClient, directive: str,
+                                *, preserve_page_baseline: bool = False) -> str:
+    """Own a bounded worker through connection, result and teardown."""
+    teardown_started = asyncio.get_running_loop().create_future()
+
+    async def execute(step):
+        # SDK connect and disconnect must stay in the SAME task: Claude's
+        # AnyIO scopes cannot be exited by a separate cleanup task.
+        try:
+            await client.connect()
+            run._begin_turn(directive, preserve_page_baseline=preserve_page_baseline)
+            await client.query(directive)
+            await _consume_turn_stream(
+                run, client, stop_on_result=True, fail_on_error_result=True, step=step)
+            return step.reply
+        finally:
+            # Stop the watchdog before teardown, retaining exclusive ownership
+            # until the adapter has settled its tools and disconnected.
+            run._turn_active = False
+            teardown_started.set_result(None)
+            try:
+                await client.disconnect()
+            except BaseException as exc:
+                step.teardown_failed = True
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+                raise WorkerTeardownError("compile worker teardown was not confirmed; recreate the session") from exc
+
+    with _own_compile_step(run, client) as step:
+        step.task = asyncio.create_task(execute(step))
+        cancelled = False
+        try:
+            try:
+                await asyncio.wait({step.task, teardown_started}, return_when=asyncio.FIRST_COMPLETED)
+            except asyncio.CancelledError:
+                cancelled = True
+                step.task.cancel()
+            # asyncio.wait, unlike wait_for, does not await cancellation of a
+            # wedged SDK/tool. Keep this workspace quarantined and report the
+            # failure so Runtime can dispose the box and recovery can rehydrate
+            # the last committed checkpoint into a different workspace.
+            done, _ = await asyncio.wait({step.task}, timeout=_WORKER_TEARDOWN_TIMEOUT_S)
+            if not done:
+                step.teardown_failed = True
+                if cancelled:
+                    raise asyncio.CancelledError
+                raise WorkerTeardownError("compile worker teardown was not confirmed; recreate the session")
+            if cancelled:
+                raise asyncio.CancelledError
+            if step.task.cancelled() and run._turn_dead:
+                run._turn_dead = False
+                raise ModelStallError("model worker stopped by watchdog")
+            return step.task.result()
+        finally:
+            if not step.task.done():
+                step.teardown_failed = True
+                step.task.cancel()
+            # Retain the task with the quarantined step until box disposal, and
+            # retrieve any late exception without treating late exit as recovery.
+            step.task.add_done_callback(_observe_task_exit)
+
+
 @_observe_pi_sessions
 async def _drive_batch_session(run: "CompileRun", directive: str, label: str,
                                pdf_page_ranges: dict | None = None,
                                raw_scope: dict | None = None) -> str:
     """One bounded internal session: fresh session_id, same role/tools/workspace.
-    Streams its output through _emit_message with turn_done suppressed; returns
-    the session's final reply text. run.client points at the live session so the
-    park/ruling MCP tools and the inject seam keep working.
+    Returns a step-local reply; only the orchestrator closes the logical turn.
+    The persistent conversation client keeps its identity throughout execution.
 
     Self-healing (07-24): the model turn is wrapped in a bounded client-REBUILD
     loop. A stall the watchdog cannot recover in place (dead subprocess, or a
@@ -3967,12 +4083,10 @@ async def _drive_batch_session(run: "CompileRun", directive: str, label: str,
     (finished batches stay stamped; the next trigger resumes from the first
     pending batch). Batches are idempotent, so re-running an unstamped batch is
     always safe."""
+    if run._active_step is not None or run._turn_active:
+        raise RuntimeError("another model turn already owns execution")
     root = Path(run.workdir).resolve()
     wd = str(root)
-    client = None
-    prev_client = run.client
-    run._suppress_turn_done = True
-    run._last_turn_reply = ""
     attempt = 0
     try:
         while True:
@@ -3984,33 +4098,18 @@ async def _drive_batch_session(run: "CompileRun", directive: str, label: str,
                     pdf_page_ranges=pdf_page_ranges,
                     raw_scope=raw_scope,
                 )
-                await client.connect()
-                run.client = client
                 if attempt == 0:
                     await run.emit({"type": "log", "text": _loc(run, f"—— {label} started ——", f"—— {label} 开始 ——")})
                     _print_compile_lifecycle("turn.start", run, extra=f"label={label}")
                 else:
                     _print_compile_lifecycle(
                         "turn.rebuilt", run, extra=f"label={label} attempt={attempt}")
-                # A rebuilt client is another transport attempt for the SAME
-                # logical batch turn. Keep the first attempt's byte baseline so
-                # pages written before a lost terminator are still stamped even
-                # when the idempotent retry performs no write.
-                run._begin_turn(directive_full, preserve_page_baseline=attempt > 0)
-                await client.query(directive_full)
-                await _consume_turn_stream(
-                    run, client, stop_on_result=True, fail_on_error_result=True)
+                reply = await _execute_compile_step(
+                    run, client, directive_full, preserve_page_baseline=attempt > 0)
                 _print_compile_lifecycle("turn.done", run, extra=f"label={label}")
-                return run._last_turn_reply
+                return reply
             except (ModelStallError, AgentTransportError) as exc:
                 attempt += 1
-                # Tear down the dead/wedged client before rebuilding. Disconnect
-                # may itself raise on a broken transport — best-effort.
-                if client is not None:
-                    with contextlib.suppress(Exception):
-                        await client.disconnect()
-                    client = None
-                run.client = prev_client
                 if attempt > _BATCH_REBUILD_MAX_RETRIES:
                     _print_compile_lifecycle(
                         "turn.rebuild_exhausted", run,
@@ -4028,26 +4127,20 @@ async def _drive_batch_session(run: "CompileRun", directive: str, label: str,
                     f"(第 {attempt}/{_BATCH_REBUILD_MAX_RETRIES} 次)。")})
                 # loop → rebuild on a fresh client, same directive
     finally:
-        run._suppress_turn_done = False
-        run.client = prev_client
-        if client is not None:
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
-        # The exclusion ledger is machine-owned: whatever the model did this
-        # session, the file at rest is canonical strict JSON again (parseable
-        # hand-written rows survive; mechanical slips are absorbed).
-        norm_err = selfcheck.normalize_exclusions_file(run.workdir)
-        if norm_err:
-            # stdout stays whitelisted (the err text can name the ledger path);
-            # the owner gets the full detail on their SSE stream.
-            _print_compile_lifecycle("exclusions.normalize_failed", run, extra="code=ledger_normalize_failed")
-            await run.emit({"type": "summary", "text": _loc(
-                run,
-                f"Exclusion ledger could not be normalized: {norm_err}",
-                f"豁免清单无法规范化:{norm_err}")})
-        await _normalize_ticket_ledger_after_turn(run, run.workdir)
+        if run._active_step is None:
+            # The exclusion ledger is machine-owned: whatever the model did this
+            # session, the file at rest is canonical strict JSON again (parseable
+            # hand-written rows survive; mechanical slips are absorbed).
+            norm_err = selfcheck.normalize_exclusions_file(run.workdir)
+            if norm_err:
+                # stdout stays whitelisted (the err text can name the ledger path);
+                # the owner gets the full detail on their SSE stream.
+                _print_compile_lifecycle("exclusions.normalize_failed", run, extra="code=ledger_normalize_failed")
+                await run.emit({"type": "summary", "text": _loc(
+                    run,
+                    f"Exclusion ledger could not be normalized: {norm_err}",
+                    f"豁免清单无法规范化:{norm_err}")})
+            await _normalize_ticket_ledger_after_turn(run, run.workdir)
 
 
 def _drain_batch_notes(run: "CompileRun") -> str:
@@ -4536,6 +4629,8 @@ def _attachment_edges(run: "CompileRun", inventory: list) -> dict[str, list[str]
 async def _plan_batches(run: "CompileRun", inventory: list) -> dict:
     """Code baseline always exists; the model may regroup topically but ONLY a
     plan that passes deterministic validation replaces the baseline."""
+    if run._active_step is not None or run._turn_active:
+        raise RuntimeError("another model turn already owns execution")
     edges = _attachment_edges(run, inventory)
     if batching.should_hierarchical(inventory):
         budget = batching.hierarchical_batch_budget_bytes()
@@ -4605,27 +4700,13 @@ async def _plan_batches(run: "CompileRun", inventory: list) -> dict:
             model_config=pi_config.for_role("compile", session_kind="authoring"), max_model_calls=8,
             tools=FileTools(wd, ["Read", "Write", "Glob"],
                             _make_compile_path_guard(Path(wd), run.locale)).tools())
-        prev = run.client
-        run._suppress_turn_done = True
-        try:
-            await client.connect()
-            run.client = client
-            directive = _loc(
-                run,
-                f"Budget: each batch's total effective must not exceed {budget} (pack by the effective field only, ignore bytes). "
-                "Read authoring/SOURCES_INVENTORY.json, write authoring/BATCH_PLAN.json.",
-                f"预算:每批 effective 总量不超过 {budget}(只按 effective 字段装箱,不看 bytes)。"
-                "读 authoring/SOURCES_INVENTORY.json,写 authoring/BATCH_PLAN.json。")
-            run._begin_turn(directive)  # planner is a model call too — arm the stall watchdog
-            await client.query(directive)
-            await _consume_turn_stream(run, client, stop_on_result=True)
-        finally:
-            run._suppress_turn_done = False
-            run.client = prev
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
+        directive = _loc(
+            run,
+            f"Budget: each batch's total effective must not exceed {budget} (pack by the effective field only, ignore bytes). "
+            "Read authoring/SOURCES_INVENTORY.json, write authoring/BATCH_PLAN.json.",
+            f"预算:每批 effective 总量不超过 {budget}(只按 effective 字段装箱,不看 bytes)。"
+            "读 authoring/SOURCES_INVENTORY.json,写 authoring/BATCH_PLAN.json。")
+        await _execute_compile_step(run, client, directive)
         proposed = batching.normalize_model_plan(_load_batch_plan(run))
         if proposed:
             # Pass the budget explicitly even though it equals the default
@@ -4647,6 +4728,10 @@ async def _plan_batches(run: "CompileRun", inventory: list) -> dict:
                 await run.emit({"type": "log", "text": _loc(run,
                     "Planner proposal failed validation, falling back to the code baseline: ",
                     "规划方案未过校验,改用代码基线分批:") + "; ".join(errors[:3])})
+    except WorkerTeardownError:
+        # A surviving planner may still write BATCH_PLAN.json. A code-plan
+        # fallback is valid only after that planner has relinquished ownership.
+        raise
     except Exception as e:
         await run.emit({"type": "log", "text": _loc(run,
             f"Planner session failed, falling back to the code baseline: {e!r}",
@@ -5273,9 +5358,14 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
         except Exception:
             pass
     finally:
-        shutil.rmtree(Path(run.workdir) / ".kbc-batch-slices", ignore_errors=True)
         run._model_idle_timeout_s = previous_model_idle_timeout
-        run._batch_active = False
+        if not _step_teardown_failed(run):
+            shutil.rmtree(Path(run.workdir) / ".kbc-batch-slices", ignore_errors=True)
+            run._batch_active = False
+    # An uncertain writer cannot release periodic sync or enter finalization.
+    # The platform must stop/recreate this box before execution can continue.
+    if _step_teardown_failed(run):
+        return
     # Red-blue PK examines the train's FINAL state, in the background, after the
     # single logical turn has closed (never inside it — turn_done latency is
     # user-visible; the PK verdict is not urgent). _pk_due re-checks the settled
@@ -5320,7 +5410,10 @@ async def _guarded_model_stream(run: "CompileRun", client):
             raise
         except AgentTransportError as exc:
             run._turn_active = False
-            run._turn_text = []
+            if run._active_step is not None and run._active_step.client is client:
+                run._active_step.discard_reply()
+            else:
+                run._turn_text.clear()
             raise ModelStallError(f"transport: {type(exc).__name__}") from exc
         yield msg
 
@@ -5331,6 +5424,7 @@ async def _consume_turn_stream(
     *,
     stop_on_result: bool,
     fail_on_error_result: bool = False,
+    step: CompileStep | None = None,
 ) -> None:
     """Relay a session's message stream through _emit_message, owning the
     stall-retry seam. A ResultMessage that the watchdog provoked (via interrupt())
@@ -5341,6 +5435,9 @@ async def _consume_turn_stream(
 
     The stream is pulled through _guarded_model_stream so a dead subprocess the
     SDK surfaces as a plain Exception becomes a rebuildable ModelStallError."""
+    text = step.text if step is not None else run._turn_text
+    if step is not None and step.client is not client:
+        raise ValueError("internal result stream does not belong to this step")
     async for msg in _guarded_model_stream(run, client):
         _note_model_activity(run, msg)
         if message_is_result(msg):
@@ -5351,15 +5448,14 @@ async def _consume_turn_stream(
                 # the domain rebuild the pending batch from its checkpoint;
                 # re-sending the original owner directive in the same session
                 # would silently replay already applied tool effects.
-                run._turn_text = []
-                run._last_turn_reply = ""
+                text.clear()
                 if fail_on_error_result:
                     raise ModelStallError("Compiler turn interrupted after tool execution; reconstruct the pending domain operation")
                 # An owner conversation remains usable, but must not replay a
                 # directive whose tool effects may already be on disk.
                 run._stall_retrying = False
             if run._stall_retrying:
-                run._turn_text = []           # the wedged attempt produced nothing usable
+                text.clear()           # the wedged attempt produced nothing usable
                 run._stall_retrying = False
                 if run._stall_fatal:
                     run._turn_active = False
@@ -5384,15 +5480,14 @@ async def _consume_turn_stream(
             # a box that kills itself has taken that decision away.
             if is_error and status == _MODEL_QUOTA_STATUS and fail_on_error_result:
                 run._turn_active = False
-                run._turn_text = []
-                run._last_turn_reply = ""
+                text.clear()
                 raise ModelQuotaExhausted(
                     f"model provider refused on billing (HTTP {status})")
             if is_error and status in _MODEL_RATE_STATUSES and not msg.data.get("tool_calls", 0):
                 if run._rate_retries < _MODEL_RATE_MAX_RETRIES:
                     run._rate_retries += 1
                     delay = _rate_backoff_delay(run._rate_retries)
-                    run._turn_text = []
+                    text.clear()
                     await run.emit({
                         "type": "rate_limited",
                         "status": status,
@@ -5418,8 +5513,7 @@ async def _consume_turn_stream(
                 # diagnostic deliberately bounded: subtype/status are enough to
                 # route the failure without echoing provider payloads or tokens.
                 run._turn_active = False
-                run._turn_text = []
-                run._last_turn_reply = ""
+                text.clear()
                 subtype = str(message_field(msg, "subtype", "unknown") or "unknown")[:80]
                 if fail_on_error_result:
                     raise ModelResultError(f"model result failed (subtype={subtype}, api_status={status})")
@@ -5449,11 +5543,11 @@ async def _consume_turn_stream(
                 continue
             await _record_turn_usage(run, client, msg)
             run._turn_active = False
-            await _emit_message(run, msg)
+            await _emit_message(run, msg, step=step)
             if stop_on_result:
                 return
             continue
-        await _emit_message(run, msg)
+        await _emit_message(run, msg, step=step)
     # The stream ended without a real ResultMessage. For a bounded sub-session
     # (stop_on_result) this is never a normal end — it means the model turn died
     # under us: the watchdog reaped a dead/wedged subprocess and disconnected to
@@ -5468,12 +5562,28 @@ async def _consume_turn_stream(
     if run._turn_dead or (stop_on_result and run._turn_active):
         run._turn_active = False
         run._turn_dead = False
-        run._turn_text = []           # discard the dead attempt's partial text
+        text.clear()           # discard the dead attempt's partial text
         raise ModelStallError(
             "model stream ended without a result (subprocess exit / transport closed)")
 
 
 _STALL_INTERRUPT_DEADLINE_S = int(os.environ.get("KBC_STALL_INTERRUPT_DEADLINE_S", "120"))
+
+
+async def _interrupt_with_deadline(client):
+    # The watchdog must keep working even if an SDK/tool never acknowledges
+    # cancellation. The caller reaps the worker on timeout; this is not stop
+    # confirmation and never releases workspace ownership.
+    task = asyncio.create_task(client.interrupt())
+    try:
+        done, _ = await asyncio.wait({task}, timeout=_STALL_INTERRUPT_DEADLINE_S)
+        if not done:
+            raise AgentTransportError("worker interrupt deadline exceeded")
+        task.result()
+    finally:
+        if not task.done():
+            task.cancel()
+        task.add_done_callback(_observe_task_exit)
 
 
 def _watchdog_idle_bound(tool_pending: bool, model_idle_timeout: float, destream_floor: float) -> float:
@@ -5504,9 +5614,16 @@ async def _reap_unrecoverable_turn(run: CompileRun, client, reason: str) -> None
       behavior — error + a turn_done that promises the session is recreated on
       the next message (run_session has no reconnect loop; the platform
       find-or-starts a fresh run/box with workspace rehydration)."""
+    step = run._active_step
+    if (step.client if step is not None else run.client) is not client:
+        # interrupt() awaited the SDK; a successor may already own execution.
+        return
     run._stall_retrying = False
     run._turn_active = False
-    run._turn_text = []               # the wedged attempt produced nothing usable
+    if run._active_step is not None:
+        run._active_step.discard_reply()
+    else:
+        run._turn_text.clear()
     if run._batch_active:
         run._turn_dead = True
         _print_compile_lifecycle("turn.dead", run, extra=f"reason={reason}")
@@ -5530,6 +5647,11 @@ async def _reap_unrecoverable_turn(run: CompileRun, client, reason: str) -> None
             "The turn stalled and could not be recovered — nothing was applied. "
             "The compile session will be recreated automatically on your next message.",
             "本轮模型停滞且中断无响应——未产生结果;编译会话将在你下一条消息时自动重建,届时重发即可。")})
+    if step is not None and step.task is not None:
+        # Let the SDK-owning task drain its tools and exit its own scopes. The
+        # step driver bounds this drain and prevents a rebuild if it times out.
+        step.task.cancel()
+        return
     try:
         await client.disconnect()
     except Exception:
@@ -5555,7 +5677,7 @@ async def _model_stall_watchdog(run: CompileRun) -> None:
             # receive loop blocks forever. Bound the wait; past the deadline,
             # give up on the turn and disconnect to unblock the loop.
             if time.monotonic() - run._stall_interrupted_at > _STALL_INTERRUPT_DEADLINE_S:
-                client = run.client
+                client = run._active_step.client if run._active_step is not None else run.client
                 if client is not None:
                     await _reap_unrecoverable_turn(
                         run, client,
@@ -5564,7 +5686,7 @@ async def _model_stall_watchdog(run: CompileRun) -> None:
                     run._stall_retrying = False
                     run._turn_active = False
             continue
-        client = run.client
+        client = run._active_step.client if run._active_step is not None else run.client
         if client is None:
             continue
         # Subprocess-liveness probe (07-24): a CLI child that has exited but whose
@@ -5611,7 +5733,7 @@ async def _model_stall_watchdog(run: CompileRun) -> None:
         run._last_stall_diagnostic = diagnostic
         await run.emit({"type": "turn_stalled", "attempt": run._model_retries, **diagnostic})
         try:
-            await client.interrupt()
+            await _interrupt_with_deadline(client)
         except Exception as e:
             # interrupt() itself failed → no interrupted-result can EVER come, so
             # the receive loop stays blocked forever. Merely clearing the latch and
@@ -7112,6 +7234,8 @@ async def _await_session_live(run: CompileRun):
     /session returns, so a turn that races ahead must wait — otherwise the SDK
     raises "Not connected. Call connect() first." A failed connect sets the event
     too (run.client stays None → 409)."""
+    if _step_teardown_failed(run):
+        return web.json_response({"error": "compile worker teardown was not confirmed; recreate the session"}, status=409)
     try:
         await asyncio.wait_for(run.connected.wait(), timeout=float(os.environ.get("KBC_CONNECT_TIMEOUT_SECS", "25")))
     except asyncio.TimeoutError:
@@ -7370,6 +7494,8 @@ async def handle_events(request: web.Request):
         pending = list(run._pending_sync_events.values())
         if pending:
             return pending
+        if _step_teardown_failed(run):
+            return []
         artifacts = _workspace_replay_artifacts(run, getattr(run, "_sync_sent", {}))
         commit = getattr(run, "_commit_input_replay", False)
         return [{"type": "syncArtifacts", "artifacts": artifacts,
