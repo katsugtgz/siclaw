@@ -629,7 +629,9 @@ describe("AgentBoxClient — prompt image URL resolution (vision-gated)", () => 
   afterAll(async () => { await srv.close(); });
 
   beforeEach(() => {
-    process.env.SICLAW_IMAGE_URL_ALLOWLIST = "*.example.org";
+    // Host entry for extension-anchored images, plus a path-scoped entry so the
+    // extensionless screenshot case below is a candidate at all.
+    process.env.SICLAW_IMAGE_URL_ALLOWLIST = "*.example.org, oss.example.org/session_resources/";
     realFetch = globalThis.fetch.bind(globalThis);
     // Host-split: image URLs are stubbed; the agentbox POST is forwarded to the real local server.
     vi.stubGlobal("fetch", vi.fn(async (url: any, init: any) => {
@@ -651,6 +653,17 @@ describe("AgentBoxClient — prompt image URL resolution (vision-gated)", () => 
     const body = JSON.parse(req.body);
     expect(body.images).toEqual([{ mimeType: "image/png", data: PNG.toString("base64") }]);
     expect(body.text).toContain("oss.example.org/a.png"); // original URL left in text
+  });
+
+  it("passes extensionless screenshot bytes to AgentBox and removes signed query from text", async () => {
+    await client.prompt({
+      text: "[图片] https://oss.example.org/session_resources/41/abc123?Signature=secret",
+      modelProvider: "openai", modelId: "gpt-4o", modelConfig: mkModelConfig(["text", "image"], "gpt-4o"),
+    });
+    const req = srv.captures.filter((c) => c.url === "/api/prompt").pop()!;
+    const body = JSON.parse(req.body);
+    expect(body.images).toEqual([{ mimeType: "image/png", data: PNG.toString("base64") }]);
+    expect(body.text).toBe("[图片] https://oss.example.org/session_resources/41/abc123");
   });
 
   it("non-vision model: does NOT resolve; no images, URL stays as plain text", async () => {

@@ -70,9 +70,45 @@ describe("extractImageUrls", () => {
     expect(extractImageUrls(`${url} ${url}`)).toEqual([url]);
     expect(extractImageUrls("https://h.cn/a.webp https://h.cn/b.jpeg")).toHaveLength(2);
   });
-  it("ignores non-image and extensionless URLs", () => {
+  it("ignores non-image and untrusted extensionless URLs", () => {
     expect(extractImageUrls("https://h.cn/page.html https://h.cn/raw")).toEqual([]);
     expect(extractImageUrls("")).toEqual([]);
+  });
+  it("extracts extensionless object URLs under a configured path prefix", () => {
+    process.env.SICLAW_IMAGE_URL_ALLOWLIST = "oss.example.org/session_resources/";
+    const url = "https://oss.example.org/session_resources/41/abc123";
+    expect(extractImageUrls(`[图片] ${url}\n[image](${url})`)).toEqual([url]);
+    expect(extractImageUrls("https://oss.example.org/manual.pdf https://other.example.org/raw")).toEqual([]);
+  });
+  it("admits no extensionless candidate from a host-only entry", () => {
+    // The allowlist says "we may reach this host", not "everything here is an
+    // image": an object-storage domain also exposes its API, and a user merely
+    // mentioning such a link would otherwise have the Gateway fetch it.
+    process.env.SICLAW_IMAGE_URL_ALLOWLIST = "oss.example.org";
+    expect(extractImageUrls("参考 https://oss.example.org/api/v1/admin/reset 和 https://oss.example.org/internal/metrics"))
+      .toEqual([]);
+    expect(extractImageUrls("https://oss.example.org/session_resources/41/abc123")).toEqual([]);
+    expect(extractImageUrls("https://oss.example.org/a.jpg")).toEqual(["https://oss.example.org/a.jpg"]);
+  });
+  it("does not probe non-object paths on a path-scoped host", () => {
+    process.env.SICLAW_IMAGE_URL_ALLOWLIST = "oss.example.org/session_resources/";
+    expect(extractImageUrls("参考 https://oss.example.org/api/v1/admin/reset 和 https://oss.example.org/internal/metrics"))
+      .toEqual([]);
+  });
+  it("keeps sentence punctuation outside both image and object URLs", () => {
+    process.env.SICLAW_IMAGE_URL_ALLOWLIST = "oss.example.org/session_resources/";
+    expect(extractImageUrls("See https://oss.example.org/session_resources/abc123. 图 https://oss.example.org/a.jpg。"))
+      .toEqual(["https://oss.example.org/session_resources/abc123", "https://oss.example.org/a.jpg"]);
+  });
+  it("keeps CJK punctuation other than 。，；！？ outside the URL", () => {
+    // 、 「」 ： … are as common as 。 in Chinese channel text. Leaving them in
+    // the match swallowed the following characters, and redaction then wrote
+    // the mangled result back over the user's own message.
+    process.env.SICLAW_IMAGE_URL_ALLOWLIST = "oss.example.org/session_resources/";
+    const url = "https://oss.example.org/session_resources/abc123";
+    for (const text of [`图 ${url}、请看这个`, `「${url}」`, `见 ${url}：下一步`, `${url}…`]) {
+      expect(extractImageUrls(text)).toEqual([url]);
+    }
   });
 });
 
@@ -107,6 +143,16 @@ describe("assertAllowedImageUrl", () => {
 
 // ── enrichImagesFromText (text image URLs) ─────────────────────────────────
 describe("enrichImagesFromText", () => {
+  it("fetches an extensionless screenshot and passes its bytes as native image input", async () => {
+    process.env.SICLAW_IMAGE_URL_ALLOWLIST = "oss.example.org/session_resources/";
+    const fetchMock = vi.fn(async (_url: unknown) => imageResponse(JPEG, "image/jpeg"));
+    vi.stubGlobal("fetch", fetchMock);
+    const url = "https://oss.example.org/session_resources/41/abc123?Signature=secret";
+    const out = await enrichImagesFromText(`[图片] ${url}`, []);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][0]).toBe(url);
+    expect(out).toEqual([{ mimeType: "image/jpeg", data: JPEG.toString("base64") }]);
+  });
   it("returns existing untouched when text has no image URL", async () => {
     const existing: InboundImage[] = [{ mimeType: "image/png", data: "AAAA" }];
     const out = await enrichImagesFromText("plain text, no urls", existing);
@@ -230,6 +276,30 @@ describe("enrichImagesFromText", () => {
 });
 
 describe("redactImageUrlsInText", () => {
+  it("redacts extensionless signed URLs while preserving Markdown and punctuation", () => {
+    process.env.SICLAW_IMAGE_URL_ALLOWLIST = "oss.example.org/session_resources/";
+    expect(redactImageUrlsInText("[图片](https://oss.example.org/session_resources/abc123?Signature=secret)."))
+      .toBe("[图片](https://oss.example.org/session_resources/abc123).");
+  });
+  it("never rewrites the surrounding message", () => {
+    // This text is persisted as the user's own message and fed to the model, so
+    // redaction may only remove the query string - never re-encode the path and
+    // never drop what followed the URL.
+    process.env.SICLAW_IMAGE_URL_ALLOWLIST = "oss.example.org/session_resources/";
+    const url = "https://oss.example.org/session_resources/abc123";
+    expect(redactImageUrlsInText(`图片：${url}?Signature=s、请看`)).toBe(`图片：${url}、请看`);
+    expect(redactImageUrlsInText(`「${url}?Signature=s」`)).toBe(`「${url}」`);
+    // No query means nothing to strip: the bytes must come back identical, not
+    // percent-encoded through URL.pathname.
+    expect(redactImageUrlsInText(`图 ${url}、请看这个`)).toBe(`图 ${url}、请看这个`);
+  });
+  it("leaves a signed non-image link alone", () => {
+    // A shared export link is not an image; stripping its signature would make
+    // the link the user posted stop working.
+    process.env.SICLAW_IMAGE_URL_ALLOWLIST = "oss.example.org/session_resources/";
+    const text = "这是导出链接 https://oss.example.org/export/20260915?Signature=abc&AccessKeyId=k ，24小时有效";
+    expect(redactImageUrlsInText(text)).toBe(text);
+  });
   it("strips signed-URL query (Signature/AccessKeyId) but keeps host+path", () => {
     expect(
       redactImageUrlsInText("see https://oss.example.org/a.jpg?Signature=secret&AccessKeyId=key here"),
