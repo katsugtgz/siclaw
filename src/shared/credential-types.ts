@@ -10,6 +10,7 @@
  */
 
 export interface Identity {
+  privateUserId?: string;
   agentId: string;
   orgId?: string;
   boxId?: string;

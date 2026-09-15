@@ -1492,3 +1492,29 @@ describe("model usage persistence ownership", () => {
     } finally { sessionRegistry.setResolver(undefined); }
   });
 });
+
+describe("private Web callback authorization", () => {
+  it("accepts a private root append without a parent and refuses another user or shared box", async () => {
+    const privateUserId = `web_${"a".repeat(32)}`;
+    sessionRegistry.remember("web-root",privateUserId,"agent-1");
+    const event={type:"delegation.append_message",message:{sessionId:"web-root",fromAgentId:"agent-1",content:"private reply",role:"assistant"}};
+    for (const [cert,status] of [[{...identity,privateUserId},200],[{...identity,privateUserId:`web_${"b".repeat(32)}`},403],[identity,403]] as const) {
+      const res=new FakeRes();
+      await handleDelegationEvents(asReq(new FakeReq(JSON.stringify(event))),asRes(res),cert,frontend as unknown as FrontendWsClient);
+      expect(res.statusCode).toBe(status);
+    }
+    sessionRegistry.forget("web-root");
+  });
+  it("only creates private child sessions under an authorized same-user parent",async()=>{
+    const privateUserId=`web_${"a".repeat(32)}`;
+    sessionRegistry.remember("web-parent",privateUserId,"agent-1");
+    const event={type:"delegation.ensure_session",sessionId:"web-child",agentId:"agent-1",userId:privateUserId,origin:"delegation",lineage:{parentSessionId:"web-parent",parentAgentId:"agent-1"}};
+    const res=new FakeRes();
+    await handleDelegationEvents(asReq(new FakeReq(JSON.stringify(event))),asRes(res),{...identity,privateUserId},frontend as unknown as FrontendWsClient);
+    expect(res.statusCode).toBe(200);
+    const denied=new FakeRes();
+    await handleDelegationEvents(asReq(new FakeReq(JSON.stringify({...event,userId:`web_${"b".repeat(32)}`}))),asRes(denied),{...identity,privateUserId},frontend as unknown as FrontendWsClient);
+    expect(denied.statusCode).toBe(403);
+    sessionRegistry.forget("web-parent");sessionRegistry.forget("web-child");
+  });
+});
