@@ -745,6 +745,8 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     const requiredResultToolName = typeof params.requiredResultToolName === "string"
       ? params.requiredResultToolName.trim() || undefined
       : undefined;
+    const strictFixedExecutor = requireSessionPersistence && Boolean(requiredResultToolName) && typeof params.logicalTurnId !== "string";
+    if (strictFixedExecutor && requestMode === "sync") throw new Error("requestMode=sync is not supported by the strict result /run contract");
     if (!agentId || !userId || !text) {
       throw new Error("agentId, userId, and text are required");
     }
@@ -922,6 +924,9 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       // Released in the finally below so a throw cannot wedge the session.
       let releaseTurn: (() => void) | undefined;
       let steeredIntoExistingTurn = false;
+      const acquireTurn = () => strictFixedExecutor
+        ? sessionTurnLocks.acquire(sessionId, undefined, { signal: turnAbort.signal })
+        : sessionTurnLocks.acquireRequest(sessionId, requestMode, turnAbort.signal, typeof params.logicalTurnId === "string");
       try {
         // One turn at a time for this session, across every box (see session-turn-lock.ts).
         // If the session is already running, fall back to the SAME steer the AgentBox's own
@@ -929,7 +934,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         // stream_error/prompt_done here instead would tell the frontend the RUNNING turn
         // had ended: it stops rendering and hides Stop while the turn is still going.
         try {
-          releaseTurn = await sessionTurnLocks.acquireRequest(sessionId, requestMode, turnAbort.signal, typeof params.logicalTurnId === "string");
+          releaseTurn = await acquireTurn();
         } catch (busyErr) {
           throwIfStoppedBeforePrompt();
           // A strict machine request is one distinct turn with one distinct
@@ -959,7 +964,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           // No steer target, or the turn ended between the rejection and the steer. Ask
           // for the lock once more; if it is genuinely still busy this throws and the
           // caller gets the ordinary busy error.
-          releaseTurn = await sessionTurnLocks.acquireRequest(sessionId, requestMode, turnAbort.signal, typeof params.logicalTurnId === "string");
+          releaseTurn = await acquireTurn();
         }
         throwIfStoppedBeforePrompt();
 

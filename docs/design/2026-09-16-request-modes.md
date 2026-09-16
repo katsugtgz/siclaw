@@ -4,6 +4,10 @@
 `async`, preserving interactive Web steering. It is independent of HTTP JSON/SSE
 selection, provider streaming and concurrent subagent execution.
 
+The fixed-executor strict structured-result `/run` contract is unchanged. It
+retains bounded busy rejection and its existing result protocol; sync mode is
+explicitly rejected there rather than silently changing that separate contract.
+
 - A sync input queues; it never steers another request.
 - An active sync request is protected: later inputs, including async inputs,
   queue until that request has ended.

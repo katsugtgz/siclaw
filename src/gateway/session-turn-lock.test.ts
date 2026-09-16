@@ -9,6 +9,11 @@ import { SessionTurnLocks, SessionBusyError } from "./session-turn-lock.js";
 const tick = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 describe("SessionTurnLocks", () => {
+  it("preserves legacy bounded admission for strict result callers", async () => {
+    const locks = new SessionTurnLocks(); const release = await locks.acquireRequest("strict", "sync");
+    await expect(locks.acquire("strict", 5)).rejects.toBeInstanceOf(SessionBusyError);
+    release();
+  });
   it("queues sync requests and protects active sync requests from async steering", async () => {
     vi.useFakeTimers();
     try {

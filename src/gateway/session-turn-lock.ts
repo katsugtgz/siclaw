@@ -83,7 +83,7 @@ export class SessionTurnLocks {
   /** Only async -> async may degrade to steer; all other combinations queue. */
   acquireRequest(sessionId: string, requestMode: RequestMode, signal?: AbortSignal, managed = false): Promise<() => void> {
     const waitMs = requestMode === "sync" || !this.canSteer(sessionId) ? REQUEST_QUEUE_TIMEOUT_MS : DEFAULT_WAIT_MS;
-    return this.acquire(sessionId, waitMs, { requestMode, signal, managed });
+    return this.acquire(sessionId, waitMs, { requestMode, signal, managed, protectSync: true });
   }
 
   /**
@@ -159,8 +159,8 @@ export class SessionTurnLocks {
    * early returns that a closure would silently turn into "carry on with the rest of the
    * function". Release from a `finally` so a throw cannot wedge the session.
    */
-  async acquire(sessionId: string, waitMs = DEFAULT_WAIT_MS, options: { requestMode?: RequestMode; signal?: AbortSignal; managed?: boolean } = {}): Promise<() => void> {
-    await this.waitForTurn(sessionId, waitMs, options.requestMode ?? "async", options.signal, options.managed ?? false);
+  async acquire(sessionId: string, waitMs = DEFAULT_WAIT_MS, options: { requestMode?: RequestMode; signal?: AbortSignal; managed?: boolean; protectSync?: boolean } = {}): Promise<() => void> {
+    await this.waitForTurn(sessionId, waitMs, options.requestMode ?? "async", options.signal, options.managed ?? false, options.protectSync ?? false);
     let released = false;
     return () => {
       if (released) return; // idempotent: a finally may run alongside an explicit release
@@ -169,7 +169,7 @@ export class SessionTurnLocks {
     };
   }
 
-  private waitForTurn(sessionId: string, waitMs: number, requestMode: RequestMode, signal?: AbortSignal, managed = false): Promise<void> {
+  private waitForTurn(sessionId: string, waitMs: number, requestMode: RequestMode, signal?: AbortSignal, managed = false, protectSync = false): Promise<void> {
     if (signal?.aborted) return Promise.reject(signal.reason ?? new Error("Queued request aborted"));
     const entry = this.held.get(sessionId);
     if (!entry) {
@@ -191,7 +191,7 @@ export class SessionTurnLocks {
         // waiter was queued. Retain its FIFO position instead of degrading it
         // to steer (or rejecting it) against the new protected request.
         const remaining = REQUEST_QUEUE_TIMEOUT_MS - (Date.now() - startedAt);
-        if (requestMode === "async" && entry.requestMode === "sync" && remaining > 0) {
+        if (protectSync && requestMode === "async" && entry.requestMode === "sync" && remaining > 0) {
           waiter.timer = setTimeout(onTimeout, remaining);
           waiter.timer.unref?.();
           return;
