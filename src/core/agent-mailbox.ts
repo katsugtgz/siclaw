@@ -1,16 +1,21 @@
-/** Mail addressed to one active user turn. Closing it never starts another turn. */
+interface Mail {
+  text: string;
+  onUndelivered?: () => void;
+}
+
+/** Mail addressed to one active turn. Its owner decides how to recover unread results. */
 export class AgentMailbox {
-  private messages: string[] = [];
-  private delivered: string[] = [];
+  private messages: Mail[] = [];
+  private delivered: Mail[] = [];
   private listeners = new Set<(outcome: "mail" | "closed" | "steered") => void>();
   private closed = false;
   private accepting = true;
 
   get ready(): boolean { return !this.closed && this.accepting && this.messages.length > 0; }
 
-  post(message: string): boolean {
+  post(message: string, onUndelivered?: () => void): boolean {
     if (this.closed) return false;
-    this.messages.push(message);
+    this.messages.push({ text: message, onUndelivered });
     for (const listener of this.listeners) listener("mail");
     return true;
   }
@@ -28,7 +33,7 @@ export class AgentMailbox {
     if (!this.ready) return undefined;
     const batch = this.messages.splice(0);
     this.delivered.push(...batch);
-    return batch.join("\n\n");
+    return batch.map(mail => mail.text).join("\n\n");
   }
 
   checkpoint(): number { return this.delivered.length; }
@@ -40,11 +45,12 @@ export class AgentMailbox {
     this.reopen();
   }
 
-  close(): void {
+  close(recoverUnread = false): void {
     this.closed = true;
-    this.messages = [];
+    const unread = this.messages.splice(0);
     this.delivered = [];
     for (const listener of this.listeners) listener("closed");
+    if (recoverUnread) for (const mail of unread) mail.onUndelivered?.();
   }
 
   /** Wait for activity, not for a successful result; never consumes mail or stops jobs. */

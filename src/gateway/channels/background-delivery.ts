@@ -17,9 +17,12 @@ import type {
 
 export type ChannelDeliveryPayload = DelegationAppendMessagePayload | ChannelDeliverMessagePayload;
 export type BackgroundChannelDelivery = (message: ChannelDeliveryPayload) => Promise<boolean>;
+export type BackgroundChannelEvent = Record<string, unknown> & { type: string };
+export type BackgroundChannelEventListener = (event: BackgroundChannelEvent) => Promise<void>;
 
 interface DeliveryEntry {
   deliver: BackgroundChannelDelivery;
+  onEvent?: BackgroundChannelEventListener;
   ttlMs: number;
   expiresAt: number;
   timer: NodeJS.Timeout;
@@ -31,14 +34,29 @@ const deliveries = new Map<string, DeliveryEntry>();
 export function registerBackgroundChannelDelivery(
   sessionId: string,
   deliver: BackgroundChannelDelivery,
-  ttlMs: number = DEFAULT_TTL_MS,
+  options: number | { ttlMs?: number; onEvent?: BackgroundChannelEventListener } = DEFAULT_TTL_MS,
 ): () => void {
+  const ttlMs = typeof options === "number" ? options : options.ttlMs ?? DEFAULT_TTL_MS;
+  const onEvent = typeof options === "number" ? undefined : options.onEvent;
   clearBackgroundChannelDelivery(sessionId);
   const expiresAt = Date.now() + ttlMs;
   const timer = setTimeout(() => clearBackgroundChannelDelivery(sessionId), ttlMs);
   timer.unref?.();
-  deliveries.set(sessionId, { deliver, ttlMs, expiresAt, timer });
+  deliveries.set(sessionId, { deliver, onEvent, ttlMs, expiresAt, timer });
   return () => clearBackgroundChannelDelivery(sessionId);
+}
+
+/** Session-level lifecycle, independent of the current main prompt's SSE subscription. */
+export async function deliverBackgroundChannelEvent(sessionId: string, event: BackgroundChannelEvent): Promise<void> {
+  const entry = getEntry(sessionId);
+  if (!entry?.onEvent) return;
+  try {
+    await entry.onEvent(event);
+    if (deliveries.get(sessionId) === entry) refreshEntry(sessionId, entry);
+  } catch (err) {
+    // An IM rendering failure must not suppress Portal events or restart the agent.
+    console.warn(`[background-delivery] event=${event.type} session=${sessionId} failed:`, err);
+  }
 }
 
 export function clearBackgroundChannelDelivery(sessionId: string): void {
@@ -58,7 +76,7 @@ export async function deliverBackgroundChannelMessage(
   const entry = getEntry(message.sessionId);
   if (!entry) return false;
   const delivered = await entry.deliver(message);
-  if (delivered) refreshEntry(message.sessionId, entry);
+  if (delivered && deliveries.get(message.sessionId) === entry) refreshEntry(message.sessionId, entry);
   return delivered;
 }
 
@@ -69,7 +87,7 @@ export async function deliverChannelVisibleMessage(
   const entry = getEntry(message.sessionId);
   if (!entry) return false;
   const delivered = await entry.deliver(message);
-  if (delivered) refreshEntry(message.sessionId, entry);
+  if (delivered && deliveries.get(message.sessionId) === entry) refreshEntry(message.sessionId, entry);
   return delivered;
 }
 

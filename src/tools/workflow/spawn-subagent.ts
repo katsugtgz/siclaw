@@ -116,7 +116,7 @@ function buildDescription(groupEnabled: boolean, backgroundAllowed: boolean, mai
       ? "All launches are asynchronous, including a single task. The returned handle is not a completed report. " +
         "Continue independent work; use wait_agent when your next step depends on a result. " +
         "Messages and results enter the active turn at execution boundaries. Do not poll or spawn a waiter. " +
-        "Use job_stop to cancel. Finish only after the results needed for the request have been integrated; late results do not restart a completed parent."
+        "Use job_stop to cancel. Prefer integrating required results before finishing; late completion results have a runtime follow-up fallback."
       : backgroundAllowed
       ? "Single tasks default to foreground; multi-item batches default to background. Set run_in_background:false to await results inline. " +
         "Background completion is delivered automatically: continue independent work, never poll or spawn a waiter. " +

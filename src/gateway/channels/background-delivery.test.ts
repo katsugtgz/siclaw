@@ -9,6 +9,7 @@ import {
   hasBackgroundChannelDelivery,
   deliverBackgroundChannelMessage,
   deliverChannelVisibleMessage,
+  deliverBackgroundChannelEvent,
 } from "./background-delivery.js";
 
 const TTL = 1_000;
@@ -65,5 +66,28 @@ describe("background-delivery TTL", () => {
     // A non-delivery must not keep a dead session alive past its original TTL.
     vi.advanceTimersByTime(401);
     expect(hasBackgroundChannelDelivery("s1")).toBe(false);
+  });
+
+  it("keeps child and main lifecycle listeners alive independently of an SSE collector", async () => {
+    const onEvent = vi.fn(async () => {});
+    registerBackgroundChannelDelivery("s1", async () => true, { ttlMs: TTL, onEvent });
+    vi.advanceTimersByTime(600);
+    await deliverBackgroundChannelEvent("s1", { type: "subagent_done", job_id: "child" });
+    vi.advanceTimersByTime(600);
+    await deliverBackgroundChannelEvent("s1", { type: "background_turn_start", turnId: "t2" });
+    expect(hasBackgroundChannelDelivery("s1")).toBe(true);
+    expect(onEvent.mock.calls.map(([event]) => event.type)).toEqual(["subagent_done", "background_turn_start"]);
+  });
+
+  it("does not let an in-flight old listener refresh or expire its replacement", async () => {
+    let unblock!: () => void;
+    registerBackgroundChannelDelivery("s1", async () => true, { ttlMs: 100, onEvent: async () => {
+      await new Promise<void>(resolve => { unblock = resolve; });
+    } });
+    const old = deliverBackgroundChannelEvent("s1", { type: "subagent_done" });
+    registerBackgroundChannelDelivery("s1", async () => true, TTL);
+    unblock(); await old;
+    vi.advanceTimersByTime(101);
+    expect(hasBackgroundChannelDelivery("s1")).toBe(true);
   });
 });

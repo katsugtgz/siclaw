@@ -51,14 +51,24 @@ usage unavailable because of a cancelled stream is not invented. A routing
 checkpoint also records the mailbox consumption cursor: rollback requeues the
 discarded attempt's mail in front of later arrivals.
 
-## Deliberate limitation
+## Late-result fallback
 
-When the main brain returns, its mailbox is closed. Late results remain in the
-normal child report/transcript/UI lifecycle, but do not wake an idle parent,
-cross into a successor user turn, or create a synthetic report. This edge case
-is intentionally not addressed. Required results are the main model's workflow
-responsibility: do useful independent work, explicitly wait when blocked, then
-integrate the result before finishing.
+When the main brain returns normally, its mailbox is closed. Terminal results
+that arrive later, or were deferred behind final text and never consumed, now
+enter the session manager's coalesced follow-up queue. Consumed results are not
+repeated; intermediate `send_message` updates alone do not start another turn.
+Stop/handoff cancels recovery rather than reviving work the user stopped.
+
+The fallback appends one ordinary `role: user` message in the SAME conversation,
+tagged `task_notification` as runtime-generated evidence, then runs a new main
+turn through normal model routing. The input is saved before calling the model,
+even if that call fails. A racing real user turn is allowed to finish first;
+the fallback is never steered into it. Single/group completion uses the existing
+job deduplication and 600 ms coalescing window. The new turn gets its own mailbox.
+This is in-process recovery, not a durable scheduler across restarts.
+
+The main model should still do useful independent work, wait sparingly when
+blocked, and integrate required results before finishing when possible.
 
 There is no new message rate limiter. Explicit sends, batched consumption and
 safe sampling boundaries constrain interruption, but do not guarantee that a
@@ -75,7 +85,7 @@ raw tool-name whitelists must include the new tools; no whitelist is bypassed.
 
 After runtime tests, delegation guidance is updated to distinguish launch from
 completion, allow independent work, require explicit waits on dependencies and
-warn that finalizing the parent ends message delivery. Platform identity and
+describe the late-result fallback without encouraging premature completion. Platform identity and
 safety policy are unchanged.
 
 Verification includes native pi-loop tests (not a replacement loop), mailbox

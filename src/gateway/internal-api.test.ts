@@ -524,6 +524,33 @@ describe("handleAgentTasksDelete", () => {
 // ── delegation persistence ───────────────────────────────
 
 describe("handleDelegationEvents", () => {
+  it("forwards authorized main and child lifecycle events to the session's IM listener", async () => {
+    sessionRegistry.remember("channel-1", "user-1", "agent-1");
+    const onEvent = vi.fn(async () => {});
+    registerBackgroundChannelDelivery("channel-1", async () => true, { onEvent });
+    for (const type of ["subagent_done", "background_turn_start", "background_turn_done"]) {
+      const res = new FakeRes();
+      await handleDelegationEvents(asReq(new FakeReq(JSON.stringify({
+        type: "delegation.emit_chat_event", sessionId: "channel-1", event: { type, sessionId: "channel-1" },
+      }))), asRes(res), identity, frontend as unknown as FrontendWsClient);
+      expect(res.statusCode).toBe(200);
+    }
+    expect(onEvent.mock.calls.map(([event]) => event.type)).toEqual(["subagent_done", "background_turn_start", "background_turn_done"]);
+    expect(frontend.emitted).toHaveLength(3);
+  });
+
+  it("does not forward another agent's session events to IM", async () => {
+    sessionRegistry.remember("channel-1", "user-1", "agent-other");
+    const onEvent = vi.fn(async () => {});
+    registerBackgroundChannelDelivery("channel-1", async () => true, { onEvent });
+    const res = new FakeRes();
+    await handleDelegationEvents(asReq(new FakeReq(JSON.stringify({
+      type: "delegation.emit_chat_event", sessionId: "channel-1", event: { type: "subagent_done" },
+    }))), asRes(res), identity, frontend as unknown as FrontendWsClient);
+    expect(res.statusCode).toBe(403);
+    expect(onEvent).not.toHaveBeenCalled();
+  });
+
   it("ensures a delegated session with explicit user ownership and lineage", async () => {
     sessionRegistry.remember("parent-1", "user-1", "agent-1");
     const res = new FakeRes();

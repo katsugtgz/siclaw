@@ -7,7 +7,7 @@ import { parseHandoffPolicy } from "../shared/agent-handoff.js";
  * Provides HTTP API for Gateway to call, with SSE streaming support.
  */
 
-import { BackgroundWorkTurn, decorateBackgroundWorkEvent } from "./background-work-turn.js";
+import { decorateBackgroundWorkEvent } from "./background-work-turn.js";
 import type { ExecutionEndEvent } from "../shared/execution-lifecycle.js";
 import { normalizeHandoffTrace, handoffParentSpan } from "../shared/handoff-trace.js";
 import fs from "node:fs";
@@ -1250,12 +1250,11 @@ export function createHttpServer(
     const handoffTrace = normalizeHandoffTrace(body.handoffTrace);
     tracingRecorder.startPrompt(managed.id, promptText, body.userId, handoffTrace?.traceId, handoffParentSpan(handoffTrace));
 
-    const backgroundWorkTurn = new BackgroundWorkTurn();
-    managed._backgroundWorkTurn = backgroundWorkTurn;
-    managed.brain.setMailbox?.(backgroundWorkTurn.mailbox);
+    const backgroundWorkTurn = sessionManager.beginBackgroundWorkTurn(managed);
 
     const actuallyFinish = () => {
-      backgroundWorkTurn.cancel();
+      if (managed._aborted) backgroundWorkTurn.cancel();
+      else backgroundWorkTurn.finish();
       managed.brain.setMailbox?.(undefined);
       managed._promptOutcome ??= managed._aborted ? "aborted" : promptOutcome;
       managed._promptDone = true;
@@ -1444,7 +1443,7 @@ export function createHttpServer(
     );
 
     // The brain owns mailbox consumption and explicit waits inside this prompt.
-    // Once it returns, late child results must not synthesize another parent turn.
+    // Once it returns, unread/late terminal results use the separate follow-up queue.
     const promptPromise = runPrompt(promptText, promptMedia);
 
     promptPromise.then((result) => {

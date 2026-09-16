@@ -308,7 +308,7 @@ function buildWorkflowSection(includePlanning: boolean, includeSubagents: boolea
     lines.push("- Call `wait_agent` **very sparingly**. Only call `wait_agent` when you need the result immediately for the next critical-path step and you are blocked until it returns.");
     lines.push("- While the subagent is running in the background, **do meaningful non-overlapping work immediately**.");
     lines.push("- **Do not repeatedly wait by reflex.**");
-    lines.push("- **Asynchronous execution**: `spawn_subagent` returns a launch handle, not findings. Do not poll `task_output` or spawn a waiter. Messages and completion results enter your current conversation at execution boundaries. A wait timeout does not stop a child. Read referenced full reports when needed, integrate the findings, and then answer. Do not finish the user request while necessary child results are still outstanding: a late result will not restart your completed turn.");
+    lines.push("- **Asynchronous execution**: `spawn_subagent` returns a launch handle, not findings. Do not poll `task_output` or spawn a waiter. Messages and completion results enter your current conversation at execution boundaries. A wait timeout does not stop a child. Read referenced full reports when needed, integrate the findings, and then answer. Prefer integrating necessary child results before finishing; as a fallback, the runtime appends late completion results as a message and starts a new turn.");
   }
   return lines.join("\n");
 }

@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { BackgroundWorkTurn } from "./background-work-turn.js";
 import { AGENT_SYNC_STATUS_SCHEMA_VERSION } from "../shared/agentbox-sync-status.js";
 import { hasAcceptedTurn, readTurnLedger, recordAcceptedTurn, TURN_LEDGER_MAX } from "./turn-ledger.js";
 import { createHmac } from "node:crypto";
@@ -261,6 +262,13 @@ function makeFakeSessionManager(ledgerDir = fs.mkdtempSync(path.join(os.tmpdir()
     markPendingAbort: vi.fn(),
     consumePendingAbort: vi.fn(() => false),
     discardPendingNotifications: vi.fn(),
+    lateResults: vi.fn(),
+    beginBackgroundWorkTurn(managed: any) {
+      const turn = new BackgroundWorkTurn(n => this.lateResults(n));
+      managed._backgroundWorkTurn = turn;
+      managed.brain.setMailbox?.(turn.mailbox);
+      return turn;
+    },
     getOrCreate: async (
       id?: string,
       _mode?: unknown,
@@ -664,7 +672,7 @@ describe("http-server — prompt + session lifecycle", () => {
     const text = await (await fetch(`http://127.0.0.1:${port}/api/stream/${session.id}`)).text();
     expect(text).toContain('"outcome":"aborted"');
   });
-  it("closes the parent when its brain returns, without waiting or synthesizing a late child reply", async () => {
+  it("closes the HTTP turn without joining children, routing late results to the separate fallback", async () => {
     const session = await sm.getOrCreate("joined");
     session.brain.prompt.mockImplementationOnce(async () => {
       (session as any)._backgroundWorkTurn.register("group");
@@ -679,6 +687,7 @@ describe("http-server — prompt + session lifecycle", () => {
     old.complete({ taskId: "group", status: "done", summary: "late result" });
     await flushAsync();
     expect(session.brain.prompt).toHaveBeenCalledTimes(1);
+    expect(sm.lateResults).toHaveBeenCalledWith({ taskId: "group", status: "done", summary: "late result" });
     expect(old.mailbox.take()).toBeUndefined();
     const ends = session._extraEventBuffer.filter((e: any) => e.type === "message_end") as any[];
     expect(ends[0].awaitingSubagents).toBeUndefined();

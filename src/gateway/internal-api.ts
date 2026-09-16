@@ -23,6 +23,7 @@ import type { ChatMessageMetadata } from "../shared/message-kinds.js";
 import { sessionRegistry, type SessionRecord } from "./session-registry.js";
 import {
   deliverBackgroundChannelMessage,
+  deliverBackgroundChannelEvent,
   deliverChannelVisibleMessage,
   hasBackgroundChannelDelivery,
 } from "./channels/background-delivery.js";
@@ -840,6 +841,9 @@ export async function handleDelegationEvents(
       }
       case "delegation.emit_chat_event": {
         frontendClient.emitEvent("chat.event", { sessionId: event.sessionId, event: event.event });
+        if (typeof event.event.type === "string") {
+          await deliverBackgroundChannelEvent(event.sessionId, { ...event.event, type: event.event.type });
+        }
         break;
       }
       case "channel.deliver_message": {

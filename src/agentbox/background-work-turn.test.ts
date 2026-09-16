@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { BackgroundWorkTurn, decorateBackgroundWorkEvent } from "./background-work-turn.js";
 
 describe("request-owned completion mail", () => {
@@ -33,6 +33,39 @@ describe("request-owned completion mail", () => {
     expect(old.mailbox.take()).toBeUndefined();
     expect(old.complete({ taskId: "different", status: "done", summary: "other" })).toBe(false);
     expect(new BackgroundWorkTurn().mailbox.take()).toBeUndefined();
+  });
+
+  it("recovers an unread result at normal finish and a late result exactly once", () => {
+    const recover = vi.fn();
+    const turn = new BackgroundWorkTurn(recover);
+    turn.register("unread"); turn.register("late"); turn.register("consumed");
+    turn.complete({ taskId: "consumed", status: "done", summary: "already integrated" });
+    turn.mailbox.take();
+    turn.mailbox.defer();
+    turn.complete({ taskId: "unread", status: "partial", summary: "not integrated" });
+    turn.finish(); turn.finish();
+    turn.complete({ taskId: "late", status: "done", summary: "arrived after final" });
+    turn.complete({ taskId: "late", status: "done", summary: "duplicate" });
+    expect(recover.mock.calls.map(([n]) => n.taskId)).toEqual(["unread", "late"]);
+    expect(turn.mailbox.take()).toBeUndefined();
+  });
+
+  it("recovers rollback mail but never intermediate send_message or cancelled work", () => {
+    const recover = vi.fn();
+    const turn = new BackgroundWorkTurn(recover);
+    turn.register("child");
+    const checkpoint = turn.mailbox.checkpoint();
+    turn.complete({ taskId: "child", status: "done", summary: "result" });
+    turn.mailbox.take();
+    turn.mailbox.rollback(checkpoint);
+    turn.mailbox.post("intermediate child update");
+    turn.finish();
+    expect(recover).toHaveBeenCalledTimes(1);
+    const stopped = new BackgroundWorkTurn(recover);
+    stopped.register("stopped");
+    stopped.complete({ taskId: "stopped", status: "done", summary: "pending at Stop" });
+    stopped.cancel(); stopped.finish();
+    expect(recover).toHaveBeenCalledTimes(1);
   });
 
   it("labels only runtime mailbox echoes as internal and never hides a final answer", () => {

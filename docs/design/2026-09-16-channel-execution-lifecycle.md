@@ -39,6 +39,19 @@ The card receives progress while the execution is active. A confirmed completion
 authorizes its final answer; failure authorizes an error notice instead. The
 existing card sequence/coalescing and fallback-delivery behavior remain intact.
 
+The Runtime's session-level channel listener also receives child completion and
+background main-turn lifecycle events over the existing AgentBox internal API.
+It outlives the first SSE collector, without opening another provider stream or
+Feishu event consumer. Child completion updates progress; it never finalizes a
+parent reply. A late-result main turn has `background_turn_start/done` boundaries
+and a separate reply card. Its text is buffered/updated until that turn completes,
+so a short follow-up is not discarded by an earlier answer-length heuristic and
+cannot overwrite the original report. Stop/error closes only that reply card.
+
+This reuses the existing process-local, TTL-bounded channel delivery registry
+(30 minutes, refreshed on delivery/events); it is not durable cross-restart IM
+delivery. A released/missing route is not claimed as a successful Feishu send.
+
 ## Compatibility and checks
 
 Deploy Runtime and AgentBox together: a new strict IM collector intentionally
