@@ -8,6 +8,8 @@ import { parseHandoffPolicy } from "../shared/agent-handoff.js";
  */
 
 import { decorateBackgroundWorkEvent } from "./background-work-turn.js";
+import { parseRequestMode, type RequestMode } from "../shared/request-mode.js";
+import { assistantTextBlocks } from "../shared/assistant-items.js";
 import type { ExecutionEndEvent } from "../shared/execution-lifecycle.js";
 import { normalizeHandoffTrace, handoffParentSpan } from "../shared/handoff-trace.js";
 import fs from "node:fs";
@@ -88,6 +90,7 @@ interface Route {
 }
 
 interface PromptRequestBody {
+  requestMode?: RequestMode;
   /** Trusted Runtime continuation context; per-request, never session-cached. */
   handoffTrace?: unknown;
   sessionId?: string;
@@ -869,6 +872,7 @@ export function createHttpServer(
   addRoute("GET", "/health", async (_req, res) => {
     sendJson(res, 200, {
       status: "ok",
+      requestModes: ["sync", "async"],
       sessions: sessionManager.list().length,
       timestamp: new Date().toISOString(),
     });
@@ -931,6 +935,9 @@ export function createHttpServer(
   addRoute("POST", "/api/prompt", async (req, res) => {
     const promptStartedAt = Date.now();
     const body = (await parseJsonBody(req)) as PromptRequestBody;
+    let requestMode: RequestMode;
+    try { requestMode = parseRequestMode(body.requestMode); }
+    catch (err) { sendJson(res, 400, { error: (err as Error).message }); return; }
     const logPromptResponse = (status: number, outcome: string, message?: unknown, sessionId = body.sessionId): void => {
       const suffix = message === undefined ? "" : ` error=${JSON.stringify(compactDispatchLogMessage(message))}`;
       console.log(`[agentbox-http] /api/prompt result boxId=${process.env.SICLAW_POD_NAME ?? "unknown"} sessionId=${sessionId ?? "pending"} turnId=${body.turnId ?? "unknown"} status=${status} outcome=${outcome} durationMs=${Date.now() - promptStartedAt}${suffix}`);
@@ -1057,6 +1064,7 @@ export function createHttpServer(
     // Mark the session busy before model setup so a refresh, second tab, or
     // fast double-submit cannot start a second prompt on the same brain.
     managed._promptDone = false;
+    managed._requestMode = requestMode;
     managed._promptOutcome = undefined;
     managed._aborted = false;
     // LLM-call timeline: the prompt is accepted NOW. Everything between here and
@@ -1097,7 +1105,7 @@ export function createHttpServer(
     // Subscribe to buffer events so SSE can replay them even if it connects late
     const brainUnsub = managed.brain.subscribe((event) => {
       if (!managed._promptDone && !managed._routeBrainEventsThroughExtra) {
-        managed._eventBuffer.push(decorateBackgroundWorkEvent(event, managed._backgroundWorkTurn));
+        managed._eventBuffer.push(decorateBackgroundWorkEvent(event, managed._backgroundWorkTurn, requestMode === "sync"));
       }
     });
 
@@ -1250,9 +1258,16 @@ export function createHttpServer(
     const handoffTrace = normalizeHandoffTrace(body.handoffTrace);
     tracingRecorder.startPrompt(managed.id, promptText, body.userId, handoffTrace?.traceId, handoffParentSpan(handoffTrace));
 
-    const backgroundWorkTurn = sessionManager.beginBackgroundWorkTurn(managed);
+    const backgroundWorkTurn = sessionManager.beginBackgroundWorkTurn(managed, requestMode);
+    let parentReportSeen = false;
+    const reportUnsubscribe = managed.brain.subscribe((event: any) => {
+      if ((event.type !== "message_end" && event.type !== "turn_end") || event.message?.role !== "assistant") return;
+      parentReportSeen = !backgroundWorkTurn.pending && !["toolUse", "error", "aborted"].includes(event.message.stopReason)
+        && assistantTextBlocks(event.message).some(block => block.text.trim() && block.phase !== "commentary");
+    });
 
     const actuallyFinish = () => {
+      reportUnsubscribe();
       if (managed._aborted) backgroundWorkTurn.cancel();
       else backgroundWorkTurn.finish();
       managed.brain.setMailbox?.(undefined);
@@ -1409,7 +1424,7 @@ export function createHttpServer(
         // The runner streams/replays brain events through this callback instead
         // of the live SSE subscription that enriches agent_end — re-apply the
         // same enrichment so token/cost stats survive on every turn.
-        emitBrainEvent: (event) => emitSessionExtraEvent(decorateBackgroundWorkEvent(enrichAgentEndEvent(managed.brain, event), backgroundWorkTurn)),
+        emitBrainEvent: (event) => emitSessionExtraEvent(decorateBackgroundWorkEvent(enrichAgentEndEvent(managed.brain, event), backgroundWorkTurn, requestMode === "sync")),
         onStateChange: () => sessionManager.persistModelRouteState(managed.id, managed.modelRouteState),
         shouldAbort: () => managed._aborted,
         applyCandidateModelParams: (candidate) => {
@@ -1442,9 +1457,24 @@ export function createHttpServer(
         : undefined,
     );
 
-    // The brain owns mailbox consumption and explicit waits inside this prompt.
-    // Once it returns, unread/late terminal results use the separate follow-up queue.
-    const promptPromise = runPrompt(promptText, promptMedia);
+    // Sync owns one request/stream through child completion AND the root's report.
+    // Async retains interactive steering and its separate late-result fallback.
+    const promptPromise = (async () => {
+      let result = await runPrompt(promptText, promptMedia);
+      if (requestMode === "sync") {
+        while (!managed._aborted && result?.success !== false) {
+          const continuation = await backgroundWorkTurn.nextRootInput();
+          if (!continuation || managed._aborted) break;
+          parentReportSeen = false;
+          result = await runPrompt(continuation);
+        }
+        if (!managed._aborted && result?.success !== false && backgroundWorkTurn.jobIds.length &&
+            !backgroundWorkTurn.isCancelled && !parentReportSeen) {
+          throw new Error("Synchronous request finished without a root report");
+        }
+      }
+      return result;
+    })();
 
     promptPromise.then((result) => {
       // The routing runner reports exhaustion (and user aborts) as a result,
@@ -1601,7 +1631,7 @@ export function createHttpServer(
     const unsubscribe = managed.brain.subscribe((event: any) => {
       if (managed._routeBrainEventsThroughExtra) return;
       // Enrich agent_end with context usage so frontend can display token stats
-      writeEvent(decorateBackgroundWorkEvent(enrichAgentEndEvent(managed.brain, event), managed._backgroundWorkTurn));
+      writeEvent(decorateBackgroundWorkEvent(enrichAgentEndEvent(managed.brain, event), managed._backgroundWorkTurn, managed._requestMode === "sync"));
     });
 
     // Heartbeat: send SSE comment every 30s to keep connection alive
@@ -1691,6 +1721,10 @@ export function createHttpServer(
       return;
     }
 
+    if (!managed._promptDone && managed._requestMode === "sync") {
+      sendJson(res, 409, { error: "Synchronous requests do not accept steering; submit a queued request", code: "REQUEST_REQUIRES_QUEUE" });
+      return;
+    }
     const steerText = body.text && body.text.length > 0
       ? body.text
       : defaultPromptTextForMedia(promptMedia);
@@ -1754,7 +1788,7 @@ export function createHttpServer(
   addRoute("GET", "/api/sessions/:sessionId/status", async (_req, res, params) => {
     const { sessionId } = params;
     const managed = sessionManager.get(sessionId);
-    const running = !!managed && (managed.isAgentActive || managed.isCompacting || managed.isRetrying);
+    const running = !!managed && (managed._promptDone === false || managed.isAgentActive || managed.isCompacting || managed.isRetrying);
     sendJson(res, 200, { running });
   });
 

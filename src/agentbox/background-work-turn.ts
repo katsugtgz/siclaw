@@ -7,6 +7,7 @@ export class BackgroundWorkTurn {
   private jobs = new Map<string, TaskNotification | undefined>();
   private cancelled = false;
   private finished = false;
+  private continuationInputs = new Set<string>();
 
   constructor(private readonly onLateResult?: (notification: TaskNotification) => void) {}
 
@@ -19,6 +20,29 @@ export class BackgroundWorkTurn {
   get isCancelled(): boolean { return this.cancelled; }
   get jobIds(): string[] { return [...this.jobs.keys()]; }
   get pending(): boolean { return !this.cancelled && !this.finished && this.pendingJobIds.length > 0; }
+
+  /** A synchronous API request retains its original stream while the root is idle.
+   * Mail already consumed by the root is not replayed. Child parallelism is unchanged. */
+  async nextRootInput(): Promise<string | undefined> {
+    this.mailbox.reopen();
+    while (!this.cancelled && !this.finished) {
+      const text = this.mailbox.take();
+      if (text) {
+        this.continuationInputs.add(text);
+        return text;
+      }
+      if (!this.pending) return undefined;
+      if (await this.mailbox.wait(30_000) === "closed") return undefined;
+    }
+    return undefined;
+  }
+
+  isContinuationInput(message: { role?: string; content?: unknown } | undefined): boolean {
+    if (message?.role !== "user") return false;
+    const text = typeof message.content === "string" ? message.content : Array.isArray(message.content)
+      ? message.content.filter(block => block?.type === "text").map(block => block.text ?? "").join("") : "";
+    return this.continuationInputs.has(text);
+  }
 
   complete(notification: TaskNotification): boolean {
     if (!this.jobs.has(notification.taskId)) return false;
@@ -58,8 +82,10 @@ export function backgroundWorkResultPrompt(results: TaskNotification[], pendingJ
     JSON.stringify({ results, pendingJobIds });
 }
 
-export function decorateBackgroundWorkEvent<T extends { message?: { role?: string; customType?: string } }>(event: T, _turn?: BackgroundWorkTurn): T {
+export function decorateBackgroundWorkEvent<T extends { message?: { role?: string; customType?: string; content?: unknown } }>(event: T, turn?: BackgroundWorkTurn, synchronous = false): T {
   return { ...event,
-    ...(event.message?.role === "custom" && event.message.customType === "agent_mailbox" ? { internalMessage: true } : {}),
+    ...(synchronous && turn?.pending ? { awaitingBackgroundJobs: true, awaitingSubagents: true } : {}),
+    ...((event.message?.role === "custom" && event.message.customType === "agent_mailbox") || turn?.isContinuationInput(event.message)
+      ? { internalMessage: true } : {}),
   };
 }

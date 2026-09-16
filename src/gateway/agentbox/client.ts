@@ -23,6 +23,7 @@ export interface AgentBoxTlsOptions {
 }
 
 export interface PromptOptions {
+  requestMode?: import("../../shared/request-mode.js").RequestMode;
   /** Source AgentBox context for an authorized conversation handoff only. */
   handoffTrace?: import("../../shared/handoff-trace.js").HandoffTraceContext;
   sessionId?: string;
@@ -142,6 +143,7 @@ export interface SessionInfo {
 }
 
 export interface HealthResponse {
+  requestModes?: Array<"sync" | "async">;
   status: string;
   sessions: number;
   timestamp: string;
@@ -294,6 +296,9 @@ export class AgentBoxClient {
    * Send a prompt
    */
   async prompt(opts: PromptOptions): Promise<PromptResponse> {
+    if (opts.requestMode === "sync" && !(await this.health()).requestModes?.includes("sync")) {
+      throw new Error("AgentBox does not support requestMode=sync; deploy matching Runtime and AgentBox versions");
+    }
     const sendOpts = await this.#withResolvedImageUrls(opts);
     console.log(`[agentbox-client] prompt sessionId=${sendOpts.sessionId ?? "new"}`);
     const resp = await this.fetch("/api/prompt", {

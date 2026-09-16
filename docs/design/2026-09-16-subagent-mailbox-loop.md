@@ -21,9 +21,12 @@ Existing parent-to-child guidance/resume handles remain supported, as do grouped
 map/reduce execution, semantic completion assessment, cancellation, report
 artifacts, child transcripts, tool restrictions and model tiering.
 
-The HTTP layer makes one routed brain invocation. It no longer waits for all
-registered jobs after that invocation returns, hides a final answer as progress,
-or launches mandatory synthesis prompts.
+An async API request makes one routed brain invocation and retains the late-result
+fallback below. A sync API request instead owns the root continuations: if the
+root returns with registered work or unread evidence, the HTTP layer keeps the
+same stream/trace open, consumes that evidence and resumes the root until it can
+report. Sync/async controls user-input admission, not child parallelism. See
+[request modes](2026-09-16-request-modes.md).
 
 ## Model execution boundaries
 
@@ -53,7 +56,7 @@ discarded attempt's mail in front of later arrivals.
 
 ## Late-result fallback
 
-When the main brain returns normally, its mailbox is closed. Terminal results
+For an async request, when the main brain returns normally, its mailbox is closed. Terminal results
 that arrive later, or were deferred behind final text and never consumed, now
 enter the session manager's coalesced follow-up queue. Consumed results are not
 repeated; intermediate `send_message` updates alone do not start another turn.

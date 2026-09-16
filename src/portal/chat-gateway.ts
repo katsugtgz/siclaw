@@ -6,6 +6,7 @@
  */
 
 import crypto from "node:crypto";
+import { parseRequestMode } from "../shared/request-mode.js";
 import http from "node:http";
 import {
   sendJson,
@@ -39,6 +40,7 @@ interface ChatAttachment {
 }
 
 interface ChatRequestBody {
+  requestMode?: import("../shared/request-mode.js").RequestMode;
   text?: string;
   session_id?: string;
   attachments?: ChatAttachment[];
@@ -267,7 +269,9 @@ async function parseChatRequestBody(
   res: http.ServerResponse,
 ): Promise<ChatRequestBody | null> {
   try {
-    return await parseBody<ChatRequestBody>(req, { maxBytes: MAX_CHAT_REQUEST_BODY_BYTES });
+    const body = await parseBody<ChatRequestBody>(req, { maxBytes: MAX_CHAT_REQUEST_BODY_BYTES });
+    body.requestMode = parseRequestMode(body.requestMode);
+    return body;
   } catch (err) {
     const tooLarge = err instanceof RequestBodyTooLargeError;
     sendJson(res, tooLarge ? 413 : 400, errorBody({
@@ -401,6 +405,7 @@ export function registerChatRoutes(
 
     const agentId = params.id;
     const sessionId = body.session_id ?? crypto.randomUUID();
+    const turnId = crypto.randomUUID();
 
     if (!connectionMap.isConnected(agentId)) {
       sendJson(res, 503, errorBody({
@@ -440,9 +445,10 @@ export function registerChatRoutes(
     req.on("close", cleanup);
 
     unsubscribe = connectionMap.subscribe(agentId, "chat.event", (data: unknown) => {
-      const envelope = data as { sessionId?: string; event?: Record<string, unknown> } | undefined;
+      const envelope = data as { sessionId?: string; turnId?: string; event?: Record<string, unknown> } | undefined;
       if (!envelope?.event) return;
       if (envelope.sessionId && envelope.sessionId !== sessionId) return;
+      if (envelope.turnId && envelope.turnId !== turnId) return;
 
       const evt = envelope.event;
 
@@ -461,8 +467,8 @@ export function registerChatRoutes(
       // Stream complete — only on prompt_done (sent by Runtime after ALL agent
       // turns finish). agent_end fires after each individual turn and must NOT
       // close the stream, or multi-turn responses (tool calls → text) get cut off.
-      if (evt.type === "prompt_done" || evt.type === "done") {
-        sseWrite(res, "done", {});
+      if (evt.type === "prompt_done" || evt.type === "done" || evt.type === "request_steered") {
+        sseWrite(res, "done", evt.type === "request_steered" ? { steered: true } : {});
         res.end();
         cleanup();
       }
@@ -506,6 +512,8 @@ export function registerChatRoutes(
 
     // Send chat.send command
     const result = await connectionMap.sendCommand(agentId, "chat.send", {
+      turnId,
+      requestMode: body.requestMode ?? "async",
       agentId,
       userId: auth.userId,
       origin: "web",
@@ -630,6 +638,7 @@ export function registerChatRoutes(
     const promptText = await appendOcrEvidence(body.text ?? "", body.attachments);
 
     const result = await connectionMap.sendCommand(params.id, "chat.steer", {
+      ...(body.requestMode === "sync" ? { requestMode: "sync" } : {}),
       agentId: params.id,
       userId: auth.userId,
       sessionId: body.session_id,

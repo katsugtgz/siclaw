@@ -33,6 +33,10 @@ export class ConversationClient {
 
   async prompt(options: PromptOptions): Promise<PromptResponse> {
     if (this.unsubscribe) throw new Error("Conversation request already started");
+    if (options.requestMode === "sync") {
+      const capabilities = await this.frontend.request("conversation.capabilities");
+      if (!capabilities?.requestModes?.includes("sync")) throw new Error("Control plane does not support synchronous request admission; upgrade it before using requestMode=sync");
+    }
     this.unsubscribe = this.frontend.subscribe("conversation.event", (data) => {
       const frame = data as { sessionId?: string; requestId?: string; event?: Record<string, unknown> };
       if (frame.sessionId !== this.entry.sessionId || frame.requestId !== this.entry.userMessageId || !frame.event) return;
@@ -51,6 +55,7 @@ export class ConversationClient {
     try {
       const result = await this.frontend.request("conversation.start", {
         ...this.entry, text: options.text, images: options.images, files: options.files,
+        requestMode: options.requestMode ?? "async",
       });
       return { ...result, ok: true, sessionId: this.entry.sessionId };
     } catch (error) {

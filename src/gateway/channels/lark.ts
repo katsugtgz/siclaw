@@ -83,7 +83,6 @@ import {
 } from "../llm-call-rows.js";
 import { messageProducedOutput, modelRouteNoticeContent, modelRouteSwitchMetadata } from "../sse-consumer.js";
 import { registerBackgroundChannelDelivery } from "./background-delivery.js";
-import { createChannelFollowup } from "./channel-followup.js";
 import { channelExecutionEvents, ChannelExecutionError } from "./channel-execution.js";
 
 const VISUAL_ONLY_NOTICE_BY_LOCALE = {
@@ -1910,7 +1909,6 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
     PLACEHOLDER_BY_LOCALE[locale],
     replyInThread,
   );
-  let deliveredTextChars = 0;
   // Live "current step" indicator. Two milestone sources feed it: explicit
   // channel_update tool calls (agent-curated) AND auto-derived first lines of
   // completed public text blocks (collectChannelResponse.onMilestone). The card
@@ -1958,25 +1956,11 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
     if (milestones.length > MILESTONE_CAP) milestones.shift();
     return flushMilestoneCard();
   };
-  // Survives the main SSE's EOF. Each fallback main turn owns a NEW card, so a
-  // short late answer neither loses to the old length heuristic nor overwrites it.
-  const followup = createChannelFollowup({
-    open: () => openTypingCard(larkClient, messageId, PLACEHOLDER_BY_LOCALE[locale], replyInThread),
-    update: (card, text) => updateCardContent(larkClient, card, text),
-    finish: async (card, text) => {
-      if (card && (await finalizeCard(larkClient, card, text)).contentOk) return;
-      await deliverAnswerOutsideCard(larkClient, messageId, text, replyInThread);
-    },
-    emptyText: EMPTY_RESULT_NOTICE_BY_LOCALE[locale],
-    errorText: AGENT_ERROR_NOTICE_BY_LOCALE[locale],
-    cancelledText: EXECUTION_CANCELLED_NOTICE_BY_LOCALE[locale],
-  });
   registerBackgroundChannelDelivery(sessionId, async (backgroundMessage) => {
     if ("text" in backgroundMessage) {
       const display = stripVisualBlocks(backgroundMessage.text, { stripSourceBlocks: true })
         || (backgroundMessage.kind === "final" ? EMPTY_RESULT_NOTICE_BY_LOCALE[locale] : "");
       if (!display || !display.trim()) return true;
-      if (await followup.message(display)) return true;
 
       if (backgroundMessage.kind === "final") {
         const md = buildMilestoneCardMarkdown({ milestones: [], finalText: display });
@@ -1988,7 +1972,6 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
           true,
           replyInThread,
         );
-        if (delivered) deliveredTextChars = md.length;
         return delivered;
       }
 
@@ -1997,35 +1980,10 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
       return true;
     }
 
-    const display = stripVisualBlocks(backgroundMessage.content, { stripSourceBlocks: true })
-      || EMPTY_RESULT_NOTICE_BY_LOCALE[locale];
-    if (await followup.message(display)) return true;
-    if (!shouldDeliverBackgroundReply(display, deliveredTextChars)) return true;
-    const md = buildMilestoneCardMarkdown({ milestones: [], finalText: display });
-    if (cardSession) {
-      // contentOk, not ok: a failed streaming-mode flip still shows the answer,
-      // so only a body that never landed justifies a second message.
-      const { contentOk } = await finalizeCard(larkClient, cardSession, md);
-      if (contentOk) {
-        deliveredTextChars = md.length;
-        return true;
-      }
-      console.warn(`[lark] Background card update failed for session=${sessionId}; posting a replacement card`);
-    }
-    await deliverAnswerOutsideCard(larkClient, messageId, md, replyInThread);
-    deliveredTextChars = md.length;
-    return true;
-  }, { onEvent: async (event) => {
-    if (event.type === "subagent_done") {
-      // Subscribe to child lifecycle independently of the main SSE. Completion
-      // updates progress only; the parent still owns synthesis and final output.
-      if (!cardFinalizing) await addMilestone(locale === "zh-CN"
-        ? `子任务已返回（${String(event.status ?? "done")}）`
-        : `Subagent returned (${String(event.status ?? "done")})`);
-      return;
-    }
-    await followup.event(event);
-  } });
+    // A synchronous request owns its answer stream. Detached assistant rows
+    // remain history; they must not replace its card or start a second reply.
+    return false;
+  });
 
   // One turn at a time for this session. The AgentBox's own 409 only sees its own
   // sessions, so once an agent runs more than one box two messages could be dispatched to
@@ -2042,7 +2000,7 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
   let releaseTurn: (() => void) | undefined;
   try {
     const remoteConversation = frontendClient ? await supportsConversations(frontendClient) : false;
-    if (!remoteConversation) releaseTurn = await sessionTurnLocks.acquire(sessionId);
+    if (!remoteConversation) releaseTurn = await sessionTurnLocks.acquireRequest(sessionId, "sync");
     let client: Pick<AgentBoxClient, "prompt" | "streamEvents">;
     if (remoteConversation && frontendClient) {
       client = new ConversationClient(frontendClient, { agentId, userId: binding.createdBy, sessionId, userMessageId: promptMessageId, origin: "channel" });
@@ -2084,6 +2042,7 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
       ? { discussion: drained.lines, truncated: drained.truncated, asker: senderLabel(senderOpenId) }
       : undefined;
     const promptOpts: PromptOptions = {
+      requestMode: "sync",
       text: buildChannelTurnPrompt(promptText, sharedContext),
       agentId,
       mode: "channel",
@@ -2171,7 +2130,6 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
       isAnswer && assistantMessageId
         ? { ctx: { sessionId, channelId, messageId: assistantMessageId }, locale }
         : undefined);
-    deliveredTextChars = finalCardBody.length;
     if (!contentOk) {
       // The body never landed (rejected update / oversized answer), so the card
       // is frozen on its ⏳ placeholder and the answer would exist ONLY in the
@@ -2197,7 +2155,6 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
     // a real answer, an error notice, OR the session-busy notice (sessionBusy carries no
     // resultText/agentError, so it must be listed explicitly or the busy notice is dropped).
     await replyToLark(larkClient, messageId, finalCardBody, replyInThread);
-    deliveredTextChars = finalCardBody.length;
   }
 
   await replyVisualImages(larkClient, messageId, replyImages, replyInThread);
@@ -3013,12 +2970,6 @@ async function replyToLark(
     console.error(`[lark] Failed to reply to messageId=${messageId}:`, err);
     return false;
   }
-}
-
-function shouldDeliverBackgroundReply(text: string, previousChars: number): boolean {
-  const chars = text.trim().length;
-  if (chars === 0) return false;
-  return !(previousChars > 80 && chars < 120 && chars < previousChars * 0.75);
 }
 
 /**

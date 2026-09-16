@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { SessionTurnLocks, SessionBusyError } from "./session-turn-lock.js";
 
 /**
@@ -9,6 +9,32 @@ import { SessionTurnLocks, SessionBusyError } from "./session-turn-lock.js";
 const tick = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 describe("SessionTurnLocks", () => {
+  it("queues sync requests and protects active sync requests from async steering", async () => {
+    vi.useFakeTimers();
+    try {
+      const locks = new SessionTurnLocks();
+      const a = await locks.acquireRequest("s", "async");
+      const b = locks.acquireRequest("s", "sync");
+      let started = false; b.then(() => { started = true; });
+      await vi.advanceTimersByTimeAsync(6000);
+      expect(started).toBe(false);
+      a(); const releaseB = await b;
+      expect(locks.canSteer("s")).toBe(false);
+      const c = locks.acquireRequest("s", "async");
+      await vi.advanceTimersByTimeAsync(6000);
+      releaseB(); const releaseC = await c;
+      expect(locks.canSteer("s")).toBe(true); releaseC();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("cancels only the queued request without releasing the active one", async () => {
+    const locks = new SessionTurnLocks(); const release = await locks.acquireRequest("s", "sync");
+    const controller = new AbortController();
+    const queued = locks.acquireRequest("s", "async", controller.signal);
+    controller.abort(new Error("request canceled"));
+    await expect(queued).rejects.toThrow("request canceled");
+    expect(locks.isBusy("s")).toBe(true); release(); expect(locks.isBusy("s")).toBe(false);
+  });
   it("serialises two turns for the same session", async () => {
     const locks = new SessionTurnLocks();
     let active = 0, maxActive = 0;
@@ -157,4 +183,3 @@ describe("SessionTurnLocks — waiting for the box to take the prompt", () => {
     second();
   });
 });
-

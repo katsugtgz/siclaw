@@ -263,7 +263,8 @@ function makeFakeSessionManager(ledgerDir = fs.mkdtempSync(path.join(os.tmpdir()
     consumePendingAbort: vi.fn(() => false),
     discardPendingNotifications: vi.fn(),
     lateResults: vi.fn(),
-    beginBackgroundWorkTurn(managed: any) {
+    beginBackgroundWorkTurn(managed: any, requestMode = "async") {
+      managed._requestMode = requestMode;
       const turn = new BackgroundWorkTurn(n => this.lateResults(n));
       managed._backgroundWorkTurn = turn;
       managed.brain.setMailbox?.(turn.mailbox);
@@ -636,6 +637,51 @@ describe("http-server — sub-agent tier turn state", () => {
 });
 
 describe("http-server — prompt + session lifecycle", () => {
+  it("sync keeps the original SSE through child completion and root synthesis", async () => {
+    const session = await sm.getOrCreate("sync-join");
+    const emit = (text: string) => session.brain.emitter.emit("event", { type: "message_end", message: {
+      role: "assistant", stopReason: "stop", content: [{ type: "text", text }],
+    } });
+    session.brain.prompt.mockImplementationOnce(async () => {
+      (session as any)._backgroundWorkTurn.register("child"); emit("Initial progress only");
+    }).mockImplementationOnce(async (text: string) => {
+      expect(text).toContain("child report"); emit("ROOT_FINAL_REPORT");
+    });
+    await getJson(port, "/api/prompt", "POST", { text: "inspect", sessionId: session.id, requestMode: "sync" });
+    const response = await fetch(`http://127.0.0.1:${port}/api/stream/${session.id}`);
+    let ended = false; const body = response.text().then(text => { ended = true; return text; });
+    await flushAsync();
+    expect(session._promptDone).toBe(false); expect(ended).toBe(false);
+    expect((await getJson(port, `/api/sessions/${session.id}/status`)).data.running).toBe(true);
+    expect((await getJson(port, `/api/sessions/${session.id}/steer`, "POST", { text: "must queue" })).status).toBe(409);
+    (session as any)._backgroundWorkTurn.complete({ taskId: "child", status: "done", summary: "child report" });
+    const output = await body;
+    expect(output).toContain("ROOT_FINAL_REPORT");
+    expect(output.match(/"type":"execution_end"/g)).toHaveLength(1);
+    expect(session.brain.prompt).toHaveBeenCalledTimes(2);
+    expect(sm.lateResults).not.toHaveBeenCalled();
+  });
+
+  it("rejects an invalid request mode before starting the brain", async () => {
+    const result = await getJson(port, "/api/prompt", "POST", { text: "inspect", requestMode: "invalid" });
+    expect(result.status).toBe(400);
+  });
+
+  it("Stop terminates a sync request waiting for a child without starting synthesis", async () => {
+    const session = await sm.getOrCreate("sync-stop");
+    session.brain.prompt.mockImplementationOnce(async () => {
+      (session as any)._backgroundWorkTurn.register("child");
+      session.brain.emitter.emit("event", { type: "message_end", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Work is running" }] } });
+    });
+    await getJson(port, "/api/prompt", "POST", { text: "inspect", sessionId: session.id, requestMode: "sync" });
+    await flushAsync(); expect(session._promptDone).toBe(false);
+    await getJson(port, `/api/sessions/${session.id}/abort`, "POST", {});
+    await flushAsync();
+    const output = await (await fetch(`http://127.0.0.1:${port}/api/stream/${session.id}`)).text();
+    expect(output).toContain('"outcome":"aborted"');
+    expect(session.brain.prompt).toHaveBeenCalledTimes(1);
+  });
+
   it("signals execution_end only when the whole prompt resolves, including late subscribers", async () => {
     const session = await sm.getOrCreate("execution-boundary");
     let finish!: () => void;

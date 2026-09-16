@@ -13,7 +13,6 @@ import {
 import {
   clearBackgroundChannelDelivery,
   deliverBackgroundChannelMessage,
-  deliverBackgroundChannelEvent,
   deliverChannelVisibleMessage,
 } from "./background-delivery.js";
 import { sessionRegistry } from "../session-registry.js";
@@ -2643,6 +2642,7 @@ describe("handleLarkMessage — streaming card flow", () => {
       connected: true,
       subscribe: vi.fn((_channel: string, handler: (data: unknown) => void) => { receive = handler; return vi.fn(); }),
       request: vi.fn(async (method: string, input: any) => {
+        if (method === "conversation.capabilities") return { handoff: true, requestModes: ["sync", "async"] };
         if (method === "conversation.start") {
           for (const event of [
             { type: "text", text: "正在准备国内检查" },
@@ -2682,6 +2682,7 @@ describe("handleLarkMessage — streaming card flow", () => {
       connected: true,
       subscribe: vi.fn((_channel: string, handler: (data: unknown) => void) => { receive = handler; return vi.fn(); }),
       request: vi.fn(async (method: string, input: any) => {
+        if (method === "conversation.capabilities") return { handoff: true, requestModes: ["sync", "async"] };
         if (method === "conversation.start") {
           for (const event of [
             { type: "knowledge_sources", sources },
@@ -2807,34 +2808,7 @@ describe("handleLarkMessage — streaming card flow", () => {
     expect(lark.cardkit.v1.cardElement.create).not.toHaveBeenCalled();
   });
 
-  it("listens for late child and main events after SSE ends, using a separate card for a short follow-up", async () => {
-    resolveBindingMock.mockResolvedValue(makeBinding());
-    promptMock.mockResolvedValue({ sessionId: "s-late-followup" });
-    streamEventsMock.mockImplementation(async function* () {
-      yield { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Initial main report. ".repeat(60) }] } };
-      yield { type: "execution_end", outcome: "completed" };
-    });
-    const lark = makeCardAwareLarkClient();
-    lark.cardkit.v1.card.create
-      .mockResolvedValueOnce({ data: { card_id: "INITIAL" } })
-      .mockResolvedValueOnce({ data: { card_id: "FOLLOWUP" } });
-    await handleLarkMessage(makeTextEvent("check"), lark, "lark", makeAgentBoxManager("a1") as any, undefined, {} as any);
-    const sessionId = promptMock.mock.calls[0][0].sessionId;
-    const finalized = lark.cardkit.v1.card.settings.mock.calls.length;
-    await deliverBackgroundChannelEvent(sessionId, { type: "subagent_done", job_id: "child", status: "partial" });
-    expect(lark.cardkit.v1.card.create).toHaveBeenCalledTimes(1);
-    await deliverBackgroundChannelEvent(sessionId, { type: "background_turn_start", turnId: "t2" });
-    await deliverBackgroundChannelMessage({ sessionId, role: "assistant", content: "42 (partial)" });
-    expect(lark.cardkit.v1.card.create).toHaveBeenCalledTimes(2);
-    expect(lark.cardkit.v1.card.settings).toHaveBeenCalledTimes(finalized);
-    await deliverBackgroundChannelEvent(sessionId, { type: "background_turn_done", turnId: "t2", outcome: "completed" });
-    const updates = lark.cardkit.v1.cardElement.content.mock.calls.map(([request]: any[]) => request);
-    expect(updates.filter(r => r.path.card_id === "INITIAL")).toHaveLength(1);
-    expect(updates.at(-1)).toMatchObject({ path: { card_id: "FOLLOWUP" }, data: { content: "42 (partial)" } });
-    clearBackgroundChannelDelivery(sessionId);
-  });
-
-  it("updates the Lark card when a background channel report arrives after the first SSE turn", async () => {
+  it("does not replace the request's card with detached subagent or background reports", async () => {
     resolveBindingMock.mockResolvedValue(makeBinding());
     promptMock.mockResolvedValue({ sessionId: "s-background" });
     streamEventsMock.mockImplementation(async function* () {
@@ -2879,9 +2853,9 @@ describe("handleLarkMessage — streaming card flow", () => {
     });
 
     const contentCalls = lark.cardkit.v1.cardElement.content.mock.calls;
-    expect(contentCalls.at(-1)[0].data.content).toContain("集群节点健康报告");
-    expect(contentCalls.at(-1)[0].data.content).toContain("GPFS");
-    expect(contentCalls).toHaveLength(2);
+    expect(contentCalls).toHaveLength(1);
+    expect(contentCalls.at(-1)[0].data.content).not.toContain("集群节点健康报告");
+    expect(promptMock.mock.calls[0][0].requestMode).toBe("sync");
     clearBackgroundChannelDelivery(sessionId);
   });
 
@@ -2959,15 +2933,12 @@ describe("handleLarkMessage — streaming card flow", () => {
       })).resolves.toBe(true);
       expect(lark.cardkit.v1.cardElement.content.mock.calls).toHaveLength(updatesBeforeMilestone);
 
-      await deliverBackgroundChannelMessage({
+      await expect(deliverBackgroundChannelMessage({
         sessionId,
         role: "assistant",
         content: '```chart\n{"type":"bar","data":[1,2]}\n```',
-      });
-      const delivered = lark.cardkit.v1.cardElement.content.mock.calls.at(-1)[0].data.content as string;
-      expect(delivered).toContain("⚠");
-      expect(delivered).not.toContain("```chart");
-      expect(delivered).not.toContain('"type":"bar"');
+      })).resolves.toBe(false);
+      expect(lark.cardkit.v1.cardElement.content.mock.calls).toHaveLength(updatesBeforeMilestone);
     } finally {
       releaseStream();
       await handlePromise;

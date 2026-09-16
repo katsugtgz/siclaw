@@ -13,6 +13,7 @@ import { UsageOutbox } from "./usage-outbox.js";
  */
 
 import { BackgroundWorkTurn, lateSubagentResultPrompt } from "./background-work-turn.js";
+import type { RequestMode } from "../shared/request-mode.js";
 import { persistableToolDetails } from "../shared/tool-result-metadata.js";
 import fs from "node:fs";
 import path from "node:path";
@@ -152,6 +153,8 @@ export interface ManagedSession {
   isRetrying: boolean;
   /** Whether the current prompt has finished (for race condition prevention) */
   _promptDone: boolean;
+  /** User-input policy for the whole accepted request, including root continuations. */
+  _requestMode?: RequestMode;
   /** Result of the whole prompt, for live and late event-stream subscribers. */
   _promptOutcome?: import("../shared/execution-lifecycle.js").ExecutionOutcome;
   /** Launch ownership and mailbox scoped to the current user prompt. */
@@ -399,10 +402,11 @@ export class AgentBoxSessionManager {
   private backgroundWorkOwners = new Map<string, BackgroundWorkTurn>();
 
   /** Both HTTP and fallback turns use the same mailbox and late-result recovery. */
-  beginBackgroundWorkTurn(managed: ManagedSession): BackgroundWorkTurn {
+  beginBackgroundWorkTurn(managed: ManagedSession, mode: RequestMode = "async"): BackgroundWorkTurn {
+    managed._requestMode = mode;
     const turn = new BackgroundWorkTurn(notification => {
       const job = this.jobs.get(notification.taskId);
-      if (this.sessions.get(managed.id) !== managed || managed._aborted ||
+      if (mode === "sync" || this.sessions.get(managed.id) !== managed || managed._aborted ||
           job?.type !== "subagent" || job.suppressNotifyTurn) return;
       console.info(`[agentbox-session] late subagent result session=${managed.id} job=${notification.taskId}; queuing follow-up`);
       this.queueParentNotification(managed, notification);

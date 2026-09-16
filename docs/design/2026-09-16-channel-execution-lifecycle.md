@@ -39,25 +39,21 @@ The card receives progress while the execution is active. A confirmed completion
 authorizes its final answer; failure authorizes an error notice instead. The
 existing card sequence/coalescing and fallback-delivery behavior remain intact.
 
-The Runtime's session-level channel listener also receives child completion and
-background main-turn lifecycle events over the existing AgentBox internal API.
-It outlives the first SSE collector, without opening another provider stream or
-Feishu event consumer. Child completion updates progress; it never finalizes a
-parent reply. A late-result main turn has `background_turn_start/done` boundaries
-and a separate reply card. Its text is buffered/updated until that turn completes,
-so a short follow-up is not discarded by an earlier answer-length heuristic and
-cannot overwrite the original report. Stop/error closes only that reply card.
-
-This reuses the existing process-local, TTL-bounded channel delivery registry
-(30 minutes, refreshed on delivery/events); it is not durable cross-restart IM
-delivery. A released/missing route is not claimed as a successful Feishu send.
+Feishu submits `requestMode: sync` and consumes one request stream through owned
+background work and the root's final synthesis. It does not subscribe separately
+to child completion or background-turn lifecycle, nor open a second result card.
+The previous detached-turn channel listener and answer-length heuristic have
+been removed. Detached assistant rows are not allowed to replace the request's
+card; explicit `channel_update` delivery remains available.
 
 ## Compatibility and checks
 
 Deploy Runtime and AgentBox together: a new strict IM collector intentionally
-does not treat an older box's unmarked EOF as success. There is no database or
-provider API change, no new dependency, and no change to the provider's sampling
-cutoff policy or Feishu subscription settings.
+does not treat an older box's unmarked EOF as success. Request modes additionally
+require the matching SiCore admission schema/protocol; capability negotiation
+rejects unsupported sync requests instead of silently using async behavior.
+There is no new dependency or provider API change, and no change to the provider's
+sampling cutoff policy or Feishu subscription settings.
 
 Regression checks cover early agent_end, child completion, provider recovery,
 terminal failure/cancellation, premature EOF, late SSE subscription, and a mocked
