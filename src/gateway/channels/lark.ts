@@ -1969,7 +1969,9 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
           messageId,
           cardSession,
           md,
-          true,
+          // A tool may propose final content, but only the request terminal
+          // is allowed to close this card's streaming lifecycle.
+          false,
           replyInThread,
         );
         return delivered;

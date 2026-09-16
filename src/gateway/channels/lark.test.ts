@@ -2893,6 +2893,7 @@ describe("handleLarkMessage — streaming card flow", () => {
       const delivered = lark.cardkit.v1.cardElement.content.mock.calls.at(-1)[0].data.content as string;
       expect(delivered).toContain("⚠");
       expect(delivered).not.toContain("visual-card");
+      expect(lark.cardkit.v1.card.settings).not.toHaveBeenCalled(); // only the request terminal finalizes
     } finally {
       releaseStream();
       await handlePromise;

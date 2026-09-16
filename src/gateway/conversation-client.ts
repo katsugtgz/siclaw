@@ -1,4 +1,5 @@
 import type { FrontendWsClient } from "./frontend-ws-client.js";
+import { supportsRequestMode } from "../shared/request-mode.js";
 import type { PromptOptions, PromptResponse } from "./agentbox/client.js";
 
 /** An older standalone Portal can still run local turns, without handoff. A
@@ -35,7 +36,7 @@ export class ConversationClient {
     if (this.unsubscribe) throw new Error("Conversation request already started");
     if (options.requestMode === "sync") {
       const capabilities = await this.frontend.request("conversation.capabilities");
-      if (!capabilities?.requestModes?.includes("sync")) throw new Error("Control plane does not support synchronous request admission; upgrade it before using requestMode=sync");
+      if (!supportsRequestMode(capabilities?.requestModes, "sync")) throw new Error("Control plane does not support synchronous request admission; upgrade it before using requestMode=sync");
     }
     this.unsubscribe = this.frontend.subscribe("conversation.event", (data) => {
       const frame = data as { sessionId?: string; requestId?: string; event?: Record<string, unknown> };

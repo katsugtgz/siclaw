@@ -8,3 +8,8 @@ export function parseRequestMode(value: unknown): RequestMode {
 }
 
 export const REQUEST_QUEUE_TIMEOUT_MS = 30 * 60_000;
+
+/** Capability responses are wire data; a string like "async" is not a mode list. */
+export function supportsRequestMode(modes: unknown, mode: RequestMode): boolean {
+  return Array.isArray(modes) && modes.includes(mode);
+}

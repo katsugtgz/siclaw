@@ -1,4 +1,5 @@
 import { SandboxCallbackUncertainError } from "../../shared/sandbox-tool-types.js";
+import { supportsRequestMode } from "../../shared/request-mode.js";
 import { readSandboxToolError } from "../../script-sandbox/errors.js";
 /**
  * AgentBox HTTP Client
@@ -296,7 +297,7 @@ export class AgentBoxClient {
    * Send a prompt
    */
   async prompt(opts: PromptOptions): Promise<PromptResponse> {
-    if (opts.requestMode === "sync" && !(await this.health()).requestModes?.includes("sync")) {
+    if (opts.requestMode === "sync" && !supportsRequestMode((await this.health()).requestModes, "sync")) {
       throw new Error("AgentBox does not support requestMode=sync; deploy matching Runtime and AgentBox versions");
     }
     const sendOpts = await this.#withResolvedImageUrls(opts);

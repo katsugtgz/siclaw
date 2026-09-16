@@ -45,6 +45,8 @@ to child completion or background-turn lifecycle, nor open a second result card.
 The previous detached-turn channel listener and answer-length heuristic have
 been removed. Detached assistant rows are not allowed to replace the request's
 card; explicit `channel_update` delivery remains available.
+Even `channel_update(kind=final)` updates content without closing streaming;
+only the request's terminal path finalizes the card.
 
 ## Compatibility and checks
 

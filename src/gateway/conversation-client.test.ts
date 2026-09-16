@@ -15,6 +15,8 @@ describe("control-plane conversations", () => {
  it("requires negotiated sync support and forwards requestMode at the API boundary", async () => {
   const f=fixture();
   await expect(f.client.prompt({text:"inspect",requestMode:"sync",subagentTiers:undefined})).rejects.toThrow("does not support");
+  f.frontend.request.mockResolvedValueOnce({requestModes:"async"});
+  await expect(f.client.prompt({text:"inspect",requestMode:"sync",subagentTiers:undefined})).rejects.toThrow("does not support");
   expect(f.frontend.subscribe).not.toHaveBeenCalled();
   f.frontend.request.mockImplementation(async method => method === "conversation.capabilities" ? {handoff:true,requestModes:["sync","async"]} : {ok:true});
   await f.client.prompt({text:"inspect",requestMode:"sync",subagentTiers:undefined});
