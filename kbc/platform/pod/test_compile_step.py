@@ -239,6 +239,62 @@ async def test_watchdog_interrupt_call_cannot_hold_the_step_forever(run, monkeyp
         await asyncio.gather(watchdog, task, return_exceptions=True)
 
 
+async def test_watchdog_bounds_worker_that_swallows_cancellation(run, monkeypatch, tmp_path):
+    monkeypatch.setattr(compile_box, "_MODEL_WATCHDOG_POLL_S", 0.001)
+    monkeypatch.setattr(compile_box, "_WORKER_TEARDOWN_TIMEOUT_S", 0.01)
+    monkeypatch.setenv("KBC_BATCH_PLANNER", "model")
+    monkeypatch.setattr(compile_box.pi_config, "for_role", lambda *a, **kw: {})
+    (tmp_path / "raw").mkdir()
+    (tmp_path / "raw/source.md").write_text("synthetic source")
+    cancelled, release = asyncio.Event(), asyncio.Event()
+
+    class UnresponsiveWorker(Client):
+        returncode = 1
+
+        async def receive_messages(self):
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    cancelled.set()
+            yield result()
+
+    worker = UnresponsiveWorker()
+    monkeypatch.setattr(compile_box, "create_agent_client", lambda **kw: worker)
+    watchdog = asyncio.create_task(compile_box._model_stall_watchdog(run))
+    driver = asyncio.create_task(compile_box._run_batch_compile(run, "compile scope"))
+    step = None
+    try:
+        await asyncio.wait_for(cancelled.wait(), 0.5)
+        step = run._active_step
+        done, _ = await asyncio.wait({driver}, timeout=0.5)
+        assert driver in done, "watchdog cancellation must start the teardown deadline before SDK finally"
+        await driver
+        assert not worker.disconnected
+        assert run._active_step is step and step.teardown_failed
+        assert run._batch_active and not run._turn_active
+        events = drain(run)
+        failures = [event for event in events if event["type"] == "error"]
+        assert len(failures) == 1
+        assert failures[0]["code"] == "worker_teardown_failed"
+        assert failures[0]["stage"] == "batch_compile"
+        assert not any(event["type"] == "syncArtifacts" for event in events)
+        assert not (tmp_path / compile_box.batching.BATCH_PLAN_PATH).exists()
+        with pytest.raises(RuntimeError, match="teardown was not confirmed"):
+            await compile_box._sync_workspace(run, {})
+        with pytest.raises(RuntimeError, match="already owns execution"):
+            await compile_box._execute_compile_step(run, Client(), "competing step")
+    finally:
+        release.set()
+        watchdog.cancel()
+        driver.cancel()
+        await asyncio.gather(watchdog, driver, return_exceptions=True)
+        if step and step.task:
+            await asyncio.gather(step.task, return_exceptions=True)
+    assert worker.disconnected
+    assert run._active_step is step and step.teardown_failed
+
+
 async def test_late_watchdog_failure_cannot_cancel_a_successor_step(run):
     entered, release = asyncio.Event(), asyncio.Event()
 

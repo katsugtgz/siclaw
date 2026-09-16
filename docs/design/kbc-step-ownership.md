@@ -32,6 +32,9 @@ successor; failure handling checks the original client identity.
 
 The interrupt call itself is bounded by `KBC_STALL_INTERRUPT_DEADLINE_S` (120
 seconds by default). SDK/tool teardown has a separate 30-second deadline.
+The teardown deadline starts when the watchdog requests worker cancellation or
+the worker begins disconnecting, whichever happens first. It does not depend on
+the SDK entering its cleanup block after cancellation.
 Neither deadline waits indefinitely for a coroutine to acknowledge cancellation.
 Execution ownership is released only after teardown succeeds. If teardown cannot
 be confirmed, the step keeps ownership, new messages/commands receive a conflict,
@@ -78,6 +81,8 @@ promise automatic retry for operations the control plane does not yet recover.
 reconstruction after a transport failure, failed results without commit,
 cancellation and overlapping starts, watchdog targeting, planner completion,
 connection failure, hanging interruption, and unconfirmed or hanging teardown.
+It also covers a worker that swallows watchdog cancellation before cleanup and
+requires the batch to report failure while retaining workspace isolation.
 Real Pi and Claude SDK tests exercise host-tool writes and cancellation through
 the step driver against synthetic model servers. Runtime relay tests verify
 failure persistence before ACK and stream closure, including lost ACKs and
