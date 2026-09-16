@@ -66,7 +66,8 @@ export class ConversationClient {
         if (this.failure) throw this.failure;
         const event = this.events.shift() as Record<string, unknown> | undefined;
         if (event) {
-          if (event.type === "stream_error") throw new Error("Conversation execution failed; inspect its trace for details");
+          // A failed provider/turn may be followed by steering or recovery.
+          // Preserve the event; the execution consumer waits for prompt_done.
           yield event;
           continue;
         }

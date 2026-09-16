@@ -83,6 +83,7 @@ import {
 } from "../llm-call-rows.js";
 import { messageProducedOutput, modelRouteNoticeContent, modelRouteSwitchMetadata } from "../sse-consumer.js";
 import { registerBackgroundChannelDelivery } from "./background-delivery.js";
+import { channelExecutionEvents, ChannelExecutionError } from "./channel-execution.js";
 
 const VISUAL_ONLY_NOTICE_BY_LOCALE = {
   "zh-CN": "已生成图片如下。",
@@ -104,6 +105,14 @@ const SESSION_BUSY_NOTICE_BY_LOCALE = {
 const AGENT_ERROR_NOTICE_BY_LOCALE = {
   "zh-CN": "❌ 处理时出错了，请稍后重试。",
   "en-US": "❌ Something went wrong while processing this. Please try again later.",
+} as const;
+const DELIVERY_INTERRUPTED_NOTICE_BY_LOCALE = {
+  "zh-CN": "⚠️ 本次回复的结果传输中断，尚未确认任务完成；这不是完整结果。此中断不会主动关闭飞书长连接。",
+  "en-US": "⚠️ Result delivery was interrupted before task completion was confirmed; this is not a complete result. This interruption does not close the Feishu event connection.",
+} as const;
+const EXECUTION_CANCELLED_NOTICE_BY_LOCALE = {
+  "zh-CN": "本次任务已取消。",
+  "en-US": "This task was cancelled.",
 } as const;
 const NEW_SESSION_NOTICE_BY_LOCALE = {
   "zh-CN": "✅ 已开启新会话，此入口中的历史上下文已清空。",
@@ -2081,7 +2090,6 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
       // web/api/a2a (origin="channel" set on the session above). Tool output on
       // this stream is already sanitized at the agentbox boundary.
       persist: remoteConversation ? undefined : { agentId, modelConfig: modelBinding?.modelConfig, traceId: promptResult.traceId },
-      throwOnError: remoteConversation,
     });
     const linkLabel = locale === "zh-CN" ? "打开交互时间线（需要登录及会话权限）" : "Open interactive timeline (sign-in and session access required)";
     resultText = [collected.text, ...collected.visualLinks.map(url => `[${linkLabel}](${url})`)].filter(Boolean).join("\n\n");
@@ -2106,6 +2114,10 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
   const sanitizedResultBody = stripVisualBlocks(resultText, { stripSourceBlocks: replyImages.length > 0 });
   const displayBody = sessionBusy
     ? SESSION_BUSY_NOTICE_BY_LOCALE[locale]
+    : agentError instanceof ChannelExecutionError && agentError.outcome === "disconnected"
+      ? DELIVERY_INTERRUPTED_NOTICE_BY_LOCALE[locale]
+    : agentError instanceof ChannelExecutionError && agentError.outcome === "aborted"
+      ? EXECUTION_CANCELLED_NOTICE_BY_LOCALE[locale]
     : agentError
       ? AGENT_ERROR_NOTICE_BY_LOCALE[locale]
       : sanitizedResultBody
@@ -3113,7 +3125,7 @@ export async function collectChannelResponse(
   client: Pick<AgentBoxClient, "streamEvents"> & { readonly conversationEvents?: boolean },
   sessionId: string,
   logPrefix = "lark",
-  options: { includeImages?: boolean; onMilestone?: (text: string) => void; onActivity?: (text: string) => void; persist?: ChannelPersistContext; locale?: LarkLocale; throwOnError?: boolean } = {},
+  options: { includeImages?: boolean; onMilestone?: (text: string) => void; onActivity?: (text: string) => void; persist?: ChannelPersistContext; locale?: LarkLocale } = {},
 ): Promise<CollectedChannelResponse> {
   // Reuse the public-text adapter used by web. Publish completed text blocks
   // before tools start; never wait for the following model call. Complete blocks
@@ -3149,7 +3161,7 @@ export async function collectChannelResponse(
   const seenImageKeys = new Set<string>();
   // Track the latest assistant turn so we only reply with the *final* text
   // (tool-use turns emit intermediate message_end events that aren't meant
-  // for the user). pi-agent's agent_end signals the last turn is complete.
+  // for the user). Only the execution boundary below authorizes final delivery.
   let lastAssistantText = "";
   let lastAssistantMessageId: string | null = null;
   // Exact text persisted on lastAssistantMessageId (updateMessage requires content).
@@ -3232,7 +3244,7 @@ export async function collectChannelResponse(
   };
 
   try {
-    for await (const event of client.streamEvents(sessionId)) {
+    for await (const event of channelExecutionEvents(client.streamEvents(sessionId), client.conversationEvents)) {
       const ev = event as Record<string, any>;
       if (ev.type === "agent_switch") {
         flushPendingNarration();
@@ -3519,7 +3531,8 @@ export async function collectChannelResponse(
     }
   } catch (err) {
     console.error(`[${logPrefix}] SSE collect error for session=${sessionId}:`, err);
-    if (options.throwOnError) throw err;
+    if (persist) await flushTerminalError();
+    throw err;
   }
   if (persist) await flushTerminalError();
   // Prefer the last full assistant turn; fall back to streamed deltas if the

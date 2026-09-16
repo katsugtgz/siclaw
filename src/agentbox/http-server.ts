@@ -8,6 +8,7 @@ import { parseHandoffPolicy } from "../shared/agent-handoff.js";
  */
 
 import { BackgroundWorkTurn, decorateBackgroundWorkEvent } from "./background-work-turn.js";
+import type { ExecutionEndEvent } from "../shared/execution-lifecycle.js";
 import { normalizeHandoffTrace, handoffParentSpan } from "../shared/handoff-trace.js";
 import fs from "node:fs";
 import { randomUUID } from "node:crypto";
@@ -1056,6 +1057,7 @@ export function createHttpServer(
     // Mark the session busy before model setup so a refresh, second tab, or
     // fast double-submit cannot start a second prompt on the same brain.
     managed._promptDone = false;
+    managed._promptOutcome = undefined;
     managed._aborted = false;
     // LLM-call timeline: the prompt is accepted NOW. Everything between here and
     // the first provider request (model setup, media preflight, language
@@ -1111,6 +1113,7 @@ export function createHttpServer(
     // prompt never actually started) and surface as 500.
     const releasePromptLockOnSetupFailure = (err: unknown): void => {
       console.error(`[agentbox-http] Prompt setup failed for session ${managed.id}:`, err);
+      managed._promptOutcome = "error";
       managed._promptDone = true;
       managed._routeBrainEventsThroughExtra = false;
       managed.brain.llmCalls?.endPrompt({ explicit: true });
@@ -1254,6 +1257,7 @@ export function createHttpServer(
     const actuallyFinish = () => {
       backgroundWorkTurn.cancel();
       managed.brain.setMailbox?.(undefined);
+      managed._promptOutcome ??= managed._aborted ? "aborted" : promptOutcome;
       managed._promptDone = true;
       managed._routeBrainEventsThroughExtra = false;
       managed.brain.llmCalls?.endPrompt({ explicit: true });
@@ -1370,6 +1374,7 @@ export function createHttpServer(
     // and the SSE stream closes. Reset `_aborted` so the NEXT prompt isn't wrongly skipped.
     if (managed._aborted) {
       console.log(`[agentbox-http] Prompt for ${managed.id} aborted before start (pre-prompt latch)`);
+      managed._promptOutcome = "aborted";
       managed._aborted = false;
       // Use actuallyFinish (NOT onPromptFinish): no brain run started, so there is no
       // agent_end/auto_*_end event coming. onPromptFinish would take its deferred branch and
@@ -1580,6 +1585,8 @@ export function createHttpServer(
 
     // If prompt already finished before SSE connected, close immediately
     if (managed._promptDone) {
+      writeEvent({ type: "execution_end", sessionId, turnId: managed._currentTurnId,
+        outcome: managed._promptOutcome ?? (managed._aborted ? "aborted" : "unknown") } satisfies ExecutionEndEvent);
       console.log(`[agentbox-http] Prompt already done for session ${sessionId}, closing SSE after replay (${managed._eventBuffer.length} brain + ${extraReplayCount} extra events)`);
       closeSSE();
       return;
@@ -1630,6 +1637,8 @@ export function createHttpServer(
 
     // Close SSE when prompt completes
     const cleanup = () => {
+      writeEvent({ type: "execution_end", sessionId, turnId: managed._currentTurnId,
+        outcome: managed._promptOutcome ?? (managed._aborted ? "aborted" : "unknown") } satisfies ExecutionEndEvent);
       console.log(`[agentbox-http] SSE closing for session ${sessionId} (prompt done, ${sseEventCount} events sent)`);
       clearInterval(heartbeat);
       unsubAll();

@@ -628,6 +628,42 @@ describe("http-server — sub-agent tier turn state", () => {
 });
 
 describe("http-server — prompt + session lifecycle", () => {
+  it("signals execution_end only when the whole prompt resolves, including late subscribers", async () => {
+    const session = await sm.getOrCreate("execution-boundary");
+    let finish!: () => void;
+    session.brain.prompt.mockImplementationOnce(async () => {
+      session.brain.emitter.emit("event", { type: "agent_end" });
+      await new Promise<void>(resolve => { finish = resolve; });
+      session.brain.emitter.emit("event", { type: "message_end", message: {
+        role: "assistant", stopReason: "stop", content: [{ type: "text", text: "final report" }],
+      } });
+    });
+    await getJson(port, "/api/prompt", "POST", { text: "inspect", sessionId: session.id });
+    const response = await fetch(`http://127.0.0.1:${port}/api/stream/${session.id}`);
+    let ended = false;
+    const body = response.text().then(text => { ended = true; return text; });
+    await flushAsync();
+    expect(ended).toBe(false); // agent_end is not the HTTP prompt boundary
+    finish();
+    const text = await body;
+    expect(text).toContain('"type":"execution_end"');
+    expect(text).toContain('"outcome":"completed"');
+    const replay = await (await fetch(`http://127.0.0.1:${port}/api/stream/${session.id}`)).text();
+    expect(replay).toContain('"type":"execution_end"');
+    expect(replay).toContain('"outcome":"completed"');
+  });
+
+  it("reports cancellation separately from a successful execution", async () => {
+    const session = await sm.getOrCreate("cancelled-execution");
+    let finish!: () => void;
+    session.brain.prompt.mockImplementationOnce(() => new Promise<void>(resolve => { finish = resolve; }));
+    session.brain.abort.mockImplementationOnce(async () => { finish(); });
+    await getJson(port, "/api/prompt", "POST", { text: "inspect", sessionId: session.id });
+    await getJson(port, `/api/sessions/${session.id}/abort`, "POST", {});
+    await flushAsync();
+    const text = await (await fetch(`http://127.0.0.1:${port}/api/stream/${session.id}`)).text();
+    expect(text).toContain('"outcome":"aborted"');
+  });
   it("closes the parent when its brain returns, without waiting or synthesizing a late child reply", async () => {
     const session = await sm.getOrCreate("joined");
     session.brain.prompt.mockImplementationOnce(async () => {

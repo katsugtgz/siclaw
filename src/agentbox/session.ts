@@ -152,6 +152,8 @@ export interface ManagedSession {
   isRetrying: boolean;
   /** Whether the current prompt has finished (for race condition prevention) */
   _promptDone: boolean;
+  /** Result of the whole prompt, for live and late event-stream subscribers. */
+  _promptOutcome?: import("../shared/execution-lifecycle.js").ExecutionOutcome;
   /** Launch ownership and mailbox scoped to the current user prompt. */
   _backgroundWorkTurn?: BackgroundWorkTurn;
   /** Events buffered during prompt execution (replayed when SSE connects) */
@@ -2304,6 +2306,7 @@ export class AgentBoxSessionManager {
         }
         // Acquire the mutex synchronously (no await between check and set).
         managed._promptDone = false;
+        managed._promptOutcome = undefined;
         managed._aborted = false;
         // Cancel any pending release timer (mirrors getOrCreate): a background job's
         // onSettled may have armed scheduleRelease just before this turn started — left
@@ -2424,7 +2427,7 @@ export class AgentBoxSessionManager {
         });
         managed._bufferUnsub = () => brainUnsub();
         try {
-          await runPromptWithModelRouting(
+          const result = await runPromptWithModelRouting(
             managed.brain,
             text,
             effectivePolicy,
@@ -2451,7 +2454,9 @@ export class AgentBoxSessionManager {
               },
             },
           );
+          managed._promptOutcome = managed._aborted ? "aborted" : result?.success === false ? "error" : "completed";
         } catch (err) {
+          managed._promptOutcome = managed._aborted ? "aborted" : "error";
           console.warn(`[agentbox-session] synthetic prompt failed for ${managed.id}:`, err);
         } finally {
           // Preserve non-empty public output, including pure-text reports.

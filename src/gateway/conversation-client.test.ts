@@ -28,10 +28,15 @@ describe("control-plane conversations", () => {
   expect(f.frontend.request.mock.calls[0][1]).not.toHaveProperty("modelConfig");
   expect(f.off).toHaveBeenCalledTimes(1);
  });
- it("a failed destination does not turn the source progress into a successful result", async () => {
+ it("keeps a stream_error as data until the logical request ends", async () => {
   const f=fixture();await f.client.prompt({text:"inspect",subagentTiers:undefined});
   f.emit({type:"stream_error",error:{message:"private diagnostic"}});
-  await expect(async()=>{for await(const _ of f.client.streamEvents("s")) { /* drain */ }}).rejects.toThrow("Conversation execution failed");
+  f.emit({type:"message_start",message:{role:"user",content:"follow-up"}});
+  f.emit({type:"message_end",message:{role:"assistant",content:[{type:"text",text:"recovered"}]}});
+  f.emit({type:"prompt_done"});
+  const seen=[];for await(const e of f.client.streamEvents("s")) seen.push(e);
+  expect(seen).toHaveLength(4);
+  expect(seen[0]).toMatchObject({type:"stream_error"});
   expect(f.off).toHaveBeenCalled();
  });
  it("a timed-out submission never retries locally or redispatches", async () => {
