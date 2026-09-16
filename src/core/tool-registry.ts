@@ -474,6 +474,10 @@ export interface ToolRefs {
    * never sees a non-working tool (children get no executor → no recursion).
    */
   spawnSubagentExecutor?: SpawnSubagentExecutor;
+  /** Active-turn mailbox. Undefined between turns; never creates a prompt. */
+  agentMailbox?: () => import("./agent-mailbox.js").AgentMailbox | undefined;
+  /** Child-only, scoped to the launching parent turn. No arbitrary target/interrupt. */
+  sendParentMessage?: (message: string) => boolean;
   /** Internal full-output access, with the same session boundary as the recovery tools. */
   readToolResult?: (id: string) => Promise<string>;
   /**

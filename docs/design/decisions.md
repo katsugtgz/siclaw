@@ -876,3 +876,36 @@ workflows in Portal reduces maintenance while preserving scriptable diagnostics.
   carry its own terminal packages transitively; Siclaw does not expose that UI.
 - Builds clear `dist/` before compiling, so removed terminal modules cannot leak
   into packages built in an existing checkout.
+
+---
+
+## ADR-021: Deliver Subagent Results Through the Active Turn's Mailbox
+
+**Date**: 2026-09-16
+
+**Decision**: AgentBox chat launches subagents asynchronously. The parent uses
+`wait_agent` when blocked on a result; completion and explicit child messages
+enter its active-turn mailbox. The model loop consumes mail at safe boundaries,
+instead of the HTTP handler automatically joining children and prompting a
+second synthesis turn.
+
+**Reason**: Launch, completion, result delivery and parent response are separate
+events. Keeping them explicit avoids turning a late completion into another user
+request, while allowing independent parent work during child execution.
+
+**Consequences**:
+
+- A completed thinking/commentary block can end the current provider sampling
+  early. The parent agent turn and client HTTP/SSE conversation remain active;
+  the next model request includes the mailbox evidence. This is not an abort of
+  the entire parent turn or an unrestricted child interrupt capability.
+- Final-answer boundaries defer mail; tools or user steering can reopen delivery.
+- Once the parent finishes, late results do not restart it or enter its next turn.
+  Handling that edge case is explicitly out of scope.
+- Existing child report artifacts, transcripts, acceptance and cancellation stay
+  in place. No all-message or length-based report concatenation is introduced.
+- Runtime and AgentBox tool catalogs must be deployed together. Raw tool-name
+  whitelists need the new mailbox tools; permission filters are not bypassed.
+
+See [the implementation design](2026-09-16-subagent-mailbox-loop.md) for the pi SDK
+adapter, provider-phase limitations and verification scope.

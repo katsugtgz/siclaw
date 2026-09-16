@@ -1,71 +1,44 @@
 import { describe, expect, it } from "vitest";
-import { BackgroundWorkTurn, backgroundWorkResultPrompt, decorateBackgroundWorkEvent } from "./background-work-turn.js";
+import { BackgroundWorkTurn, decorateBackgroundWorkEvent } from "./background-work-turn.js";
 
-describe("required subagent completion mailbox", () => {
-  it("delivers a client result while its long-lived server remains running", async () => {
+describe("request-owned completion mail", () => {
+  it("publishes each result once without waiting for other children", async () => {
     const turn = new BackgroundWorkTurn();
     turn.register("server"); turn.register("client");
-    const waiting = turn.next();
-    turn.complete({ taskId: "client", status: "completed", outputFile: "/tmp/client", summary: "client finished" });
-    expect((await waiting).map(n => n.taskId)).toEqual(["client"]);
-    expect(turn.pending).toBe(true);
-    expect(turn.resultPrompt([])).toContain('"pendingJobIds":["server"]');
-    const stopped = turn.next();
-    turn.complete({ taskId: "server", status: "stopped", summary: "helper stopped" });
-    expect((await stopped)[0].status).toBe("stopped");
+    const waiting = turn.mailbox.wait(1000);
+    turn.complete({ taskId: "client", status: "completed", summary: "client finished" });
+    expect(await waiting).toBe("mail");
+    const result = turn.mailbox.take();
+    expect(result).toContain("client finished");
+    expect(result).toContain('"pendingJobIds":["server"]');
+    turn.complete({ taskId: "client", status: "completed", summary: "duplicate" });
+    expect(turn.mailbox.take()).toBeUndefined();
+    turn.complete({ taskId: "server", status: "stopped", summary: "stopped" });
     expect(turn.pending).toBe(false);
-    expect(turn.complete({ taskId: "client", status: "completed", summary: "duplicate" })).toBe(true);
-    expect(await turn.next()).toEqual([]);
+    expect(turn.mailbox.take()).toContain("stopped");
   });
 
-  it("wakes on real user input during a job wait, without consuming ready results", async () => {
+  it("rolls back a failed launch", () => {
     const turn = new BackgroundWorkTurn();
-    expect(turn.queueSteer("active-model input")).toBe(false);
-    turn.register("job");
-    const waiting = turn.next();
-    expect(turn.queueSteer("stop the server and summarize")).toBe(true);
-    turn.complete({ taskId: "job", status: "completed", summary: "ready" });
-    expect(await waiting).toEqual([]);
-    expect(turn.takeSteer()?.text).toBe("stop the server and summarize");
-    expect((await turn.next())[0].taskId).toBe("job");
-  });
-
-  it("rolls back a launch failure instead of keeping the request waiting", async () => {
-    const turn = new BackgroundWorkTurn();
-    turn.register("failed-launch");
-    const waiting = turn.next();
-    turn.unregister("failed-launch");
-    expect(await waiting).toEqual([]);
+    turn.register("failed"); turn.unregister("failed");
     expect(turn.jobIds).toEqual([]);
-  });
-
-  it("handles completion before waiting and children launched during synthesis", async () => {
-    const turn = new BackgroundWorkTurn();
-    turn.register("group");
-    turn.complete({ taskId: "group", status: "done", summary: "reduce report" });
-    expect(backgroundWorkResultPrompt(await turn.next())).toContain("reduce report");
-    turn.register("followup");
-    expect(turn.pending).toBe(true);
-    turn.complete({ taskId: "followup", status: "timed_out", summary: "timeout" });
-    expect((await turn.next())[0].status).toBe("timed_out");
-  });
-
-  it("marks only server-authored result echoes as internal", () => {
-    const turn = new BackgroundWorkTurn();
-    const text = turn.resultPrompt([{ taskId: "a", status: "done", summary: "ready" }]);
-    const echo = decorateBackgroundWorkEvent({ message: { role: "user", content: [{ type: "text", text }] } }, turn);
-    expect(echo).toHaveProperty("internalMessage", true);
-    expect(decorateBackgroundWorkEvent({ message: { role: "user", content: "also check node B" } }, turn)).not.toHaveProperty("internalMessage");
-  });
-
-  it("Stop wakes the waiter and late owned results never schedule a detached reply", async () => {
-    const turn = new BackgroundWorkTurn();
-    turn.register("a");
-    const waiting = turn.next();
-    turn.cancel();
-    expect(await waiting).toEqual([]);
-    expect(turn.complete({ taskId: "a", status: "done", summary: "late" })).toBe(true);
-    expect(turn.complete({ taskId: "another-turn", status: "done", summary: "other" })).toBe(false);
     expect(turn.pending).toBe(false);
+  });
+
+  it("keeps late results owned by their closed turn", async () => {
+    const old = new BackgroundWorkTurn(); old.register("child");
+    const wait = old.mailbox.wait(1000); old.cancel();
+    expect(await wait).toBe("closed");
+    expect(old.complete({ taskId: "child", status: "done", summary: "late" })).toBe(true);
+    expect(old.mailbox.take()).toBeUndefined();
+    expect(old.complete({ taskId: "different", status: "done", summary: "other" })).toBe(false);
+    expect(new BackgroundWorkTurn().mailbox.take()).toBeUndefined();
+  });
+
+  it("labels only runtime mailbox echoes as internal and never hides a final answer", () => {
+    const turn = new BackgroundWorkTurn(); turn.register("still-running");
+    expect(decorateBackgroundWorkEvent({ message: { role: "custom", customType: "agent_mailbox" } }, turn).internalMessage).toBe(true);
+    expect(decorateBackgroundWorkEvent({ message: { role: "user" } }, turn)).not.toHaveProperty("internalMessage");
+    expect(decorateBackgroundWorkEvent({ message: { role: "assistant" } }, turn)).not.toHaveProperty("awaitingSubagents");
   });
 });

@@ -1,0 +1,84 @@
+# Active-turn subagent mailbox loop
+
+This supersedes the HTTP-owned join/synthesis loop described in the September 9
+subagent notes. It follows the execution boundaries observed in Codex v2, adapted
+to the installed pi SDK rather than replacing/forking its agent loop.
+
+## Runtime first
+
+AgentBox chat sessions (including channels) launch single and batched subagents
+asynchronously. `spawn_subagent` returns a job/resume handle, never a promise that
+the assignment is already done. The active-turn runtime does not advertise the
+old `run_in_background` switch. External executors without a mailbox keep their
+legacy foreground/background behavior; a2a/task tool availability is unchanged.
+
+Each user prompt owns an `AgentMailbox`. Child completion is deduplicated by the
+existing job registry and addressed to the launching turn, not whichever turn is
+currently running in the same session. A child may also use `send_message` for a
+material finding or blocker; its executor is bound to that original parent's
+mailbox. It has no arbitrary recipient, interrupt, or root-start capability.
+Existing parent-to-child guidance/resume handles remain supported, as do grouped
+map/reduce execution, semantic completion assessment, cancellation, report
+artifacts, child transcripts, tool restrictions and model tiering.
+
+The HTTP layer makes one routed brain invocation. It no longer waits for all
+registered jobs after that invocation returns, hides a final answer as progress,
+or launches mandatory synthesis prompts.
+
+## Model execution boundaries
+
+`wait_agent` waits for mailbox activity, timeout, user steering or cancellation.
+It neither consumes the message body nor cancels the child on timeout. The
+runtime queues the actual evidence as a hidden `agent_mailbox` custom message,
+which pi persists and includes in the next model request. Multiple ready messages
+are consumed together. No extra LLM summarizer runs on the notification path.
+
+The sampling wrapper checks completed thinking or explicitly tagged commentary
+blocks. When mail is ready and no tool call has been emitted in that sampling,
+it clones the completed partial response, cancels only that provider request,
+and emits a normal terminal sampling event. Queued mail drives continuation of
+the same pi run. It never calls `brain.abort()` for mailbox activity. Avoiding a
+cutoff after a tool-call block preserves tool-result pairing and authorized work.
+
+Non-commentary text (including missing phase) defers mailbox delivery; tool
+execution and real user steering reopen it. Completed tool turns consume ready
+mail before the next model request. Providers without phase annotations do not
+get text-boundary preemption, but still get thinking/tool/wait boundaries.
+
+The wrapper sits inside existing recording and output guards so preempted calls
+still emit timing/usage evidence and pass through normal sanitation. Provider
+usage unavailable because of a cancelled stream is not invented. A routing
+checkpoint also records the mailbox consumption cursor: rollback requeues the
+discarded attempt's mail in front of later arrivals.
+
+## Deliberate limitation
+
+When the main brain returns, its mailbox is closed. Late results remain in the
+normal child report/transcript/UI lifecycle, but do not wake an idle parent,
+cross into a successor user turn, or create a synthetic report. This edge case
+is intentionally not addressed. Required results are the main model's workflow
+responsibility: do useful independent work, explicitly wait when blocked, then
+integrate the result before finishing.
+
+There is no new message rate limiter. Explicit sends, batched consumption and
+safe sampling boundaries constrain interruption, but do not guarantee that a
+chatty child cannot cause repeated continuation. This change adds no recursive
+subagents or durable scheduler. Legacy detached shell-job notification behavior
+outside an owned HTTP turn is unchanged.
+
+## Tool and prompt rollout
+
+`wait_agent` (parent only) and `send_message` (child only) belong to the existing
+`spawn_subagents` capability; frontend/backend catalogs must agree. Deploy the
+runtime and AgentBox from this revision together. Installations with explicit
+raw tool-name whitelists must include the new tools; no whitelist is bypassed.
+
+After runtime tests, delegation guidance is updated to distinguish launch from
+completion, allow independent work, require explicit waits on dependencies and
+warn that finalizing the parent ends message delivery. Platform identity and
+safety policy are unchanged.
+
+Verification includes native pi-loop tests (not a replacement loop), mailbox
+ownership/dedup/close, commentary and final boundaries, tool continuation, wait
+semantics, HTTP lifetime, installed SDK contracts, and normal model routing.
+No live provider or production-cluster evaluation is implied by these tests.

@@ -7,7 +7,6 @@ import { parseHandoffPolicy } from "../shared/agent-handoff.js";
  * Provides HTTP API for Gateway to call, with SSE streaming support.
  */
 
-import { assistantTextBlocks } from "../shared/assistant-items.js";
 import { BackgroundWorkTurn, decorateBackgroundWorkEvent } from "./background-work-turn.js";
 import { normalizeHandoffTrace, handoffParentSpan } from "../shared/handoff-trace.js";
 import fs from "node:fs";
@@ -1250,17 +1249,11 @@ export function createHttpServer(
 
     const backgroundWorkTurn = new BackgroundWorkTurn();
     managed._backgroundWorkTurn = backgroundWorkTurn;
-    let parentReportSeen = false;
-    const reportUnsubscribe = managed.brain.subscribe((event: any) => {
-      if ((event.type !== "message_end" && event.type !== "turn_end") || event.message?.role !== "assistant") return;
-      parentReportSeen = !backgroundWorkTurn.pending && event.message.stopReason !== "toolUse"
-        && event.message.stopReason !== "error" && event.message.stopReason !== "aborted"
-        && assistantTextBlocks(event.message).some(block => block.text.trim() && block.phase !== "commentary");
-    });
+    managed.brain.setMailbox?.(backgroundWorkTurn.mailbox);
 
     const actuallyFinish = () => {
       backgroundWorkTurn.cancel();
-      reportUnsubscribe();
+      managed.brain.setMailbox?.(undefined);
       managed._promptDone = true;
       managed._routeBrainEventsThroughExtra = false;
       managed.brain.llmCalls?.endPrompt({ explicit: true });
@@ -1445,30 +1438,9 @@ export function createHttpServer(
         : undefined,
     );
 
-    // Keep the original stream, prompt mutex, trace and persistence consumer alive
-    // through required child completion and parent synthesis. No detached reply path.
-    const promptPromise = (async () => {
-      let result = await runPrompt(promptText, promptMedia);
-      while (!managed._aborted && result?.success !== false) {
-        const notifications = await backgroundWorkTurn.next();
-        if (managed._aborted) break;
-        const steer = backgroundWorkTurn.takeSteer();
-        if (steer) {
-          parentReportSeen = false;
-          result = await runPrompt(steer.text, steer.media);
-          continue;
-        }
-        if (notifications.length === 0) {
-          if (backgroundWorkTurn.jobIds.length && !backgroundWorkTurn.isCancelled && !parentReportSeen) {
-            throw new Error("Required background work finished without a parent report");
-          }
-          break;
-        }
-        parentReportSeen = false;
-        result = await runPrompt(backgroundWorkTurn.resultPrompt(notifications));
-      }
-      return result;
-    })();
+    // The brain owns mailbox consumption and explicit waits inside this prompt.
+    // Once it returns, late child results must not synthesize another parent turn.
+    const promptPromise = runPrompt(promptText, promptMedia);
 
     promptPromise.then((result) => {
       // The routing runner reports exhaustion (and user aborts) as a result,
@@ -1720,9 +1692,7 @@ export function createHttpServer(
     // addition to that active prompt, so it inherits this existing trace.
     const traceId = tracingRecorder.getRootTraceId(sessionId);
     try {
-      if (managed._backgroundWorkTurn?.queueSteer(steerText, promptMedia)) {
-        // The original request loop resumes this real input with normal persistence.
-      } else if (promptMedia) {
+      if (promptMedia) {
         await managed.brain.steer(steerText, promptMedia);
       } else {
         await managed.brain.steer(steerText);

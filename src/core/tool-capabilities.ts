@@ -43,7 +43,7 @@ export const CAPABILITY_GROUPS: Record<string, string[]> = {
   run_sandbox:     ["run_script"],
   search_memory:   ["memory_search", "memory_get"],
   plan_tasks:      ["task_create", "task_update", "task_list", "task_get"],     // split ①
-  spawn_subagents: ["spawn_subagent", "task_output", "job_stop"], // split ① (permission amplification)
+  spawn_subagents: ["spawn_subagent", "wait_agent", "send_message", "task_output", "job_stop"], // runtime gates parent/child tools
   // Handing the conversation to another agent is NOT delegation and does not
   // belong in that group: delegation calls a peer and keeps the turn, a transfer
   // gives the session away. This key remains for stored selections. Resolved

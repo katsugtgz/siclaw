@@ -83,15 +83,16 @@ describe("notifyParent", () => {
     (managed as any)._backgroundWorkTurn = turn;
     turn.register("child");
     mgr.jobs.register({ jobId: "child", type: "subagent", parentSessionId: "s1", description: "check", status: "done", startedAt: 0, notified: false });
-    const waiting = turn.next();
+    const waiting = turn.mailbox.wait(1000);
     await mgr.notifyParent("s1", "child", { taskId: "child", status: "done", summary: "five ready nodes" });
-    expect((await waiting)[0].summary).toBe("five ready nodes");
+    expect(await waiting).toBe("mail");
+    expect(turn.mailbox.take()).toContain("five ready nodes");
     await flushCoalesce();
     expect(managed._pendingNotifications).toEqual([]);
     expect(brain.prompt).not.toHaveBeenCalled();
     expect(brain.followUp).not.toHaveBeenCalled();
     await mgr.notifyParent("s1", "child", { taskId: "child", status: "done", summary: "duplicate" });
-    expect(await turn.next()).toEqual([]);
+    expect(turn.mailbox.take()).toBeUndefined();
   });
 
   it("does not announce report completion when a message write is rejected", async () => {
@@ -317,7 +318,7 @@ describe("notifyParent", () => {
     expect(nonExec).toHaveLength(0);
   });
 
-  it("a text-only synthetic turn for a SUB-AGENT (inline result, no output_file) persists the report + fires background_turn_done", async () => {
+  it("an idle parent's subagent completion folds the card without synthesizing a report", async () => {
     const mgr = new AgentBoxSessionManager() as any;
     // Brain that, on prompt(), emits one assistant text message (the inline result report) and no tool call.
     let cb: ((e: any) => void) | undefined;
@@ -338,9 +339,10 @@ describe("notifyParent", () => {
     await flushCoalesce();
     const events = send.mock.calls.map((c) => c[0]);
     const report = events.filter((e: any) => e?.type === "delegation.append_message").find((e: any) => (e.message?.content || "").includes("34"));
-    expect(report).toBeTruthy(); // the text-only report is persisted (not dropped)
+    expect(report).toBeUndefined(); // late child results do not synthesize a parent response
+    expect(brain.prompt).not.toHaveBeenCalled();
     const btd = events.filter((e: any) => e?.type === "delegation.emit_chat_event" && e?.event?.type === "background_turn_done");
-    expect(btd).toHaveLength(1); // refetch trigger fired so the UI shows the report
+    expect(btd).toHaveLength(0);
   });
 
   it("routes an idle synthetic turn through fallback using the session's last modelRouting policy", async () => {
@@ -418,7 +420,7 @@ describe("notifyParent", () => {
     };
     mgr.sessions.set("s1", managed);
     mgr.persistModelRouteState = vi.fn();
-    mgr.jobs.register({ jobId: "sa1", type: "subagent", parentSessionId: "s1", description: "compute", status: "completed", startedAt: 0, notified: false });
+    mgr.jobs.register({ jobId: "sa1", type: "bash", parentSessionId: "s1", description: "compute", status: "completed", startedAt: 0, notified: false });
     const send = vi.fn(async () => ({ ok: true, id: "x" }));
     mgr.gatewayClient = { sendDelegationPersistenceEvent: send };
     mgr.agentId = "agent-1";
@@ -519,7 +521,7 @@ describe("notifyParent", () => {
     expect(execEvents).toHaveLength(0);
   });
 
-  it("a background GROUP job (type subagent + isGroup) notifies once with the inline group summary", async () => {
+  it("a late background GROUP completion folds once without restarting its parent", async () => {
     const mgr = new AgentBoxSessionManager() as any;
     let cb: ((e: any) => void) | undefined;
     const brain = {
@@ -541,12 +543,7 @@ describe("notifyParent", () => {
     // dedup: a second notify for the same group job is a no-op.
     await mgr.notifyParent("s1", "grp1", { taskId: "grp1", status: "partial", summary });
     await flushCoalesce();
-    expect(brain.prompt).toHaveBeenCalledTimes(1); // ONE synthetic turn, deduped
-    const promptText = brain.prompt.mock.calls[0][0] as string;
-    expect(promptText).toContain("<task_notification>");
-    // Quotes are XML-escaped inside the <summary> block.
-    expect(promptText).toContain("Sub-agent group &quot;triage&quot; partial");
-    expect(promptText).toContain("Causes: net, storage.");
+    expect(brain.prompt).not.toHaveBeenCalled(); // no active launching turn to receive it
     // Live fold event uses the subagent_done channel (a group is a subagent job), NOT exec_job_event.
     const fold = send.mock.calls.map((c) => c[0]).filter((e: any) => e?.event?.type === "subagent_done");
     expect(fold).toHaveLength(1);

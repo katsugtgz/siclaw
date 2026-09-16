@@ -152,7 +152,7 @@ export interface ManagedSession {
   isRetrying: boolean;
   /** Whether the current prompt has finished (for race condition prevention) */
   _promptDone: boolean;
-  /** Required background work owned by the current user prompt. */
+  /** Launch ownership and mailbox scoped to the current user prompt. */
   _backgroundWorkTurn?: BackgroundWorkTurn;
   /** Events buffered during prompt execution (replayed when SSE connects) */
   _eventBuffer: unknown[];
@@ -2171,11 +2171,9 @@ export class AgentBoxSessionManager {
   }
 
   /**
-   * Inject a completed background job's <task_notification> into the parent model.
-   *  - claimNotification dedups (job_stop vs process-exit race → exactly one notice).
-   *  - Parent run in-flight → flush now via followUp (rides the current turn).
-   *  - Parent idle → buffer + a short coalescing window, so a burst of completions becomes
-   *    ONE synthetic turn (the model reacts once instead of re-summarizing per job).
+   * Fold the job UI and deliver a deduplicated result to its launching turn's mailbox.
+   * Subagents never create a parent turn. Only unowned legacy shell jobs retain
+   * the detached/coalesced synthetic notification path below.
    */
   private async notifyParent(
     sessionId: string,
@@ -2224,6 +2222,8 @@ export class AgentBoxSessionManager {
     const owner = this.backgroundWorkOwners.get(jobId) ?? managed._backgroundWorkTurn;
     this.backgroundWorkOwners.delete(jobId);
     if (owner?.complete(n)) return;
+    // Subagents never wake an idle parent or leak an old result into a successor turn.
+    if (job?.type === "subagent") return;
     if (job?.suppressNotifyTurn) return;
 
     // Buffer the model-facing notification and arm the coalescing window. We deliver it ONLY
@@ -2832,6 +2832,9 @@ export class AgentBoxSessionManager {
      */
     const sharedMcpManager = this.sessions.get(request.parentSessionId)?.mcpManager;
 
+    // Group children use <spawnId>#<index|reduce>; ownership stays with the original
+    // launch, even if a queued child starts after the parent has finished its turn.
+    const parentMailbox = this.backgroundWorkOwners.get(request.spawnId.split("#")[0])?.mailbox;
     const child = await createSiclawSession({
       mcpManager: sharedMcpManager,
       sessionManager: childSessionManager,
@@ -2857,7 +2860,12 @@ export class AgentBoxSessionManager {
       isSubagent: true,
       // The agent-type's prompt flavour for this child.
       systemPromptAppend: request.agentPrompt,
-      subagentPrompt: type.systemPromptAddendum,
+      subagentPrompt: type.systemPromptAddendum + (parentMailbox
+        ? "\nYour final assistant reply is returned to the parent. End with the complete findings, evidence references, and limitations needed for the assignment; a card/message delivery acknowledgement is not a substitute for that report. Use send_message only for material interim findings or blockers, not routine progress or a duplicate final report."
+        : ""),
+      sendParentMessage: parentMailbox ? message => parentMailbox.post(
+        JSON.stringify({ type: "subagent_message", childSessionId, message: redactText(message, redactionConfig) }),
+      ) : undefined,
       // Deliberately omit spawnSubagentExecutor + delegate executors → the child
       // never sees spawn_subagent (no recursion).
     });
@@ -3620,6 +3628,7 @@ export class AgentBoxSessionManager {
       // spawn_subagent is available in normal chat (top-level sessions only — child
       // sessions above omit this executor, so sub-agents cannot recurse).
       spawnSubagentExecutor: this.createSpawnSubagentExecutor(),
+      agentMailbox: () => this.sessions.get(id)?._backgroundWorkTurn?.mailbox,
       // Snapshot the box's menu at creation — this is the value the session will
       // hold for its lifetime, and the tool schema built below derives from it.
       subagentTierMenu: this.subagentTierMenuState,
