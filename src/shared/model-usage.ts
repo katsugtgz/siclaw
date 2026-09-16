@@ -14,6 +14,7 @@ export interface UsageIdentity {
   sourceName: string;
 }
 export interface UsageObservation {
+  apiRequestId?: string;
   schemaVersion: 1;
   callId: string;
   phase: "started" | "finished";
@@ -49,6 +50,6 @@ export interface UsageBatchResponse {
   results: { callId: string; phase: string; status: "accepted" | "duplicate" | "rejected" | "retryable"; reason?: string }[];
 }
 export interface UsageSink {
-  context(): Pick<UsageObservation, "sessionId" | "traceId" | "executionRole" | "requestId" | "parentCallId" | "executorRole">;
+  context(): Pick<UsageObservation, "sessionId" | "traceId" | "executionRole" | "requestId" | "parentCallId" | "executorRole" | "apiRequestId">;
   record(observation: UsageObservation): void;
 }

@@ -817,6 +817,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         `不要提"交接"、不要复述、不要重新自我介绍。要办的事:]\n${text}`
       : text;
     const promptOpts: PromptOptions = {
+      apiRequestId: typeof params.apiRequestId === "string" ? params.apiRequestId : undefined,
       sessionId,
       turnId,
       requiredResultToolName,

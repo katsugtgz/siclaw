@@ -23,6 +23,8 @@ export interface AgentBoxTlsOptions {
 }
 
 export interface PromptOptions {
+  /** Opaque control-plane dispatch receipt; never a credential. */
+  apiRequestId?: string;
   /** Source AgentBox context for an authorized conversation handoff only. */
   handoffTrace?: import("../../shared/handoff-trace.js").HandoffTraceContext;
   sessionId?: string;

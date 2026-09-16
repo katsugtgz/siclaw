@@ -5716,14 +5716,29 @@ describe("handleLarkMessage — /apikey", () => {
     expect(reply).toContain("…");
   });
 
-  it("works on an OPEN personal bot — unlike PAIR, issuing is not gated on the authorized mode", async () => {
-    issuePersonalApiKeyMock.mockResolvedValue({ success: true, pickupUrl: PICKUP });
+  it("explains public personal-key refusal without a login link", async () => {
+    issuePersonalApiKeyMock.mockResolvedValue({ success: false, denied: { reason: "personal_key_unavailable" } });
     const lark = makeLarkClient();
-
     await sendPersonal("/apikey", lark);
-
     expect(issuePersonalApiKeyMock).toHaveBeenCalledTimes(1);
-    expect(replyText(lark)).toContain(PICKUP);
+    expect(replyText(lark)).toContain("公开 Agent 不提供个人 API Key");
+    expect(replyText(lark)).not.toContain(PICKUP);
+  });
+
+  it("reports an unavailable public key without suggesting issuance or rotating", async () => {
+    getPersonalApiKeyStatusMock.mockResolvedValue({ success: true, exists: true, personalKeyAvailable: false });
+    const lark = makeLarkClient();
+    await sendPersonal("/apikey status", lark);
+    expect(replyText(lark)).toContain("已有的个人 Key 也不可使用");
+    expect(issuePersonalApiKeyMock).not.toHaveBeenCalled();
+  });
+
+  it("reports a revoked personal identity as unusable", async () => {
+    getPersonalApiKeyStatusMock.mockResolvedValue({ success: true, exists: true, personalKeyAvailable: true, status: "unauthorized", keyPrefix: "sk-fixture" });
+    const lark = makeLarkClient();
+    await sendPersonal("/apikey status", lark);
+    expect(replyText(lark)).toContain("不可使用");
+    expect(issuePersonalApiKeyMock).not.toHaveBeenCalled();
   });
 
   it("/apikey status reports the current key and rotates nothing", async () => {

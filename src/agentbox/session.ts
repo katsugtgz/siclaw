@@ -121,7 +121,7 @@ import { extractToolResultId } from "../core/message-utils.js";
  * `mainTraceId` stamps chat_messages.trace_id (DB audit); `spawnSpanContext` nests the child
  * ROOT under the parent's spawn_subagent tool span (Langfuse). Both undefined when tracing is off.
  */
-type SubagentTraceContext = { mainTraceId?: string; spawnSpanContext?: SpanContext };
+type SubagentTraceContext = { apiRequestId?: string; mainTraceId?: string; spawnSpanContext?: SpanContext };
 
 export interface ManagedSession {
   agentPrompt?: string;
@@ -175,6 +175,7 @@ export interface ManagedSession {
    * (every brain.prompt() callsite chains through a single Promise queue,
    * _promptDone becomes a status flag derived from the queue).
    */
+  _apiRequestId?: string;
   _promptInflight: Promise<void> | null;
   /** Mutable reference to the active kubeconfig path — tools read .current at execution time */
   kubeconfigRef: KubeconfigRef;
@@ -749,11 +750,14 @@ export class AgentBoxSessionManager {
    * Reads userDataDir from settings.json.
    */
   private usageOutbox?: UsageOutbox;
-  setUsageRole(sessionId: string, role: "root" | "delegated"): void {
+  setUsageRole(sessionId: string, role: "root" | "delegated", apiRequestId?: string): void {
     const managed = this.sessions.get(sessionId);
-    if (managed) this.attachUsage(managed.brain, sessionId, role);
+    if (managed) {
+      managed._apiRequestId = apiRequestId;
+      this.attachUsage(managed.brain, sessionId, role, undefined, apiRequestId);
+    }
   }
-  private attachUsage(brain: BrainSession, sessionId: string, role: "root" | "internal_subagent" | "delegated", traceId?: string): void {
+  private attachUsage(brain: BrainSession, sessionId: string, role: "root" | "internal_subagent" | "delegated", traceId?: string, apiRequestId?: string): void {
     if (!this.gatewayClient || !this.agentId) return;
     if (!this.usageOutbox) {
       // Agent identity partitions local spawners that share a user data directory.
@@ -772,7 +776,7 @@ export class AgentBoxSessionManager {
     brain.llmCalls?.setUsageSink?.({
       context: () => {
         const rootTrace = traceId ?? tracingRecorder.getRootTraceId(sessionId);
-        return { sessionId, executionRole: role, traceId: rootTrace, ...(rootTrace ? { requestId: rootTrace } : {}) };
+        return { sessionId, apiRequestId, executionRole: role, traceId: rootTrace, ...(rootTrace ? { requestId: rootTrace } : {}) };
       },
       record: observation => this.usageOutbox!.record(observation),
     });
@@ -1140,6 +1144,7 @@ export class AgentBoxSessionManager {
       // ⚠️ Never re-capture per child with a derived `${groupId}#i` id — that mints phantom spans.
       const traceCtx = {
         mainTraceId: tracingRecorder.getRootTraceId(request.parentSessionId),
+        apiRequestId: this.sessions.get(request.parentSessionId)?._apiRequestId,
         spawnSpanContext: tracingRecorder.ensureToolSpan(request.parentSessionId, request.spawnId, "spawn_subagent"),
       };
 
@@ -2792,7 +2797,7 @@ export class AgentBoxSessionManager {
    */
   private async runSpawnedSubagent(
     request: SpawnSubagentRequest,
-    opts?: { childSessionId?: string; jobId?: string; mainTraceId?: string; spawnSpanContext?: SpanContext },
+    opts?: { childSessionId?: string; jobId?: string; apiRequestId?: string; mainTraceId?: string; spawnSpanContext?: SpanContext },
     onProgress?: (progress: SpawnSubagentProgress) => void,
     signal?: AbortSignal,
   ): Promise<SpawnSubagentResult> {
@@ -2864,7 +2869,7 @@ export class AgentBoxSessionManager {
     child.sessionIdRef.current = childSessionId;
     const mailbox = this.subagentRuns.get(childSessionId)?.mailbox;
     mailbox?.attach(child.brain);
-    this.attachUsage(child.brain, childSessionId, "internal_subagent", mainTraceId);
+    this.attachUsage(child.brain, childSessionId, "internal_subagent", mainTraceId, opts?.apiRequestId);
 
     // ── Model selection: tier, or the parent's effective model ──────────────
     //
