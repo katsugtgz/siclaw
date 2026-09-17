@@ -65,6 +65,8 @@ export const CAPABILITY_EVENT = "capability.event" as const;
 export const CAPABILITY_PERSIST_ARTIFACTS = "capability.persistArtifacts" as const;
 export const CAPABILITY_OBSERVE_CONTAINER = "capability.observeContainer" as const;
 export const CAPABILITY_FETCH_INPUT = "capability.fetchInput" as const;
+/** Consumer-owned permission to retire a quiescent compiler for an image upgrade. */
+export const INPUT_REF_UPGRADE_ADMISSION = "upgrade-admission" as const;
 
 /**
  * siclaw → consumer: opaque run-state store (option B). siclaw OWNS the execution

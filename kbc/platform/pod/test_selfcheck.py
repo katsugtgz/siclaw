@@ -1601,6 +1601,7 @@ class _FakeRun:
     """Just the attrs _post_turn_selfcheck touches: the engine-neutral surface."""
     def __init__(self, workdir):
         self.run_id = "test-media-run"
+        self._turn_active = False
         self.workdir = workdir
         self._selfcheck_key = None
         self._l1_repairs_used = 0
@@ -2066,6 +2067,7 @@ async def test_seam_settles_when_nothing_pending():
 
         class _R:  # just what _emit_message touches
             workdir = td
+            _turn_active = False
             _selfcheck_key = None
             _l1_repairs_used = 0
             _turn_text = ["编好了"]

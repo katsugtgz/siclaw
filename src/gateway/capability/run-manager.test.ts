@@ -30,6 +30,46 @@ beforeEach(() => {
 });
 
 describe("CapabilityRunManager", () => {
+  it("persists prepared image retirement across Runtime recovery", async () => {
+    const backend = new FakeBackend();
+    const manager = new CapabilityRunManager(backend);
+    const run = await manager.startRun({ profile: "kb-compile", orgId: "org", initialStatus: "idle" });
+    backend.failPersistCount = 1;
+    await expect(manager.checkpointImageUpgrade(run.runId, true)).rejects.toThrow();
+    expect(run.imageUpgradePending).toBeUndefined();
+    await manager.checkpointImageUpgrade(run.runId, true);
+    const state = backend.persists().at(-1)!.params;
+    expect(state.checkpoint.image_upgrade).toEqual({ continuation: true });
+    backend.activeRuns = [{ ...state, id: run.runId }];
+    const onIdle = vi.fn(async () => {});
+    const recovered = new CapabilityRunManager(backend, { now: () => 10_000, onIdle, idleTtlMs: 1 });
+    await recovered.reconcile();
+    expect(recovered.get(run.runId)?.imageUpgradePending).toBe(true);
+    expect(onIdle).toHaveBeenCalledOnce();
+  });
+  it("checks idle maintenance fairly and never overlaps its in-flight checks with reaping", async () => {
+    const backend = new FakeBackend();
+    let now = 0;
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const onIdle = vi.fn(async () => held);
+    const onReap = vi.fn();
+    const manager = new CapabilityRunManager(backend, { now: () => now, idleTtlMs: 100, onIdle, onReap });
+    const idle = [];
+    for (let i = 0; i < 6; i++) idle.push(await manager.startRun({ profile: "kb-compile", orgId: "o", initialStatus: "idle" }));
+    await manager.startRun({ profile: "kb-compile", orgId: "o", initialStatus: "running" });
+    await manager.reconcile();
+    expect(onIdle).toHaveBeenCalledTimes(4);
+    now = 101;
+    await manager.reapStale();
+    expect(onReap).toHaveBeenCalledTimes(2);
+    expect(onReap.mock.calls.every(([r]) => idle.slice(4).includes(r))).toBe(true);
+    release();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    now = 0;
+    await manager.reconcile();
+    expect(onIdle).toHaveBeenCalledTimes(8);
+  });
   it("startRun initialStatus idle — a hosting-only run is a conversation at rest, not a stuck turn", async () => {
     const be = new FakeBackend();
     const mgr = new CapabilityRunManager(be);
