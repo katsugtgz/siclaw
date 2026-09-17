@@ -22,6 +22,8 @@ import type {
 import { estimateMessagesTokens } from "../compaction.js";
 import type { LlmCallRecorder } from "../llm-call-recorder.js";
 import { rememberPromptFiles } from "../openai-file-payload.js";
+import type { AgentMailbox } from "../agent-mailbox.js";
+import { installMailboxLoop } from "../mailbox-loop.js";
 
 /** Valid pi thinking levels; guards reasoningEffort coming off the wire. */
 const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh"]);
@@ -109,6 +111,13 @@ export class PiAgentBrain implements BrainSession {
 
   /** A strict repair owns the session loop; steers must become separate turns. */
   private requiredResultRepairActive = false;
+  private mailbox?: AgentMailbox;
+  private mailboxCheckpoints = new Map<unknown, number>();
+
+  setMailbox(mailbox: AgentMailbox | undefined): void {
+    this.mailbox = mailbox;
+    this.mailboxCheckpoints.clear();
+  }
 
   constructor(
     readonly session: AgentSession,
@@ -125,7 +134,7 @@ export class PiAgentBrain implements BrainSession {
       const decision = await previous?.(context, signal);
       if (decision?.block) return decision;
       if (context.toolCall.name === "transfer_to_agent") {
-        if (session.pendingMessageCount > 0) {
+        if (session.pendingMessageCount > 0 || this.mailbox?.ready) {
           return { block: true, reason: "Pending user input or task results must be processed before handing off. Read them and reconsider the destination." };
         }
         // Reserve synchronously after extension checks. New steers cannot enter
@@ -219,6 +228,8 @@ export class PiAgentBrain implements BrainSession {
     const successfulTools = new Set<string>();
 
     const promptOptions = this.promptOptionsForMedia(media);
+
+    const releaseMailbox = this.mailbox ? installMailboxLoop(this.session, this.mailbox) : undefined;
 
     const unsub = this.session.subscribe((event: any) => {
       if (event?.message?.role === "assistant") this.llmCalls?.attachPendingFailure(event.message);
@@ -336,6 +347,7 @@ export class PiAgentBrain implements BrainSession {
       }
     } finally {
       unsub();
+      releaseMailbox?.();
       this.llmCalls?.endPrompt();
     }
   }
@@ -481,9 +493,10 @@ export class PiAgentBrain implements BrainSession {
     }
     const promptOptions = this.promptOptionsForMedia(media);
     if (!promptOptions) {
-      return this.session.steer(text);
+      return this.session.steer(text).then(() => { this.mailbox?.steer(); });
     }
-    return this.session.prompt(text, { ...promptOptions, streamingBehavior: "steer" });
+    return this.session.prompt(text, { ...promptOptions, streamingBehavior: "steer" })
+      .then(() => { this.mailbox?.steer(); });
   }
 
   followUp(text: string): Promise<void> {
@@ -762,7 +775,9 @@ export class PiAgentBrain implements BrainSession {
   }
 
   createPromptCheckpoint(): unknown {
-    return this.session.sessionManager.getLeafId();
+    const checkpoint = this.session.sessionManager.getLeafId();
+    if (this.mailbox) this.mailboxCheckpoints.set(checkpoint, this.mailbox.checkpoint());
+    return checkpoint;
   }
 
   restorePromptCheckpoint(checkpoint: unknown): void {
@@ -776,6 +791,8 @@ export class PiAgentBrain implements BrainSession {
       sessionManager.resetLeaf();
     }
     this.session.agent.state.messages = sessionManager.buildSessionContext().messages;
+    const mailboxCheckpoint = this.mailboxCheckpoints.get(checkpoint);
+    if (mailboxCheckpoint !== undefined) this.mailbox?.rollback(mailboxCheckpoint);
   }
 }
 

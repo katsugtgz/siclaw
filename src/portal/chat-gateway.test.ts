@@ -183,6 +183,13 @@ describe("chat-gateway routes", () => {
         sessionId: "s1",
         systemPrompt: "You are an ops bot.",
       }));
+      const sent = vi.mocked(connMap.sendCommand).mock.calls[0][2];
+      expect(sent.requestMode).toBe("async");
+      const listener = vi.mocked(connMap.subscribe).mock.calls[0][2];
+      listener({ sessionId: "s1", turnId: "another-request", event: { type: "prompt_done" } });
+      expect(res.writableEnded).not.toBe(true);
+      listener({ sessionId: "s1", turnId: sent.turnId, event: { type: "prompt_done" } });
+      expect(res.end).toHaveBeenCalled();
     });
 
     it("rejects another user's session before opening SSE or sending a command", async () => {

@@ -1,5 +1,6 @@
 import { AgentRetiredError } from "../shared/agent-retirement.js";
 import { parseHandoffPolicy } from "../shared/agent-handoff.js";
+import { parseRequestMode } from "../shared/request-mode.js";
 /**
  * Siclaw Agent Runtime — stateless execution engine (DB-free).
  *
@@ -698,7 +699,10 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     }
   };
 
+  rpcMethods.set("chat.capabilities", async () => ({ requestModes: ["sync", "async"] }));
+
   rpcMethods.set("chat.send", async (params, context: RpcContext) => {
+    const requestMode = parseRequestMode(params.requestMode);
     const agentId = params.agentId as string;
     const userId = params.userId as string;
     const orgId = params.orgId as string | undefined;
@@ -741,6 +745,8 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     const requiredResultToolName = typeof params.requiredResultToolName === "string"
       ? params.requiredResultToolName.trim() || undefined
       : undefined;
+    const strictFixedExecutor = requireSessionPersistence && Boolean(requiredResultToolName) && typeof params.logicalTurnId !== "string";
+    if (strictFixedExecutor && requestMode === "sync") throw new Error("requestMode=sync is not supported by the strict result /run contract");
     if (!agentId || !userId || !text) {
       throw new Error("agentId, userId, and text are required");
     }
@@ -816,6 +822,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         `不要提"交接"、不要复述、不要重新自我介绍。要办的事:]\n${text}`
       : text;
     const promptOpts: PromptOptions = {
+      requestMode,
       sessionId,
       turnId,
       requiredResultToolName,
@@ -917,6 +924,9 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       // Released in the finally below so a throw cannot wedge the session.
       let releaseTurn: (() => void) | undefined;
       let steeredIntoExistingTurn = false;
+      const acquireTurn = () => strictFixedExecutor
+        ? sessionTurnLocks.acquire(sessionId, undefined, { signal: turnAbort.signal })
+        : sessionTurnLocks.acquireRequest(sessionId, requestMode, turnAbort.signal, typeof params.logicalTurnId === "string");
       try {
         // One turn at a time for this session, across every box (see session-turn-lock.ts).
         // If the session is already running, fall back to the SAME steer the AgentBox's own
@@ -924,13 +934,13 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         // stream_error/prompt_done here instead would tell the frontend the RUNNING turn
         // had ended: it stops rendering and hides Stop while the turn is still going.
         try {
-          releaseTurn = await sessionTurnLocks.acquire(sessionId);
+          releaseTurn = await acquireTurn();
         } catch (busyErr) {
           throwIfStoppedBeforePrompt();
           // A strict machine request is one distinct turn with one distinct
           // result. Folding it into the running turn as a steer would lose its
           // required-result contract, so surface busy and let the caller retry.
-          if (requiredResultToolName) throw busyErr;
+          if (requiredResultToolName || requestMode === "sync" || !sessionTurnLocks.canSteer(sessionId)) throw busyErr;
           const running = sessionTurnLocks.busyOn(sessionId);
           const steered = running ? await new AgentBoxClient(running.endpoint, 10000, agentBoxTlsOptions)
             .steerSession(sessionId, text, { images, files })
@@ -948,12 +958,13 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
             if (promptMessageId) void bindMessageTraceId(promptMessageId, sessionId, steered.traceId).catch((bindErr) => {
               warnTraceBindFailure("busy-degrade steer", sessionId, promptMessageId!, bindErr);
             });
+            context.sendEvent("chat.event", { sessionId, turnId, event: { type: "request_steered" } });
             return; // the running turn owns the stream and will emit its own prompt_done
           }
           // No steer target, or the turn ended between the rejection and the steer. Ask
           // for the lock once more; if it is genuinely still busy this throws and the
           // caller gets the ordinary busy error.
-          releaseTurn = await sessionTurnLocks.acquire(sessionId);
+          releaseTurn = await acquireTurn();
         }
         throwIfStoppedBeforePrompt();
 
@@ -1048,7 +1059,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           // prompt will fire its own when it actually finishes, and an
           // extra one would close the frontend stream prematurely.
           if (err instanceof Error && err.message.includes("Session is already running")) {
-            if (requiredResultToolName) throw err;
+            if (requiredResultToolName || requestMode === "sync") throw err;
             const steerResult = await client.steerSession(sessionId, text, { images, files });
             steeredIntoExistingTurn = true;
             // Delivered as a steer onto the running turn — the dispatch did
@@ -1074,6 +1085,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
             if (promptMessageId) void bindMessageTraceId(promptMessageId, sessionId, steerResult.traceId).catch((bindErr) => {
               warnTraceBindFailure("automatic steer", sessionId, promptMessageId!, bindErr);
             });
+            context.sendEvent("chat.event", { sessionId, turnId, event: { type: "request_steered" } });
             return;
           }
           // Most dispatch failures have an UNKNOWN outcome, not "did not happen":
@@ -2019,13 +2031,27 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     return { ok: true, ...(requestedTurnId ? { turnId: requestedTurnId, stopped } : {}) };
   });
 
-  rpcMethods.set("chat.steer", async (params) => {
+  rpcMethods.set("chat.steer", async (params, context: RpcContext) => {
+    const requestMode = parseRequestMode(params.requestMode);
     const agentId = params.agentId as string;
     const sessionId = params.sessionId as string;
     const text = params.text as string;
     const images = params.images as PromptOptions["images"];
     const files = params.files as PromptOptions["files"];
     if (!agentId || !sessionId || !text) throw new Error("agentId, sessionId, text required");
+
+    if (requestMode === "sync" || !sessionTurnLocks.canSteer(sessionId)) {
+      // Only the control plane may claim a successor to a managed request.
+      // Its caller re-submits through the request queue; never start an unfenced
+      // local execution just because a steer raced a sync request admission.
+      if (sessionTurnLocks.isManaged(sessionId)) throw new Error("REQUEST_REQUIRES_QUEUE: submit through the conversation request queue");
+      const binding = await resolveAgentModelBinding(agentId, frontendClient);
+      const userId = params.userId ?? await sessionRegistry.resolveUser(sessionId);
+      if (!binding || !userId) throw new Error("Cannot queue input without the session owner and model binding");
+      const send = rpcMethods.get("chat.send")!;
+      const result = await send({ ...params, ...binding, userId, requestMode }, context);
+      return { ...(result as object), queued: true };
+    }
 
     // Persist the steer as a user message BEFORE injecting it, mirroring
     // chat.send (L198). Without this the steer only rides the running prompt's

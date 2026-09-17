@@ -44,6 +44,7 @@ import {
   taskCreateRegistration, taskUpdateRegistration, taskListRegistration, taskGetRegistration,
 } from "./workflow/task-tools.js";
 import { registration as spawnSubagent } from "./workflow/spawn-subagent.js";
+import { waitAgentRegistration, sendParentMessageRegistration } from "./workflow/agent-mailbox-tools.js";
 import { registration as jobStop } from "./workflow/job-stop.js";
 import { registration as taskOutput } from "./workflow/task-output.js";
 
@@ -59,6 +60,6 @@ export const allToolEntries: ToolEntry[] = [
   saveFeedback, manageSchedule, taskReport, skillPreview,
   channelUpdate, requestInput,
   taskCreateRegistration, taskUpdateRegistration, taskListRegistration, taskGetRegistration,
-  spawnSubagent, jobStop, taskOutput,
+  spawnSubagent, waitAgentRegistration, sendParentMessageRegistration, jobStop, taskOutput,
   transferToAgent, searchHandoffTargets,
 ];
