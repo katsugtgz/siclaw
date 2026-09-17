@@ -16,8 +16,29 @@ _APIS = {"anthropic-messages", "openai-completions", "openai-responses"}
 _THINKING_LEVELS = {"off", "minimal", "low", "medium", "high", "xhigh", "max"}
 
 
-def configure(execution: object) -> None:
-    global _roles, _agent_type
+def refresh_credentials(execution: object) -> None:
+    """Rotate secrets atomically while retaining the run's frozen model contract."""
+    if not isinstance(execution, dict) or set(execution.get("roles", {})) != set(_roles):
+        raise ValueError("Credential refresh does not match the active execution")
+    replacements = {}
+    for role, current in _roles.items():
+        updated = execution["roles"][role]
+        if not isinstance(updated, dict) or any(updated.get(key) != current.get(key)
+                for key in ("model", "thinking_level", "auth_header", "headers", "source_model_id")):
+            raise ValueError("Credential refresh cannot change the active model contract")
+        token = updated.get("api_key")
+        if not isinstance(token, str) or not token.strip():
+            raise ValueError("Credential refresh contains an empty credential")
+        replacements[role] = token
+    for role, token in replacements.items():
+        _roles[role]["api_key"] = token
+
+
+def credential(role: str) -> str:
+    return _roles[role]["api_key"]
+
+
+def validate_execution(execution: object) -> tuple[dict, dict | None]:
     if not isinstance(execution, dict) or execution.get("version") not in (1, 2):
         raise ValueError("Pi compilation requires execution configuration version 1 or 2")
     roles = execution.get("roles")
@@ -65,27 +86,35 @@ def configure(execution: object) -> None:
             raise ValueError("Compiler Agent Type requires a published release identity")
         if not isinstance(agent_type.get("system_prompt", ""), str):
             raise ValueError("Invalid compiler Agent Type instructions")
-    _agent_type = deepcopy(agent_type)
-    _roles = deepcopy(roles)
+    return deepcopy(roles), deepcopy(agent_type)
+
+
+def configure(execution: object) -> None:
+    global _roles, _agent_type
+    _roles, _agent_type = validate_execution(execution)
 
 
 def for_role(role: str, *, model: str | None = None, effort: str | None = None,
-             session_kind: str = "verify") -> dict:
-    if role not in _roles:
+             session_kind: str = "verify", transport: bool = True, execution: dict | None = None) -> dict:
+    roles, agent_type = validate_execution(execution) if execution is not None else (_roles, _agent_type)
+    if role not in roles:
         raise ValueError(f"Pi model role {role} is not configured")
-    config = deepcopy(_roles[role])
+    config = deepcopy(roles[role])
     config["role"] = role
-    if _agent_type is not None:
-        config["agent_type"] = {key: _agent_type[key] for key in ("slug", "release_id", "revision_id", "release_version", "harness", "harness_version")}
+    if agent_type is not None:
+        config["agent_type"] = {key: agent_type[key] for key in ("slug", "release_id", "revision_id", "release_version", "harness", "harness_version")}
         if role == "compile":
-            config["system_prompt_append"] = _agent_type.get("system_prompt", "")
+            config["system_prompt_append"] = agent_type.get("system_prompt", "")
     if model and config["model"]["id"] != model:
         raise ValueError(f"Pi model role {role} differs from the requested model; refresh its execution configuration")
     if effort is not None:
         if effort not in _THINKING_LEVELS:
             raise ValueError("Invalid Pi thinking level")
         config["thinking_level"] = effort
-    if config["model"]["api"] == "anthropic-messages":
+    if transport:
+        import model_access
+        config = model_access.route(config)
+    if transport and config["model"]["api"] == "anthropic-messages":
         import destream
         config["model"]["baseUrl"] = destream.session_endpoint(session_kind, config["model"]["baseUrl"])
     return config
@@ -101,4 +130,4 @@ def for_model(model: str, *, effort: str | None = None, session_kind: str = "ver
 
 
 def role_model(role: str) -> str:
-    return for_role(role, session_kind="test")["model"]["id"]
+    return for_role(role, session_kind="test", transport=False)["model"]["id"]

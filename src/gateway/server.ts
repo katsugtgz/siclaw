@@ -39,7 +39,7 @@ import { CAPABILITY_OBSERVE_CONTAINER } from "./capability/contract.js";
 import { driveCapabilitySession } from "./capability/session-driver.js";
 import { asFailureToken } from "./capability/failure.js";
 import { driveTestSession, shouldRelayTestSession } from "./capability/test-relay.js";
-import { CAPABILITY_GET_RUN, isTerminalCapabilityStatus } from "./capability/contract.js";
+import { CAPABILITY_GET_RUN, CAPABILITY_FETCH_INPUT, isTerminalCapabilityStatus } from "./capability/contract.js";
 import type {
   CapabilityCancelRequest,
   CapabilityCancelResponse,
@@ -1373,6 +1373,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
             // an older box ignores the field, while a newer box only waits for
             // ACKs when a runtime explicitly advertises this support.
             artifact_ack: true,
+            credential_refresh: true,
             // Whole-block authority: consumer LLM config wins as-is; only an
             // absent block uses Runtime's Helm env. The box applies it before
             // its SDK connects. Never logged here; token stays out of PodSpec.
@@ -1705,7 +1706,9 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // candidate/ draft to pin even after a reap/restart.
     const { client } = await ensureCapabilitySession(runId, rec.profile, rec.orgId || undefined, undefined);
     const allowedTools = getBoxProfile("kb-test").allowedTools ?? null;
+    const testInput = await frontendClient.request(CAPABILITY_FETCH_INPUT, { run_id: runId, ref: "test-model" }) as { llm?: unknown };
     const opened = (await client.postJson(`/test-session/${runId}`, {
+      ...(testInput.llm ? { llm: testInput.llm } : {}),
       allowed_tools: allowedTools,
       // Optional consumer-provided snapshot (e.g. a published version bundle);
       // absent → the box pins the run's candidate/ draft.
@@ -1759,7 +1762,10 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // If the box died since testStart, the respawned box won't know this tid →
     // the box's 404 surfaces as an error and the consumer starts a fresh test
     // session (test sessions are disposable; there is nothing to resume).
-    await client.postJson(`/test-message/${req.test_session_id}`, { message: req.message });
+    const testInput = await frontendClient.request(CAPABILITY_FETCH_INPUT, { run_id: req.run_id, ref: "test-model" }) as { llm?: unknown };
+    await client.postJson(`/test-message/${req.test_session_id}`, {
+      message: req.message, ...(testInput.llm ? { llm: testInput.llm } : {}),
+    });
     return { ok: true, run_id: req.run_id, test_session_id: req.test_session_id };
   });
 

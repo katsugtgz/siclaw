@@ -171,7 +171,10 @@ def engine_kind() -> str:
 
 
 def create_agent_client(**kwargs):
-    if engine_kind() == "claude_agent_sdk":
+    selected = kwargs.pop("engine_kind", None) or engine_kind()
+    if selected not in {"claude_agent_sdk", "pi_agent"}:
+        raise ValueError("Unsupported compiler engine")
+    if selected == "claude_agent_sdk":
         from claude_engine import ClaudeAgentClient
         return ClaudeAgentClient(**kwargs)
     from pi_engine import PiAgentClient

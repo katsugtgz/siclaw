@@ -26,6 +26,7 @@ import type {
 } from "./contract.js";
 import {
   CAPABILITY_EVENT,
+  CAPABILITY_FETCH_INPUT,
   CAPABILITY_PERSIST_ARTIFACTS,
   CAPABILITY_PERSIST_TURN,
   isTerminalCapabilityStatus,
@@ -37,6 +38,8 @@ import { ExecutionObservationRelay, type ExecutionObservation } from "./executio
 
 interface BoxEvent {
   type: string;
+  request_id?: string;
+  model?: { source_model_id: string; id: string; baseUrl: string; api: string };
   /** Negotiated ordered delivery; only these frames require a persistence ACK. */
   event_id?: string;
   event_ack?: number;
@@ -280,6 +283,28 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
       console.log(`[capability] run=${runId} box event: ${evt.type}`);
     }
     switch (evt.type) {
+      case "refresh_credentials": {
+        if (!evt.request_id || !/^[a-f0-9]{32}$/.test(evt.request_id)) break;
+        // Private control traffic only: never publish the LLM block as an
+        // event, observation, checkpoint, or error body.
+        let reply: { api_key?: unknown; error?: string };
+        try {
+          const input = await frontendClient.request(CAPABILITY_FETCH_INPUT, {
+            run_id: runId, ref: "model-credential", model: evt.model,
+          }) as { api_key?: unknown };
+          reply = input.api_key ? { api_key: input.api_key } : { error: "credential_refresh_unavailable" };
+        } catch {
+          reply = { error: "credential_refresh_failed" };
+        }
+        try {
+          await client.postJson(`/model-credentials/${runId}/${evt.request_id}`, reply, 10_000);
+        } catch {
+          // The box owns a bounded refresh timeout. A lost reply must not
+          // tear down its authoring session or discard its checkpoints.
+          console.warn(`[capability] credential refresh reply unavailable run=${runId}`);
+        }
+        break;
+      }
       case "execution_observation":
         observations.enqueue(evt.observation);
         break;

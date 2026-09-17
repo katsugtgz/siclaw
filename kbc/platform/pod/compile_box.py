@@ -52,6 +52,7 @@ from aiohttp import web
 
 import batching
 import destream
+import model_access
 import incremental
 import mediaverify
 import office_ingest
@@ -5920,8 +5921,8 @@ def _test_max_turns() -> int:
     return int(os.environ.get("KBC_TEST_MAX_TURNS", "60"))
 
 
-def _test_sdk_version() -> str:
-    if _engine_kind() == "claude_agent_sdk":
+def _test_sdk_version(engine: str | None = None) -> str:
+    if (engine or _engine_kind()) == "claude_agent_sdk":
         from claude_engine import sdk_version
         return sdk_version()
     return pi_sdk_version()
@@ -5939,6 +5940,7 @@ def _test_consumer_fingerprint(
     model: str | None = None,
     sdk_version: str | None = None,
     max_turns: int | None = None,
+    llm: dict | None = None,
 ) -> str:
     """Stable identity for the answer-affecting read-only consumer contract.
 
@@ -5950,18 +5952,20 @@ def _test_consumer_fingerprint(
     role = _prompt("test_role", locale)
     contract = {
         "version": TEST_CONSUMER_CONTRACT_VERSION,
-        "engine": _engine_kind(),
+        "engine": llm["engine"] if llm else _engine_kind(),
         "role_sha256": hashlib.sha256(role.encode("utf-8")).hexdigest(),
         "model": model or _test_model(),
-        "sdk_version": sdk_version or _test_sdk_version(),
+        "sdk_version": sdk_version or _test_sdk_version(llm["engine"] if llm else None),
         "tools": sorted(set(_effective_test_allowed_tools(allowed_tools))),
         # Claude enforces this as SDK turns; the Codex adapter enforces the same
         # configured value as local tool calls inside one user turn.
         "turn_budget": max_turns if max_turns is not None else _test_max_turns(),
     }
     if _engine_kind() in {"pi_agent", "claude_agent_sdk"}:
-        execution = pi_config.for_role("blue", session_kind="test")
-        contract["execution"] = {"model": execution["model"], "thinking_level": execution.get("thinking_level", "off")}
+        execution = pi_config.for_role("blue", session_kind="test", transport=False,
+                                       execution=llm["execution"] if llm else None)
+        contract["execution"] = {"model": execution["model"], "thinking_level": execution.get("thinking_level", "off"),
+                                 "source_model_id": execution.get("source_model_id")}
     encoded = json.dumps(contract, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
@@ -6490,9 +6494,12 @@ def _build_test_client(run: "TestRun", sid: str):
     out so both the first connect and a post-stall rebuild build an identical
     client (same snapshot, same profile) — only the SDK session id differs."""
     effective_tools = _effective_test_allowed_tools(run.allowed_tools)
+    llm = getattr(run, "consumer_llm", None)
     return create_agent_client(
+        engine_kind=llm["engine"] if llm else None,
         cwd=run.cwd, system_prompt=_prompt("test_role", run.locale), session_id=sid,
-        model_config=pi_config.for_role("blue", model=run.consumer_model or _test_model(), session_kind="test"),
+        model_config=pi_config.for_role("blue", model=run.consumer_model or _test_model(), session_kind="test",
+                                        execution=llm["execution"] if llm else None),
         tools=FileTools(run.cwd, effective_tools, _make_test_path_guard(Path(run.cwd), run.locale)).tools(),
         max_model_calls=run.consumer_max_turns if run.consumer_max_turns is not None else _test_max_turns())
 
@@ -7066,17 +7073,16 @@ _CACHED_SESSION_SETTINGS = {
 
 
 async def handle_session(request: web.Request):
-    """Start (or no-op attach to) the run's persistent CONVERSATIONAL session —
-    it connects and waits for the first /message (prepare chat; a compile is just
-    a later turn). Idempotent: a second call for a live run is a no-op, so the
-    runtime can safely ensure-then-message. A live attach deliberately does not
-    hot-apply a new LLM block: its already-connected SDK child captured the
-    original environment. Rotate with the documented grace window + box respawn
-    until an idle-boundary client reconnect protocol exists."""
+    """Attach without restarting execution; only credentials may rotate live."""
     run_id = request.match_info["run_id"]
-    if run_id in RUNS:
-        return web.json_response({"ok": True, "run_id": run_id, "already_live": True})
     body = await request.json() if request.body_exists else {}
+    if run_id in RUNS:
+        if "llm" in body:
+            try:
+                pi_config.refresh_credentials((body.get("llm") or {}).get("execution"))
+            except ValueError as error:
+                return web.json_response({"error": str(error)}, status=409)
+        return web.json_response({"ok": True, "run_id": run_id, "already_live": True})
     # Consumer-managed LLM endpoint + KBC_* knobs (DESIGN-kb-llm-binding-v2):
     # applied to os.environ BEFORE any SDK/engine session exists, so the
     # persistent session, batch sessions, PK and media-verify all inherit them.
@@ -7089,6 +7095,8 @@ async def handle_session(request: web.Request):
     _seed_workdir(run.workdir)
     _ensure_workdir_constitution(run.workdir, run.locale)
     RUNS[run_id] = run
+    if body.get("credential_refresh") is True:
+        model_access.configure(run_id, run.emit)
     run.task = asyncio.create_task(_run_wrapper(run))
     return web.json_response({"ok": True, "run_id": run_id})
 
@@ -7624,7 +7632,19 @@ async def handle_open_test(request: web.Request):
             }},
             status=429)
     consumer_tools = _effective_test_allowed_tools(body.get("allowed_tools"))
-    consumer_model = _test_model()
+    consumer_llm = body.get("llm")
+    if consumer_llm is not None:
+        try:
+            if consumer_llm.get("engine") not in {"pi_agent", "claude_agent_sdk"}:
+                raise ValueError("Unsupported test engine")
+            selected = pi_config.for_role("blue", transport=False, execution=consumer_llm.get("execution"))
+            if consumer_llm["engine"] == "claude_agent_sdk" and selected["model"]["api"] != "anthropic-messages":
+                raise ValueError("Claude Agent SDK requires an Anthropic test model")
+        except (ValueError, TypeError, AttributeError):
+            return web.json_response({"error": "invalid test model configuration"}, status=400)
+        consumer_model = selected["model"]["id"]
+    else:
+        consumer_model = _test_model()
     consumer_max_turns = _test_max_turns()
     tid = str(uuid.uuid4())
     dest = Path(_test_snapshot_root()) / tid
@@ -7642,10 +7662,12 @@ async def handle_open_test(request: web.Request):
     # Tool whitelist from the runtime BoxProfile (kb-test); None/absent → read-only default.
     run.allowed_tools = consumer_tools
     run.consumer_model = consumer_model
+    run.consumer_llm = consumer_llm
     run.consumer_max_turns = consumer_max_turns
     run.consumer_fingerprint = _test_consumer_fingerprint(
         run.locale, run.allowed_tools, run.consumer_model,
         max_turns=run.consumer_max_turns,
+        llm=consumer_llm,
     )
     run.pages = pages
     if idem_key is not None:
@@ -7778,6 +7800,17 @@ async def handle_test_message(request: web.Request):
     text = (body.get("message") or "").strip()
     if not text:
         return web.json_response({"error": "message is required"}, status=400)
+    if body.get("llm") is not None:
+        llm = body["llm"]
+        try:
+            selected = pi_config.for_role("blue", transport=False, execution=llm["execution"])
+            fingerprint = _test_consumer_fingerprint(run.locale, run.allowed_tools, selected["model"]["id"],
+                max_turns=run.consumer_max_turns, llm=llm)
+        except (ValueError, KeyError, TypeError):
+            return web.json_response({"error": "invalid test model configuration"}, status=400)
+        if fingerprint != run.consumer_fingerprint:
+            return web.json_response({"error": {"code": "kb_test_model_changed", "retriable": False,
+                "message": "Test model changed; start a new test session"}}, status=409)
     if run._needs_rebuild or run._pending_terminator_deadline is not None:
         # Rebuild before arming whenever the generation stream is broken or in
         # doubt:
@@ -7932,6 +7965,7 @@ def build_app() -> web.Application:
         middlewares=[_client_certificate_middleware],
     )
     app.on_startup.append(destream.start)
+    app.on_startup.append(model_access.start)
     app.on_startup.append(_start_test_session_reaper)
     app.on_shutdown.append(_flush_on_shutdown)
     app.on_cleanup.append(_stop_test_session_reaper)
@@ -7943,6 +7977,7 @@ def build_app() -> web.Application:
         web.post("/sources/commit", handle_sources_commit),
         web.post("/authoring", handle_authoring),
         web.post("/session/{run_id}", handle_session),
+        web.post("/model-credentials/{run_id}/{request_id}", model_access.receive),
         web.post("/message/{run_id}", handle_message),
         web.post("/command/{run_id}", handle_command),
         web.post("/artifacts/ack/{run_id}", handle_artifacts_ack),
