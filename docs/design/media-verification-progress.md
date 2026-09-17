@@ -16,9 +16,13 @@ remain owned by the authoring operation.
 
 Progress and transcript artifacts sync at most once per ten seconds plus group
 phase boundaries. This dedicated path never syncs an in-flight Candidate batch.
-The regular workspace sync also retries these artifacts. Progress counters track
-completed work; failures can update the snapshot without advancing effective
-progress. No percentage or completion time is inferred from inventory size.
+While transcription or comparison workers are pending, a timed wait flushes
+completed work even if no further result arrives. It also retries a failed sync
+during batch compilation, when regular workspace sync is paused. Cancellation
+drains the group's workers and ends these timed flushes. Sync-only ticks leave
+the recorded progress timestamps unchanged. Progress counters track completed
+work; failures can update the snapshot without advancing effective progress.
+No percentage or completion time is inferred from inventory size.
 
 Transcripts are atomically saved per image under
 `authoring/media-transcripts/<sha256-of-image-path>.json` immediately after a

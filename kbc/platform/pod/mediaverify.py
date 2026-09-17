@@ -372,7 +372,7 @@ async def run_blind_verify(engine, workdir: str, pending: dict[str, list[str]],
 
     say(f"Self-check (image · blind transcription): transcribing {len(images)} image(s)…" if en
         else f"自检(图像·盲转写):{len(images)} 张图转写中…")
-    await asyncio.gather(*(_one(i) for i in images))
+    await status.gather(*(_one(i) for i in images))
     await status.update("comparing", cache_entries=len(cache))
 
     findings: list[dict] = []
@@ -421,7 +421,7 @@ async def run_blind_verify(engine, workdir: str, pending: dict[str, list[str]],
 
     say(f"Self-check (image · comparison): comparing {len(pending)} page(s)…" if en
         else f"自检(图像·比对):{len(pending)} 页比对中…")
-    await asyncio.gather(*(_page(p, imgs) for p, imgs in pending.items()))
+    await status.gather(*(_page(p, imgs) for p, imgs in pending.items()))
     shutil.rmtree(empty, ignore_errors=True)
     await status.update("complete", findings=len(findings))
     if suppressed_all:
