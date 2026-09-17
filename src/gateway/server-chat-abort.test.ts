@@ -126,6 +126,8 @@ function fakeAgentBoxManager() {
     setSpawnEnvResolver: vi.fn(),
     setPersistenceResolver: vi.fn(),
     getOrCreate: vi.fn(async () => ({ endpoint: "https://fake.internal" })),
+    // Non-spawning lookup, used by chat.sessionStatus.
+    getAsync: vi.fn(async () => ({ endpoint: "https://fake.internal" })),
     list: vi.fn(() => []),
     cleanup: vi.fn(async () => {}),
   } as any;
@@ -510,6 +512,67 @@ describe("startRuntime — chat.abort wiring", () => {
 
     abortSessionError = new Error("box unreachable");
     await expect(abort({ agentId: "a", sessionId: "S" })).rejects.toThrow(/box unreachable/);
+  });
+
+  it("reports a Stop that beat the dispatch as stopped — and then makes it true", async () => {
+    // The turn is still on its way to the box, so the box answers 404. Calling that
+    // `pending` was the bug: the control plane could never obtain proof of the stop,
+    // so it kept its claim on the conversation and refused every later message —
+    // permanently, since nothing else releases it. This Runtime cancelled the turn
+    // itself, so the 404 here is not ambiguous.
+    const manager = fakeAgentBoxManager();
+    manager.getOrCreate.mockResolvedValue({ boxId: "box-a", endpoint: "https://fake.internal" });
+    server = await bootRuntime(manager);
+    const send = server.rpcMethods.get("chat.send")!;
+    const abort = server.rpcMethods.get("chat.abort")!;
+
+    let releasePrompt: () => void = () => {};
+    promptBlocker = new Promise<void>((resolve) => { releasePrompt = resolve; });
+    await send({ agentId: "a", userId: "u", text: "hi", sessionId: "pre", turnId: "T-pre" }, { sendEvent: vi.fn() });
+    await waitFor(() => promptCalls.length === 1);
+
+    abortSessionError = new Error('AgentBox request failed: 404 {"error":"Session not found"}');
+    const ack = await abort({ agentId: "a", sessionId: "pre", turnId: "T-pre" });
+    expect(ack).toMatchObject({ ok: true, turnId: "T-pre", stopped: true });
+
+    // The answer above is a claim about the future, so hold it to it: once the
+    // in-flight prompt lands, the turn is stopped on the box it actually reached.
+    abortSessionError = undefined;
+    releasePrompt();
+    await waitFor(() => abortSessionTurnIds.filter((id) => id === "T-pre").length >= 2);
+  });
+
+  it("reports a turn accepted but not yet dispatched as pending", async () => {
+    // The cold-spawn window. The box has never heard of this session and would say so
+    // truthfully; only this Runtime knows a turn is on its way there. A caller that
+    // acts on "not running" — releasing a conversation's claim — must see this.
+    const manager = fakeAgentBoxManager();
+    manager.getOrCreate.mockResolvedValue({ boxId: "box-a", endpoint: "https://fake.internal" });
+    server = await bootRuntime(manager);
+    const send = server.rpcMethods.get("chat.send")!;
+    const status = server.rpcMethods.get("chat.sessionStatus")!;
+
+    expect(await status({ agentId: "a", sessionId: "spawning" })).toMatchObject({ pending: false });
+
+    let releasePrompt: () => void = () => {};
+    promptBlocker = new Promise<void>((resolve) => { releasePrompt = resolve; });
+    await send({ agentId: "a", userId: "u", text: "hi", sessionId: "spawning", turnId: "T-spawn" }, { sendEvent: vi.fn() });
+    await waitFor(() => promptCalls.length === 1);
+
+    expect(await status({ agentId: "a", sessionId: "spawning" })).toMatchObject({ pending: true });
+    releasePrompt();
+  });
+
+  it("keeps a 404 ambiguous for a turn this Runtime never ran", async () => {
+    // Same 404, no local cancellation behind it: the turn may be running under a
+    // Runtime process that is gone, or on a box we did not ask. Nothing here proves
+    // it stopped, and claiming otherwise would release a live conversation.
+    server = await bootRuntime();
+    const abort = server.rpcMethods.get("chat.abort")!;
+
+    abortSessionError = new Error('AgentBox request failed: 404 {"error":"Session not found"}');
+    const ack = await abort({ agentId: "a", sessionId: "unknown", turnId: "T-foreign" });
+    expect(ack).toMatchObject({ ok: true, turnId: "T-foreign", stopped: false });
   });
 
   it("does not ask for an acknowledgement on an ordinary turn", async () => {

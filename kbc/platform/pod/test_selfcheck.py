@@ -1360,7 +1360,7 @@ async def test_media_clean_pass_settles_converge():
         _mk(base, "candidate/p.md", "---\ntype: Topic\nsources:\n  - resource: s/a.md\n  - resource: s/i1.png\n---\nx")
         run = _FakeRun(td)
 
-        async def clean_verify(engine, workdir, pending, progress=None, locale=None):
+        async def clean_verify(engine, workdir, pending, progress=None, locale=None, **kwargs):
             return {"findings": [], "errors": [], "images": 1, "cache_hits": 0,
                     "completed_pages": sorted(pending), "failed_pages": []}
 
@@ -1550,7 +1550,7 @@ async def test_media_chunks_self_drain_then_settle():
 
         calls: list[dict] = []
 
-        async def clean_verify(engine, workdir, pending, progress=None, locale=None):
+        async def clean_verify(engine, workdir, pending, progress=None, locale=None, **kwargs):
             calls.append(dict(pending))
             return {"findings": [], "errors": [], "images": 1, "cache_hits": 0,
                     "completed_pages": sorted(pending), "failed_pages": []}
@@ -1600,6 +1600,7 @@ def test_state_key():
 class _FakeRun:
     """Just the attrs _post_turn_selfcheck touches: the engine-neutral surface."""
     def __init__(self, workdir):
+        self.run_id = "test-media-run"
         self.workdir = workdir
         self._selfcheck_key = None
         self._l1_repairs_used = 0
@@ -1693,7 +1694,7 @@ async def test_media_verify_wiring():
 
         calls: list[dict] = []
 
-        async def fake_verify(engine, workdir, pending, progress=None, locale=None):
+        async def fake_verify(engine, workdir, pending, progress=None, locale=None, **kwargs):
             calls.append(dict(pending))
             done = sorted(pending)  # every page in the chunk verifies to completion
             if len(calls) == 1:  # first chunk: one confirmed misread (still a COMPLETED verification)
@@ -1768,7 +1769,7 @@ async def test_media_inject_failure_does_not_double_settle():
             raise RuntimeError("session gone")
         run.inject_user_message = broken_inject
 
-        async def verify_with_findings(engine, workdir, pending, progress=None, locale=None):
+        async def verify_with_findings(engine, workdir, pending, progress=None, locale=None, **kwargs):
             return {"findings": [{"page": "p.md", "image": "s/i1.png", "kind": "不一致",
                                   "claim": "x", "expected": "y", "fix": "z"}],
                     "errors": [], "images": 1, "cache_hits": 0,
@@ -1815,7 +1816,7 @@ async def test_media_failed_chunk_still_drains_later_chunks():
 
         calls: list[dict] = []
 
-        async def p_fails_q_verifies(engine, workdir, pending, progress=None, locale=None):
+        async def p_fails_q_verifies(engine, workdir, pending, progress=None, locale=None, **kwargs):
             calls.append(dict(pending))
             done = [p for p in pending if p != "p.md"]
             failed = [p for p in pending if p == "p.md"]
@@ -1871,7 +1872,7 @@ async def test_media_failed_pages_retry_then_exhaust():
         _mk(base, "candidate/p.md", "---\ntype: Topic\nsources:\n  - resource: s/a.md\n  - resource: s/i1.png\n---\nx")
         run = _FakeRun(td)
 
-        async def failing_verify(engine, workdir, pending, progress=None, locale=None):
+        async def failing_verify(engine, workdir, pending, progress=None, locale=None, **kwargs):
             return {"findings": [], "errors": ["transcription failed s/i1.png: boom"],
                     "images": 1, "cache_hits": 0,
                     "completed_pages": [], "failed_pages": sorted(pending)}
@@ -1920,7 +1921,7 @@ async def test_media_attempt_count_resets_on_success():
         run = _FakeRun(td)
         calls = [0]
 
-        async def flaky_verify(engine, workdir, pending, progress=None, locale=None):
+        async def flaky_verify(engine, workdir, pending, progress=None, locale=None, **kwargs):
             calls[0] += 1
             if calls[0] == 1:  # first attempt: transcription failure
                 return {"findings": [], "errors": ["transcription failed s/i1.png: flaky"],

@@ -394,7 +394,7 @@ describe("driveCapabilitySession — box event → capability wire mapping", () 
           { type: "syncArtifacts", artifacts: [{ path: "candidate/a.md", content: "# A" }] },
         ]),
         runId: "r1", frontendClient: fe, manager: mgr,
-      })).rejects.toThrow("no longer active");
+      })).rejects.toMatchObject({ name: "RelayArtifactPersistenceError", message: expect.stringContaining("no longer active") });
     } finally {
       errSpy.mockRestore();
     }
@@ -625,7 +625,7 @@ describe("driveCapabilitySession — bounded stream reconnect", () => {
     await expect(driveCapabilitySession({
       client: reliableClient(client), runId: "r1", frontendClient: fakeFrontend(), manager: mgr,
       reconnect: { ...alive, maxAttempts: 2 },
-    })).rejects.toThrow("still broken");
+    })).rejects.toMatchObject({ name: "RelayStreamError", message: "still broken" });
     expect(paths).toEqual(["/events/r1?ack=1", "/events/r1?ack=1&replay=1", "/events/r1?ack=1&replay=1"]);
   });
 

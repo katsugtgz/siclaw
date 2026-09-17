@@ -2008,8 +2008,18 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // would let a turn settle in between, drop us into the session-wide branch, and
     // break the consumer of a SUCCESSOR that started meanwhile. The snapshot above
     // decides it instead.
+    //
+    // ownedTargets records the turns this Runtime actually cancelled — it holds their
+    // controller, so their outcome is not a matter of inference. That is evidence the
+    // box cannot supply, and stopOne below is where it pays off.
+    const ownedTargets = new Set<string>();
     if (liveTurns.length > 0) {
-      for (const id of targets) turnAborts.get(id)?.abort();
+      for (const id of targets) {
+        const ctrl = turnAborts.get(id);
+        if (!ctrl) continue;
+        ctrl.abort();
+        ownedTargets.add(id);
+      }
     } else {
       // Nothing of ours is registered for this session — a turn from before a
       // restart, or a caller naming one we never saw. Fall back to the session's own
@@ -2027,8 +2037,20 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // reporting it as a failed Stop would be a lie.
     const stopOne = (id?: string) => client.abortSession(sessionId, id).catch((err) => {
       if (!isSessionNotFound(err)) throw err;
-      console.log(`[runtime] abort: session=${sessionId} not on the box we asked; treating as already stopped`);
-      return { ok: true, pending: true }; // no turn-specific stop proof from a legacy 404
+      // A 404 ON ITS OWN is ambiguous — the turn may be running on another box, or
+      // under a Runtime process that is gone — so it earns no stop proof. It stops
+      // being ambiguous for a turn we OWN: its controller is aborted, so chat.send
+      // throws at its next pre-prompt checkpoint and releases the dispatch, and a
+      // prompt() still in flight is stopped on the box the session lock names by the
+      // post-acceptance block there. Such a turn can no longer reach any box, which
+      // is precisely what "stopped" means.
+      //
+      // Reporting it `pending` was a Stop pressed in the pre-dispatch window becoming
+      // permanent: the control plane could never prove the stop, so it never released
+      // its claim on the conversation and every later message was refused as busy.
+      const owned = id !== undefined && ownedTargets.has(id);
+      console.log(`[runtime] abort: session=${sessionId} turn=${id ?? "current"} not on the box we asked; ${owned ? "this Runtime owns its cancellation — reporting stopped" : "treating as already stopped"}`);
+      return { ok: true, pending: !owned };
     });
     let stopped = true;
     for (const id of targets.length === 0 ? [undefined] : targets) {
@@ -2128,16 +2150,31 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // one of them. Deriving the instance-0 pod name would report a session pinned to
     // instance 1 as not running — losing stream reattachment on refresh, and making a
     // live A2A task look orphaned after a Portal restart.
+    // `observed` separates "the executor answered" from "we could not ask it". Both
+    // report running:false, which is the correct fail-safe for stream re-attachment —
+    // this method's original caller — and exactly the wrong one for a caller that
+    // wants to ACT on the session not running. Without the flag, an unreachable box
+    // is indistinguishable from an idle one.
+    //
+    // `pending` is the other half of that question, and the box cannot answer it at
+    // all: a turn this Runtime has accepted but not yet handed over is registered
+    // HERE and nowhere else. Asking only the box during that window gets a truthful
+    // "not running" about a turn that is seconds away from starting — a cold spawn
+    // is exactly when this is most likely, and acting on it would let a second
+    // execution start on the same transcript.
+    const pending = liveTurnIds.has(sessionId) || Boolean(sessionTurnLocks.busyOn(sessionId));
     const scope = webExecutionScope(agentId, (await sessionRegistry.get(sessionId))?.userId);
     const handle = await (agentBoxManager.getForSession?.(scope, sessionId) ?? agentBoxManager.getAsync(scope));
-    if (!handle) return { ok: true, running: false };
+    // No box holds this session and none exists to hold it: there is nothing that
+    // could be executing. That is an observation, not a failure to observe.
+    if (!handle) return { ok: true, running: false, pending, observed: true };
     try {
       const client = new AgentBoxClient(handle.endpoint, 10000, agentBoxTlsOptions);
       const { running } = await client.sessionStatus(sessionId);
-      return { ok: true, running: !!running };
+      return { ok: true, running: !!running, pending, observed: true };
     } catch (err: any) {
       console.warn(`[rpc] chat.sessionStatus: agent=${agentId} session=${sessionId} probe failed: ${err?.message ?? err}`);
-      return { ok: true, running: false };
+      return { ok: true, running: false, pending, observed: false };
     }
   });
 
