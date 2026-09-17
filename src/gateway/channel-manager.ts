@@ -107,8 +107,20 @@ export interface PersonalAccessDenied {
   reason?: string;
   /** Single-use next step (link/apply). Absent when the tier accepts no self-service. */
   actionUrl?: string;
-  /** Epoch ms the `actionUrl` dies. Render durations FROM this, never hard-code the TTL. */
+  /** Epoch ms the `actionUrl` dies. Use for EXPIRY checks — not for the displayed duration. */
   expiresAtMs?: number;
+  /**
+   * How long the link is valid for in total, in minutes, straight from the issuer.
+   *
+   * Separate from `expiresAtMs` because the two answer different questions. Expiry is a moment and
+   * has to be checked against the clock; validity is a property of the ticket and is what a card
+   * should show. Deriving the second from the first meant subtracting the delivery hop and then
+   * flooring, so a fresh 10-minute link announced itself as "9 分钟内有效" every time.
+   *
+   * Optional: an older frontend does not send it, and the renderer falls back to the remaining-time
+   * figure. Still never hard-coded here — the TTL is the issuer's to define.
+   */
+  ttlMinutes?: number;
   /** Non-localized English fallback, used only when `reason` has no template. May embed the URL. */
   message?: string;
 }

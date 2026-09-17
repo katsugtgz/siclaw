@@ -16,6 +16,8 @@ import {
   localeForDomain,
   buildModeCard,
   MODE_ACTION_KIND,
+  buildLinkActionCard,
+  sendLinkActionCard,
 } from "./lark-card.js";
 
 // ── sanitizeMarkdownForFeishu ──────────────────────────────────
@@ -598,5 +600,89 @@ describe("buildModeCard", () => {
     expect(topicBtn.type).toBe("primary");
     expect(sharedBtn.type).toBe("default");
     expect(perUserBtn.type).toBe("default");
+  });
+});
+
+// ── buildLinkActionCard / sendLinkActionCard ───────────────────
+
+type El = { tag: string; content?: string; columns?: unknown[] };
+const elementsOf = (card: Record<string, any>): El[] => card.body.elements as El[];
+const OPTS = { body: "需要先关联账号。", title: "需要先关联账号", note: "仅可打开一次 · 10 分钟内有效", buttonLabel: "关联账号", url: "https://sicore.example/siclaw/agent-access/tok" };
+
+describe("buildLinkActionCard", () => {
+  it("puts the note AFTER the button and greys it", () => {
+    // Order is the point: the note explains the button, so reading it before the button splits the
+    // explanation from the action. Grey is what stops it reading as a second sentence of the body —
+    // it renders through an inline <font> because a `note` element is not in the proven tag set.
+    const els = elementsOf(buildLinkActionCard(OPTS));
+    const tags = els.map((e) => e.tag);
+    expect(tags.indexOf("column_set")).toBeLessThan(tags.lastIndexOf("markdown"));
+    expect(els[els.length - 1].content).toBe("<font color='grey'>仅可打开一次 · 10 分钟内有效</font>");
+  });
+
+  it("carries a blue header when a title is given", () => {
+    const card = buildLinkActionCard(OPTS) as any;
+    expect(card.header.title.content).toBe("需要先关联账号");
+    // Blue, not a warning colour: being asked to link an account is a step in a normal flow. The
+    // red ✗ this replaces made a routine prompt read as a failure.
+    expect(card.header.template).toBe("blue");
+  });
+
+  it("omits the header when asked to, and when there is no title", () => {
+    // The no-header shape is the retry path, and it must still be a complete card.
+    expect((buildLinkActionCard(OPTS, false) as any).header).toBeUndefined();
+    const { title: _dropped, ...untitled } = OPTS;
+    expect((buildLinkActionCard(untitled) as any).header).toBeUndefined();
+    expect(elementsOf(buildLinkActionCard(OPTS, false)).some((e) => e.tag === "column_set")).toBe(true);
+  });
+
+  it("still strips a URL embedded in the body", () => {
+    // Pre-existing invariant, re-asserted because the header work reshuffled this function: the
+    // button is the single rendering path for a single-use link.
+    const card = buildLinkActionCard({ ...OPTS, body: `点这里 ${OPTS.url} 完成` });
+    expect(JSON.stringify(elementsOf(card)[0])).not.toContain(OPTS.url);
+  });
+});
+
+describe("sendLinkActionCard", () => {
+  const clientWith = (create: any) => ({
+    cardkit: { v1: { card: { create } } },
+    im: { message: { reply: vi.fn().mockResolvedValue({ code: 0 }) } },
+  });
+
+  it("retries WITHOUT the header when CardKit rejects the headered card", async () => {
+    // CardKit rejects an unsupported field by returning no card_id — it does not throw. `header` is
+    // not among the fields proven against this tenant, so betting the delivery on it would trade a
+    // plain-but-working card for plain text. One retry makes the worst case equal to the old shape.
+    const create = vi.fn()
+      .mockResolvedValueOnce({ code: 1, msg: "unsupported field", data: {} })
+      .mockResolvedValueOnce({ code: 0, data: { card_id: "c1" } });
+    const client = clientWith(create);
+    await expect(sendLinkActionCard(client as any, "m1", OPTS)).resolves.toBe(true);
+    expect(create).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(create.mock.calls[0][0].data.data).header).toBeDefined();
+    expect(JSON.parse(create.mock.calls[1][0].data.data).header).toBeUndefined();
+  });
+
+  it("does not retry when the first attempt succeeds", async () => {
+    const create = vi.fn().mockResolvedValue({ code: 0, data: { card_id: "c1" } });
+    const client = clientWith(create);
+    await expect(sendLinkActionCard(client as any, "m1", OPTS)).resolves.toBe(true);
+    expect(create).toHaveBeenCalledTimes(1);
+  });
+
+  it("gives up after both shapes fail, so the caller can fall back to text", async () => {
+    const create = vi.fn().mockResolvedValue({ code: 1, msg: "nope", data: {} });
+    const client = clientWith(create);
+    await expect(sendLinkActionCard(client as any, "m1", OPTS)).resolves.toBe(false);
+    expect(create).toHaveBeenCalledTimes(2);
+  });
+
+  it("survives a create that throws, rather than losing the link", async () => {
+    const create = vi.fn()
+      .mockRejectedValueOnce(new Error("boom"))
+      .mockResolvedValueOnce({ code: 0, data: { card_id: "c1" } });
+    const client = clientWith(create);
+    await expect(sendLinkActionCard(client as any, "m1", OPTS)).resolves.toBe(true);
   });
 });

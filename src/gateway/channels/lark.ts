@@ -239,16 +239,29 @@ const PERSONAL_ACCESS_ADMIN_HINT_BY_LOCALE = {
 const PERSONAL_DENIAL_COPY_BY_LOCALE: Record<LarkLocale, Map<string, string>> = {
   "zh-CN": new Map([
     // Not yet linked: send them to link, once.
-    ["binding_required", "❌ 使用这个助手需要先关联账号。"],
+    ["binding_required", "使用这个助手需要先关联你的 Sicore 账号。关联完回到这里，重新发送刚才那条消息即可。"],
     // ALREADY linked but unauthorized — must not say "go link", they did that.
-    ["access_request_required", "❌ 你还没有这个助手的使用权限，可以点下面的链接申请。"],
+    ["access_request_required", "你还没有这个助手的使用权限，可以提交一个申请。负责人通过后回到这里重发消息即可。"],
     // Unauthorized and self-service is closed: no link exists to offer.
-    ["access_denied", "❌ 你没有这个助手的使用权限，请联系该助手的负责人开通。"],
+    ["access_denied", "你没有这个助手的使用权限，请联系该助手的负责人开通。"],
   ]),
   "en-US": new Map([
-    ["binding_required", "❌ Using this assistant requires linking your account first."],
-    ["access_request_required", "❌ You don't have access to this assistant yet — request it via the link below."],
-    ["access_denied", "❌ You don't have access to this assistant. Ask its owner to grant it."],
+    ["binding_required", "Using this assistant needs your Sicore account linked. Once linked, come back here and resend your message."],
+    ["access_request_required", "You don't have access to this assistant yet — submit a request. Once it is approved, come back and resend your message."],
+    ["access_denied", "You don't have access to this assistant. Ask its owner to grant it."],
+  ]),
+};
+// Card header per reason. Short — a title bar is a glance, the body carries the detail. Kept apart
+// from the body copy because the TEXT fallback has no header to put it in: prefixing the prose with
+// it there would read as a stutter ("需要先关联账号。使用这个助手需要先关联…").
+const PERSONAL_DENIAL_TITLE_BY_LOCALE: Record<LarkLocale, Map<string, string>> = {
+  "zh-CN": new Map([
+    ["binding_required", "需要先关联账号"],
+    ["access_request_required", "需要申请使用权限"],
+  ]),
+  "en-US": new Map([
+    ["binding_required", "Link your account first"],
+    ["access_request_required", "Access request needed"],
   ]),
 };
 // Appended when a one-time `actionUrl` is present. The remaining validity is DERIVED from
@@ -280,6 +293,26 @@ const SINGLE_USE_LINK_NOTE_BY_LOCALE: Record<LarkLocale, (minutes: number | null
   "zh-CN": (m) => (m === null ? "仅可打开一次" : `仅可打开一次 · ${m} 分钟内有效`),
   "en-US": (m) => (m === null ? "Opens once" : `Opens once · valid for ${m} minute${m === 1 ? "" : "s"}`),
 };
+// How long the link is good for, as a PROPERTY of the ticket rather than a countdown.
+//
+// The card does not refresh, so the number on it is read once, moments after the ticket was minted
+// — and `minutesUntil` floors the remainder, which made a brand-new 10-minute link announce itself
+// as "9 分钟内有效" every single time. The delivery hop (frontend → WS → runtime → Feishu) eats the
+// first several seconds, and floor turns that into a whole minute of under-reporting.
+//
+// Prefer the frontend's own `ttlMinutes` when it sends one; fall back to the remaining-time figure
+// otherwise. The fallback is what keeps this honest: the TTL lives in sicore (InviteTTL), and a
+// constant here would silently drift the day it changes — the exact mistake the /apikey copy made.
+function singleUseValidityNote(
+  locale: LarkLocale,
+  ttlMinutes: number | undefined,
+  remaining: number | null,
+): string {
+  const ttl = typeof ttlMinutes === "number" && Number.isFinite(ttlMinutes) && ttlMinutes > 0
+    ? Math.round(ttlMinutes)
+    : null;
+  return SINGLE_USE_LINK_NOTE_BY_LOCALE[locale](ttl ?? remaining);
+}
 // Shown instead of a dead link: the frontend mints a fresh one on the sender's next message, so
 // resending is the actual recovery. Handing over an already-expired URL just sends them to an
 // error page with no hint that anything can be done about it.
@@ -1503,10 +1536,15 @@ export async function handleLarkMessage(
         if (denied && rendersActionLink(denied, locale)) {
           await deliverSingleUseLink(larkClient, messageId, locale, {
             body: template ?? truncateDenialProse(denied.message) ?? PERSONAL_ACCESS_GATED_NOTICE_BY_LOCALE[locale],
+            // No title for a reason this build has never seen: the header would then have to be
+            // generic while the body is the frontend's own prose, and a mismatched pair reads worse
+            // than no header at all.
+            title: PERSONAL_DENIAL_TITLE_BY_LOCALE[locale].get(denied.reason ?? ""),
             buttonLabel: PERSONAL_DENIAL_BUTTON_BY_LOCALE[locale].get(denied.reason ?? "")
               ?? PERSONAL_DENIAL_BUTTON_NEUTRAL_BY_LOCALE[locale],
             url: denied.actionUrl,
             expiresAtMs: denied.expiresAtMs,
+            ttlMinutes: denied.ttlMinutes,
           }, deniedReply);
         } else {
           await replyToLark(larkClient, messageId, deniedReply);
@@ -2440,7 +2478,7 @@ async function deliverSingleUseLink(
   larkClient: any,
   messageId: string,
   locale: LarkLocale,
-  card: { body: string; buttonLabel: string; url: string; expiresAtMs?: number },
+  card: { body: string; title?: string; buttonLabel: string; url: string; expiresAtMs?: number; ttlMinutes?: number },
   textFallback: string,
   expiredReply?: string,
 ): Promise<boolean> {
@@ -2462,7 +2500,8 @@ async function deliverSingleUseLink(
   }
   const sent = await sendLinkActionCard(larkClient, messageId, {
     body: card.body,
-    note: SINGLE_USE_LINK_NOTE_BY_LOCALE[locale](remaining),
+    title: card.title,
+    note: singleUseValidityNote(locale, card.ttlMinutes, remaining),
     buttonLabel: card.buttonLabel,
     url: card.url,
   });

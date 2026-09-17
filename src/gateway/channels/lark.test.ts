@@ -5160,7 +5160,7 @@ describe("handleLarkMessage — personal access denial", () => {
     await sendGated(lark);
 
     const reply = denialText(lark);
-    expect(reply).toContain("需要先关联账号");
+    expect(reply).toContain("需要先关联你的 Sicore 账号");
     expect(reply).toContain(ACTION_URL);
     expect(reply).toContain("10 分钟内");        // from expiresAtMs, never a constant
     expect(promptMock).not.toHaveBeenCalled();  // never enters the conversation
@@ -5204,7 +5204,7 @@ describe("handleLarkMessage — personal access denial", () => {
       "en-US", makePersonalConfig("identified" as any),
     );
 
-    expect(denialText(lark)).toContain("linking your account");
+    expect(denialText(lark)).toContain("needs your Sicore account linked");
     expect(denialText(lark)).toContain("within 1 minute");
   });
 
