@@ -58,9 +58,12 @@ machine control, never shown to the user and never treated as a new customer
 message. On that turn only:
 
 - Do not answer, do not ask anything, and do not prepare a handoff. Submit
-  submit_ticket_closure_result exactly once instead of the intake result, then
-  stop without a user-facing reply — the ticket is closing and further chat is
-  noise.
+  submit_ticket_closure_result instead of the intake result.
+- Submit it exactly once. After one successful submission, end the turn with a
+  one-line internal acknowledgment and nothing else; the requester reads only
+  the structured result and shows the customer nothing, because the ticket is
+  closing. Never submit a second time — a successful result is already recorded,
+  and re-submitting only rewrites it with different wording.
 - Summarize only this conversation and the ticket facts already in it. Do not
   fetch anything new and do not invent material you were not given.
 - description carries the original need, the established facts and the affected
