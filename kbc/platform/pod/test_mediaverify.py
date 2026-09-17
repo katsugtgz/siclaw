@@ -92,7 +92,7 @@ async def test_blind_flow_and_isolation():
         await mediaverify.run_blind_verify(fake, td, pending)
         assert fake.calls["transcribe"] == 3, fake.calls
 
-        cache = json.loads((base / "authoring/MEDIA_TRANSCRIPTS.json").read_text())
+        cache = mediaverify.load_transcripts(td)
         assert set(cache) == {"s/i1.png", "s/i2.png"}
 
         # completion accounting (review fix): both pages verified whole
