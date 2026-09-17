@@ -20,6 +20,21 @@ function refs(): ToolRefs {
 }
 
 describe("production tool registry", () => {
+  it.each([false, true])("scopes mailbox tools to the parent or child through the real registry (child=%s)", child => {
+    const registry = new ToolRegistry(); registry.register(...allToolEntries);
+    const context = refs();
+    if (child) context.sendParentMessage = () => true;
+    else {
+      context.agentMailbox = () => undefined;
+      context.spawnSubagentExecutor = vi.fn();
+    }
+    const allowedTools = resolveCapabilities(["spawn_subagents"]);
+    const names = registry.resolve({ mode: "web", refs: context, allowedTools }).map(tool => tool.name);
+    expect(names).toContain(child ? "send_message" : "wait_agent");
+    expect(names).not.toContain(child ? "wait_agent" : "send_message");
+    expect(names.includes("spawn_subagent")).toBe(!child);
+    expect(registry.resolve({ mode: "web", refs: context, allowedTools: [] })).toEqual([]);
+  });
   it.each([false, true])("keeps the retired-only selection out of execution tools (handoff=%s)", (handoffAvailable) => {
     const registry = new ToolRegistry();
     registry.register(...allToolEntries);

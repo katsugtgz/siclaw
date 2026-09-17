@@ -6,12 +6,12 @@
  * `task_template`, plus an optional `reduce_prompt` that synthesises all per-item results into
  * one summary. A single task is just `items` of length 1 — there is no second way to delegate.
  *
- *  - N=1, no reduce_prompt → the runtime COLLAPSES to one legacy child run: foreground by
- *    default, live steps stream to the AgentWorkCard, events/delegation_id/notification are
- *    byte-identical to the pre-v3 single spawn.
+ *  - N=1, no reduce_prompt → one child run with its own transcript and live card.
  *  - N>1, or any reduce_prompt → the runtime runs the map→reduce group orchestration: children
  *    fan out through a bounded worker pool, results feed the reduce stage, and only the final
- *    summary (or per-item capsules when no reduce) returns to the parent context.
+ *    reports remain available through the completion notification and report artifacts.
+ * Mailbox-backed chat launches either shape asynchronously; wait_agent joins only
+ * when the parent model needs the result. Legacy external executors retain their mode switch.
  *
  * The plan is validated + rendered HERE (call-layer, fail-fast) via validateAndRenderGroupPlan,
  * so a bad plan bounces back to the model before any child starts. The runtime is injected via
@@ -90,7 +90,7 @@ function itemToText(item: string | Record<string, string>): string {
   return typeof item === "string" ? item : JSON.stringify(item);
 }
 
-function buildDescription(groupEnabled: boolean, backgroundAllowed: boolean): string {
+function buildDescription(groupEnabled: boolean, backgroundAllowed: boolean, mailboxLoop = false): string {
   return [
     "Delegate bounded work to subagents. Use one free-form item for a single task. " +
     "Describe the goal, relevant context, scope/constraints and useful deliverables; the child chooses how to investigate. " +
@@ -112,7 +112,12 @@ function buildDescription(groupEnabled: boolean, backgroundAllowed: boolean): st
     "Running children receive guidance at a safe boundary; completed children continue their own transcript. " +
     "Do not relaunch duplicate work. Handles belong to this parent session and expire with its output artifacts (normally 24 hours). " +
     "A follow-up is a new result; a previous batch synthesis remains historical, so integrate the revised findings.",
-    backgroundAllowed
+    mailboxLoop
+      ? "All launches are asynchronous, including a single task. The returned handle is not a completed report. " +
+        "Continue independent work; use wait_agent when your next step depends on a result. " +
+        "Messages and results enter the active turn at execution boundaries. Do not poll or spawn a waiter. " +
+        "Use job_stop to cancel. Prefer integrating required results before finishing; late completion results have a runtime follow-up fallback."
+      : backgroundAllowed
       ? "Single tasks default to foreground; multi-item batches default to background. Set run_in_background:false to await results inline. " +
         "Background completion is delivered automatically: continue independent work, never poll or spawn a waiter. " +
         "Keep the user request active until required work and synthesis finish; use job_stop to cancel."
@@ -125,11 +130,9 @@ export function createSpawnSubagentTool(
   refs: ToolRefs,
   executor = refs.spawnSubagentExecutor,
 ): ToolDefinition {
-  // Background (detached) delegation is allowed only when the global switch is on AND this entry
-  // point can receive an async conclusion. Only the `channel` session sets foregroundSubagentOnly
-  // (see agent-factory) — there every launch runs foreground so the turn carries the real answer.
-  // web/cli keep background; a2a/api/task never resolve this tool (see `modes` below). exec is separate.
-  const backgroundAllowed = RUN_IN_BACKGROUND_ENABLED && !refs.foregroundSubagentOnly;
+  // Mailbox-backed chat uses async launches plus explicit waits. Retain the old
+  // foreground gate only for executors without that runtime (e.g. external embedders).
+  const backgroundAllowed = Boolean(refs.agentMailbox) || (RUN_IN_BACKGROUND_ENABLED && !refs.foregroundSubagentOnly);
   // The menu this SESSION advertises. Read once, here, because the schema and the
   // description are built once — the same reason the resolution honours the
   // session's snapshot rather than the box's current menu.
@@ -138,7 +141,7 @@ export function createSpawnSubagentTool(
     name: "spawn_subagent",
     label: "Spawn Sub-agent",
     description:
-      buildDescription(isSubagentGroupEnabled(), backgroundAllowed) +
+      buildDescription(isSubagentGroupEnabled(), backgroundAllowed, Boolean(refs.agentMailbox)) +
       renderTierMenuForDescription(tierMenu),
     parameters: Type.Object({
       description: Type.String({ description: "Short (3-5 word) label for the task or batch." }),
@@ -205,7 +208,7 @@ export function createSpawnSubagentTool(
           }
         : {}),
       // Advertise detached execution only on surfaces with completion delivery.
-      ...(backgroundAllowed
+      ...(backgroundAllowed && !refs.agentMailbox
         ? {
             run_in_background: Type.Optional(
               Type.Boolean({
@@ -273,10 +276,9 @@ export function createSpawnSubagentTool(
       });
       if (!plan.ok) return errorResult(plan.error);
 
-      // Conditional default (design §"Tool layer (single entry)"): a single item runs foreground (grab the result and
-      // keep reasoning), a multi-item batch runs background (asymmetric harm — each side fits its own
-      // failure mode). An explicit run_in_background always wins; the flag is force-false while gated.
-      const runInBackground = backgroundAllowed
+      // The active-turn loop has one launch contract, independent of batch size.
+      // Legacy executors retain their previous foreground/background selection.
+      const runInBackground = refs.agentMailbox ? true : backgroundAllowed
         ? (p.run_in_background ?? plan.tasks.length > 1)
         : false;
 

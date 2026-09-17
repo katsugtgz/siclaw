@@ -12,6 +12,17 @@ function fixture() {
 }
 
 describe("control-plane conversations", () => {
+ it("requires negotiated sync support and forwards requestMode at the API boundary", async () => {
+  const f=fixture();
+  await expect(f.client.prompt({text:"inspect",requestMode:"sync",subagentTiers:undefined})).rejects.toThrow("does not support");
+  f.frontend.request.mockResolvedValueOnce({requestModes:"async"});
+  await expect(f.client.prompt({text:"inspect",requestMode:"sync",subagentTiers:undefined})).rejects.toThrow("does not support");
+  expect(f.frontend.subscribe).not.toHaveBeenCalled();
+  f.frontend.request.mockImplementation(async method => method === "conversation.capabilities" ? {handoff:true,requestModes:["sync","async"]} : {ok:true});
+  await f.client.prompt({text:"inspect",requestMode:"sync",subagentTiers:undefined});
+  expect(f.frontend.request).toHaveBeenLastCalledWith("conversation.start",expect.objectContaining({requestMode:"sync"}));
+  f.client.close();
+ });
  it("subscribes before dispatch, filters old requests and observes the destination's conclusion", async () => {
   const f=fixture();
   f.frontend.request.mockImplementation(async () => {
@@ -28,10 +39,15 @@ describe("control-plane conversations", () => {
   expect(f.frontend.request.mock.calls[0][1]).not.toHaveProperty("modelConfig");
   expect(f.off).toHaveBeenCalledTimes(1);
  });
- it("a failed destination does not turn the source progress into a successful result", async () => {
+ it("keeps a stream_error as data until the logical request ends", async () => {
   const f=fixture();await f.client.prompt({text:"inspect",subagentTiers:undefined});
   f.emit({type:"stream_error",error:{message:"private diagnostic"}});
-  await expect(async()=>{for await(const _ of f.client.streamEvents("s")) { /* drain */ }}).rejects.toThrow("Conversation execution failed");
+  f.emit({type:"message_start",message:{role:"user",content:"follow-up"}});
+  f.emit({type:"message_end",message:{role:"assistant",content:[{type:"text",text:"recovered"}]}});
+  f.emit({type:"prompt_done"});
+  const seen=[];for await(const e of f.client.streamEvents("s")) seen.push(e);
+  expect(seen).toHaveLength(4);
+  expect(seen[0]).toMatchObject({type:"stream_error"});
   expect(f.off).toHaveBeenCalled();
  });
  it("a timed-out submission never retries locally or redispatches", async () => {

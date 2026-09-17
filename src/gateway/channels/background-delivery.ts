@@ -58,7 +58,7 @@ export async function deliverBackgroundChannelMessage(
   const entry = getEntry(message.sessionId);
   if (!entry) return false;
   const delivered = await entry.deliver(message);
-  if (delivered) refreshEntry(message.sessionId, entry);
+  if (delivered && deliveries.get(message.sessionId) === entry) refreshEntry(message.sessionId, entry);
   return delivered;
 }
 
@@ -69,7 +69,7 @@ export async function deliverChannelVisibleMessage(
   const entry = getEntry(message.sessionId);
   if (!entry) return false;
   const delivered = await entry.deliver(message);
-  if (delivered) refreshEntry(message.sessionId, entry);
+  if (delivered && deliveries.get(message.sessionId) === entry) refreshEntry(message.sessionId, entry);
   return delivered;
 }
 

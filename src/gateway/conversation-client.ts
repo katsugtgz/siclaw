@@ -1,4 +1,5 @@
 import type { FrontendWsClient } from "./frontend-ws-client.js";
+import { supportsRequestMode } from "../shared/request-mode.js";
 import type { PromptOptions, PromptResponse } from "./agentbox/client.js";
 
 /** An older standalone Portal can still run local turns, without handoff. A
@@ -33,6 +34,10 @@ export class ConversationClient {
 
   async prompt(options: PromptOptions): Promise<PromptResponse> {
     if (this.unsubscribe) throw new Error("Conversation request already started");
+    if (options.requestMode === "sync") {
+      const capabilities = await this.frontend.request("conversation.capabilities");
+      if (!supportsRequestMode(capabilities?.requestModes, "sync")) throw new Error("Control plane does not support synchronous request admission; upgrade it before using requestMode=sync");
+    }
     this.unsubscribe = this.frontend.subscribe("conversation.event", (data) => {
       const frame = data as { sessionId?: string; requestId?: string; event?: Record<string, unknown> };
       if (frame.sessionId !== this.entry.sessionId || frame.requestId !== this.entry.userMessageId || !frame.event) return;
@@ -51,6 +56,7 @@ export class ConversationClient {
     try {
       const result = await this.frontend.request("conversation.start", {
         ...this.entry, text: options.text, images: options.images, files: options.files,
+        requestMode: options.requestMode ?? "async",
       });
       return { ...result, ok: true, sessionId: this.entry.sessionId };
     } catch (error) {
@@ -66,7 +72,8 @@ export class ConversationClient {
         if (this.failure) throw this.failure;
         const event = this.events.shift() as Record<string, unknown> | undefined;
         if (event) {
-          if (event.type === "stream_error") throw new Error("Conversation execution failed; inspect its trace for details");
+          // A failed provider/turn may be followed by steering or recovery.
+          // Preserve the event; the execution consumer waits for prompt_done.
           yield event;
           continue;
         }

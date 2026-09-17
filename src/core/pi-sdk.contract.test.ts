@@ -15,6 +15,8 @@ import {
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { PiAgentBrain } from "./brains/pi-agent-brain.js";
+import { AgentMailbox } from "./agent-mailbox.js";
+import { createWaitAgentTool } from "../tools/workflow/agent-mailbox-tools.js";
 import { createPiExecutionSession } from "./pi-execution.js";
 import { summarizeWithFallback } from "./compaction.js";
 import { resolveSessionThinkingLevel } from "./session-thinking.js";
@@ -127,6 +129,27 @@ function resultTool(execute = vi.fn(async () => ({
 }
 
 describe("installed Pi SDK contract", () => {
+  it("serializes mailbox evidence after an explicit wait within one parent prompt", async () => {
+    const mailbox = new AgentMailbox();
+    const wait = createWaitAgentTool({ agentMailbox: () => mailbox } as ToolRefs);
+    let round = 0;
+    const requests = mockNetwork(() => ++round === 1 ? completion({ tool_calls: [{
+      index: 0, id: "wait-1", type: "function", function: { name: "wait_agent", arguments: '{"timeout_ms":1000}' },
+    }] }, "tool_calls") : completion({ content: "Answer using the delegated evidence" }));
+    const { brain, sessionManager } = await createFixture([{ ...wait, execute: async (...args) => {
+      const waiting = wait.execute(...args);
+      mailbox.post("Child found the exact failure: node-7 link down");
+      return waiting;
+    } }]);
+    brain.setMailbox(mailbox);
+    try { await brain.prompt("Use the child result"); }
+    finally { brain.setMailbox(undefined); mailbox.close(); }
+    expect(requests).toHaveLength(2);
+    expect(JSON.stringify(requests[1].body.messages)).toContain("node-7 link down");
+    expect(JSON.stringify(requests[1].body.messages)).toContain("timed_out");
+    expect(JSON.stringify(requests[1].body.messages)).not.toContain("missing tool result");
+    expect(JSON.stringify(sessionManager.buildSessionContext().messages)).toContain("agent_mailbox");
+  });
   it("sends QA research tools to the provider and writes a working result", async () => {
     let outputPath = "";
     const requests = mockNetwork(() => requests.length === 1

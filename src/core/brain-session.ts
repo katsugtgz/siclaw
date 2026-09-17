@@ -185,6 +185,9 @@ export interface BrainSession {
   /** Send a prompt to the agent. Resolves when the agent finishes responding. */
   prompt(text: string, media?: PromptMedia, requirements?: PromptRequirements): Promise<void>;
 
+  /** Bind model-visible mail to the active user turn; never starts an idle brain. */
+  setMailbox?(mailbox: import("./agent-mailbox.js").AgentMailbox | undefined): void;
+
   /** Evaluate the delegated result against its assignment using the full execution context.
    * No tools execute during assessment. An unavailable/invalid assessment fails closed. */
   assessTaskCompletion?(assignment: string): Promise<TaskCompletionAssessment>;
