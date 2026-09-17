@@ -64,9 +64,12 @@ await record("support-module-known", async () => {
   return received;
 });
 
+// Deliberately does NOT ask for a human: a request to be transferred is itself a
+// decline to clarify, and the assistant may then hand off with the unknown module
+// recorded honestly instead — correct behaviour, but it makes this case ambiguous.
 await record("support-module-missing", async () => {
   const received = await runSupport({ baseUrl, apiKey: supportKey, signal: AbortSignal.timeout(180_000) },
-    "Something is broken and I keep getting an error. Please transfer me to a human.");
+    "Something is broken in your product and I keep getting an error. Can you help?");
   if (received.result.label) throw new Error("Handed off an incident without collecting the module");
   if (!received.result.info.missing_fields.includes("module")) throw new Error("Missing module was not reported as module");
   return received;
