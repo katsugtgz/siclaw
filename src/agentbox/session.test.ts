@@ -1054,6 +1054,7 @@ describe("AgentBoxSessionManager — Stop / abort latches", () => {
     // the child startPrompt so its ROOT nests under that span (nested layout).
     const SC = { traceId: T1, spanId: "1122334455667788", traceFlags: 1, isRemote: true };
     const mgr = new AgentBoxSessionManager() as any;
+    const usageSpy = vi.spyOn(mgr, "attachUsage");
     // fake brain emits an assistant message so finalText is non-empty → status stays "done"
     (globalThis as any).__fakeBrainFactories.push((emitter: any) => ({
       prompt: async () => {
@@ -1068,9 +1069,10 @@ describe("AgentBoxSessionManager — Stop / abort latches", () => {
       const res = await mgr.runSpawnedSubagent(
         { spawnId: "s1", parentSessionId: "parent", parentAgentId: "a1", description: "d", prompt: "do x",
           userId: "u1", subagentType: "general-purpose", taskListId: "tl", runInBackground: false },
-        { childSessionId: "child-1", mainTraceId: T1, spawnSpanContext: SC },
+        { childSessionId: "child-1", mainTraceId: T1, spawnSpanContext: SC, apiRequestId: "original-receipt" },
       );
       expect(res.status).toBe("done");
+      expect(usageSpy).toHaveBeenCalledWith(expect.anything(), "child-1", "internal_subagent", T1, "original-receipt");
       // Core anti-regression: the child's ROOT must inherit the parent's mainTraceId (4th arg,
       // for DB stamping) AND get the spawn span context (5th arg, for span nesting); attach must
       // precede startPrompt (else startPrompt takes the id-only branch, no span).

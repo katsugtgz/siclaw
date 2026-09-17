@@ -56,6 +56,7 @@ function toIdentity(cert: CertificateIdentity, sessionId?: string): Identity {
   if (sessionId) assertSafeIdField(sessionId, "sessionId");
   return {
     agentId: cert.agentId,
+    privateUserId: cert.privateUserId,
     orgId: cert.orgId,
     boxId: cert.boxId,
     sessionId,

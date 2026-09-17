@@ -1,3 +1,4 @@
+import { matchesPrivateUser } from "../security/session-principal.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { CertificateIdentity } from "../security/cert-manager.js";
 import { loadScriptSandboxConfig } from "../../script-sandbox/config.js";
@@ -60,7 +61,7 @@ export function createScriptSandboxApi(deploymentMode: string, controlPlane: San
         if (!record(body) || Object.keys(body).some(k => k !== "session_id" && k !== "request" && k !== "callback_token") || !identifier(body.session_id)) throw new ScriptSandboxError("Session and script request required");
         if (body.callback_token !== undefined && (typeof body.callback_token !== "string" || !/^[a-f0-9]{64}$/.test(body.callback_token))) throw new ScriptSandboxError("Invalid callback grant");
         const userId = currentUser?.(body.session_id, identity.agentId);
-        if (!userId) throw new ScriptSandboxError("Active Web caller required", 403);
+        if (!userId || !matchesPrivateUser(identity.privateUserId, userId)) throw new ScriptSandboxError("Active Web caller required", 403);
         const result = await service.run(body.request, { agentId: identity.agentId, boxId: identity.boxId, sessionId: body.session_id, userId, callbackToken: body.callback_token as string | undefined }, controller.signal);
         send(200, result);
       } catch (error) {

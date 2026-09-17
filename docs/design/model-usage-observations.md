@@ -10,6 +10,16 @@ contract. Workload ownership is resolved by the consuming control plane from
 the authenticated session or capability run. Compiler sessions retain their
 native identity and executor role; they do not impersonate a chat Agent.
 
+## API request attribution
+
+Sicore may send an opaque `apiRequestId` with an authenticated API/A2A prompt.
+Runtime relays it to AgentBox. The accepted prompt captures it after admission;
+subagents inherit the receipt captured at dispatch, even after a later parent
+turn starts. Each model observation carries the same receipt. It contains no
+credentials. Sicore resolves the immutable receipt and validates its root-session
+and organization binding before attributing usage. Old producers omit it and
+remain without a key dimension; they are never assigned the first session key.
+
 ## Evidence and identity
 
 Each call has a UUID, immutable dispatch timestamp, session and trace identity,

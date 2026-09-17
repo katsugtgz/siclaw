@@ -93,6 +93,7 @@ interface PromptRequestBody {
   requestMode?: RequestMode;
   /** Trusted Runtime continuation context; per-request, never session-cached. */
   handoffTrace?: unknown;
+  apiRequestId?: string;
   sessionId?: string;
   /** User who initiated this prompt (per-request), forwarded to the trace
    *  recorder as the root span's user.id. */
@@ -1017,7 +1018,7 @@ export function createHttpServer(
       sendJson(res, 400, { error: "The configured Ticket result tool is unavailable; check the instance MCP binding" });
       return;
     }
-    sessionManager.setUsageRole(managed.id, String(body.origin) === "delegation" ? "delegated" : "root");
+
     if (managed.mcpManager) {
       observedMcpServers = managed.mcpManager.getServerConnections();
     }
@@ -1064,6 +1065,7 @@ export function createHttpServer(
     // Mark the session busy before model setup so a refresh, second tab, or
     // fast double-submit cannot start a second prompt on the same brain.
     managed._promptDone = false;
+    sessionManager.setUsageRole(managed.id, String(body.origin) === "delegation" ? "delegated" : "root", body.apiRequestId);
     managed._requestMode = requestMode;
     managed._promptOutcome = undefined;
     managed._aborted = false;
