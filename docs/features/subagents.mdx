@@ -121,11 +121,15 @@ assignment. Once a batch child finishes, wait for the batch's synthesis before
 following up. Revised findings must be integrated into the final answer; they do
 not silently rewrite a previous batch summary.
 
-On persistent conversational surfaces, a single task defaults to foreground and a
-multi-task batch defaults to background. Required background work keeps the request
-active and delivers completion to the main Agent. Channel sessions that require a
-single foreground reply continue to wait for results before responding. This
-feature does not enable detached channel execution.
+AgentBox chat surfaces, including channels, launch both single tasks and batches
+asynchronously. The main Agent continues independent work and calls `wait_agent`
+when its next step requires a child's result. Completion and explicit child
+`send_message` updates enter the current turn's mailbox; the runtime consumes them
+at safe model/tool boundaries. A wait timeout does not cancel the child.
+
+The main Agent must integrate necessary results before giving its final answer.
+There is no automatic join or later synthetic reply: after the main turn ends,
+late child results update the report/transcript but do not restart the parent.
 
 ## Check every target
 

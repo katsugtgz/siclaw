@@ -145,6 +145,8 @@ export interface CreateSiclawSessionOpts {
   taskListId?: string;
   /** Runtime bridge that spawns sub-agent(s) — single or map→reduce batch (design §6). Injected by the agentbox. */
   spawnSubagentExecutor?: import("./tool-registry.js").SpawnSubagentExecutor;
+  agentMailbox?: import("./tool-registry.js").ToolRefs["agentMailbox"];
+  sendParentMessage?: import("./tool-registry.js").ToolRefs["sendParentMessage"];
   /**
    * Sub-agent model tier menu to advertise on `spawn_subagent`. Absent/null → the
    * parameter is not exposed at all, so a deployment without tiers never shows the
@@ -554,9 +556,11 @@ export async function createSiclawSession(
       handoffPolicy: opts?.handoffPolicy,
       knowledgeCitationTool: citationSupport?.tool,
       spawnSubagentExecutor: opts?.spawnSubagentExecutor,
+      agentMailbox: opts?.agentMailbox,
+      sendParentMessage: opts?.sendParentMessage,
       readToolResult: async (id) => (await toolResultArtifactStore.readFull(id)).text,
-      // Channels currently deliver one foreground response. Do not advertise
-      // background launches until they support an owned, resumable delivery lifecycle.
+      // Legacy executors without an active-turn mailbox remain foreground-only
+      // on channels. Mailbox-backed launches use the same async loop on all chat surfaces.
       foregroundSubagentOnly: mode === "channel",
       // The tier menu this session will advertise. Passed in rather than read from
       // box state because the tool schema is built HERE, once: the menu the lead is

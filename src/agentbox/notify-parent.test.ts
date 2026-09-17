@@ -60,6 +60,77 @@ function setup(promptDone: boolean) {
 }
 
 describe("notifyParent", () => {
+  it("recovers attached late/unread children, coalesces them and does not repeat consumed mail", async () => {
+    const { mgr, managed, brain } = setup(false);
+    const turn = mgr.beginBackgroundWorkTurn(managed);
+    for (const id of ["consumed", "unread", "late"]) {
+      mgr.jobs.register({ jobId: id, type: "subagent", parentSessionId: "s1", description: id,
+        status: "done", startedAt: 0, notified: false });
+      mgr.registerBackgroundWork("s1", id);
+    }
+    await mgr.notifyParent("s1", "consumed", { taskId: "consumed", status: "done", summary: "already used" });
+    turn.mailbox.take();
+    turn.mailbox.defer();
+    await mgr.notifyParent("s1", "unread", { taskId: "unread", status: "partial", summary: "deferred by final" });
+    turn.finish(); managed._promptDone = true;
+    await mgr.notifyParent("s1", "late", { taskId: "late", status: "done", summary: "late result" });
+    await flushCoalesce();
+    expect(brain.prompt).toHaveBeenCalledTimes(1);
+    const text = brain.prompt.mock.calls[0][0];
+    expect(text).toContain("deferred by final");
+    expect(text).toContain("late result");
+    expect(text).not.toContain("already used");
+    expect(managed._backgroundWorkTurn).not.toBe(turn);
+    expect(brain.followUp).not.toHaveBeenCalled();
+  });
+
+  it("waits for a racing real prompt instead of steering the late result into it", async () => {
+    const { mgr, managed, brain } = setup(true);
+    const queued = mgr.runSyntheticPrompt(managed, "late result", true);
+    managed._promptDone = false;
+    let release!: () => void;
+    managed._promptInflight = new Promise<void>(resolve => { release = resolve; });
+    await Promise.resolve();
+    expect(brain.prompt).not.toHaveBeenCalled();
+    expect(brain.followUp).not.toHaveBeenCalled();
+    managed._promptDone = true; managed._promptInflight = null; release();
+    await queued;
+    expect(brain.prompt).toHaveBeenCalledTimes(1);
+  });
+
+  it("persists late input once before the model, even if the continuation fails", async () => {
+    const { mgr, brain } = setup(true);
+    const send = vi.fn(async () => ({ ok: true, id: "row" }));
+    mgr.gatewayClient = { sendDelegationPersistenceEvent: send }; mgr.agentId = "agent-1";
+    let listener: ((event: any) => void) | undefined;
+    brain.subscribe.mockImplementation((cb: any) => { listener = cb; return () => {}; });
+    brain.prompt.mockImplementation(async (text: string) => {
+      expect(send.mock.calls.some(([e]: any[]) => e.message?.role === "user")).toBe(true);
+      listener?.({ type: "message_end", message: { role: "user", content: text } });
+      throw new Error("model unavailable");
+    });
+    mgr.jobs.register({ jobId: "child", type: "subagent", parentSessionId: "s1", description: "check",
+      status: "done", startedAt: 0, notified: false });
+    await mgr.notifyParent("s1", "child", { taskId: "child", status: "done", summary: "answer" });
+    await flushCoalesce();
+    expect(send.mock.calls.filter(([e]: any[]) => e.message?.role === "user")).toHaveLength(1);
+    expect(send.mock.calls.some(([e]: any[]) => e.event?.type === "background_turn_done" && e.event.outcome === "error")).toBe(true);
+  });
+
+  it("does not recover a stopped child or revive an explicitly closed/replaced session", async () => {
+    const { mgr, managed, brain } = setup(false);
+    const turn = mgr.beginBackgroundWorkTurn(managed);
+    mgr.jobs.register({ jobId: "child", type: "subagent", parentSessionId: "s1", description: "check",
+      status: "done", startedAt: 0, notified: false });
+    mgr.registerBackgroundWork("s1", "child");
+    turn.finish();
+    mgr.sessions.set("s1", fakeManaged("s1", fakeBrain(), true));
+    await mgr.notifyParent("s1", "child", { taskId: "child", status: "done", summary: "obsolete result" });
+    await flushCoalesce();
+    expect(brain.prompt).not.toHaveBeenCalled();
+    expect(mgr.sessions.get("s1").brain.prompt).not.toHaveBeenCalled();
+  });
+
   it("keeps a late cancelled job attached to its old request after a new request starts", async () => {
     const { mgr, managed, brain } = setup(false);
     const oldTurn = new BackgroundWorkTurn();
@@ -83,15 +154,16 @@ describe("notifyParent", () => {
     (managed as any)._backgroundWorkTurn = turn;
     turn.register("child");
     mgr.jobs.register({ jobId: "child", type: "subagent", parentSessionId: "s1", description: "check", status: "done", startedAt: 0, notified: false });
-    const waiting = turn.next();
+    const waiting = turn.mailbox.wait(1000);
     await mgr.notifyParent("s1", "child", { taskId: "child", status: "done", summary: "five ready nodes" });
-    expect((await waiting)[0].summary).toBe("five ready nodes");
+    expect(await waiting).toBe("mail");
+    expect(turn.mailbox.take()).toContain("five ready nodes");
     await flushCoalesce();
     expect(managed._pendingNotifications).toEqual([]);
     expect(brain.prompt).not.toHaveBeenCalled();
     expect(brain.followUp).not.toHaveBeenCalled();
     await mgr.notifyParent("s1", "child", { taskId: "child", status: "done", summary: "duplicate" });
-    expect(await turn.next()).toEqual([]);
+    expect(turn.mailbox.take()).toBeUndefined();
   });
 
   it("does not announce report completion when a message write is rejected", async () => {
@@ -317,7 +389,7 @@ describe("notifyParent", () => {
     expect(nonExec).toHaveLength(0);
   });
 
-  it("a text-only synthetic turn for a SUB-AGENT (inline result, no output_file) persists the report + fires background_turn_done", async () => {
+  it("appends a late result as user input and starts a fresh parent turn", async () => {
     const mgr = new AgentBoxSessionManager() as any;
     // Brain that, on prompt(), emits one assistant text message (the inline result report) and no tool call.
     let cb: ((e: any) => void) | undefined;
@@ -337,10 +409,18 @@ describe("notifyParent", () => {
     await mgr.notifyParent("s1", "sa1", { taskId: "sa1", status: "completed", summary: "result: 34" }); // no output_file → inline result
     await flushCoalesce();
     const events = send.mock.calls.map((c) => c[0]);
-    const report = events.filter((e: any) => e?.type === "delegation.append_message").find((e: any) => (e.message?.content || "").includes("34"));
-    expect(report).toBeTruthy(); // the text-only report is persisted (not dropped)
+    const rows = events.filter((e: any) => e?.type === "delegation.append_message");
+    expect(rows.map((e: any) => e.message.role)).toEqual(["user", "assistant"]);
+    expect(rows[0].message.content).toContain("result: 34");
+    expect(rows[0].message.metadata).toEqual({ kind: "task_notification" });
+    expect(rows[1].message.content).toBe("The sum is 34");
+    expect(brain.prompt).toHaveBeenCalledTimes(1);
+    expect(brain.followUp).not.toHaveBeenCalled();
+    const startIndex = events.findIndex(e => e.event?.type === "background_turn_start");
+    expect(startIndex).toBeGreaterThan(events.indexOf(rows[0]));
+    expect(startIndex).toBeLessThan(events.indexOf(rows[1]));
     const btd = events.filter((e: any) => e?.type === "delegation.emit_chat_event" && e?.event?.type === "background_turn_done");
-    expect(btd).toHaveLength(1); // refetch trigger fired so the UI shows the report
+    expect(btd).toHaveLength(1);
   });
 
   it("routes an idle synthetic turn through fallback using the session's last modelRouting policy", async () => {
@@ -418,7 +498,7 @@ describe("notifyParent", () => {
     };
     mgr.sessions.set("s1", managed);
     mgr.persistModelRouteState = vi.fn();
-    mgr.jobs.register({ jobId: "sa1", type: "subagent", parentSessionId: "s1", description: "compute", status: "completed", startedAt: 0, notified: false });
+    mgr.jobs.register({ jobId: "sa1", type: "bash", parentSessionId: "s1", description: "compute", status: "completed", startedAt: 0, notified: false });
     const send = vi.fn(async () => ({ ok: true, id: "x" }));
     mgr.gatewayClient = { sendDelegationPersistenceEvent: send };
     mgr.agentId = "agent-1";
@@ -519,7 +599,7 @@ describe("notifyParent", () => {
     expect(execEvents).toHaveLength(0);
   });
 
-  it("a background GROUP job (type subagent + isGroup) notifies once with the inline group summary", async () => {
+  it("a late background GROUP completion folds once and starts one follow-up", async () => {
     const mgr = new AgentBoxSessionManager() as any;
     let cb: ((e: any) => void) | undefined;
     const brain = {
@@ -541,12 +621,8 @@ describe("notifyParent", () => {
     // dedup: a second notify for the same group job is a no-op.
     await mgr.notifyParent("s1", "grp1", { taskId: "grp1", status: "partial", summary });
     await flushCoalesce();
-    expect(brain.prompt).toHaveBeenCalledTimes(1); // ONE synthetic turn, deduped
-    const promptText = brain.prompt.mock.calls[0][0] as string;
-    expect(promptText).toContain("<task_notification>");
-    // Quotes are XML-escaped inside the <summary> block.
-    expect(promptText).toContain("Sub-agent group &quot;triage&quot; partial");
-    expect(promptText).toContain("Causes: net, storage.");
+    expect(brain.prompt).toHaveBeenCalledTimes(1);
+    expect(brain.prompt.mock.calls[0][0]).toContain("Causes: net, storage.");
     // Live fold event uses the subagent_done channel (a group is a subagent job), NOT exec_job_event.
     const fold = send.mock.calls.map((c) => c[0]).filter((e: any) => e?.event?.type === "subagent_done");
     expect(fold).toHaveLength(1);

@@ -21,6 +21,8 @@
  */
 
 /** Shape a caller can map to HTTP 409 — matches what an AgentBox returns for the same reason. */
+import { REQUEST_QUEUE_TIMEOUT_MS, type RequestMode } from "../shared/request-mode.js";
+
 export class SessionBusyError extends Error {
   readonly status = 409;
   constructor(sessionId: string, waitedMs: number) {
@@ -43,9 +45,14 @@ interface Waiter {
   resolve: () => void;
   reject: (err: Error) => void;
   timer: ReturnType<typeof setTimeout>;
+  requestMode: RequestMode;
+  managed: boolean;
+  cleanup: () => void;
 }
 
 interface Entry {
+  requestMode: RequestMode;
+  managed: boolean;
   /** Where the in-flight turn was dispatched, when known. Dropped on release. */
   boxId?: string;
   endpoint?: string;
@@ -68,6 +75,15 @@ export class SessionTurnLocks {
   /** Whether a turn is currently running for this session, as far as this Runtime knows. */
   isBusy(sessionId: string): boolean {
     return this.held.has(sessionId);
+  }
+
+  canSteer(sessionId: string): boolean { return this.held.get(sessionId)?.requestMode !== "sync"; }
+  isManaged(sessionId: string): boolean { return this.held.get(sessionId)?.managed === true; }
+
+  /** Only async -> async may degrade to steer; all other combinations queue. */
+  acquireRequest(sessionId: string, requestMode: RequestMode, signal?: AbortSignal, managed = false): Promise<() => void> {
+    const waitMs = requestMode === "sync" || !this.canSteer(sessionId) ? REQUEST_QUEUE_TIMEOUT_MS : DEFAULT_WAIT_MS;
+    return this.acquire(sessionId, waitMs, { requestMode, signal, managed, protectSync: true });
   }
 
   /**
@@ -143,8 +159,8 @@ export class SessionTurnLocks {
    * early returns that a closure would silently turn into "carry on with the rest of the
    * function". Release from a `finally` so a throw cannot wedge the session.
    */
-  async acquire(sessionId: string, waitMs = DEFAULT_WAIT_MS): Promise<() => void> {
-    await this.waitForTurn(sessionId, waitMs);
+  async acquire(sessionId: string, waitMs = DEFAULT_WAIT_MS, options: { requestMode?: RequestMode; signal?: AbortSignal; managed?: boolean; protectSync?: boolean } = {}): Promise<() => void> {
+    await this.waitForTurn(sessionId, waitMs, options.requestMode ?? "async", options.signal, options.managed ?? false, options.protectSync ?? false);
     let released = false;
     return () => {
       if (released) return; // idempotent: a finally may run alongside an explicit release
@@ -153,25 +169,46 @@ export class SessionTurnLocks {
     };
   }
 
-  private waitForTurn(sessionId: string, waitMs: number): Promise<void> {
+  private waitForTurn(sessionId: string, waitMs: number, requestMode: RequestMode, signal?: AbortSignal, managed = false, protectSync = false): Promise<void> {
+    if (signal?.aborted) return Promise.reject(signal.reason ?? new Error("Queued request aborted"));
     const entry = this.held.get(sessionId);
     if (!entry) {
-      this.held.set(sessionId, { queue: [], acceptWaiters: [] });
+      this.held.set(sessionId, { queue: [], acceptWaiters: [], requestMode, managed });
       return Promise.resolve();
     }
     const startedAt = Date.now();
     return new Promise<void>((resolve, reject) => {
+      const rejectWaiter = (error: Error) => {
+        const i = entry.queue.indexOf(waiter);
+        if (i >= 0) entry.queue.splice(i, 1);
+        clearTimeout(waiter.timer);
+        waiter.cleanup();
+        reject(error);
+      };
+      const onAbort = () => rejectWaiter(signal?.reason ?? new Error("Queued request aborted"));
+      const onTimeout = () => {
+        // The active request may have changed from async to sync while this
+        // waiter was queued. Retain its FIFO position instead of degrading it
+        // to steer (or rejecting it) against the new protected request.
+        const remaining = REQUEST_QUEUE_TIMEOUT_MS - (Date.now() - startedAt);
+        if (protectSync && requestMode === "async" && entry.requestMode === "sync" && remaining > 0) {
+          waiter.timer = setTimeout(onTimeout, remaining);
+          waiter.timer.unref?.();
+          return;
+        }
+        rejectWaiter(new SessionBusyError(sessionId, Date.now() - startedAt));
+      };
       const waiter: Waiter = {
         resolve,
         reject,
-        timer: setTimeout(() => {
-          const i = entry.queue.indexOf(waiter);
-          if (i >= 0) entry.queue.splice(i, 1);
-          reject(new SessionBusyError(sessionId, Date.now() - startedAt));
-        }, waitMs),
+        requestMode,
+        managed,
+        cleanup: () => signal?.removeEventListener("abort", onAbort),
+        timer: setTimeout(onTimeout, waitMs),
       };
       waiter.timer.unref?.();
       entry.queue.push(waiter);
+      signal?.addEventListener("abort", onAbort, { once: true });
     });
   }
 
@@ -184,6 +221,9 @@ export class SessionTurnLocks {
       return;
     }
     clearTimeout(next.timer);
+    next.cleanup();
+    entry.requestMode = next.requestMode;
+    entry.managed = next.managed;
     // Hand the lock straight to the next waiter — dropping and re-acquiring would let a
     // request that arrived later jump the queue.
     entry.boxId = undefined;
