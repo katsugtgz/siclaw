@@ -5,6 +5,8 @@ import json
 import tempfile
 from pathlib import Path
 
+import pytest
+
 import mediaverify
 from test_mediaverify import FakeEngine, _mk
 
@@ -122,4 +124,78 @@ def test_media_sync_does_not_publish_unsealed_candidate():
             assert "candidate/inflight.md" not in paths
             await compile_box._sync_media_progress(run)
             assert len(events) == 1
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("blocked_role,fail_first_sync", [
+    ("transcribe", False), ("compare", False), ("transcribe", True),
+])
+def test_batch_media_results_sync_while_sibling_waits(monkeypatch, blocked_role, fail_first_sync):
+    import compile_box
+    import media_progress
+
+    monkeypatch.setattr(media_progress, "SYNC_INTERVAL_SECS", 0.02, raising=False)
+    monkeypatch.setattr(compile_box, "SYNC_INTERVAL_SECS", 0.01)
+
+    async def run():
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as recovered:
+            root = Path(td)
+            for name in ["a", "b"]:
+                _mk(root, f"raw/{name}.png", name)
+            for page in ["p.md", "q.md"]:
+                _mk(root, f"candidate/{page}", "unsealed")
+            block = asyncio.Event()
+            saved = asyncio.Event()
+            events = []
+            failed_syncs = 0
+            phase = "transcribing" if blocked_role == "transcribe" else "comparing"
+            counter = "transcribed" if blocked_role == "transcribe" else "pages_compared"
+
+            class Engine(FakeEngine):
+                async def run_readonly_agent(self, **kwargs):
+                    slow_input = "b.png" if blocked_role == "transcribe" else "q.md"
+                    if kwargs.get("role") == blocked_role and slow_input in kwargs["user_message"]:
+                        await block.wait()
+                    return await super().run_readonly_agent(**kwargs)
+
+            run = compile_box.CompileRun("batch-media-run", td, 1)
+            run._sync_sent = {}
+            run._batch_active = True
+
+            async def emit(event):
+                nonlocal failed_syncs
+                progress = next((json.loads(a["content"]) for a in event.get("artifacts", [])
+                                 if a["path"] == media_progress.PROGRESS_PATH), {})
+                has_result = progress.get("phase") == phase and progress.get(counter) == 1
+                if has_result and fail_first_sync and failed_syncs == 0:
+                    failed_syncs += 1
+                    raise OSError("temporary sync failure")
+                events.append(event)
+                for artifact in event.get("artifacts", []):
+                    _mk(Path(recovered), artifact["path"], artifact["content"])
+                if has_result:
+                    saved.set()
+
+            run.emit = emit
+            syncer = asyncio.create_task(compile_box._sync_loop(run, run._sync_sent))
+            task = asyncio.create_task(mediaverify.run_blind_verify(
+                Engine(), td, {"p.md": ["a.png"], "q.md": ["b.png"]},
+                run_id=run.run_id, on_progress=lambda: compile_box._sync_media_progress(run)))
+            try:
+                await asyncio.wait_for(saved.wait(), timeout=1)
+                assert not task.done(), "the slow sibling must still be running"
+                assert "a.png" in mediaverify.load_transcripts(recovered)
+                assert not (Path(recovered) / "candidate").exists()
+                persisted = json.loads((Path(recovered) / media_progress.PROGRESS_PATH).read_text())
+                local = json.loads((root / media_progress.PROGRESS_PATH).read_text())
+                assert persisted["last_progress_at"] == local["last_progress_at"]
+                assert persisted["updated_at"] == local["updated_at"]
+                assert failed_syncs == int(fail_first_sync)
+            finally:
+                task.cancel()
+                syncer.cancel()
+                await asyncio.gather(task, syncer, return_exceptions=True)
+            emitted = len(events)
+            await asyncio.sleep(0.05)
+            assert len(events) == emitted, "cancelled groups must stop syncing"
     asyncio.run(run())

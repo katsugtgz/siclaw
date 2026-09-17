@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 PROGRESS_PATH = "authoring/MEDIA_VERIFY_PROGRESS.json"
+SYNC_INTERVAL_SECS = 10
 
 
 class MediaProgress:
@@ -43,6 +44,27 @@ class MediaProgress:
             self.value["phase"] = phase
             await self._save(True, values)
 
+    async def gather(self, *coroutines):
+        """Flush completed work while the remaining workers are still waiting."""
+        tasks = [asyncio.create_task(coroutine) for coroutine in coroutines]
+        group = asyncio.gather(*tasks)
+        try:
+            while True:
+                delay = (max(0, SYNC_INTERVAL_SECS - (time.monotonic() - self.last_emit))
+                         if self.on_progress else None)
+                done, _ = await asyncio.wait({group}, timeout=delay)
+                if done:
+                    return await group
+                async with self.lock:
+                    await self._emit(False)
+        finally:
+            # A cancelled/failed group must not leave workers writing progress
+            # after its caller has moved on to recovery or another group.
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(group, *tasks, return_exceptions=True)
+
     async def _save(self, force, values):
         self.value.update(values)
         self.value["updated_at"] = self.now()
@@ -50,7 +72,10 @@ class MediaProgress:
         temporary = self.path.with_suffix(".tmp")
         temporary.write_text(json.dumps(self.value, ensure_ascii=False) + "\n", encoding="utf-8")
         temporary.replace(self.path)
+        await self._emit(force)
+
+    async def _emit(self, force):
         now = time.monotonic()
-        if self.on_progress and (force or now - self.last_emit >= 10):
+        if self.on_progress and (force or now - self.last_emit >= SYNC_INTERVAL_SECS):
             await self.on_progress()
-            self.last_emit = now
+            self.last_emit = time.monotonic()
