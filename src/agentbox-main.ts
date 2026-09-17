@@ -13,7 +13,7 @@ import { AgentBoxSessionManager } from "./agentbox/session.js";
 import { loadConfig, reloadConfig, getConfigPath } from "./core/config.js";
 import { GatewayClient } from "./agentbox/gateway-client.js";
 import { syncAllResources, syncResource } from "./agentbox/resource-sync.js";
-import { createToolsHandler } from "./agentbox/sync-handlers.js";
+import { createToolsHandler, modelHandler } from "./agentbox/sync-handlers.js";
 import {
   runWithinBudget,
   startStartupBudget,
@@ -212,10 +212,46 @@ async function main() {
     }
   }
 
+  // Re-read the provider half of settings.json from the Gateway. Reuses
+  // modelHandler so the merge rule lives in one place: only providers/default/
+  // modelRouting/tracing are replaced, and the MCP servers that syncAllResources
+  // just wrote survive.
+  const resyncProviderSettings = async (): Promise<void> => {
+    const client = sessionManager.gatewayClient?.toClientLike();
+    if (!client) return;
+    try {
+      const payload = await modelHandler.fetch(client);
+      await modelHandler.materialize(payload);
+      reloadConfig();
+    } catch (err) {
+      // Best-effort by design: the box already has usable settings, and a
+      // later reload push can still correct them.
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`[agentbox] Post-listen settings refresh failed (keeping startup settings): ${msg}`);
+    }
+  };
+
   const protocol = server instanceof https.Server ? "https" : "http";
   server.listen(PORT, () => {
     console.log(`[agentbox] ${protocol.toUpperCase()} server listening on port ${PORT}`);
     console.log(`[agentbox] Health check: ${protocol}://localhost:${PORT}/health`);
+    // Close the cold-start window, and it has to be HERE — after listen.
+    //
+    // The settings fetched at the top of main() can already be stale by the time
+    // this box starts serving: everything between them (resource sync, tool
+    // capabilities) runs inside a 30s budget, and a key rotated during that
+    // stretch never reaches this box. agent.reload only targets boxes whose pod
+    // reports status="running", which requires readinessProbe to pass, which
+    // requires this listen — so the rotation skipped us and we kept the old key
+    // until the pod was recycled. Nothing reported it, either: the box was not
+    // in the rollout's audience, so its agent could read "applied" while one
+    // instance quietly served a revoked key.
+    //
+    // readinessProbe runs every 2s, so this refetch lands well before the pod is
+    // marked ready — and therefore before the control plane would target it.
+    // No session invalidation: this is milliseconds after listen, nothing has
+    // built a brain yet.
+    void resyncProviderSettings();
   });
 
   // In K8s mode (HTTPS / mTLS), apply the metrics config fetched from the Gateway.

@@ -39,14 +39,23 @@ import type {
 let _mockSkillsDir = "";
 let _mockKnowledgeDir = "";
 
+// modelHandler rewrites the provider half of settings.json, so its tests need
+// to see what was written and to seed the keys it must leave alone.
+let _mockConfigExtra: Record<string, unknown> = {};
+let _writtenConfig: Record<string, unknown> | null = null;
+
 vi.mock("../core/config.js", () => ({
   loadConfig: () => ({
     paths: { skillsDir: _mockSkillsDir, knowledgeDir: _mockKnowledgeDir },
+    ..._mockConfigExtra,
   }),
   reloadConfig: () => ({
     paths: { skillsDir: _mockSkillsDir, knowledgeDir: _mockKnowledgeDir },
+    ..._mockConfigExtra,
   }),
-  writeConfig: () => {},
+  writeConfig: (config: Record<string, unknown>) => {
+    _writtenConfig = config;
+  },
 }));
 
 class FakeTransport implements CredentialTransport {
@@ -351,17 +360,78 @@ describe("promptHandler.postReload", () => {
   });
 });
 
-describe("modelHandler.postReload", () => {
+describe("modelHandler", () => {
   const dummyBrain = { reload: async () => {} };
 
-  it("invalidates warm sessions without fetching secrets or local state", async () => {
+  beforeEach(() => {
+    _mockConfigExtra = {};
+    _writtenConfig = null;
+  });
+
+  function fakeClient(payload: unknown): {
+    client: GatewaySyncClientLike;
+    calls: Array<[string, string]>;
+  } {
+    const calls: Array<[string, string]> = [];
+    return {
+      calls,
+      client: {
+        request: async (path: string, method: "GET" | "POST") => {
+          calls.push([path, method]);
+          return payload;
+        },
+      },
+    };
+  }
+
+  it("degrades to invalidate-only without a Gateway client (Local mode)", async () => {
     const invalidate = vi.fn();
     await expect(modelHandler.fetch(null)).resolves.toBeNull();
     await expect(modelHandler.materialize(null)).resolves.toBe(0);
+    expect(_writtenConfig).toBeNull();
     await modelHandler.postReload!({
       sessions: [{ id: "s1", brain: dummyBrain, invalidate }],
     });
     expect(invalidate).toHaveBeenCalledOnce();
+  });
+
+  it("refetches settings so a rotated key lands on disk", async () => {
+    // The whole point of the handler: without this write, the box keeps
+    // seeding pi's credential store from the key it started with.
+    const { client, calls } = fakeClient({
+      providers: { "openai-gpt5": { apiKey: "sk-new", baseUrl: "https://api" } },
+      default: { provider: "openai-gpt5", modelId: "gpt-5" },
+    });
+    const payload = await modelHandler.fetch(client);
+    expect(calls).toEqual([["/api/internal/settings", "GET"]]);
+    await expect(modelHandler.materialize(payload)).resolves.toBe(1);
+    expect((_writtenConfig?.providers as Record<string, { apiKey: string }>)["openai-gpt5"].apiKey)
+      .toBe("sk-new");
+    expect(_writtenConfig?.default).toEqual({ provider: "openai-gpt5", modelId: "gpt-5" });
+  });
+
+  it("leaves box-local settings alone", async () => {
+    // settings.json is one file shared with the MCP sync and the box's own
+    // paths/server config. A wholesale overwrite here would drop the MCP
+    // servers that mcpHandler just wrote into it.
+    _mockConfigExtra = {
+      mcpServers: { kubernetes: { command: "kubectl" } },
+      server: { port: 8080, gatewayUrl: "https://gw" },
+    };
+    await modelHandler.materialize({ providers: { p: {} } });
+    expect(_writtenConfig?.mcpServers).toEqual({ kubernetes: { command: "kubectl" } });
+    expect(_writtenConfig?.server).toEqual({ port: 8080, gatewayUrl: "https://gw" });
+    expect(_writtenConfig?.paths).toBeDefined();
+  });
+
+  it("clears a default the Gateway no longer sends", async () => {
+    // An agent whose model was unbound answers with providers:{} and no
+    // default. Merging alone would leave the old one pointing at a provider
+    // that is not configured any more.
+    _mockConfigExtra = { default: { provider: "gone", modelId: "old" } };
+    await expect(modelHandler.materialize({ providers: {} })).resolves.toBe(0);
+    expect(_writtenConfig).not.toBeNull();
+    expect("default" in _writtenConfig!).toBe(false);
   });
 });
 

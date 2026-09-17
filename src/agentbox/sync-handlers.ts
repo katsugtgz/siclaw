@@ -13,7 +13,7 @@ import { LIBRARY_INTRODUCTION_FILE, libraryIntroductionPreview, readLibraryIntro
 import fs from "node:fs";
 import { AGENT_TYPES } from "../core/agent-types.js";
 import path from "node:path";
-import { loadConfig, reloadConfig, writeConfig } from "../core/config.js";
+import { loadConfig, reloadConfig, writeConfig, type SiclawConfig } from "../core/config.js";
 import { parseKnowledgeLabels } from "../knowledge/labels.js";
 import { isKnowledgeNavigationPage } from "../knowledge/page-kind.js";
 import {
@@ -162,20 +162,75 @@ export const promptHandler: AgentBoxSyncHandler<null> = {
 // ── Model handler ────────────────────────────────────────────────────
 
 /**
- * Model bindings are resolved by the Gateway for every prompt. Invalidating
- * the warm brain makes the next turn rebuild with the just-published Release,
- * including provider configuration and credentials. Session invalidation is
- * turn-safe: a currently running prompt completes on the old Release.
+ * The provider half of settings.json, as served by /api/internal/settings.
+ * Everything else in that response (paths, server, debug…) is box-local and
+ * must not be overwritten by a reload.
  */
-export const modelHandler: AgentBoxSyncHandler<null> = {
+interface ModelSettingsPayload {
+  providers?: Record<string, unknown>;
+  default?: { provider: string; modelId: string };
+  modelRouting?: unknown;
+  tracing?: unknown;
+}
+
+/** The keys a model reload owns. Anything outside this list survives untouched. */
+const MODEL_SETTINGS_KEYS = ["providers", "default", "modelRouting", "tracing"] as const;
+
+/**
+ * Model bindings are resolved by the Gateway for every prompt, so invalidating
+ * the warm brain is enough to pick up a just-published Release: the next turn
+ * rebuilds against the new binding. Session invalidation is turn-safe — a
+ * running prompt completes on the old Release.
+ *
+ * ⚠️ That is NOT enough for a rotated API key, which is why this handler
+ * refetches settings.json instead of being a pure invalidation.
+ *
+ * The key travels on every prompt, but it does not win. `createAgent` seeds
+ * pi's credential store from settings.json (`setRuntimeApiKey`), and pi's
+ * resolution rule is that a stored credential OWNS the provider — the key in
+ * the per-prompt `registerProvider` config is only consulted when nothing is
+ * stored. settings.json is fetched once, at box startup. So a box that started
+ * before the rotation kept serving the old key until its pod was replaced, and
+ * "which boxes got the new key" came down to which ones happened to restart.
+ *
+ * Rewriting settings.json here closes that: materialize lands the new key on
+ * disk, the invalidation forces the next turn through `createAgent`, and that
+ * rebuild re-seeds the credential store from the file we just wrote.
+ *
+ * Ordering matters and is load-bearing: materialize runs before postReload, so
+ * the file is already current when the rebuilt session reads it.
+ */
+export const modelHandler: AgentBoxSyncHandler<ModelSettingsPayload | null> = {
   type: "model",
-  async fetch(): Promise<null> {
-    return null;
+
+  async fetch(client: GatewaySyncClientLike | null): Promise<ModelSettingsPayload | null> {
+    // Optional by design — see the descriptor's requiresGatewayClient comment.
+    // Local mode has no Gateway to ask and still wants the invalidation.
+    if (!client) return null;
+    const descriptor = GATEWAY_SYNC_DESCRIPTORS.model;
+    const data = await client.request(descriptor.gatewayPath, "GET");
+    return (data ?? null) as ModelSettingsPayload | null;
   },
-  async materialize(): Promise<number> {
-    return 0;
+
+  async materialize(payload: ModelSettingsPayload | null): Promise<number> {
+    if (!payload) return 0;
+    const next: SiclawConfig = { ...loadConfig() };
+    const writable = next as unknown as Record<string, unknown>;
+    // Assign AND delete: an agent whose model was unbound comes back with no
+    // `default`, and merging alone would leave the previous one pointing at a
+    // provider that is no longer configured.
+    for (const key of MODEL_SETTINGS_KEYS) {
+      const value = payload[key];
+      if (value === undefined) delete writable[key];
+      else writable[key] = value;
+    }
+    writeConfig(next);
+    return Object.keys(payload.providers ?? {}).length;
   },
+
   async postReload(context: ReloadContext): Promise<void> {
+    // Drop the cached parse so the rebuild below reads the file just written.
+    reloadConfig();
     invalidateSessions(context);
   },
 };
