@@ -197,13 +197,21 @@ export const GATEWAY_SYNC_DESCRIPTORS: Record<GatewaySyncType, GatewaySyncDescri
   },
   model: {
     type: "model",
-    gatewayPath: "",
+    gatewayPath: "/api/internal/settings",
     reloadPath: "/api/reload-model",
     retry: { maxRetries: 1, baseDelayMs: 1000 },
+    // FALSE even though there IS a payload to fetch, which is the unusual part.
+    // Local mode has no Gateway URL, and the route skips the whole reload for a
+    // descriptor that demands a client it cannot get — including the session
+    // invalidation, which works perfectly well without one. So the handler
+    // treats the fetch as optional and degrades to invalidate-only instead.
     requiresGatewayClient: false,
-    // Model credentials and provider config continue to resolve per message.
-    // Reload is an identity-bound session invalidation, not a secret-bearing
-    // payload sync.
+    // Model IDENTITY (which release, which model id) still resolves per message
+    // off the binding the Gateway sends with every prompt. What does NOT is the
+    // provider SECRET: settings.json is read once at box startup, and the key it
+    // carries is written into pi's credential store, which then owns the
+    // provider and shadows the key arriving on each prompt. Refetching settings
+    // here is what makes a rotation reach a box that is already running.
     initialSync: false,
   },
 };

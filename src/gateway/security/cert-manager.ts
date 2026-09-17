@@ -17,9 +17,9 @@
  * value is looked up from the agents table on every authz decision in
  * Upstream (SQL join on agents.is_production = resource.is_production) —
  * this way a toggle reflects immediately without requiring pod rebuild
- * or cert re-issue. AgentBox is user-unaware end-to-end: no userId in
- * cert, no userId in request payloads; user attribution is resolved at
- * Runtime boundaries via sessionId.
+ * or cert re-issue. Ordinary boxes resolve user attribution at Runtime
+ * boundaries via sessionId. Private Web boxes additionally carry the signed
+ * user principal in OU, restricting every callback to that user.
  */
 
 import crypto from "node:crypto";
@@ -59,6 +59,8 @@ export function randomSerialHex(randomBytes: (n: number) => Buffer = crypto.rand
 }
 
 export interface CertificateIdentity {
+  /** Immutable private Web principal, signed into the certificate OU. */
+  privateUserId?: string;
   agentId: string;
   orgId: string;
   boxId: string;
@@ -175,6 +177,7 @@ export class CertificateManager {
     agentId: string,
     orgId: string,
     boxId: string,
+    privateUserId?: string,
   ): CertificateBundle {
     const { privateKey, publicKey } = crypto.generateKeyPairSync("rsa", {
       modulusLength: 2048,
@@ -186,7 +189,7 @@ export class CertificateManager {
     const expiresAt = new Date(issuedAt.getTime() + AGENTBOX_CERT_VALIDITY_DAYS * 24 * 60 * 60 * 1000);
 
     const cert = CertificateManager.createCertificateStatic({
-      subject: { CN: agentId, O: orgId, serialNumber: boxId },
+      subject: { CN: agentId, O: orgId, serialNumber: boxId, ...(privateUserId ? { OU: privateUserId } : {}) },
       issuerAttrs: this.caSubjectAttrs,
       publicKey,
       signingKey: this.caKey,
@@ -212,7 +215,7 @@ export class CertificateManager {
       cert,
       key: privateKey,
       ca: this.caCert,
-      identity: { agentId, orgId, boxId, issuedAt, expiresAt },
+      identity: { agentId, orgId, boxId, issuedAt, expiresAt, ...(privateUserId ? { privateUserId } : {}) },
     };
   }
 
@@ -251,7 +254,9 @@ export class CertificateManager {
         return null;
       }
 
-      return { agentId, orgId, boxId, issuedAt: cert.validity.notBefore, expiresAt: cert.validity.notAfter };
+      const privateUserId = getAttr("organizationalUnitName");
+      if (privateUserId && !/^web_[0-9a-f]{32}$/.test(privateUserId)) return null;
+      return { agentId, orgId, boxId, issuedAt: cert.validity.notBefore, expiresAt: cert.validity.notAfter, ...(privateUserId ? { privateUserId } : {}) };
     } catch (err) {
       console.error("[cert-manager] Certificate verification error:", err);
       return null;
@@ -312,7 +317,10 @@ export class CertificateManager {
     const subjectAttrs = [];
     if (opts.subject.CN) subjectAttrs.push({ name: "commonName", value: opts.subject.CN });
     if (opts.subject.O) subjectAttrs.push({ name: "organizationName", value: opts.subject.O });
-    if (opts.subject.OU) subjectAttrs.push({ name: "organizationalUnitName", value: opts.subject.OU });
+    // Web principals contain an underscore, which X.509 PrintableString excludes.
+    // Kubernetes' Go TLS parser enforces the ASN.1 character set strictly.
+    // @types/node-forge incorrectly types valueTagClass as Class rather than Type.
+    if (opts.subject.OU) subjectAttrs.push({ name: "organizationalUnitName", value: opts.subject.OU, valueTagClass: forge.asn1.Type.UTF8 as unknown as forge.asn1.Class });
     if (opts.subject.serialNumber) subjectAttrs.push({ name: "serialNumber", value: opts.subject.serialNumber });
     cert.setSubject(subjectAttrs);
 
@@ -327,7 +335,7 @@ export class CertificateManager {
       const issuerAttrs = [];
       if (issuerData.CN) issuerAttrs.push({ name: "commonName", value: issuerData.CN });
       if (issuerData.O) issuerAttrs.push({ name: "organizationName", value: issuerData.O });
-      if (issuerData.OU) issuerAttrs.push({ name: "organizationalUnitName", value: issuerData.OU });
+      if (issuerData.OU) issuerAttrs.push({ name: "organizationalUnitName", value: issuerData.OU, valueTagClass: forge.asn1.Type.UTF8 as unknown as forge.asn1.Class });
       cert.setIssuer(issuerAttrs);
     }
 

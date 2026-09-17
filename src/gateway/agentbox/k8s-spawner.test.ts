@@ -1977,3 +1977,33 @@ describe("K8sSpawner — every listing carries what staleness is judged on", () 
     expect(withoutClock(forAgent)).toEqual(withoutClock(fromList));
   });
 });
+
+import { webExecutionScope } from "../../shared/web-execution-scope.js";
+
+describe("private Web execution volumes and certificate identity", () => {
+  it("mounts disjoint data for two users while retaining the source Agent configuration", async () => {
+    const agent = "590c7f3b-9c0b-4d0f-8842-f704249cea7b";
+    const cm = new FakeCertManager();
+    const s = new K8sSpawner({ persistence: { enabled: true, claimName: "private-data" } });
+    s.setCertManager(cm as any);
+    for (const user of [`web_${"a".repeat(32)}`, `web_${"b".repeat(32)}`]) {
+      let reads = 0;
+      readPodImpl.fn = async () => {
+        if (++reads === 1) throw Object.assign(new Error("not found"), {code:404});
+        return { status:{phase:"Running",podIP:"10.1.2.3",conditions:[{type:"Ready",status:"True"}]},metadata:{labels:{}} };
+      };
+      const scope = webExecutionScope(agent,user);
+      await s.spawn({agentId:scope,persistence:true});
+      const pod = calls.createNamespacedPod.at(-1).body;
+      const secret = calls.createNamespacedSecret.at(-1).body;
+      expect(pod.metadata.name.length).toBeLessThanOrEqual(63);
+      expect(secret.metadata.name.length).toBeLessThanOrEqual(63);
+      expect(pod.spec.containers[0].env).toContainEqual({name:"SICLAW_AGENT_ID",value:agent});
+      expect(pod.spec.containers[0].volumeMounts.find((m:any)=>m.mountPath==="/app/.siclaw/user-data").subPath).toBe(`agents/${scope}`);
+      expect(cm.issuedCalls.at(-1)).toEqual([agent,"",`webbox-${scope}`,user]);
+    }
+    const [a,b] = calls.createNamespacedPod.map((c:any)=>c.body);
+    expect(a.metadata.name).not.toBe(b.metadata.name);
+    expect(a.spec.containers[0].volumeMounts).not.toEqual(b.spec.containers[0].volumeMounts);
+  });
+});

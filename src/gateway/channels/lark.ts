@@ -2833,11 +2833,13 @@ const API_KEY_PICKUP_BUTTON_BY_LOCALE: Record<LarkLocale, string> = {
  */
 const API_KEY_DENIAL_COPY_BY_LOCALE: Record<LarkLocale, Map<string, { lead: string; resume?: string }>> = {
   "zh-CN": new Map([
+    ["personal_key_unavailable", { lead: "公开 Agent 不提供个人 API Key，可直接在飞书聊天。平台接入请由 Agent Owner 在 Sicore 创建专用 Key。" }],
     ["binding_required", { lead: "❌ 领取 API Key 需要先关联账号。", resume: "关联完成后回来重发 /apikey" }],
     ["access_request_required", { lead: "❌ 领取 API Key 需要该 Agent 的使用授权。", resume: "审批通过后回来重发 /apikey" }],
     ["access_denied", { lead: "❌ 你没有该 Agent 的使用权限，且未开放自助申请，请联系负责人。" }],
   ]),
   "en-US": new Map([
+    ["personal_key_unavailable", { lead: "Public agents do not offer personal API keys. Chat directly in Feishu; the Agent owner can create platform keys in Sicore." }],
     ["binding_required", { lead: "❌ Getting an API key requires linking your account first.", resume: "Once linked, send /apikey again." }],
     ["access_request_required", { lead: "❌ Getting an API key requires access to this agent.", resume: "Once approved, send /apikey again." }],
     ["access_denied", { lead: "❌ You don't have access to this agent and self-service requests are closed — ask its owner." }],
@@ -2897,11 +2899,21 @@ function formatApiKeyStatusReply(result: PersonalApiKeyStatusResult, locale: Lar
   // the advice attached to this branch ("send /apikey") ROTATES — so inferring absence from a
   // merely-missing field would destroy the very key the user asked us to inspect. A present
   // prefix is sufficient evidence that a key exists.
+  if (result.personalKeyAvailable === false) {
+    return locale === "en-US"
+      ? "This public agent does not offer personal API keys. You can chat directly in Feishu. Any existing personal key is unusable."
+      : "这个公开 Agent 不提供个人 API Key，可直接在飞书聊天。已有的个人 Key 也不可使用。";
+  }
   const hasKey = result.exists === true || Boolean(result.keyPrefix);
   if (!hasKey) {
     return locale === "en-US"
       ? "You don't have an API key for this agent yet — send /apikey to get one."
       : "你还没有这个 Agent 的 API Key，发送 /apikey 领取。";
+  }
+  if (result.status && result.status !== "active") {
+    return locale === "en-US"
+      ? `Your key (${result.keyPrefix ?? "unknown"}…) is unusable. Check your account link and Agent access, then send /apikey to replace it.`
+      : `当前 Key（${result.keyPrefix ?? "未知"}…）不可使用。请确认账号关联及 Agent 权限后，发送 /apikey 重新领取。`;
   }
   const lastUsed = formatApiKeyTimestamp(result.lastUsedAt, locale, true);
   const expiry = formatApiKeyTimestamp(result.expiresAt, locale, false);

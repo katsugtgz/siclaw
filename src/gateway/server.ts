@@ -1,3 +1,4 @@
+import { webExecutionScope, sourceAgentId } from "../shared/web-execution-scope.js";
 import { AgentRetiredError } from "../shared/agent-retirement.js";
 import { parseHandoffPolicy } from "../shared/agent-handoff.js";
 import { parseRequestMode } from "../shared/request-mode.js";
@@ -40,7 +41,7 @@ import { CAPABILITY_OBSERVE_CONTAINER } from "./capability/contract.js";
 import { driveCapabilitySession } from "./capability/session-driver.js";
 import { asFailureToken } from "./capability/failure.js";
 import { driveTestSession, shouldRelayTestSession } from "./capability/test-relay.js";
-import { CAPABILITY_GET_RUN, isTerminalCapabilityStatus } from "./capability/contract.js";
+import { CAPABILITY_GET_RUN, CAPABILITY_FETCH_INPUT, isTerminalCapabilityStatus } from "./capability/contract.js";
 import type {
   CapabilityCancelRequest,
   CapabilityCancelResponse,
@@ -245,11 +246,11 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
 
   const sandboxTurns = new SandboxTurnContext();
   const scriptSandbox = createScriptSandboxApi(spawner?.name ?? "local", frontendClient, async (principal, args, signal, approval) => {
-    const handle = await agentBoxManager.getForSession(principal.agentId, principal.sessionId);
+    const handle = await agentBoxManager.getForSession(webExecutionScope(principal.agentId, (await sessionRegistry.get(principal.sessionId))?.userId), principal.sessionId);
     // K8s pool replicas share a certificate whose boxId names the pool, not a Pod.
     // Route by the live session binding; only its originating box holds the active
     // callback grant. A moved/replaced box rejects the grant instead of executing.
-    if (!handle || handle.agentId !== principal.agentId || !principal.callbackToken) {
+    if (!handle || sourceAgentId(handle.agentId) !== principal.agentId || !principal.callbackToken) {
       throw new Error("Sandbox callback placement changed");
     }
     signal.throwIfAborted();
@@ -822,6 +823,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         `不要提"交接"、不要复述、不要重新自我介绍。要办的事:]\n${text}`
       : text;
     const promptOpts: PromptOptions = {
+      apiRequestId: typeof params.apiRequestId === "string" ? params.apiRequestId : undefined,
       requestMode,
       sessionId,
       turnId,
@@ -987,7 +989,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         // Persistence is resolved by agentId in the manager's persistenceResolver
         // (registered in startRuntime), not from per-request params — so every
         // entry point lands the same mode for the same agent.
-        const handle = await agentBoxManager.getOrCreate(agentId, undefined, sessionId);
+        const handle = await agentBoxManager.getOrCreate(webExecutionScope(agentId, userId), undefined, sessionId);
         const selectedBoxId = handle.boxId ?? "unknown";
         console.log(`[runtime] chat.send selected agentId=${agentId} sessionId=${sessionId} turnId=${turnId} boxId=${selectedBoxId}`);
         // Which box this turn went to. Placement reads it back as a hint while the turn
@@ -1385,6 +1387,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
             // an older box ignores the field, while a newer box only waits for
             // ACKs when a runtime explicitly advertises this support.
             artifact_ack: true,
+            credential_refresh: true,
             // Whole-block authority: consumer LLM config wins as-is; only an
             // absent block uses Runtime's Helm env. The box applies it before
             // its SDK connects. Never logged here; token stays out of PodSpec.
@@ -1717,7 +1720,9 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // candidate/ draft to pin even after a reap/restart.
     const { client } = await ensureCapabilitySession(runId, rec.profile, rec.orgId || undefined, undefined);
     const allowedTools = getBoxProfile("kb-test").allowedTools ?? null;
+    const testInput = await frontendClient.request(CAPABILITY_FETCH_INPUT, { run_id: runId, ref: "test-model" }) as { llm?: unknown };
     const opened = (await client.postJson(`/test-session/${runId}`, {
+      ...(testInput.llm ? { llm: testInput.llm } : {}),
       allowed_tools: allowedTools,
       // Optional consumer-provided snapshot (e.g. a published version bundle);
       // absent → the box pins the run's candidate/ draft.
@@ -1771,7 +1776,10 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // If the box died since testStart, the respawned box won't know this tid →
     // the box's 404 surfaces as an error and the consumer starts a fresh test
     // session (test sessions are disposable; there is nothing to resume).
-    await client.postJson(`/test-message/${req.test_session_id}`, { message: req.message });
+    const testInput = await frontendClient.request(CAPABILITY_FETCH_INPUT, { run_id: req.run_id, ref: "test-model" }) as { llm?: unknown };
+    await client.postJson(`/test-message/${req.test_session_id}`, {
+      message: req.message, ...(testInput.llm ? { llm: testInput.llm } : {}),
+    });
     return { ok: true, run_id: req.run_id, test_session_id: req.test_session_id };
   });
 
@@ -1947,6 +1955,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
    * to do nothing, because the turn may still be running somewhere.
    */
   async function boxForRunningTurn(agentId: string, sessionId: string): Promise<AgentBoxClient> {
+    agentId = webExecutionScope(agentId, (await sessionRegistry.get(sessionId))?.userId);
     const endpoint = sessionTurnLocks.busyOn(sessionId)?.endpoint
       ?? (await agentBoxManager.getHolder?.(agentId, sessionId).catch(() => undefined))?.endpoint
       ?? (await agentBoxManager.getOrCreate(agentId, undefined, sessionId)).endpoint;
@@ -2119,7 +2128,8 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // one of them. Deriving the instance-0 pod name would report a session pinned to
     // instance 1 as not running — losing stream reattachment on refresh, and making a
     // live A2A task look orphaned after a Portal restart.
-    const handle = await (agentBoxManager.getForSession?.(agentId, sessionId) ?? agentBoxManager.getAsync(agentId));
+    const scope = webExecutionScope(agentId, (await sessionRegistry.get(sessionId))?.userId);
+    const handle = await (agentBoxManager.getForSession?.(scope, sessionId) ?? agentBoxManager.getAsync(scope));
     if (!handle) return { ok: true, running: false };
     try {
       const client = new AgentBoxClient(handle.endpoint, 10000, agentBoxTlsOptions);
@@ -2159,7 +2169,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     if (!agentId) throw new Error("agentId required");
 
     const boxes = await agentBoxManager.list();
-    const targets = boxes.filter((b) => b.agentId === agentId);
+    const targets = boxes.filter((b) => sourceAgentId(b.agentId) === agentId);
 
     // Stop all matching boxes in parallel; each error is contained so one
     // failure doesn't block the rest.
@@ -2219,7 +2229,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // pods either have no podIP yet or a stale one, and RPCs to them would
     // ETIMEDOUT and slow the whole fan-out. See bug report
     // "siclaw-agent-reload-stale-pods-and-serial-blocking".
-    const targets = boxes.filter((b) => b.agentId === agentId && b.status === "running");
+    const targets = boxes.filter((b) => sourceAgentId(b.agentId) === agentId && b.status === "running");
 
     if (targets.length === 0) {
       console.log(`[rpc] agent.reload: no active boxes for agent=${agentId}, skipping`);
@@ -2267,7 +2277,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     if (!agentId) throw new Error("agentId required");
 
     const boxes = await agentBoxManager.list();
-    const agentBoxes = boxes.filter((b) => b.agentId === agentId);
+    const agentBoxes = boxes.filter((b) => sourceAgentId(b.agentId) === agentId);
     const targets = agentBoxes.filter((b) => b.status === "running");
     if (targets.length === 0) {
       return {

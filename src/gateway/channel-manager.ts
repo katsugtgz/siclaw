@@ -340,6 +340,8 @@ export interface PersonalApiKeyIssueResult {
 
 /** Result of `/apikey status` — read-only, never rotates. */
 export interface PersonalApiKeyStatusResult {
+  personalKeyAvailable?: boolean;
+  status?: "active" | "expired" | "idle_expired" | "unauthorized";
   success: boolean;
   agentId?: string;
   exists?: boolean;

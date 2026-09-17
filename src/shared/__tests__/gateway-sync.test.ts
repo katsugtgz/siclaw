@@ -103,11 +103,15 @@ describe("GATEWAY_SYNC_DESCRIPTORS", () => {
     expect(d.reloadPath).toBe("/api/reload-prompt");
   });
 
-  it("model: rebuilds sessions without transporting credentials", () => {
+  it("model: refetches settings so a rotated key reaches a running box", () => {
     const d = GATEWAY_SYNC_DESCRIPTORS.model;
+    // Optional fetch: a path to call, but no hard requirement for a client.
+    // Local mode has no Gateway and must still get the invalidation, and the
+    // reload route skips outright when requiresGatewayClient is true.
     expect(d.requiresGatewayClient).toBe(false);
+    expect(d.gatewayPath).toBe("/api/internal/settings");
+    // Startup already fetches settings in agentbox-main; this is the hot path.
     expect(d.initialSync).toBe(false);
-    expect(d.gatewayPath).toBe("");
     expect(d.reloadPath).toBe("/api/reload-model");
   });
 

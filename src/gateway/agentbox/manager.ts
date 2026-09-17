@@ -1,3 +1,4 @@
+import { decodeWebExecutionScope, sourceAgentId } from "../../shared/web-execution-scope.js";
 /**
  * AgentBox Manager
  *
@@ -303,6 +304,7 @@ export class AgentBoxManager {
   }
 
   private async resolveReplicas(agentId: string): Promise<number> {
+    if (decodeWebExecutionScope(agentId)) return 1;
     if (!this.replicasResolver) return 1;
     const cached = this.replicasCache.get(agentId);
     if (cached && Date.now() - cached.at < REPLICAS_TTL_MS) return cached.value;
@@ -424,6 +426,7 @@ export class AgentBoxManager {
     sessionId?: string,
   ): Promise<AgentBoxAcquisition> {
     if (!agentId) throw new Error("AgentBoxManager.getOrCreate requires an agentId");
+    if (decodeWebExecutionScope(agentId) && !this.isK8s) throw new Error("Private Web execution requires Kubernetes isolation");
     if (this.isK8s) {
       // A capability box is a per-run job, not a long-lived agent, so it never pools.
       const wantProfile = config?.profile ?? "agent";
@@ -1581,7 +1584,7 @@ export class AgentBoxManager {
    * key collisions.
    */
   private async resolveEnv(agentId: string, configEnv?: Record<string, string>): Promise<Record<string, string>> {
-    const lazy = this.spawnEnvResolver ? (await this.spawnEnvResolver(agentId)) ?? {} : {};
+    const lazy = this.spawnEnvResolver ? (await this.spawnEnvResolver(sourceAgentId(agentId))) ?? {} : {};
     return { ...lazy, ...(configEnv ?? {}) };
   }
 
@@ -1594,7 +1597,7 @@ export class AgentBoxManager {
    */
   private async resolvePersistence(agentId: string, configValue?: boolean): Promise<boolean | undefined> {
     if (configValue !== undefined) return configValue;
-    return this.persistenceResolver ? await this.persistenceResolver(agentId) : undefined;
+    return this.persistenceResolver ? await this.persistenceResolver(sourceAgentId(agentId)) : undefined;
   }
 
   /**

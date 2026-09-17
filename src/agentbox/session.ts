@@ -122,7 +122,7 @@ import { extractToolResultId } from "../core/message-utils.js";
  * `mainTraceId` stamps chat_messages.trace_id (DB audit); `spawnSpanContext` nests the child
  * ROOT under the parent's spawn_subagent tool span (Langfuse). Both undefined when tracing is off.
  */
-type SubagentTraceContext = { mainTraceId?: string; spawnSpanContext?: SpanContext };
+type SubagentTraceContext = { apiRequestId?: string; mainTraceId?: string; spawnSpanContext?: SpanContext };
 
 export interface ManagedSession {
   agentPrompt?: string;
@@ -180,6 +180,7 @@ export interface ManagedSession {
    * (every brain.prompt() callsite chains through a single Promise queue,
    * _promptDone becomes a status flag derived from the queue).
    */
+  _apiRequestId?: string;
   _promptInflight: Promise<void> | null;
   /** Mutable reference to the active kubeconfig path — tools read .current at execution time */
   kubeconfigRef: KubeconfigRef;
@@ -400,16 +401,18 @@ export class AgentBoxSessionManager {
   // Retain the launching request owner until notification, even if Stop/handoff
   // replaces the session's current request before a late child/process exit.
   private backgroundWorkOwners = new Map<string, BackgroundWorkTurn>();
+  private notificationReceipts = new WeakMap<TaskNotification, string | undefined>();
 
   /** Both HTTP and fallback turns use the same mailbox and late-result recovery. */
   beginBackgroundWorkTurn(managed: ManagedSession, mode: RequestMode = "async"): BackgroundWorkTurn {
     managed._requestMode = mode;
+    const apiRequestId = managed._apiRequestId;
     const turn = new BackgroundWorkTurn(notification => {
       const job = this.jobs.get(notification.taskId);
       if (mode === "sync" || this.sessions.get(managed.id) !== managed || managed._aborted ||
           job?.type !== "subagent" || job.suppressNotifyTurn) return;
       console.info(`[agentbox-session] late subagent result session=${managed.id} job=${notification.taskId}; queuing follow-up`);
-      this.queueParentNotification(managed, notification);
+      this.queueParentNotification(managed, notification, apiRequestId);
     });
     managed._backgroundWorkTurn = turn;
     managed.brain.setMailbox?.(turn.mailbox);
@@ -769,11 +772,14 @@ export class AgentBoxSessionManager {
    * Reads userDataDir from settings.json.
    */
   private usageOutbox?: UsageOutbox;
-  setUsageRole(sessionId: string, role: "root" | "delegated"): void {
+  setUsageRole(sessionId: string, role: "root" | "delegated", apiRequestId?: string): void {
     const managed = this.sessions.get(sessionId);
-    if (managed) this.attachUsage(managed.brain, sessionId, role);
+    if (managed) {
+      managed._apiRequestId = apiRequestId;
+      this.attachUsage(managed.brain, sessionId, role, undefined, apiRequestId);
+    }
   }
-  private attachUsage(brain: BrainSession, sessionId: string, role: "root" | "internal_subagent" | "delegated", traceId?: string): void {
+  private attachUsage(brain: BrainSession, sessionId: string, role: "root" | "internal_subagent" | "delegated", traceId?: string, apiRequestId?: string): void {
     if (!this.gatewayClient || !this.agentId) return;
     if (!this.usageOutbox) {
       // Agent identity partitions local spawners that share a user data directory.
@@ -792,7 +798,7 @@ export class AgentBoxSessionManager {
     brain.llmCalls?.setUsageSink?.({
       context: () => {
         const rootTrace = traceId ?? tracingRecorder.getRootTraceId(sessionId);
-        return { sessionId, executionRole: role, traceId: rootTrace, ...(rootTrace ? { requestId: rootTrace } : {}) };
+        return { sessionId, apiRequestId, executionRole: role, traceId: rootTrace, ...(rootTrace ? { requestId: rootTrace } : {}) };
       },
       record: observation => this.usageOutbox!.record(observation),
     });
@@ -1160,6 +1166,7 @@ export class AgentBoxSessionManager {
       // ⚠️ Never re-capture per child with a derived `${groupId}#i` id — that mints phantom spans.
       const traceCtx = {
         mainTraceId: tracingRecorder.getRootTraceId(request.parentSessionId),
+        apiRequestId: this.sessions.get(request.parentSessionId)?._apiRequestId,
         spawnSpanContext: tracingRecorder.ensureToolSpan(request.parentSessionId, request.spawnId, "spawn_subagent"),
       };
 
@@ -2247,11 +2254,12 @@ export class AgentBoxSessionManager {
     // via the synthetic-turn path (never followUp): the completion itself already shows in the
     // tool box (exec_job_done above). Requests without an owner use the legacy
     // queued delivery path; attached work has already returned above.
-    this.queueParentNotification(managed, n);
+    this.queueParentNotification(managed, n, managed._apiRequestId);
   }
 
-  private queueParentNotification(managed: ManagedSession, n: TaskNotification): void {
+  private queueParentNotification(managed: ManagedSession, n: TaskNotification, apiRequestId?: string): void {
     if (managed._aborted) return;
+    this.notificationReceipts.set(n, apiRequestId);
     managed._pendingNotifications.push(n);
     if (!managed._coalesceTimer) {
       managed._coalesceTimer = setTimeout(() => {
@@ -2294,9 +2302,20 @@ export class AgentBoxSessionManager {
     }
     const batch = managed._pendingNotifications.splice(0);
     if (batch.length === 0) return;
-    const hasSubagent = batch.some(n => this.jobs.get(n.taskId)?.type === "subagent");
-    await this.runSyntheticPrompt(managed,
-      hasSubagent ? lateSubagentResultPrompt(batch) : buildNotificationBatch(batch), hasSubagent);
+    // A late result retains its launching request even if another API key has
+    // since used the session. Coalesce only results with the same receipt.
+    const byRequest = new Map<string | undefined, TaskNotification[]>();
+    for (const notification of batch) {
+      const receipt = this.notificationReceipts.get(notification);
+      const group = byRequest.get(receipt) ?? [];
+      group.push(notification);
+      byRequest.set(receipt, group);
+    }
+    for (const [receipt, notifications] of byRequest) {
+      const hasSubagent = notifications.some(n => this.jobs.get(n.taskId)?.type === "subagent");
+      await this.runSyntheticPrompt(managed,
+        hasSubagent ? lateSubagentResultPrompt(notifications) : buildNotificationBatch(notifications), hasSubagent, receipt);
+    }
   }
 
   /**
@@ -2306,7 +2325,7 @@ export class AgentBoxSessionManager {
    * already started (we wait for it) or hits the 409 guard. This closes
    * the TOCTOU documented at the _promptInflight declaration.
    */
-  private runSyntheticPrompt(managed: ManagedSession, text: string, persistInput = false): Promise<void> {
+  private runSyntheticPrompt(managed: ManagedSession, text: string, persistInput = false, apiRequestId?: string): Promise<void> {
     const run = (managed._syntheticPromptQueue ?? Promise.resolve())
       .catch(() => {})
       .then(async () => {
@@ -2327,6 +2346,7 @@ export class AgentBoxSessionManager {
         managed._promptOutcome = undefined;
         managed._aborted = false;
         managed._currentTurnId = randomUUID();
+        this.setUsageRole(managed.id, "root", apiRequestId);
         const backgroundWorkTurn = this.beginBackgroundWorkTurn(managed);
         // Cancel any pending release timer (mirrors getOrCreate): a background job's
         // onSettled may have armed scheduleRelease just before this turn started — left
@@ -2833,7 +2853,7 @@ export class AgentBoxSessionManager {
    */
   private async runSpawnedSubagent(
     request: SpawnSubagentRequest,
-    opts?: { childSessionId?: string; jobId?: string; mainTraceId?: string; spawnSpanContext?: SpanContext },
+    opts?: { childSessionId?: string; jobId?: string; apiRequestId?: string; mainTraceId?: string; spawnSpanContext?: SpanContext },
     onProgress?: (progress: SpawnSubagentProgress) => void,
     signal?: AbortSignal,
   ): Promise<SpawnSubagentResult> {
@@ -2913,7 +2933,7 @@ export class AgentBoxSessionManager {
     child.sessionIdRef.current = childSessionId;
     const mailbox = this.subagentRuns.get(childSessionId)?.mailbox;
     mailbox?.attach(child.brain);
-    this.attachUsage(child.brain, childSessionId, "internal_subagent", mainTraceId);
+    this.attachUsage(child.brain, childSessionId, "internal_subagent", mainTraceId, opts?.apiRequestId);
 
     // ── Model selection: tier, or the parent's effective model ──────────────
     //

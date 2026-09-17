@@ -126,7 +126,7 @@ describe("startRuntime — chat.send forwards sub-agent tier candidates", () => 
     const send = server.rpcMethods.get("chat.send")!;
 
     await send(
-      { agentId: "a", userId: "u", text: "hi", sessionId: "S1", subagentTiers: TIERS },
+      { agentId: "a", userId: "u", text: "hi", sessionId: "S1", subagentTiers: TIERS, apiRequestId: "receipt-first" },
       { sendEvent: vi.fn() },
     );
     await waitFor(() => promptCalls.length > 0);
@@ -135,6 +135,7 @@ describe("startRuntime — chat.send forwards sub-agent tier candidates", () => 
     // Runtime editing the payload here would just be a second, divergent copy of
     // rules that already live at the boundary.
     expect(promptCalls[0].subagentTiers).toEqual(TIERS);
+    expect(promptCalls[0].apiRequestId).toBe("receipt-first");
   });
 
   it("passes undefined when the caller sends no tiers, rather than inventing state", async () => {
@@ -148,6 +149,7 @@ describe("startRuntime — chat.send forwards sub-agent tier candidates", () => 
     await waitFor(() => promptCalls.length > 0);
 
     expect(promptCalls[0].subagentTiers).toBeUndefined();
+    expect(promptCalls[0].apiRequestId).toBeUndefined();
     // Absent, not null: the box treats both as "no tiers this turn", but sending a
     // key the caller never set would misreport a clear as a decision.
     expect("subagentTiers" in promptCalls[0]).toBe(true);

@@ -1,3 +1,4 @@
+import { decodeWebExecutionScope } from "../../shared/web-execution-scope.js";
 /**
  * K8s Pod Spawner
  *
@@ -258,6 +259,7 @@ export class K8sSpawner implements BoxSpawner {
 
   /** The name every box of this agent shares, without an instance index. */
   private podBaseName(agentId: string, prefix = "agentbox"): string {
+    if (decodeWebExecutionScope(agentId)) prefix = "webbox";
     const sanitized = agentId.toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 50);
     return `${prefix}-${sanitized}`;
   }
@@ -471,6 +473,9 @@ export class K8sSpawner implements BoxSpawner {
     const isCompiler = ["kb-compile", "kb-compile-codex", "kb-test"].includes(profile.name);
     const image = boxConfig.image ?? profile.image ?? this.config.image;
     const agentId = boxConfig.agentId;
+    const privateScope = decodeWebExecutionScope(agentId);
+    const sourceAgent = privateScope?.agentId ?? agentId;
+    if (privateScope && profile.name !== "agent") throw new Error("Private Web scope requires the agent profile");
     if (!agentId) throw new Error("K8sSpawner.spawn requires a non-empty agentId");
     const podPrefix = profile.podNamePrefix ?? "agentbox";
     const podName = this.podName(agentId, podPrefix, boxConfig.instance ?? 0);
@@ -586,7 +591,7 @@ export class K8sSpawner implements BoxSpawner {
     // The AGENT's name, not a pod's: this identity is shared by every box, and the
     // metrics-flush authorizer accepts `<certBase>-<instance>` from any of them.
     const certBase = this.podBaseName(agentId, podPrefix);
-    const certBundle = this.certManager.issueAgentBoxCertificate(agentId, orgId, certBase);
+    const certBundle = privateScope ? this.certManager.issueAgentBoxCertificate(sourceAgent, orgId, certBase, privateScope.userId) : this.certManager.issueAgentBoxCertificate(agentId, orgId, certBase);
     const certSecretName = this.certSecretName(agentId, podPrefix);
 
     const secretLabels = {
@@ -603,7 +608,7 @@ export class K8sSpawner implements BoxSpawner {
     const env: k8s.V1EnvVar[] = [
       { name: "PI_CODING_AGENT_DIR", value: ".siclaw/user-data/agent" },
       { name: "SICLAW_GATEWAY_URL", value: this.gatewayUrl(namespace) },
-      { name: "SICLAW_AGENT_ID", value: agentId },
+      { name: "SICLAW_AGENT_ID", value: sourceAgent },
       // Which pod this process is. Every box of an agent presents the SAME certificate,
       // so the cert can no longer tell the Gateway which replica is reporting — the box
       // has to say, and the Gateway authorizes the claim against the cert (see

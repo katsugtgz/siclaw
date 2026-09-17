@@ -647,7 +647,8 @@ describe("http-server — prompt + session lifecycle", () => {
     }).mockImplementationOnce(async (text: string) => {
       expect(text).toContain("child report"); emit("ROOT_FINAL_REPORT");
     });
-    await getJson(port, "/api/prompt", "POST", { text: "inspect", sessionId: session.id, requestMode: "sync" });
+    await getJson(port, "/api/prompt", "POST", { text: "inspect", sessionId: session.id, requestMode: "sync", apiRequestId: "sync-receipt" });
+    expect(sm.setUsageRole).toHaveBeenCalledWith(session.id, "root", "sync-receipt");
     const response = await fetch(`http://127.0.0.1:${port}/api/stream/${session.id}`);
     let ended = false; const body = response.text().then(text => { ended = true; return text; });
     await flushAsync();
@@ -1396,10 +1397,11 @@ describe("http-server — prompt + session lifecycle", () => {
     const existing = await sm.getOrCreate("busy");
     existing._promptDone = false;
 
-    const r = await getJson(port, "/api/prompt", "POST", { text: "hi again", sessionId: "busy" });
+    const r = await getJson(port, "/api/prompt", "POST", { text: "hi again", sessionId: "busy", requestMode: "sync", apiRequestId: "rejected-receipt" });
 
     expect(r.status).toBe(409);
     expect(r.data.error).toMatch(/already running/i);
+    expect(sm.setUsageRole).not.toHaveBeenCalled();
     expect(existing.brain.prompt).not.toHaveBeenCalled();
   });
 

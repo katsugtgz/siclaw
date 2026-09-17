@@ -1,3 +1,4 @@
+import { matchesSessionPrincipal } from "./security/session-principal.js";
 /**
  * CredentialService — forwards all credential requests via FrontendWsClient RPC.
  *
@@ -36,7 +37,7 @@ export class CredentialService {
     if (identity.sessionId) {
       const owner = await this.registry.get(identity.sessionId);
       if (owner) {
-        if (owner.agentId !== identity.agentId) {
+        if (!matchesSessionPrincipal(identity, owner)) {
           throw new SessionOwnershipError(
             `session ${identity.sessionId} belongs to agent ${owner.agentId}, not ${identity.agentId}`,
           );
@@ -44,6 +45,7 @@ export class CredentialService {
         userId = owner.userId;
       }
     }
+    if (identity.privateUserId && userId !== identity.privateUserId) throw new SessionOwnershipError("Private session required");
     return {
       userId,
       agentId: identity.agentId,

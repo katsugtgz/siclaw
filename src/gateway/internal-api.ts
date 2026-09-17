@@ -1,3 +1,4 @@
+import { matchesSessionPrincipal, matchesPrivateUser } from "./security/session-principal.js";
 /**
  * Internal API handlers for AgentBox consumption (Port 3002 mTLS).
  *
@@ -68,8 +69,8 @@ function sendJson(res: http.ServerResponse, status: number, data: unknown): void
 async function sessionBelongsToIdentity(sessionId: string | null | undefined, identity: CertificateIdentity): Promise<boolean> {
   if (!sessionId) return true;
   const owner = await sessionRegistry.get(sessionId);
-  if (!owner) return true;
-  if (owner.agentId === identity.agentId) return true;
+  if (!owner) return !identity.privateUserId;
+  if (matchesSessionPrincipal(identity, owner)) return true;
   if (owner.authoritative) return false;
   // The re-read must not be able to make things worse than the refusal it is
   // trying to avoid. This is the only I/O on the about-to-refuse path, and an
@@ -84,7 +85,7 @@ async function sessionBelongsToIdentity(sessionId: string | null | undefined, id
     console.warn(`[internal-api] could not re-read session ${sessionId} before refusing: ${String(err)}`);
     return false;
   }
-  return refreshed?.agentId === identity.agentId;
+  return !!refreshed && matchesSessionPrincipal(identity, refreshed);
 }
 
 /**
@@ -95,8 +96,8 @@ async function sessionBelongsToIdentity(sessionId: string | null | undefined, id
 async function sessionOwnedByIdentity(sessionId: string | null | undefined, identity: CertificateIdentity): Promise<boolean> {
   if (!sessionId) return true;
   const cached = await sessionRegistry.get(sessionId);
-  if (!cached) return true;
-  if (cached.authoritative) return cached.agentId === identity.agentId;
+  if (!cached) return !identity.privateUserId;
+  if (cached.authoritative) return matchesSessionPrincipal(identity, cached);
 
   let fromRow: SessionRecord | undefined;
   try {
@@ -107,7 +108,7 @@ async function sessionOwnedByIdentity(sessionId: string | null | undefined, iden
     // is broken when the answer is simply unavailable.
     console.warn(`[internal-api] could not re-read session ${sessionId} for an owner-only check: ${String(err)}`);
   }
-  if (fromRow?.authoritative) return fromRow.agentId === identity.agentId;
+  if (fromRow?.authoritative) return matchesSessionPrincipal(identity, fromRow);
   // Distinct from "not your session": an operator reading these needs to tell a
   // real attribution mismatch from a window where the row simply could not be
   // reached, because the second one clears up on its own and the first does not.
@@ -130,10 +131,10 @@ async function resolveUserForIdentity(
   sessionId: string | null | undefined,
   identity: CertificateIdentity,
 ): Promise<{ userId: string; ok: boolean }> {
-  if (!sessionId) return { userId: "", ok: true };
+  if (!sessionId) return { userId: "", ok: !identity.privateUserId };
   const owner = await sessionRegistry.get(sessionId);
-  if (!owner) return { userId: "", ok: true };
-  if (owner.agentId !== identity.agentId) return { userId: "", ok: false };
+  if (!owner) return { userId: "", ok: !identity.privateUserId };
+  if (!matchesSessionPrincipal(identity, owner)) return { userId: "", ok: false };
   return { userId: owner.userId, ok: true };
 }
 
@@ -187,6 +188,7 @@ async function validateDelegationEventActor(
     }
     case "delegation.ensure_session": {
       if (!event.userId) return { status: 400, error: "delegation.ensure_session requires userId" };
+      if (!matchesPrivateUser(identity.privateUserId, event.userId)) return { status: 403, error: "private user mismatch" };
       if (!agentMatchesIdentity(event.agentId, identity)) return { status: 403, error: "delegation agent mismatch" };
       if (!agentMatchesIdentity(event.lineage?.parentAgentId, identity)) return { status: 403, error: "delegation parent agent mismatch" };
       if (!agentMatchesIdentity(event.lineage?.targetAgentId, identity)) return { status: 403, error: "delegation target agent mismatch" };
@@ -195,7 +197,8 @@ async function validateDelegationEventActor(
       // happy path's latency is halved.
       const [own, parentOwn] = await Promise.all([
         // Subject: owner-only (this call upserts the row) — see sessionOwnedByIdentity.
-        sessionOwnedByIdentity(event.sessionId, identity),
+        identity.privateUserId && event.lineage?.parentSessionId && !(await sessionRegistry.get(event.sessionId))
+          ? Promise.resolve(true) : sessionOwnedByIdentity(event.sessionId, identity),
         // Parent: append-only child history follows the current session owner.
         sessionBelongsToIdentity(event.lineage?.parentSessionId, identity),
       ]);

@@ -84,6 +84,33 @@ describe("notifyParent", () => {
     expect(brain.followUp).not.toHaveBeenCalled();
   });
 
+  it("keeps late recovery usage with each launching API request", async () => {
+    const { mgr, managed, brain } = setup(false);
+    let sink: any;
+    (brain as any).llmCalls = { beginPrompt: vi.fn(), endPrompt: vi.fn(), setUsageSink: (value: any) => { sink = value; } };
+    mgr.gatewayClient = { sendDelegationPersistenceEvent: vi.fn(async () => ({ ok: true, id: "row" })) };
+    mgr.agentId = "agent";
+    mgr.usageOutbox = { record: vi.fn() };
+    const receipts: Array<string | undefined> = [];
+    brain.prompt.mockImplementation(async () => { receipts.push(sink.context().apiRequestId); });
+    for (const [id, receipt] of [["old-child", "receipt-a"], ["new-child", "receipt-b"]]) {
+      mgr.setUsageRole("s1", "root", receipt);
+      const owner = mgr.beginBackgroundWorkTurn(managed);
+      mgr.jobs.register({ jobId: id, type: "subagent", parentSessionId: "s1", description: id,
+        status: "done", startedAt: 0, notified: false });
+      mgr.registerBackgroundWork("s1", id);
+      owner.finish();
+    }
+    managed._promptDone = true;
+    await mgr.notifyParent("s1", "old-child", { taskId: "old-child", status: "done", summary: "first request result" });
+    await mgr.notifyParent("s1", "new-child", { taskId: "new-child", status: "done", summary: "second request result" });
+    await flushCoalesce();
+    expect(receipts).toEqual(["receipt-a", "receipt-b"]);
+    expect(brain.prompt.mock.calls[0][0]).toContain("first request result");
+    expect(brain.prompt.mock.calls[0][0]).not.toContain("second request result");
+    expect(brain.prompt.mock.calls[1][0]).toContain("second request result");
+  });
+
   it("waits for a racing real prompt instead of steering the late result into it", async () => {
     const { mgr, managed, brain } = setup(true);
     const queued = mgr.runSyntheticPrompt(managed, "late result", true);
