@@ -53,6 +53,44 @@ await record("support-handoff", async () => {
   return received;
 });
 
+// Module-aware handoff: incident and consultation handoffs must name the affected
+// module in description. Assertions stay shape-level; the prose still needs review.
+await record("support-module-known", async () => {
+  const received = await runSupport({ baseUrl, apiKey: supportKey, signal: AbortSignal.timeout(180_000) },
+    "The Example Product console page fails to load and shows HTTP 500 after login. I retried three times. Please get a human to look at it.");
+  if (!received.result.label) throw new Error("Handoff with a stated module was not prepared");
+  if (received.result.info.missing_fields.includes("module")) throw new Error("Asked for a module the message already stated");
+  if (!/console/i.test(received.result.info.description)) throw new Error("Handoff description omits the stated module");
+  return received;
+});
+
+await record("support-module-missing", async () => {
+  const received = await runSupport({ baseUrl, apiKey: supportKey, signal: AbortSignal.timeout(180_000) },
+    "Something is broken and I keep getting an error. Please transfer me to a human.");
+  if (received.result.label) throw new Error("Handed off an incident without collecting the module");
+  if (!received.result.info.missing_fields.includes("module")) throw new Error("Missing module was not reported as module");
+  return received;
+});
+
+await record("support-module-consultation", async () => {
+  const received = await runSupport({ baseUrl, apiKey: supportKey, signal: AbortSignal.timeout(180_000) },
+    "I have a question your documentation does not answer and I want a human to explain it. I will not describe the feature further.");
+  if (received.result.label && !/module|模块/i.test(received.result.info.description)) {
+    throw new Error("Consultation handoff neither collected nor recorded the module");
+  }
+  return received;
+});
+
+await record("support-module-unidentifiable", async () => {
+  const received = await runSupport({ baseUrl, apiKey: supportKey, signal: AbortSignal.timeout(180_000) },
+    "You already asked which module this affects. I genuinely do not know and cannot check. Hand this to a human as it is.");
+  if (!received.result.label || received.result.info.missing_fields.length) {
+    throw new Error("An unidentifiable module blocked the handoff instead of being recorded");
+  }
+  if (received.result.info.product.length) throw new Error("Invented a product for an unidentifiable module");
+  return received;
+});
+
 await record("cross-agent-session", async () => {
   if (!supportSession) throw new Error("Support session prerequisite did not pass");
   try {
