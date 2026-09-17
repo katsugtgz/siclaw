@@ -117,6 +117,14 @@ export const defaultStreamReconnectPolicy: StreamReconnectPolicy = {
 // event persistence. This deadline never resets on retries or heartbeat traffic.
 const EVENT_PERSIST_RETRY_MS = 120_000;
 
+// These controlled names survive the existing safe exception_class projection.
+// Keep the original cause for server logs; never put provider text in receipts.
+function relayFailure(name: "RelayArtifactPersistenceError" | "RelayEventCommitError" | "RelayTurnPersistenceError" | "RelayEventAckError" | "RelayStreamError", cause: unknown): Error {
+  const error = new Error(cause instanceof Error ? cause.message : "Capability relay failed", { cause });
+  error.name = name;
+  return error;
+}
+
 /**
  * Relay the box event stream over the capability protocol until the box closes
  * the stream (`end`). Returns when the stream ends. Errors propagate to the
@@ -183,7 +191,8 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
           if (acknowledgedStream && event.event_id) {
             // Lost ACK responses are transport failures: reattach and ACK the
             // same event without replaying its already-persisted side effects.
-            await client.postJson(`/events/ack/${runId}`, { event_id: event.event_id }, 10_000);
+            await client.postJson(`/events/ack/${runId}`, { event_id: event.event_id }, 10_000)
+              .catch((error) => { throw relayFailure("RelayEventAckError", error); });
           }
           // A fatal worker may never emit end (e.g. SDK teardown is wedged).
           // Once its failure is durable, end this relay so the server's existing
@@ -203,10 +212,11 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
           console.warn(`[capability] run=${runId} box stream error after the run settled; ignoring`);
           return;
         }
-        if (!replaySupported) throw err; // Legacy boxes cannot replay lost lifecycle frames.
+        if (!replaySupported) throw relayFailure("RelayStreamError", err); // Legacy boxes cannot replay lost lifecycle frames.
         attempts++;
         if (attempts > policy.maxAttempts || !(await policy.isBoxAlive(client))) {
-          throw err;
+          if (err instanceof Error && err.name === "RelayEventAckError") throw err;
+          throw relayFailure("RelayStreamError", err);
         }
         // The probe awaited; the run may have been cancelled or finished meanwhile.
         if (runSettled()) return;
@@ -260,7 +270,7 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
     await persistEventStep(
       () => manager.commitRelayEvent(runId, evt.event_id!, status, failure),
       status === "done" || status === "failed",
-    );
+    ).catch((error) => { throw relayFailure("RelayEventCommitError", error); });
   }
 
   async function relayBoxEvent(evt: BoxEvent): Promise<void> {
@@ -323,7 +333,8 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
         {
           const turn: CapabilityPersistTurnRequest = { run_id: runId, text: evt.text ?? "" };
           if (evt.event_id) {
-            await persistEventStep(() => frontendClient.request(CAPABILITY_PERSIST_TURN, turn));
+            await persistEventStep(() => frontendClient.request(CAPABILITY_PERSIST_TURN, turn))
+              .catch((error) => { throw relayFailure("RelayTurnPersistenceError", error); });
             await commitEvent(evt, "idle");
           } else {
             try {
@@ -379,9 +390,9 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
             } catch (err) {
               const rec = manager.get(runId);
               if (!rec || isTerminalCapabilityStatus(rec.status)) {
-                throw new Error(
+                throw relayFailure("RelayArtifactPersistenceError", new Error(
                   `persistArtifacts retry aborted because run ${runId} is no longer active: ${err instanceof Error ? err.message : String(err)}`,
-                );
+                ));
               }
               console.error(
                 `[capability] run=${runId} persistArtifacts failed; retrying in ${delayMs}ms:`,

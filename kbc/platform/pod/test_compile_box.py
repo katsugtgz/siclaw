@@ -4238,7 +4238,7 @@ async def test_batch_media_round_cap_marks_pending_exhausted():
 
             verify_calls = {"n": 0}
 
-            async def never_verifies(engine, workdir, pending, progress=None, locale=None):
+            async def never_verifies(engine, workdir, pending, progress=None, locale=None, **kwargs):
                 verify_calls["n"] += 1
                 return {"findings": [], "errors": [], "images": 1,
                         "completed_pages": [], "failed_pages": ["page.md"]}
@@ -5236,7 +5236,7 @@ async def test_hierarchical_media_rechecks_after_ledger_repair():
                 if "media-repair" in page.read_text() and "ledger-repair" not in page.read_text():
                     page.write_text(page.read_text() + "ledger-repair\n")
 
-            async def fake_blind_verify(engine, workdir, pending, progress=None, locale=None):
+            async def fake_blind_verify(engine, workdir, pending, progress=None, locale=None, **kwargs):
                 nonlocal media_calls
                 media_calls += 1
                 order.append(f"verify:{media_calls}:{'ledger-repair' in page.read_text()}")
