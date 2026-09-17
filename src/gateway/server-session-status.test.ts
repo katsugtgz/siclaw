@@ -4,6 +4,13 @@
  * Contract: never spawn a box just to check liveness (getAsync, not getOrCreate); fail-safe to
  * running:false on a missing box or any client error, so a transient hiccup makes the page show
  * static history rather than a stuck spinner.
+ *
+ * `observed` carries whether that running:false is an answer or a shrug. Reconnect does not
+ * care — it wants the fail-safe either way — but a caller that ACTS on "not running" does,
+ * and there is no second probe to tell them apart afterwards.
+ *
+ * `pending` covers what the box cannot be asked: a turn this Runtime has accepted but not
+ * yet handed over. See server-chat-abort.test.ts for that window under a real dispatch.
  */
 import { describe, it, expect, afterEach, vi } from "vitest";
 
@@ -79,7 +86,8 @@ describe("startRuntime — chat.sessionStatus", () => {
     server = await bootRuntime();
     const status = server.rpcMethods.get("chat.sessionStatus")!;
     const res = await status({ agentId: "a", sessionId: "S" });
-    expect(res).toMatchObject({ ok: true, running: false });
+    // No box exists to be running the session — an observation, not a failed probe.
+    expect(res).toMatchObject({ ok: true, running: false, pending: false, observed: true });
   });
 
   it("returns the agentbox running flag when a box exists", async () => {
@@ -88,16 +96,16 @@ describe("startRuntime — chat.sessionStatus", () => {
     server = await bootRuntime();
     const status = server.rpcMethods.get("chat.sessionStatus")!;
     const res = await status({ agentId: "a", sessionId: "S" });
-    expect(res).toMatchObject({ ok: true, running: true });
+    expect(res).toMatchObject({ ok: true, running: true, pending: false, observed: true });
   });
 
-  it("fails safe to running:false when the agentbox probe throws", async () => {
+  it("fails safe to running:false when the agentbox probe throws — but says it never looked", async () => {
     nextHandle = { endpoint: "https://fake.internal" };
     statusImpl = async () => { throw new Error("ECONNREFUSED"); };
     server = await bootRuntime();
     const status = server.rpcMethods.get("chat.sessionStatus")!;
     const res = await status({ agentId: "a", sessionId: "S" });
-    expect(res).toMatchObject({ ok: true, running: false });
+    expect(res).toMatchObject({ ok: true, running: false, pending: false, observed: false });
   });
 
   it("rejects when agentId/sessionId are missing", async () => {

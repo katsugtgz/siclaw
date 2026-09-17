@@ -2538,6 +2538,46 @@ def _media_verify_due(run) -> dict[str, list[str]] | None:
     return selfcheck.cap_media_pending(pending, _media_verify_max_images())
 
 
+async def _sync_media_progress(run) -> None:
+    """Sync reusable media work without exposing an unsealed batch Candidate."""
+    sent = getattr(run, "_sync_sent", None)
+    if sent is None:
+        return
+    from media_progress import PROGRESS_PATH
+    try:
+        async with run._sync_lock:
+            root = Path(run.workdir)
+            paths = sorted((root / mediaverify.TRANSCRIPTS_DIR).glob("*.json"))
+            paths.append(root / PROGRESS_PATH)
+            changed = []
+            hashes = {}
+            size = 0
+            for path in paths:
+                if not path.is_file():
+                    continue
+                if path.stat().st_size > MAX_SYNC_FILE_BYTES:
+                    raise ValueError("media progress artifact exceeds sync limit")
+                content = path.read_text("utf-8")
+                rel = path.relative_to(root).as_posix()
+                digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+                if sent.get(rel) == digest:
+                    continue
+                changed.append({"path": rel, "content": content})
+                hashes[rel] = digest
+                size += len(content.encode("utf-8"))
+                if size >= 512 * 1024:
+                    await run.emit({"type": "syncArtifacts", "artifacts": changed})
+                    sent.update(hashes)
+                    changed, hashes, size = [], {}, 0
+            if changed:
+                await run.emit({"type": "syncArtifacts", "artifacts": changed})
+                sent.update(hashes)
+    except Exception as error:
+        # Keep the local cache and make the failure visible; later progress or
+        # the periodic sync retries it. Never turn telemetry loss into a pass.
+        _print_compile_lifecycle("media.sync_failed", run, extra=f"exception_class={type(error).__name__}")
+
+
 async def _set_converge_phase(run, phase: str) -> None:
     """Set the DURABLE verify converge phase (SELFCHECK.json) + sync it, so the
     frontend reads an authoritative 校对中/修订中/settled signal instead of
@@ -2614,7 +2654,8 @@ async def _run_media_verify_flow(run, chunk: dict[str, list[str]]) -> None:
         result = await mediaverify.run_blind_verify(
             selected_readonly_engine(), run.workdir, chunk,
             progress=lambda s: loop.create_task(run.emit({"type": "summary", "text": s})),
-            locale=getattr(run, "locale", None))
+            locale=getattr(run, "locale", None), run_id=run.run_id,
+            on_progress=lambda: _sync_media_progress(run))
         failed_pages = list(result.get("failed_pages") or [])
         exhausted = _settle_media_outcome(run, chunk, result)
         settled = True
@@ -5243,7 +5284,8 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
                         selected_readonly_engine(), run.workdir, chunk,
                         progress=lambda s: asyncio.get_running_loop().create_task(
                             run.emit({"type": "summary", "text": s})),
-                        locale=getattr(run, "locale", None))
+                        locale=getattr(run, "locale", None), run_id=run.run_id,
+                        on_progress=lambda: _sync_media_progress(run))
                 except Exception as e:
                     await run.emit({"type": "summary", "text": _loc(run,
                         f"Self-check (images) failed, skipping this chunk: {e!r}",

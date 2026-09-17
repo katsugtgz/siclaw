@@ -39,9 +39,11 @@ from pathlib import Path
 import re
 
 from redblue import _agent_json  # JSON call + one lenient retry, shared shape
-from selfcheck import _is_en, parse_okf_sources, source_inventory  # locale gate + OKF provenance parse
+from selfcheck import _is_en, parse_okf_sources, source_inventory, read_selfcheck
+from media_progress import MediaProgress
 
 TRANSCRIPTS_PATH = "authoring/MEDIA_TRANSCRIPTS.json"
+TRANSCRIPTS_DIR = "authoring/media-transcripts"
 _TRANSCRIPT_CHAR_CAP = 6000  # per image, persisted
 
 
@@ -164,19 +166,37 @@ def _sha8(path: Path) -> str:
 
 def load_transcripts(workdir: str) -> dict:
     p = Path(workdir) / TRANSCRIPTS_PATH
-    if not p.is_file():
-        return {}
-    try:
+    cache = {}
+    if p.is_file():
         v = json.loads(p.read_text(encoding="utf-8"))
-        return v if isinstance(v, dict) else {}
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return {}
+        if not isinstance(v, dict):
+            raise ValueError("invalid legacy media transcript cache")
+        cache.update(v)
+    for shard in sorted((Path(workdir) / TRANSCRIPTS_DIR).glob("*.json")):
+        item = json.loads(shard.read_text("utf-8"))
+        if not isinstance(item, dict) or not isinstance(item.get("image"), str) or not isinstance(item.get("transcript"), dict):
+            raise ValueError("invalid media transcript cache shard")
+        cache[item["image"]] = {"sha8": item.get("sha8"), "transcript": item["transcript"]}
+    return cache
+
+
+def save_transcript(workdir: str, image: str, value: dict) -> None:
+    # Stable per-image files avoid the workspace per-file sync limit and keep
+    # completed work durable while sibling transcriptions are still running.
+    key = hashlib.sha256(image.encode("utf-8")).hexdigest()
+    p = Path(workdir) / TRANSCRIPTS_DIR / (key + ".json")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    content = json.dumps({"image": image, **value}, ensure_ascii=False) + "\n"
+    if p.is_file() and p.read_text("utf-8") == content:
+        return
+    temporary = p.with_suffix(".tmp")
+    temporary.write_text(content, encoding="utf-8")
+    temporary.replace(p)
 
 
 def save_transcripts(workdir: str, cache: dict) -> None:
-    p = Path(workdir) / TRANSCRIPTS_PATH
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(cache, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+    for image, value in cache.items():
+        save_transcript(workdir, image, value)
 
 
 async def transcribe_image(engine, workdir: str, img_rel: str, cache: dict,
@@ -206,6 +226,7 @@ async def transcribe_image(engine, workdir: str, img_rel: str, cache: dict,
                 "notes": ("(transcript truncated — over the length cap)" if _is_en(locale)
                           else "(转写超长已截断)")}
     cache[img_rel] = {"sha8": sha, "transcript": data}
+    save_transcript(workdir, img_rel, cache[img_rel])
     return data
 
 
@@ -307,7 +328,8 @@ def suppress_text_backed(workdir: str, page: str, page_text: str,
 
 
 async def run_blind_verify(engine, workdir: str, pending: dict[str, list[str]],
-                           progress=None, locale: str | None = None) -> dict:
+                           progress=None, locale: str | None = None,
+                           run_id: str = "", on_progress=None) -> dict:
     """Transcribe every image in `pending` (cache-aware, concurrent), then
     compare each page against its transcripts. Fail-open per item: a failed
     transcript/compare is recorded in errors, never raises."""
@@ -316,6 +338,11 @@ async def run_blind_verify(engine, workdir: str, pending: dict[str, list[str]],
     sem = asyncio.Semaphore(int(_env("KBC_MV_CONCURRENCY", "3")))
     cache = load_transcripts(workdir)
     images = sorted({img for imgs in pending.values() for img in imgs})
+    receipts = ((read_selfcheck(workdir) or {}).get("media_verify") or {}).get("verified_fingerprints") or {}
+    missing = sum(page not in receipts for page in pending)
+    status = MediaProgress(workdir, run_id, len(images), len(pending), missing, on_progress)
+    save_transcripts(workdir, cache)  # migrate inherited aggregate entries
+    await status.update("transcribing", cache_entries=len(cache))
     errors: list[str] = []
     transcripts: dict[str, dict] = {}
     hits = 0
@@ -329,19 +356,24 @@ async def run_blind_verify(engine, workdir: str, pending: dict[str, list[str]],
             except Exception as e:
                 errors.append(f"transcription failed {img}: {e!r}" if en
                               else f"转写失败 {img}: {e!r}")
+                await status.advance("transcription_failed")
                 return
         if t is not None:
             transcripts[img] = t
-            if pre and cache[img].get("transcript") is t:
+            if pre is t:
                 hits += 1
+                await status.advance("cache_hits", effective=True, cache_entries=len(cache))
+            else:
+                await status.advance("transcribed", effective=True, cache_entries=len(cache))
         else:
             errors.append(f"transcription failed {img}: unparsable output / file missing" if en
                           else f"转写失败 {img}: 无法解析/文件缺失")
+            await status.advance("transcription_failed")
 
     say(f"Self-check (image · blind transcription): transcribing {len(images)} image(s)…" if en
         else f"自检(图像·盲转写):{len(images)} 张图转写中…")
-    await asyncio.gather(*(_one(i) for i in images))
-    save_transcripts(workdir, cache)
+    await status.gather(*(_one(i) for i in images))
+    await status.update("comparing", cache_entries=len(cache))
 
     findings: list[dict] = []
     suppressed_all: list[dict] = []
@@ -362,6 +394,7 @@ async def run_blind_verify(engine, workdir: str, pending: dict[str, list[str]],
             errors.append(f"page {page}: {missing} image(s) not transcribed — comparison skipped" if en
                           else f"页 {page}: {missing} 张图未转写——本轮不比对")
             failed.append(page)
+            await status.advance("comparison_failed")
             return
         try:
             text = (cand / page).read_text(encoding="utf-8")
@@ -369,6 +402,7 @@ async def run_blind_verify(engine, workdir: str, pending: dict[str, list[str]],
             errors.append(f"failed to read page {page}: {e!r}" if en
                           else f"读页失败 {page}: {e!r}")
             failed.append(page)
+            await status.advance("comparison_failed")
             return
         async with sem:
             try:
@@ -380,13 +414,16 @@ async def run_blind_verify(engine, workdir: str, pending: dict[str, list[str]],
                 errors.append(f"comparison failed {page}: {e!r}" if en
                               else f"比对失败 {page}: {e!r}")
                 failed.append(page)
+                await status.advance("comparison_failed")
                 return
         completed.append(page)
+        await status.advance("pages_compared", effective=True, findings=len(findings))
 
     say(f"Self-check (image · comparison): comparing {len(pending)} page(s)…" if en
         else f"自检(图像·比对):{len(pending)} 页比对中…")
-    await asyncio.gather(*(_page(p, imgs) for p, imgs in pending.items()))
+    await status.gather(*(_page(p, imgs) for p, imgs in pending.items()))
     shutil.rmtree(empty, ignore_errors=True)
+    await status.update("complete", findings=len(findings))
     if suppressed_all:
         say(f"Self-check (image · comparison): {len(suppressed_all)} beyond-transcript doubt(s) "
             "auto-resolved — claim verbatim-backed by a co-cited text source (image kept as corroboration)" if en
