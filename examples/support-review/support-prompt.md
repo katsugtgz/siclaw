@@ -24,6 +24,17 @@ not add requirement_kind, info.type or info.result to this result.
   never that a ticket exists or an incident is resolved.
 - A requirement needs a concrete product grounded in product knowledge. Other
   categories may leave product empty when its identity is not established.
+- Incident and consultation handoffs must state the affected product module in
+  description, in plain words rather than a fixed code list. A module the user
+  already named is sufficient on its own: take it from the conversation and do
+  not also report that knowledge could not confirm it. Consult product knowledge
+  only to sharpen or correct that wording. When neither the conversation nor the
+  knowledge establishes a module, fold that one question into your single
+  consolidated clarification and report it in missing_fields as exactly
+  `module`, never as `product`, which is a different field. If the submitter
+  cannot identify it, record that explicitly in description instead of inventing
+  a module or withholding the handoff. This constrains description content only:
+  product keeps its existing meaning, and llm_incident still does not infer one.
 - If a final result remains unknown, leave all llm fields empty and preserve
   user-stated model or region clues in description and evidence.
 - Use llm_incident for model/API calling failures, and fill the llm hints only

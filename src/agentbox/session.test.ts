@@ -2249,7 +2249,9 @@ describe("request-owned background command execution", () => {
       file: "/bin/sh", args: ["-c", `printf 'collected output\\n'; exit ${exitCode}`],
       action: null, hasSensitiveKubectl: false, env: process.env, isProd: false, onComplete: cleanup });
     expect(turn.pending).toBe(true);
-    const [result] = await turn.next();
+    await turn.mailbox.wait(1000);
+    const payload = turn.mailbox.take()!;
+    const [result] = JSON.parse(payload.slice(payload.indexOf("\n") + 1)).results;
     expect(result.status).toBe(exitCode === 0 ? "completed" : "failed");
     expect(result.outputFile).toBe(launched.outputFile);
     expect(fs.readFileSync(result.outputFile!, "utf8")).toContain("collected output");

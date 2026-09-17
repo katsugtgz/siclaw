@@ -24,7 +24,10 @@ const closeSessionMock = vi.fn();
 vi.mock("../agentbox/client.js", () => ({
   AgentBoxClient: class {
     prompt = promptMock;
-    streamEvents = streamEventsMock;
+    async *streamEvents(...args: unknown[]) {
+      yield* streamEventsMock(...args) ?? [];
+      yield { type: "execution_end", outcome: "completed" };
+    }
     closeSession = closeSessionMock;
   },
 }));

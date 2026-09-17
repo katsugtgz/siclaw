@@ -30,10 +30,24 @@ const promptMock = vi.fn();
 const streamEventsMock = vi.fn();
 const closeSessionMock = vi.fn();
 
+const larkSdk = vi.hoisted(() => ({ handlers: {} as Record<string, (event: any) => any>, close: vi.fn(), start: vi.fn(), client: undefined as any }));
+vi.mock("@larksuiteoapi/node-sdk", () => ({
+  Domain: { Lark: "lark", Feishu: "feishu" },
+  Client: class { constructor() { return larkSdk.client; } },
+  EventDispatcher: class { register(handlers: typeof larkSdk.handlers) { larkSdk.handlers = handlers; } },
+  WSClient: class {
+    start = larkSdk.start;
+    close = larkSdk.close;
+  },
+}));
+
 vi.mock("../agentbox/client.js", () => ({
   AgentBoxClient: class {
     prompt = promptMock;
-    streamEvents = streamEventsMock;
+    async *streamEvents(...args: unknown[]) {
+      yield* streamEventsMock(...args) ?? [];
+      yield { type: "execution_end", outcome: "completed" };
+    }
     closeSession = closeSessionMock;
   },
 }));
@@ -98,16 +112,18 @@ vi.mock("../chat-repo.js", () => ({
   updateMessage: (...args: unknown[]) => updateMessageMock(...args),
 }));
 
-// ── Existing behaviour: degraded boot when SDK missing (kept from old suite) ─
+// ── Event transport has a channel lifetime, not a provider/request lifetime ─
 
-describe("createLarkHandler — fallback when SDK is missing", () => {
-  it("start() resolves and does not throw when SDK import fails", async () => {
+describe("createLarkHandler — independent transport lifetime", () => {
+  it("closes the event transport only when the channel is stopped", async () => {
     const handler = createLarkHandler(
       { id: "c1", config: { app_id: "x", app_secret: "y" } },
       {} as any,
     );
     await expect(handler.start()).resolves.toBeUndefined();
+    expect(larkSdk.close).not.toHaveBeenCalled();
     await expect(handler.stop()).resolves.toBeUndefined();
+    expect(larkSdk.close).toHaveBeenCalledTimes(1);
   });
 
   it("accepts channel.config as a JSON string", async () => {
@@ -117,6 +133,42 @@ describe("createLarkHandler — fallback when SDK is missing", () => {
     );
     await expect(handler.start()).resolves.toBeUndefined();
     await expect(handler.stop()).resolves.toBeUndefined();
+  });
+
+  it("ACKs immediately and keeps the same WS alive through provider continuation and delivery failure", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding());
+    promptMock.mockResolvedValue({ sessionId: "lark-lifetime" });
+    let release!: () => void;
+    const hold = new Promise<void>(resolve => { release = resolve; });
+    streamEventsMock.mockImplementationOnce(async function* () {
+      yield { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "progress only" }], stopReason: "toolUse" } };
+      yield { type: "agent_end" };
+      yield { type: "subagent_done", status: "done" };
+      await hold;
+      yield { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "complete report" }], stopReason: "stop" } };
+    }).mockImplementationOnce(async function* () {
+      yield { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "unfinished second request" }] } };
+      throw new Error("provider-to-runtime transport lost");
+    });
+    const handler = createLarkHandler({ id: "lark-lifetime", config: { app_id: "test", app_secret: "test" } }, makeAgentBoxManager("a1") as any, undefined, {} as any);
+    await handler.start();
+    const receive = larkSdk.handlers["im.message.receive_v1"];
+    // The provider is still held, but the event ACK must already have returned.
+    await receive(makeTextEvent("first"));
+    await waitForExpect(() => expect(promptMock).toHaveBeenCalledTimes(1));
+    expect(larkSdk.client.cardkit.v1.card.settings).not.toHaveBeenCalled();
+    expect(larkSdk.close).not.toHaveBeenCalled();
+    release();
+    await waitForExpect(() => expect(larkSdk.client.cardkit.v1.card.settings).toHaveBeenCalledTimes(1));
+    await receive(makeTextEvent("second", { message_id: "mid-second" }));
+    await waitForExpect(() => expect(larkSdk.client.cardkit.v1.card.settings).toHaveBeenCalledTimes(2));
+    const body = larkSdk.client.cardkit.v1.cardElement.content.mock.calls.at(-1)[0].data.content;
+    expect(body).toContain("结果传输中断");
+    expect(body).not.toContain("unfinished second request");
+    expect(larkSdk.start).toHaveBeenCalledTimes(1);
+    expect(larkSdk.close).not.toHaveBeenCalled();
+    await handler.stop();
+    expect(larkSdk.close).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -257,7 +309,31 @@ async function waitForExpect(assertion: () => void): Promise<void> {
   throw lastError;
 }
 
+function makeCardAwareLarkClient() {
+  return {
+    im: {
+      image: { create: vi.fn().mockResolvedValue({ image_key: "img-chart-1" }) },
+      message: { reply: vi.fn().mockResolvedValue({}) },
+    },
+    cardkit: {
+      v1: {
+        card: {
+          create: vi.fn().mockResolvedValue({ data: { card_id: "CARD-99" } }),
+          settings: vi.fn().mockResolvedValue({ code: 0 }),
+        },
+        cardElement: {
+          content: vi.fn().mockResolvedValue({ code: 0 }),
+          create: vi.fn().mockResolvedValue({ code: 0 }),
+        },
+      },
+    },
+  };
+}
+
 beforeEach(() => {
+  larkSdk.handlers = {};
+  larkSdk.close.mockReset(); larkSdk.start.mockReset().mockResolvedValue(undefined);
+  larkSdk.client = { ...makeCardAwareLarkClient(), request: vi.fn().mockResolvedValue({ bot: { open_id: "test-bot" } }) };
   supportsConversationsMock.mockReset().mockResolvedValue(false);
   promptMock.mockReset();
   streamEventsMock.mockReset();
@@ -2566,6 +2642,7 @@ describe("handleLarkMessage — streaming card flow", () => {
       connected: true,
       subscribe: vi.fn((_channel: string, handler: (data: unknown) => void) => { receive = handler; return vi.fn(); }),
       request: vi.fn(async (method: string, input: any) => {
+        if (method === "conversation.capabilities") return { handoff: true, requestModes: ["sync", "async"] };
         if (method === "conversation.start") {
           for (const event of [
             { type: "text", text: "正在准备国内检查" },
@@ -2605,6 +2682,7 @@ describe("handleLarkMessage — streaming card flow", () => {
       connected: true,
       subscribe: vi.fn((_channel: string, handler: (data: unknown) => void) => { receive = handler; return vi.fn(); }),
       request: vi.fn(async (method: string, input: any) => {
+        if (method === "conversation.capabilities") return { handoff: true, requestModes: ["sync", "async"] };
         if (method === "conversation.start") {
           for (const event of [
             { type: "knowledge_sources", sources },
@@ -2622,26 +2700,6 @@ describe("handleLarkMessage — streaming card flow", () => {
     expect(content).toBe(answer);
   });
 
-  function makeCardAwareLarkClient() {
-    return {
-      im: {
-        image: { create: vi.fn().mockResolvedValue({ image_key: "img-chart-1" }) },
-        message: { reply: vi.fn().mockResolvedValue({}) },
-      },
-      cardkit: {
-        v1: {
-          card: {
-            create: vi.fn().mockResolvedValue({ data: { card_id: "CARD-99" } }),
-            settings: vi.fn().mockResolvedValue({ code: 0 }),
-          },
-          cardElement: {
-            content: vi.fn().mockResolvedValue({ code: 0 }),
-            create: vi.fn().mockResolvedValue({ code: 0 }),
-          },
-        },
-      },
-    };
-  }
 
   it("opens typing card before agent runs, then finalizes with the final assistant text", async () => {
     resolveBindingMock.mockResolvedValue(makeBinding());
@@ -2750,7 +2808,7 @@ describe("handleLarkMessage — streaming card flow", () => {
     expect(lark.cardkit.v1.cardElement.create).not.toHaveBeenCalled();
   });
 
-  it("updates the Lark card when a background channel report arrives after the first SSE turn", async () => {
+  it("does not replace the request's card with detached subagent or background reports", async () => {
     resolveBindingMock.mockResolvedValue(makeBinding());
     promptMock.mockResolvedValue({ sessionId: "s-background" });
     streamEventsMock.mockImplementation(async function* () {
@@ -2795,9 +2853,9 @@ describe("handleLarkMessage — streaming card flow", () => {
     });
 
     const contentCalls = lark.cardkit.v1.cardElement.content.mock.calls;
-    expect(contentCalls.at(-1)[0].data.content).toContain("集群节点健康报告");
-    expect(contentCalls.at(-1)[0].data.content).toContain("GPFS");
-    expect(contentCalls).toHaveLength(2);
+    expect(contentCalls).toHaveLength(1);
+    expect(contentCalls.at(-1)[0].data.content).not.toContain("集群节点健康报告");
+    expect(promptMock.mock.calls[0][0].requestMode).toBe("sync");
     clearBackgroundChannelDelivery(sessionId);
   });
 
@@ -2835,6 +2893,7 @@ describe("handleLarkMessage — streaming card flow", () => {
       const delivered = lark.cardkit.v1.cardElement.content.mock.calls.at(-1)[0].data.content as string;
       expect(delivered).toContain("⚠");
       expect(delivered).not.toContain("visual-card");
+      expect(lark.cardkit.v1.card.settings).not.toHaveBeenCalled(); // only the request terminal finalizes
     } finally {
       releaseStream();
       await handlePromise;
@@ -2875,15 +2934,12 @@ describe("handleLarkMessage — streaming card flow", () => {
       })).resolves.toBe(true);
       expect(lark.cardkit.v1.cardElement.content.mock.calls).toHaveLength(updatesBeforeMilestone);
 
-      await deliverBackgroundChannelMessage({
+      await expect(deliverBackgroundChannelMessage({
         sessionId,
         role: "assistant",
         content: '```chart\n{"type":"bar","data":[1,2]}\n```',
-      });
-      const delivered = lark.cardkit.v1.cardElement.content.mock.calls.at(-1)[0].data.content as string;
-      expect(delivered).toContain("⚠");
-      expect(delivered).not.toContain("```chart");
-      expect(delivered).not.toContain('"type":"bar"');
+      })).resolves.toBe(false);
+      expect(lark.cardkit.v1.cardElement.content.mock.calls).toHaveLength(updatesBeforeMilestone);
     } finally {
       releaseStream();
       await handlePromise;
@@ -3905,7 +3961,10 @@ describe("handleLarkMessage — streaming card flow", () => {
 describe("collectResponse — SSE event flattening", () => {
   function fakeClient(events: unknown[]) {
     return {
-      streamEvents: async function* () { for (const e of events) yield e; },
+      streamEvents: async function* () {
+        for (const e of events) yield e;
+        yield { type: "execution_end", outcome: "completed" };
+      },
     } as any;
   }
 
@@ -4078,6 +4137,7 @@ describe("collectResponse — SSE event flattening", () => {
       yield { type: "message_end", message: { role: "assistant", content: [{
         type: "text", text: "共 5 个节点。", textSignature: JSON.stringify({ v: 1, phase: "final_answer" }),
       }] } };
+      yield { type: "execution_end", outcome: "completed" };
     } };
     const collected = await collectChannelResponse(client as any, "native-progress", "lark", {
       onMilestone: text => milestones.push(text),
@@ -4093,6 +4153,7 @@ describe("collectResponse — SSE event flattening", () => {
       yield { type: "tool_execution_start", toolCallId: "cmd", toolName: "bash" };
       expect(milestones).toEqual(["先查询集群。"]);
       yield { type: "message_end", message: { role: "assistant", content: "共 5 个节点。" } };
+      yield { type: "execution_end", outcome: "completed" };
     } };
     const collected = await collectChannelResponse(client as any, "legacy-progress", "lark", {
       onMilestone: text => milestones.push(text),
@@ -4266,7 +4327,11 @@ describe("collectResponse — SSE event flattening", () => {
 
 describe("collectChannelResponse — audit persistence", () => {
   function fakeClient(events: unknown[]) {
-    return { streamEvents: async function* () { for (const e of events) yield e; } } as any;
+    return { streamEvents: async function* () {
+      for (const e of events) yield e;
+      yield { type: "execution_end", outcome: "completed" };
+      yield { type: "prompt_done" }; // control-plane client fixtures end at this boundary
+    } } as any;
   }
   const envelope = (overrides: Record<string, unknown> = {}) => ({
     v: 1,
@@ -4474,7 +4539,7 @@ describe("collectChannelResponse — audit persistence", () => {
   });
 
   it("persists only the final retry error and redacts its envelope metadata", async () => {
-    await collectChannelResponse(fakeClient([
+    await expect(collectChannelResponse(fakeClient([
       { type: "message_end", message: {
         role: "assistant", content: [], stopReason: "error", errorMessage: "first",
         llmCall: envelope({ round: 1, stop_reason: "error", error_message: "first" }),
@@ -4491,7 +4556,7 @@ describe("collectChannelResponse — audit persistence", () => {
       } },
     ]), "s-errors", "lark", {
       persist: { agentId: "a1", modelConfig: { apiKey: "sk-secret123" } },
-    });
+    })).rejects.toMatchObject({ outcome: "error" });
 
     const rows = appendMessageMock.mock.calls.map((call) => call[0] as any)
       .filter((row) => row.role === "assistant");
@@ -4509,12 +4574,12 @@ describe("collectChannelResponse — audit persistence", () => {
   // not enforced. It also bypassed redaction outright: `redact` is the identity
   // function when there is no model config to build a redactor from.
   it("writes nothing at all when the binding is not audited", async () => {
-    await collectChannelResponse(fakeClient([
+    await expect(collectChannelResponse(fakeClient([
       { type: "message_end", message: {
         role: "assistant", content: [], stopReason: "error", errorMessage: "boom sk-secret123",
         llmCall: envelope({ round: 1, stop_reason: "error", error_message: "boom sk-secret123" }),
       } },
-    ]), "s-unaudited", "lark", {});
+    ]), "s-unaudited", "lark", {})).rejects.toMatchObject({ outcome: "error" });
 
     expect(appendMessageMock.mock.calls).toHaveLength(0);
   });
@@ -4525,11 +4590,11 @@ describe("collectChannelResponse — audit persistence", () => {
   // as a blank assistant bubble on reload, and a reader scanning error content
   // reported the turn empty rather than failed.
   it("does not persist an error row for a failure that carries no message", async () => {
-    await collectChannelResponse(fakeClient([
+    await expect(collectChannelResponse(fakeClient([
       { type: "message_end", message: { role: "assistant", content: [], stopReason: "error" } },
     ]), "s-no-msg", "lark", {
       persist: { agentId: "a1", modelConfig: {} },
-    });
+    })).rejects.toMatchObject({ outcome: "error" });
 
     const rows = appendMessageMock.mock.calls.map((call) => call[0] as any);
     expect(rows.some((row) => row.metadata?.kind === "error_response")).toBe(false);

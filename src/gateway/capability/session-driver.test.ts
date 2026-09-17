@@ -56,6 +56,29 @@ function reliableClient(client: any) {
 const emits = (fe: any) => fe.emitEvent.mock.calls.filter((c: any[]) => c[0] === CAPABILITY_EVENT).map((c: any[]) => c[1]);
 
 describe("driveCapabilitySession — box event → capability wire mapping", () => {
+  it("refreshes only the requesting run's model credential over the private channel", async () => {
+    const fe = fakeFrontend();
+    fe.request.mockResolvedValue({ api_key: "private-rotated-key" });
+    const requestId = "a".repeat(32);
+    const model = { source_model_id: "binding", id: "model", api: "anthropic-messages", baseUrl: "https://model.invalid" };
+    const client = { ...fakeClient([{ type: "refresh_credentials", request_id: requestId, model }]), postJson: vi.fn().mockResolvedValue({ ok: true }) };
+    await driveCapabilitySession({ client, runId: "r1", frontendClient: fe, manager: fakeManager() });
+    expect(fe.request).toHaveBeenCalledWith("capability.fetchInput", { run_id: "r1", ref: "model-credential", model });
+    expect(client.postJson).toHaveBeenCalledWith(`/model-credentials/r1/${requestId}`, { api_key: "private-rotated-key" }, 10_000);
+    expect(fe.emitEvent).not.toHaveBeenCalled();
+  });
+
+  it("reports refresh unavailability privately without failing the authoring run", async () => {
+    const fe = fakeFrontend();
+    fe.request.mockRejectedValue(new Error("private provider details"));
+    const manager = fakeManager();
+    const requestId = "b".repeat(32);
+    const client = { ...fakeClient([{ type: "refresh_credentials", request_id: requestId }]), postJson: vi.fn().mockResolvedValue({ ok: true }) };
+    await driveCapabilitySession({ client, runId: "r1", frontendClient: fe, manager });
+    expect(client.postJson).toHaveBeenCalledWith(`/model-credentials/r1/${requestId}`, { error: "credential_refresh_failed" }, 10_000);
+    expect(manager.endRun).not.toHaveBeenCalled();
+    expect(fe.emitEvent).not.toHaveBeenCalled();
+  });
   it("a recoverable provider failure retains the real run for the owner's next turn", async () => {
     const fe = fakeFrontend();
     const manager = new CapabilityRunManager(fe);

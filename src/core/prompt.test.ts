@@ -121,6 +121,15 @@ describe("buildSystemPrompt safety composition", () => {
     includeSubagentGuidance: false,
   };
 
+  it("puts sparse waiting and non-overlapping work in the subagent prompt", () => {
+    const prompt = buildSystemPrompt({ ...neutralInput, includeSubagentGuidance: true });
+    expect(prompt).toContain("Call `wait_agent` **very sparingly**.");
+    expect(prompt).toContain("Only call `wait_agent` when you need the result immediately for the next critical-path step and you are blocked until it returns.");
+    expect(prompt).toContain("While the subagent is running in the background, **do meaningful non-overlapping work immediately**.");
+    expect(prompt).toContain("**Do not repeatedly wait by reflex.**");
+    expect(buildSystemPrompt(neutralInput)).not.toContain("very sparingly");
+  });
+
   it("always includes domain-neutral safety for state-changing tools", () => {
     const prompt = buildSystemPrompt(neutralInput);
 

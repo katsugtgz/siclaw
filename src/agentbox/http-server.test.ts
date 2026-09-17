@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { BackgroundWorkTurn } from "./background-work-turn.js";
 import { AGENT_SYNC_STATUS_SCHEMA_VERSION } from "../shared/agentbox-sync-status.js";
 import { hasAcceptedTurn, readTurnLedger, recordAcceptedTurn, TURN_LEDGER_MAX } from "./turn-ledger.js";
 import { createHmac } from "node:crypto";
@@ -261,6 +262,14 @@ function makeFakeSessionManager(ledgerDir = fs.mkdtempSync(path.join(os.tmpdir()
     markPendingAbort: vi.fn(),
     consumePendingAbort: vi.fn(() => false),
     discardPendingNotifications: vi.fn(),
+    lateResults: vi.fn(),
+    beginBackgroundWorkTurn(managed: any, requestMode = "async") {
+      managed._requestMode = requestMode;
+      const turn = new BackgroundWorkTurn(n => this.lateResults(n));
+      managed._backgroundWorkTurn = turn;
+      managed.brain.setMailbox?.(turn.mailbox);
+      return turn;
+    },
     getOrCreate: async (
       id?: string,
       _mode?: unknown,
@@ -628,127 +637,140 @@ describe("http-server — sub-agent tier turn state", () => {
 });
 
 describe("http-server — prompt + session lifecycle", () => {
-  it.each(["message_end", "turn_end"])("keeps the original prompt open for a plain-text parent report via %s", async (finalEvent) => {
+  it("sync keeps the original SSE through child completion and root synthesis", async () => {
+    const session = await sm.getOrCreate("sync-join");
+    const emit = (text: string) => session.brain.emitter.emit("event", { type: "message_end", message: {
+      role: "assistant", stopReason: "stop", content: [{ type: "text", text }],
+    } });
+    session.brain.prompt.mockImplementationOnce(async () => {
+      (session as any)._backgroundWorkTurn.register("child"); emit("Initial progress only");
+    }).mockImplementationOnce(async (text: string) => {
+      expect(text).toContain("child report"); emit("ROOT_FINAL_REPORT");
+    });
+    await getJson(port, "/api/prompt", "POST", { text: "inspect", sessionId: session.id, requestMode: "sync", apiRequestId: "sync-receipt" });
+    expect(sm.setUsageRole).toHaveBeenCalledWith(session.id, "root", "sync-receipt");
+    const response = await fetch(`http://127.0.0.1:${port}/api/stream/${session.id}`);
+    let ended = false; const body = response.text().then(text => { ended = true; return text; });
+    await flushAsync();
+    expect(session._promptDone).toBe(false); expect(ended).toBe(false);
+    expect((await getJson(port, `/api/sessions/${session.id}/status`)).data.running).toBe(true);
+    expect((await getJson(port, `/api/sessions/${session.id}/steer`, "POST", { text: "must queue" })).status).toBe(409);
+    (session as any)._backgroundWorkTurn.complete({ taskId: "child", status: "done", summary: "child report" });
+    const output = await body;
+    expect(output).toContain("ROOT_FINAL_REPORT");
+    expect(output.match(/"type":"execution_end"/g)).toHaveLength(1);
+    expect(session.brain.prompt).toHaveBeenCalledTimes(2);
+    expect(sm.lateResults).not.toHaveBeenCalled();
+  });
+
+  it("rejects an invalid request mode before starting the brain", async () => {
+    const result = await getJson(port, "/api/prompt", "POST", { text: "inspect", requestMode: "invalid" });
+    expect(result.status).toBe(400);
+  });
+
+  it("Stop terminates a sync request waiting for a child without starting synthesis", async () => {
+    const session = await sm.getOrCreate("sync-stop");
+    session.brain.prompt.mockImplementationOnce(async () => {
+      (session as any)._backgroundWorkTurn.register("child");
+      session.brain.emitter.emit("event", { type: "message_end", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Work is running" }] } });
+    });
+    await getJson(port, "/api/prompt", "POST", { text: "inspect", sessionId: session.id, requestMode: "sync" });
+    await flushAsync(); expect(session._promptDone).toBe(false);
+    await getJson(port, `/api/sessions/${session.id}/abort`, "POST", {});
+    await flushAsync();
+    const output = await (await fetch(`http://127.0.0.1:${port}/api/stream/${session.id}`)).text();
+    expect(output).toContain('"outcome":"aborted"');
+    expect(session.brain.prompt).toHaveBeenCalledTimes(1);
+  });
+
+  it("signals execution_end only when the whole prompt resolves, including late subscribers", async () => {
+    const session = await sm.getOrCreate("execution-boundary");
+    let finish!: () => void;
+    session.brain.prompt.mockImplementationOnce(async () => {
+      session.brain.emitter.emit("event", { type: "agent_end" });
+      await new Promise<void>(resolve => { finish = resolve; });
+      session.brain.emitter.emit("event", { type: "message_end", message: {
+        role: "assistant", stopReason: "stop", content: [{ type: "text", text: "final report" }],
+      } });
+    });
+    await getJson(port, "/api/prompt", "POST", { text: "inspect", sessionId: session.id });
+    const response = await fetch(`http://127.0.0.1:${port}/api/stream/${session.id}`);
+    let ended = false;
+    const body = response.text().then(text => { ended = true; return text; });
+    await flushAsync();
+    expect(ended).toBe(false); // agent_end is not the HTTP prompt boundary
+    finish();
+    const text = await body;
+    expect(text).toContain('"type":"execution_end"');
+    expect(text).toContain('"outcome":"completed"');
+    const replay = await (await fetch(`http://127.0.0.1:${port}/api/stream/${session.id}`)).text();
+    expect(replay).toContain('"type":"execution_end"');
+    expect(replay).toContain('"outcome":"completed"');
+  });
+
+  it("reports cancellation separately from a successful execution", async () => {
+    const session = await sm.getOrCreate("cancelled-execution");
+    let finish!: () => void;
+    session.brain.prompt.mockImplementationOnce(() => new Promise<void>(resolve => { finish = resolve; }));
+    session.brain.abort.mockImplementationOnce(async () => { finish(); });
+    await getJson(port, "/api/prompt", "POST", { text: "inspect", sessionId: session.id });
+    await getJson(port, `/api/sessions/${session.id}/abort`, "POST", {});
+    await flushAsync();
+    const text = await (await fetch(`http://127.0.0.1:${port}/api/stream/${session.id}`)).text();
+    expect(text).toContain('"outcome":"aborted"');
+  });
+  it("closes the HTTP turn without joining children, routing late results to the separate fallback", async () => {
     const session = await sm.getOrCreate("joined");
-    const finish = vi.fn();
-    let releaseReport!: () => void;
     session.brain.prompt.mockImplementationOnce(async () => {
       (session as any)._backgroundWorkTurn.register("group");
       session.brain.emitter.emit("event", { type: "message_end", message: {
-        role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Checking nodes" }],
-      } });
-    }).mockImplementationOnce(async () => {
-      await new Promise<void>(resolve => { releaseReport = resolve; });
-      session.brain.emitter.emit("event", { type: finalEvent, message: {
-        role: "assistant", stopReason: "stop", content: [{ type: "text", text: "All five nodes are ready" }],
+        role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Final answer" }],
       } });
     });
     await getJson(port, "/api/prompt", "POST", { text: "check nodes", sessionId: "joined" });
-    session._promptDoneCallbacks.add(finish);
-    await flushAsync();
-    expect(session._promptDone).toBe(false);
-    expect(finish).not.toHaveBeenCalled();
-    expect((await getJson(port, "/api/prompt", "POST", { text: "duplicate", sessionId: "joined" })).status).toBe(409);
-    (session as any)._backgroundWorkTurn.complete({ taskId: "group", status: "done", summary: "All five nodes are ready" });
-    await flushAsync();
-    expect(session.brain.prompt).toHaveBeenCalledTimes(2);
-    expect(session.brain.prompt.mock.calls[1][0]).toContain("All five nodes are ready");
-    expect(session._promptDone).toBe(false);
-    releaseReport();
     await flushAsync();
     expect(session._promptDone).toBe(true);
-    expect(finish).toHaveBeenCalledTimes(1);
-    const ends = session._extraEventBuffer.filter((e: any) => e.type === "message_end" || e.type === "turn_end") as any[];
-    expect(ends[0].awaitingSubagents).toBe(true);
-    expect(ends[1].awaitingSubagents).toBeUndefined();
-  });
-
-  it("consumes mixed command/child results incrementally and summarizes only after helper cleanup", async () => {
-    const session = await sm.getOrCreate("mixed-work");
-    const text = (value: string) => session.brain.emitter.emit("event", { type: "message_end", message: {
-      role: "assistant", stopReason: "stop", content: [{ type: "text", text: value }],
-    } });
-    session.brain.prompt.mockImplementationOnce(async () => {
-      (session as any)._backgroundWorkTurn.register("listener");
-      (session as any)._backgroundWorkTurn.register("child");
-      text("Collecting results");
-    }).mockImplementationOnce(async () => {
-      text("Client finished; stopping the listener");
-      (session as any)._backgroundWorkTurn.complete({ taskId: "listener", status: "stopped", outputFile: "/tmp/listener", summary: "listener stopped" });
-    }).mockImplementationOnce(async () => { text("Verified the client and listener outputs"); });
-    await getJson(port, "/api/prompt", "POST", { text: "paired check", sessionId: "mixed-work" });
+    const old = (session as any)._backgroundWorkTurn;
+    old.complete({ taskId: "group", status: "done", summary: "late result" });
     await flushAsync();
-    expect(session._promptDone).toBe(false);
-    (session as any)._backgroundWorkTurn.complete({ taskId: "child", status: "done", summary: "client succeeded" });
-    await flushAsync();
-    expect(session.brain.prompt).toHaveBeenCalledTimes(3);
-    expect(session.brain.prompt.mock.calls[1][0]).toContain('"pendingJobIds":["listener"]');
-    expect(session.brain.prompt.mock.calls[2][0]).toContain("task_output(task_id)");
+    expect(session.brain.prompt).toHaveBeenCalledTimes(1);
+    expect(sm.lateResults).toHaveBeenCalledWith({ taskId: "group", status: "done", summary: "late result" });
+    expect(old.mailbox.take()).toBeUndefined();
     const ends = session._extraEventBuffer.filter((e: any) => e.type === "message_end") as any[];
-    expect(ends.map(e => e.awaitingBackgroundJobs === true)).toEqual([true, true, false]);
-    expect(session._promptDone).toBe(true);
+    expect(ends[0].awaitingSubagents).toBeUndefined();
   });
 
-  it("resumes a real steer during background wait on the original request", async () => {
-    const session = await sm.getOrCreate("steer-work");
-    const progress = () => session.brain.emitter.emit("event", { type: "message_end", message: {
-      role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Capture is active" }],
-    } });
+  it("keeps the HTTP turn open while the brain explicitly waits, not by starting a second prompt", async () => {
+    const session = await sm.getOrCreate("waiting");
     session.brain.prompt.mockImplementationOnce(async () => {
-      (session as any)._backgroundWorkTurn.register("listener");
-      progress();
-    }).mockImplementationOnce(async () => {
-      progress();
-      (session as any)._backgroundWorkTurn.complete({ taskId: "listener", status: "stopped", summary: "stopped" });
-    }).mockImplementationOnce(async () => {
-      session.brain.emitter.emit("event", { type: "message_end", message: {
-        role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Stopped and summarized" }],
-      } });
+      const turn = (session as any)._backgroundWorkTurn;
+      turn.register("child");
+      expect(await turn.mailbox.wait(1000)).toBe("mail");
+      expect(turn.mailbox.take()).toContain("child result");
     });
-    await getJson(port, "/api/prompt", "POST", { text: "observe", sessionId: "steer-work" });
-    await flushAsync();
-    expect((await getJson(port, "/api/sessions/steer-work/steer", "POST", { text: "finish the capture now" })).status).toBe(200);
-    await flushAsync();
-    expect(session.brain.steer).not.toHaveBeenCalled();
-    expect(session.brain.prompt.mock.calls[1][0]).toBe("finish the capture now");
-    expect(session._promptDone).toBe(true);
-  });
-
-  it("reports failure instead of silently completing when synthesis emits only commentary", async () => {
-    const session = await sm.getOrCreate("no-report");
-    const emitText = (text: string, phase: string) => session.brain.emitter.emit("event", {
-      type: "message_end", message: { role: "assistant", stopReason: "stop", content: [
-        { type: "text", text, textSignature: JSON.stringify({ v: 1, phase }) },
-      ] },
-    });
-    session.brain.prompt.mockImplementationOnce(async () => {
-      (session as any)._backgroundWorkTurn.register("child");
-      emitText("Checking", "commentary");
-    }).mockImplementationOnce(async () => { emitText("I will report later", "commentary"); });
-    await getJson(port, "/api/prompt", "POST", { text: "check", sessionId: "no-report" });
-    (session as any)._backgroundWorkTurn.complete({ taskId: "child", status: "done", summary: "five ready nodes" });
-    await flushAsync();
-    expect(session._promptDone).toBe(true);
-    expect(session._extraEventBuffer.some((e: any) => e.message?.stopReason === "error")).toBe(true);
-    expect(sm.stopSessionJobs).toHaveBeenCalledWith("no-report", ["child"]);
-  });
-
-  it("Stop during the child wait closes the parent and never starts the report", async () => {
-    const session = await sm.getOrCreate("stop-join");
-    session.brain.prompt.mockImplementationOnce(async () => {
-      (session as any)._backgroundWorkTurn.register("child");
-      session.brain.emitter.emit("event", { type: "message_end", message: {
-        role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Checking" }],
-      } });
-    });
-    await getJson(port, "/api/prompt", "POST", { text: "check", sessionId: "stop-join" });
+    await getJson(port, "/api/prompt", "POST", { text: "check", sessionId: "waiting" });
     await flushAsync();
     expect(session._promptDone).toBe(false);
-    await getJson(port, "/api/sessions/stop-join/abort", "POST", {});
+    (session as any)._backgroundWorkTurn.complete({ taskId: "child", status: "done", summary: "child result" });
     await flushAsync();
+    expect(session.brain.prompt).toHaveBeenCalledTimes(1);
     expect(session._promptDone).toBe(true);
-    (session as any)._backgroundWorkTurn.complete({ taskId: "child", status: "done", summary: "late" });
+  });
+
+  it("Stop closes the active mailbox and never starts a follow-up prompt", async () => {
+    const session = await sm.getOrCreate("stop-wait");
+    session.brain.prompt.mockImplementationOnce(async () => {
+      const turn = (session as any)._backgroundWorkTurn;
+      turn.register("child");
+      expect(await turn.mailbox.wait(1000)).toBe("closed");
+    });
+    await getJson(port, "/api/prompt", "POST", { text: "check", sessionId: "stop-wait" });
     await flushAsync();
+    expect(session._promptDone).toBe(false);
+    await getJson(port, "/api/sessions/stop-wait/abort", "POST", {});
+    await flushAsync();
+    (session as any)._backgroundWorkTurn.complete({ taskId: "child", status: "done", summary: "late" });
+    expect(session._promptDone).toBe(true);
     expect(session.brain.prompt).toHaveBeenCalledTimes(1);
   });
 
@@ -1375,10 +1397,11 @@ describe("http-server — prompt + session lifecycle", () => {
     const existing = await sm.getOrCreate("busy");
     existing._promptDone = false;
 
-    const r = await getJson(port, "/api/prompt", "POST", { text: "hi again", sessionId: "busy" });
+    const r = await getJson(port, "/api/prompt", "POST", { text: "hi again", sessionId: "busy", requestMode: "sync", apiRequestId: "rejected-receipt" });
 
     expect(r.status).toBe(409);
     expect(r.data.error).toMatch(/already running/i);
+    expect(sm.setUsageRole).not.toHaveBeenCalled();
     expect(existing.brain.prompt).not.toHaveBeenCalled();
   });
 

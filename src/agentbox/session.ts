@@ -12,7 +12,8 @@ import { UsageOutbox } from "./usage-outbox.js";
  * and restored from JSONL on the next prompt.
  */
 
-import type { BackgroundWorkTurn } from "./background-work-turn.js";
+import { BackgroundWorkTurn, lateSubagentResultPrompt } from "./background-work-turn.js";
+import type { RequestMode } from "../shared/request-mode.js";
 import { persistableToolDetails } from "../shared/tool-result-metadata.js";
 import fs from "node:fs";
 import path from "node:path";
@@ -152,7 +153,11 @@ export interface ManagedSession {
   isRetrying: boolean;
   /** Whether the current prompt has finished (for race condition prevention) */
   _promptDone: boolean;
-  /** Required background work owned by the current user prompt. */
+  /** User-input policy for the whole accepted request, including root continuations. */
+  _requestMode?: RequestMode;
+  /** Result of the whole prompt, for live and late event-stream subscribers. */
+  _promptOutcome?: import("../shared/execution-lifecycle.js").ExecutionOutcome;
+  /** Launch ownership and mailbox scoped to the current user prompt. */
   _backgroundWorkTurn?: BackgroundWorkTurn;
   /** Events buffered during prompt execution (replayed when SSE connects) */
   _eventBuffer: unknown[];
@@ -396,6 +401,23 @@ export class AgentBoxSessionManager {
   // Retain the launching request owner until notification, even if Stop/handoff
   // replaces the session's current request before a late child/process exit.
   private backgroundWorkOwners = new Map<string, BackgroundWorkTurn>();
+  private notificationReceipts = new WeakMap<TaskNotification, string | undefined>();
+
+  /** Both HTTP and fallback turns use the same mailbox and late-result recovery. */
+  beginBackgroundWorkTurn(managed: ManagedSession, mode: RequestMode = "async"): BackgroundWorkTurn {
+    managed._requestMode = mode;
+    const apiRequestId = managed._apiRequestId;
+    const turn = new BackgroundWorkTurn(notification => {
+      const job = this.jobs.get(notification.taskId);
+      if (mode === "sync" || this.sessions.get(managed.id) !== managed || managed._aborted ||
+          job?.type !== "subagent" || job.suppressNotifyTurn) return;
+      console.info(`[agentbox-session] late subagent result session=${managed.id} job=${notification.taskId}; queuing follow-up`);
+      this.queueParentNotification(managed, notification, apiRequestId);
+    });
+    managed._backgroundWorkTurn = turn;
+    managed.brain.setMailbox?.(turn.mailbox);
+    return turn;
+  }
 
   private registerBackgroundWork(sessionId: string, jobId: string): BackgroundWorkTurn | undefined {
     const owner = this.sessions.get(sessionId)?._backgroundWorkTurn;
@@ -2176,11 +2198,8 @@ export class AgentBoxSessionManager {
   }
 
   /**
-   * Inject a completed background job's <task_notification> into the parent model.
-   *  - claimNotification dedups (job_stop vs process-exit race → exactly one notice).
-   *  - Parent run in-flight → flush now via followUp (rides the current turn).
-   *  - Parent idle → buffer + a short coalescing window, so a burst of completions becomes
-   *    ONE synthetic turn (the model reacts once instead of re-summarizing per job).
+   * Fold the job UI and deliver a deduplicated result to its launching turn's mailbox.
+   * Unread/late subagent results fall back to a coalesced, user-role follow-up turn.
    */
   private async notifyParent(
     sessionId: string,
@@ -2235,20 +2254,26 @@ export class AgentBoxSessionManager {
     // via the synthetic-turn path (never followUp): the completion itself already shows in the
     // tool box (exec_job_done above). Requests without an owner use the legacy
     // queued delivery path; attached work has already returned above.
+    this.queueParentNotification(managed, n, managed._apiRequestId);
+  }
+
+  private queueParentNotification(managed: ManagedSession, n: TaskNotification, apiRequestId?: string): void {
+    if (managed._aborted) return;
+    this.notificationReceipts.set(n, apiRequestId);
     managed._pendingNotifications.push(n);
     if (!managed._coalesceTimer) {
       managed._coalesceTimer = setTimeout(() => {
-        void this.flushPendingNotifications(sessionId);
+        void this.flushPendingNotifications(managed.id).catch(err => {
+          console.error(`[agentbox-session] notification delivery failed for ${managed.id}:`, err);
+        });
       }, NOTIFICATION_COALESCE_MS);
       managed._coalesceTimer.unref?.();
     }
   }
 
   /**
-   * Deliver all buffered completion notifications as a single message. In-flight → followUp
-   * (rides the turn); idle → one synthetic turn. Re-fetches the session because the
-   * coalescing window may outlive it (released) — a no-op then. followUp rejection falls
-   * back to a synthetic turn so a notice is never lost (the latch is already spent).
+   * Coalesce completions into one user-role message and wait for an idle parent.
+   * Never inject a late result into an unrelated, already-running user turn.
    */
   private async flushPendingNotifications(sessionId: string): Promise<void> {
     const managed = this.sessions.get(sessionId);
@@ -2264,36 +2289,51 @@ export class AgentBoxSessionManager {
       this.discardPendingNotificationsFor(sessionId, managed);
       return;
     }
-    if (!managed._promptDone) {
-      // A turn is running — wait for it to finish, then deliver as a synthetic turn (where a
-      // pure-ack reaction is suppressed). Re-arm rather than followUp: a followUp's ack rides
-      // the running turn and can't be suppressed. The box already updated live, so the user
-      // isn't waiting on this; only the model's optional reaction is deferred.
+    if (!managed._promptDone || managed._promptInflight) {
+      // A turn is running: wait for it, then create a distinct input/response pair.
+      // Do not steer old completion evidence into the current user's request.
       managed._coalesceTimer = setTimeout(() => {
-        void this.flushPendingNotifications(sessionId);
+        void this.flushPendingNotifications(sessionId).catch(err => {
+          console.error(`[agentbox-session] notification delivery failed for ${sessionId}:`, err);
+        });
       }, NOTIFICATION_COALESCE_MS);
       managed._coalesceTimer.unref?.();
       return;
     }
     const batch = managed._pendingNotifications.splice(0);
     if (batch.length === 0) return;
-    // Public model output must not be filtered by tool usage or the types of
-    // jobs coalesced into this batch. Required subagents bypass this legacy
-    // detached-job path and are consumed by their original HTTP prompt.
-    await this.runSyntheticPrompt(managed, buildNotificationBatch(batch));
+    // A late result retains its launching request even if another API key has
+    // since used the session. Coalesce only results with the same receipt.
+    const byRequest = new Map<string | undefined, TaskNotification[]>();
+    for (const notification of batch) {
+      const receipt = this.notificationReceipts.get(notification);
+      const group = byRequest.get(receipt) ?? [];
+      group.push(notification);
+      byRequest.set(receipt, group);
+    }
+    for (const [receipt, notifications] of byRequest) {
+      const hasSubagent = notifications.some(n => this.jobs.get(n.taskId)?.type === "subagent");
+      await this.runSyntheticPrompt(managed,
+        hasSubagent ? lateSubagentResultPrompt(notifications) : buildNotificationBatch(notifications), hasSubagent, receipt);
+    }
   }
 
   /**
    * Run a notification as a synthetic parent turn when the parent is idle. Serialized
    * via _syntheticPromptQueue; acquires the SAME _promptDone/_promptInflight mutex that
    * HTTP /prompt uses, SYNCHRONOUSLY before any await — so an interleaving /prompt either
-   * already started (re-check degrades us to followUp) or hits the 409 guard. This closes
+   * already started (we wait for it) or hits the 409 guard. This closes
    * the TOCTOU documented at the _promptInflight declaration.
    */
-  private runSyntheticPrompt(managed: ManagedSession, text: string): Promise<void> {
+  private runSyntheticPrompt(managed: ManagedSession, text: string, persistInput = false, apiRequestId?: string): Promise<void> {
     const run = (managed._syntheticPromptQueue ?? Promise.resolve())
       .catch(() => {})
       .then(async () => {
+        while (!managed._promptDone || managed._promptInflight) {
+          if (this.sessions.get(managed.id) !== managed || managed._aborted) return;
+          await (managed._promptInflight ?? new Promise<void>(resolve => managed._promptDoneCallbacks.add(resolve)));
+        }
+        if (this.sessions.get(managed.id) !== managed) return;
         // Stop is terminal: if the user pressed Stop while this synthetic turn was queued, do
         // NOT start it (and do NOT followUp — that would ride a turn too). _aborted stays true
         // until the next real user prompt resets it. Checked under the queue, before the reset.
@@ -2301,15 +2341,13 @@ export class AgentBoxSessionManager {
           this.discardPendingNotificationsFor(managed.id, managed);
           return;
         }
-        // Re-check under the queue: an HTTP /prompt may have started since notifyParent
-        // decided "idle". If so, degrade to followUp (delivered to that running turn).
-        if (!managed._promptDone || managed._promptInflight) {
-          await managed.brain.followUp(text);
-          return;
-        }
         // Acquire the mutex synchronously (no await between check and set).
         managed._promptDone = false;
+        managed._promptOutcome = undefined;
         managed._aborted = false;
+        managed._currentTurnId = randomUUID();
+        this.setUsageRole(managed.id, "root", apiRequestId);
+        const backgroundWorkTurn = this.beginBackgroundWorkTurn(managed);
         // Cancel any pending release timer (mirrors getOrCreate): a background job's
         // onSettled may have armed scheduleRelease just before this turn started — left
         // running, release() would tear the session down mid-synthetic-turn (it has no
@@ -2346,9 +2384,7 @@ export class AgentBoxSessionManager {
             "Set SICLAW_AGENT_ID and wire the gateway client so completions survive a refresh.",
           );
         }
-        // Buffer the turn's messages and whether it did any real work (a tool call). We
-        // persist at turn end, conditionally — a reaction with NO tool call is a pure
-        // acknowledgement and is dropped (no bubble); see the finally block.
+        // Keep the input even when the model fails or produces no visible reply.
         const turnMessages: any[] = [];
         // Synthetic turns have no gateway SSE consumer to pair lifecycle events with their
         // persisted tool-result rows. Retain the invocation label until message_end arrives.
@@ -2414,6 +2450,10 @@ export class AgentBoxSessionManager {
           }
           if (event?.type === "tool_execution_start") turnHadTool = true;
           if (event?.type === "message_end" && event.message) {
+            if (event.message.role === "custom" && event.message.customType === "agent_mailbox") return;
+            // The runtime input is already durable before the model starts; pi emits
+            // the same user message again on prompt/retry, so do not append it twice.
+            if (persistInput && event.message.role === "user") return;
             if (event.message.role === "toolResult") turnHadTool = true;
             if (event.message.role === "toolResult" && event.message.toolset == null) {
               const callId = extractToolResultId(event.message);
@@ -2429,7 +2469,17 @@ export class AgentBoxSessionManager {
         });
         managed._bufferUnsub = () => brainUnsub();
         try {
-          await runPromptWithModelRouting(
+          if (canPersist && persistInput) {
+            await this.persistAppendMessage({ sessionId: sid, parentSessionId: sid,
+              fromAgentId: this.agentId, targetAgentId: this.agentId, role: "user", content: text,
+              metadata: { kind: "task_notification" } });
+          }
+          if (managed._aborted) { managed._promptOutcome = "aborted"; return; }
+          if (canPersist && persistInput) await this.persistDelegationEvent({
+            type: "delegation.emit_chat_event", sessionId: sid,
+            event: { type: "background_turn_start", sessionId: sid, turnId: managed._currentTurnId },
+          });
+          const result = await runPromptWithModelRouting(
             managed.brain,
             text,
             effectivePolicy,
@@ -2456,7 +2506,9 @@ export class AgentBoxSessionManager {
               },
             },
           );
+          managed._promptOutcome = managed._aborted ? "aborted" : result?.success === false ? "error" : "completed";
         } catch (err) {
+          managed._promptOutcome = managed._aborted ? "aborted" : "error";
           console.warn(`[agentbox-session] synthetic prompt failed for ${managed.id}:`, err);
         } finally {
           // Preserve non-empty public output, including pure-text reports.
@@ -2467,16 +2519,17 @@ export class AgentBoxSessionManager {
               : typeof m.content === "string" ? m.content : "";
             return c.trim().length > 0;
           });
-          if (canPersist && !managed._aborted && (turnHadTool || turnHadText)) {
+          if (canPersist && (persistInput || (!managed._aborted && (turnHadTool || turnHadText)))) {
             try {
               // Preserve message order; emit done only after every write succeeds.
-              for (const message of turnMessages) {
+              for (const message of managed._aborted ? [] : turnMessages) {
                 await this.persistSyntheticMessage(sid, message, currentModelRouteMetadata);
               }
               await this.persistDelegationEvent({
                 type: "delegation.emit_chat_event",
                 sessionId: sid,
-                event: { type: "background_turn_done", sessionId: sid },
+                event: { type: "background_turn_done", sessionId: sid, turnId: managed._currentTurnId,
+                  outcome: managed._promptOutcome },
               });
             } catch (err) {
               console.error(`[agentbox-session] background report delivery failed for ${sid}:`, err);
@@ -2486,6 +2539,9 @@ export class AgentBoxSessionManager {
               }).catch(error => console.error(`[agentbox-session] background error delivery failed for ${sid}:`, error));
             }
           }
+          if (managed._aborted) backgroundWorkTurn.cancel();
+          else backgroundWorkTurn.finish();
+          managed.brain.setMailbox?.(undefined);
           managed.brain.llmCalls?.endPrompt({ explicit: true });
           managed._promptDone = true;
           managed._routeBrainEventsThroughExtra = false;
@@ -2837,6 +2893,9 @@ export class AgentBoxSessionManager {
      */
     const sharedMcpManager = this.sessions.get(request.parentSessionId)?.mcpManager;
 
+    // Group children use <spawnId>#<index|reduce>; ownership stays with the original
+    // launch, even if a queued child starts after the parent has finished its turn.
+    const parentMailbox = this.backgroundWorkOwners.get(request.spawnId.split("#")[0])?.mailbox;
     const child = await createSiclawSession({
       mcpManager: sharedMcpManager,
       sessionManager: childSessionManager,
@@ -2862,7 +2921,12 @@ export class AgentBoxSessionManager {
       isSubagent: true,
       // The agent-type's prompt flavour for this child.
       systemPromptAppend: request.agentPrompt,
-      subagentPrompt: type.systemPromptAddendum,
+      subagentPrompt: type.systemPromptAddendum + (parentMailbox
+        ? "\nYour final assistant reply is returned to the parent. End with the complete findings, evidence references, and limitations needed for the assignment; a card/message delivery acknowledgement is not a substitute for that report. Use send_message only for material interim findings or blockers, not routine progress or a duplicate final report."
+        : ""),
+      sendParentMessage: parentMailbox ? message => parentMailbox.post(
+        JSON.stringify({ type: "subagent_message", childSessionId, message: redactText(message, redactionConfig) }),
+      ) : undefined,
       // Deliberately omit spawnSubagentExecutor + delegate executors → the child
       // never sees spawn_subagent (no recursion).
     });
@@ -3625,6 +3689,7 @@ export class AgentBoxSessionManager {
       // spawn_subagent is available in normal chat (top-level sessions only — child
       // sessions above omit this executor, so sub-agents cannot recurse).
       spawnSubagentExecutor: this.createSpawnSubagentExecutor(),
+      agentMailbox: () => this.sessions.get(id)?._backgroundWorkTurn?.mailbox,
       // Snapshot the box's menu at creation — this is the value the session will
       // hold for its lifetime, and the tool schema built below derives from it.
       subagentTierMenu: this.subagentTierMenuState,

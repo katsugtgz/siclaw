@@ -1,3 +1,4 @@
+import { installMailboxStream } from "./mailbox-loop.js";
 import {
   createAgentSessionFromServices,
   type CreateAgentSessionFromServicesOptions,
@@ -59,9 +60,10 @@ export async function createPiExecutionSession(options: PiExecutionOptions) {
     return finalPayload;
   };
 
-  // Recorder stays closest to the provider: input/output guard work belongs to
-  // setup/tool time rather than network latency. Preserve this wrapper order.
+  // Sampling cutoff sits inside recording so yielded calls still close their
+  // metrics. Input/output guard work remains outside the network timing wrapper.
   const llmCallRecorder = new LlmCallRecorder();
+  installMailboxStream(session.agent);
   session.agent.streamFunction = llmCallRecorder.wrapStreamFn(session.agent.streamFunction);
   installGuardPipeline(guards ?? createGuardRegistry(options.model?.contextWindow ?? 128_000), {
     agent: session.agent,

@@ -172,6 +172,36 @@ afterEach(async () => {
 });
 
 describe("startRuntime — chat.abort wiring", () => {
+  it("does not start an unfenced local follow-up when a steer hits a managed sync request", async () => {
+    server = await bootRuntime();
+    await server.rpcMethods.get("chat.send")!({ agentId: "a", userId: "u", sessionId: "S", text: "protected", requestMode: "sync", logicalTurnId: "controller-claim" }, { sendEvent: vi.fn() });
+    await waitFor(() => settleConsumer !== undefined);
+    await expect(server.rpcMethods.get("chat.steer")!({ agentId: "a", userId: "u", sessionId: "S", text: "follow-up" }, { sendEvent: vi.fn() })).rejects.toThrow("REQUEST_REQUIRES_QUEUE");
+    expect(promptCalls).toHaveLength(1); expect(steerSessionMock).not.toHaveBeenCalled();
+    settleConsumer!();
+  });
+
+  it.each([ ["sync", "async"], ["async", "sync"], ["sync", "sync"] ])(
+    "queues %s -> %s as separate request streams without steering", async (firstMode, secondMode) => {
+      server = await bootRuntime();
+      const send = server.rpcMethods.get("chat.send")!;
+      const first = { sendEvent: vi.fn() }; const second = { sendEvent: vi.fn() };
+      await send({ agentId: "a", userId: "u", sessionId: "S", text: "first", requestMode: firstMode, turnId: "first" }, first);
+      await waitFor(() => settleConsumer !== undefined);
+      const finishFirst = settleConsumer!;
+      await send({ agentId: "a", userId: "u", sessionId: "S", text: "second", requestMode: secondMode, turnId: "second" }, second);
+      await new Promise(resolve => setTimeout(resolve, 25));
+      expect(promptCalls).toHaveLength(1);
+      expect(steerSessionMock).not.toHaveBeenCalled();
+      finishFirst();
+      await waitFor(() => promptCalls.length === 2 && settleConsumer !== finishFirst);
+      expect(promptCalls[1]).toMatchObject({ text: "second", requestMode: secondMode, turnId: "second" });
+      settleConsumer!();
+      await waitFor(() => second.sendEvent.mock.calls.some(([, frame]) => frame.event?.type === "prompt_done"));
+      expect(first.sendEvent.mock.calls.filter(([,frame])=>frame.event?.type==="prompt_done")).toHaveLength(1);
+      expect(second.sendEvent.mock.calls.filter(([,frame])=>frame.event?.type==="prompt_done")).toHaveLength(1);
+    });
+
   it("forwards A2A continuation controls and reports whether context was resumed", async () => {
     promptResumed = true;
     server = await bootRuntime();

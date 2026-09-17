@@ -305,6 +305,10 @@ function buildWorkflowSection(includePlanning: boolean, includeSubagents: boolea
   if (includeSubagents) {
     lines.push("- **Fan out to sub-agents for concurrent work.** The main agent works on **one thing at a time**. To run independent work **in parallel** — the same procedure across several targets, or separate independent threads — make **one `spawn_subagent` call with all the targets in `items`** (a `task_template` + one item per target for the same procedure; one full task brief per item for separate threads; add `reduce_prompt` when the per-item results should be synthesized into one report). Never run several in parallel inside the main agent yourself, and don't split one batch into many single-item calls. Each sub-agent does its whole job and reports back; don't redo a sub-agent's work. Sequential work in the main agent is fine; **only concurrency requires sub-agents.**");
     lines.push("- **No recursion**: sub-agents can't spawn sub-agents — keep delegation one level deep.");
+    lines.push("- Call `wait_agent` **very sparingly**. Only call `wait_agent` when you need the result immediately for the next critical-path step and you are blocked until it returns.");
+    lines.push("- While the subagent is running in the background, **do meaningful non-overlapping work immediately**.");
+    lines.push("- **Do not repeatedly wait by reflex.**");
+    lines.push("- **Asynchronous execution**: `spawn_subagent` returns a launch handle, not findings. Do not poll `task_output` or spawn a waiter. Messages and completion results enter your current conversation at execution boundaries. A wait timeout does not stop a child. Read referenced full reports when needed, integrate the findings, and then answer. Prefer integrating necessary child results before finishing; as a fallback, the runtime appends late completion results as a message and starts a new turn.");
   }
   return lines.join("\n");
 }

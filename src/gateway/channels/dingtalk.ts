@@ -378,7 +378,6 @@ export async function handleDingTalkMessage(
     const collected = await collectChannelResponse(client, promptResult.sessionId, "dingtalk", {
       includeImages: true,
       persist: !remoteConversation && auditable ? { agentId, modelConfig: modelBinding?.modelConfig, traceId: promptResult.traceId } : undefined,
-      throwOnError: remoteConversation,
     });
     resultText = collected.text;
     replyImages = collected.images;
