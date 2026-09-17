@@ -19,6 +19,9 @@ vi.mock("./agentbox/client.js", () => ({
   AgentBoxClient: class {
     async postJson(path: string, body: unknown, timeoutMs?: number) {
       posts.push({ path, body, timeoutMs });
+      if (path.startsWith("/test-session/")) {
+        return { test_session_id: "test-1", snapshot_hash: "snapshot", consumer_fingerprint: "fingerprint", pages: 1 };
+      }
       if (path.startsWith("/test-recommendation/")) {
         return {
           ok: true,
@@ -83,6 +86,25 @@ afterEach(async () => {
 });
 
 describe("capability.testRecommend", () => {
+  it("refreshes test configuration on each question without respawning the authoring box", async () => {
+    const frontend = fakeFrontendClient();
+    const manager = fakeAgentBoxManager();
+    let llm = { engine: "pi_agent", execution: { roles: { blue: { model: { id: "first" }, api_key: "private-key" } } } };
+    frontend.request.mockImplementation(async (method: string, params: any) =>
+      method === "capability.fetchInput" && params.ref === "test-model" ? { llm } : {});
+    server = await startRuntime({
+      config: { port: 0, internalPort: 0, host: "127.0.0.1", serverUrl: "", portalSecret: "" } as any,
+      agentBoxManager: manager, frontendClient: frontend, credentialService: {} as any,
+    });
+    const started = await server.rpcMethods.get("capability.start")!({ profile: "kb-compile", org_id: "org-1", correlation_id: "attempt-1" }) as { run_id: string };
+    await server.rpcMethods.get("capability.testStart")!({ run_id: started.run_id });
+    expect((posts.find(post => post.path.startsWith("/test-session/"))!.body as any).llm).toEqual(llm);
+    llm = { ...llm, execution: { roles: { blue: { model: { id: "second" }, api_key: "new-private-key" } } } };
+    await server.rpcMethods.get("capability.testMessage")!({ run_id: started.run_id, test_session_id: "test-1", message: "question" });
+    expect(posts.at(-1)).toMatchObject({ path: "/test-message/test-1", body: { message: "question", llm } });
+    expect(manager.getOrCreate).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(frontend.emitEvent.mock.calls)).not.toContain("private-key");
+  });
   it("runs an explicit recommendation on the authoring box with a bounded long timeout", async () => {
     server = await startRuntime({
       config: { port: 0, internalPort: 0, host: "127.0.0.1", serverUrl: "", portalSecret: "" } as any,
