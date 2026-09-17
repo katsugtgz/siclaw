@@ -27,8 +27,26 @@ metrics and script sandbox callbacks. Ordinary Agent certificates cannot access
 private Web sessions. Browser credentials never become console credentials.
 
 Runtime advertises `webUserIsolation` only with the Kubernetes spawner. Sicore
-refuses private chat dispatch to older runtimes. Deploy Runtime/AgentBox before
-enabling Web key issuance in Sicore. This does not grant personal Sicore resource
+refuses private chat dispatch to older runtimes. This does not grant personal Sicore resource
 privileges to an external principal. Capacity planning must include one active pod
 per external principal/Agent and persistence storage; configure tenant quotas and
 idle release according to the expected number of concurrent users.
+
+## Paired rollout
+
+For the first feature rollout, deploy Sicore schema/API with its matching Web
+image, then the compatible Runtime and AgentBox. Enable integrations for use only
+when actual running boxes support both private Web execution and API/A2A request
+receipt propagation. Updating the configured AgentBox image does not replace
+existing boxes; let active sessions drain before replacing them under the
+environment's approved procedure.
+
+Older Runtime/AgentBox versions can serve API/A2A calls without the optional
+`apiRequestId`, but those model observations have no Key attribution. Protocol
+compatibility alone does not establish complete audit. Verify two keys sharing a
+session, subagent attribution, and cross-user Web isolation before acceptance.
+
+Once both capabilities are already deployed, subsequent Sicore-only policy/UI
+changes can reuse those Runtime/AgentBox images. No new Helm values or environment
+variables are required. The Sicore companion's rollout guide also covers legacy
+Feishu personal keys that lack verified holders and must be reissued after upgrade.
