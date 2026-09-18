@@ -68,5 +68,8 @@
     "done": "domain recorded: {domain}",
     "too_long": "not recorded: domain exceeds {limit} characters. Shorten to one complete topic sentence and call again (aim ~{target} chars; no inventory, no half sentence). The system will not truncate for you.",
     "failed": "domain could not be written to disk: {e}. Do not resubmit the same sentence until the workspace is writable."
+  },
+  "candidate_lookup": {
+    "desc": "Query the current Candidate tree by exact Raw sources, literal title/description/body text, or no filters to browse. Results include descriptions and a revision; use next_offset with that revision to retrieve every match. Restart at offset 0 if restart_required. Recommendations are not exhaustive semantic retrieval; read pages with Read and search the whole permitted Raw/Candidate corpus as needed. This read-only tool does not attest to coverage or truth."
   }
 }

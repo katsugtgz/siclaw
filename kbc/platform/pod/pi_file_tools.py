@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import codecs
 import mimetypes
 import os
@@ -86,10 +87,26 @@ def _integer(args: dict, key: str, default: int, *, minimum: int = 0, maximum: i
 
 
 class FileTools:
-    def __init__(self, cwd: str, allowed: list[str], guard: PermissionGuard):
+    def __init__(self, cwd: str, allowed: list[str], guard: PermissionGuard, *, feedback=None):
         self.root = Path(cwd).resolve()
         self.allowed = set(allowed)
         self.guard = guard
+        self.feedback = feedback
+
+    def write_result(self, target: Path, message: str) -> dict:
+        result = text_result(message)
+        if self.feedback is not None:
+            try:
+                report = self.feedback(target)
+            except Exception as error:
+                # Persistence already succeeded. Never invite a replay of the write
+                # by presenting advisory-check failure as a failed mutation.
+                report = {"persisted": True, "status": "check_unavailable",
+                          "error_class": type(error).__name__,
+                          "note": "Local feedback unavailable; completion checks still apply."}
+            if report is not None:
+                result["content"].append({"type": "text", "text": json.dumps(report, ensure_ascii=False)})
+        return result
 
     async def check(self, name: str, args: dict) -> None:
         if name not in self.allowed:
@@ -216,7 +233,7 @@ class FileTools:
         if not isinstance(content, str) or len(content.encode("utf-8")) > MAX_FILE_BYTES:
             raise ValueError("content must be text within the write budget")
         self._replace(target, content)
-        return text_result(f"Wrote {len(content.encode('utf-8'))} bytes to {target}")
+        return self.write_result(target, f"Wrote {len(content.encode('utf-8'))} bytes to {target}")
 
     async def edit(self, args: dict) -> dict:
         await self.check("Edit", args)
@@ -234,7 +251,7 @@ class FileTools:
         if len(result.encode("utf-8")) > MAX_FILE_BYTES:
             raise ValueError("Edited file exceeds the write budget")
         self._replace(target, result)
-        return text_result(f"Edited {target}")
+        return self.write_result(target, f"Edited {target}")
 
     @staticmethod
     def _replace(target: Path, content: str) -> None:
