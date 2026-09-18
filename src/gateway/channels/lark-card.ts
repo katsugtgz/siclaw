@@ -365,20 +365,31 @@ export function buildLinkActionCard(opts: {
   // what let this recur, so the guarantee lives with the claim.
   const body = opts.body.split(opts.url).join("").replace(/[ \t]+$/gm, "").trim();
   const elements: Record<string, unknown>[] = body ? [{ tag: "markdown", content: body }] : [];
-  // Wrapped in column_set exactly like the mode card and the feedback row — the two button layouts
-  // already proven in production. A bare `button` at body level was the other half of the rejection.
+  // Laid out exactly like the answer card's feedback row: `flex_mode: "none"` + a weighted column
+  // + `width: "fill"` on the button. Not a cosmetic copy — it is the one button geometry this
+  // tenant's CardKit is known to accept, and the two rows sit adjacent in the same conversation,
+  // so a button that hugs its label here reads as a different, lesser control than the full-width
+  // ones directly below it.
+  //
+  // A bare `button` at body level was rejected outright once; keep it wrapped.
   elements.push({
     tag: "column_set",
+    flex_mode: "none",
     columns: [
       {
         tag: "column",
-        width: "auto",
+        width: "weighted",
+        weight: 1,
         elements: [
           {
             tag: "button",
             element_id: "link_action",
+            // `primary` where the feedback row uses `default`, and deliberately so: those three are
+            // optional afterthoughts on an answer the reader already has, while this is the only
+            // way out of a refusal. Same geometry, different emphasis.
             text: { tag: "plain_text", content: opts.buttonLabel },
             type: "primary",
+            width: "fill",
             behaviors: [{ type: "open_url", default_url: opts.url }],
           },
         ],

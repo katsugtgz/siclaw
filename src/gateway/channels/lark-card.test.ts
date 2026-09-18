@@ -642,6 +642,24 @@ describe("buildLinkActionCard", () => {
     const card = buildLinkActionCard({ ...OPTS, body: `点这里 ${OPTS.url} 完成` });
     expect(JSON.stringify(elementsOf(card)[0])).not.toContain(OPTS.url);
   });
+
+  it("gives its button the same geometry as the answer card's feedback row", () => {
+    // These two cards sit adjacent in one conversation — a refusal, then the answer once the
+    // sender gets in. A button that hugs its label here reads as a lesser control than the
+    // full-width ones directly below it, which is exactly how it looked before.
+    //
+    // The three fields asserted are the same ones "renders three equal-width actions" pins on the
+    // feedback row. They are also the only button geometry this tenant's CardKit is known to
+    // accept, so drifting from them risks the silent create-without-card_id failure.
+    const row = elementsOf(buildLinkActionCard(OPTS)).find((e) => e.tag === "column_set") as any;
+    expect(row.flex_mode).toBe("none");
+    expect(row.columns).toHaveLength(1);
+    expect(row.columns[0]).toMatchObject({ width: "weighted", weight: 1 });
+    expect(row.columns[0].elements[0].width).toBe("fill");
+    // `primary` where the feedback row uses `default`, on purpose: those three are optional
+    // afterthoughts on an answer the reader already has, this is the only way out of a refusal.
+    expect(row.columns[0].elements[0].type).toBe("primary");
+  });
 });
 
 describe("sendLinkActionCard", () => {
