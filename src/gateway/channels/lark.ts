@@ -264,6 +264,17 @@ const PERSONAL_DENIAL_TITLE_BY_LOCALE: Record<LarkLocale, Map<string, string>> =
     ["access_request_required", "Access request needed"],
   ]),
 };
+// Title bars for the two SUCCESS cards. Same role as PERSONAL_DENIAL_TITLE_BY_LOCALE — the bar
+// says what the card is, the body says what to know about it — which is why the body no longer
+// repeats the headline. Green rather than blue: these hand over something that was asked for.
+const API_KEY_READY_TITLE_BY_LOCALE: Record<LarkLocale, (rotated: boolean) => string> = {
+  "zh-CN": (rotated) => (rotated ? "API Key 已更新" : "API Key 已就绪"),
+  "en-US": (rotated) => (rotated ? "API key replaced" : "API key ready"),
+};
+const WEBCHAT_READY_TITLE_BY_LOCALE: Record<LarkLocale, string> = {
+  "zh-CN": "网页对话链接已就绪",
+  "en-US": "Web chat link ready",
+};
 // Appended when a one-time `actionUrl` is present. The remaining validity is DERIVED from
 // `expiresAtMs`; never restate the frontend's TTL as a constant here (it changes without this
 // file noticing — a lesson from the /apikey copy).
@@ -1394,9 +1405,12 @@ export async function handleLarkMessage(
             );
             cardDelivered = await deliverSingleUseLink(larkClient, messageId, locale, {
               body: formatApiKeyIssueCardBody(issued, locale),
+              title: API_KEY_READY_TITLE_BY_LOCALE[locale](Boolean(issued.rotated)),
+              headerTemplate: "green",
               buttonLabel: API_KEY_PICKUP_BUTTON_BY_LOCALE[locale],
               url: pickupUrl,
               expiresAtMs: issued.expiresAt,
+              ttlMinutes: issued.ttlMinutes,
             }, reply, expiredReply);
           } else if (!issued.success) {
             // A refusal that still offers a live self-service link gets the same card treatment:
@@ -1485,9 +1499,12 @@ export async function handleLarkMessage(
         if (issued.success && actionUrl) {
           cardDelivered = await deliverSingleUseLink(larkClient, messageId, locale, {
             body: formatWebChatIssueCardBody(locale),
+            title: WEBCHAT_READY_TITLE_BY_LOCALE[locale],
+            headerTemplate: "green",
             buttonLabel: WEBCHAT_OPEN_BUTTON_BY_LOCALE[locale],
             url: actionUrl,
             expiresAtMs: issued.expiresAt,
+            ttlMinutes: issued.ttlMinutes,
           }, reply, WEBCHAT_LINK_EXPIRED_NOTICE_BY_LOCALE[locale]);
         } else if (!issued.success) {
           const denialCard = buildActionDenialCard(
@@ -2452,17 +2469,27 @@ function buildActionDenialCard(
   locale: LarkLocale,
   copies: ActionDenialCopies,
   genericCopies: GenericActionDenialCopies,
-): { body: string; buttonLabel: string; url: string; expiresAtMs?: number } | null {
+): { body: string; title?: string; buttonLabel: string; url: string; expiresAtMs?: number; ttlMinutes?: number } | null {
   if (!denied || minutesUntil(denied.expiresAtMs) === "expired") return null;
   if (!rendersActionLink(denied, locale)) return null;
   const copy = actionDenialCopy(denied, locale, copies, genericCopies);
   if (!copy) return null;
   return {
     body: [copy.lead, copy.resume].filter(Boolean).join("\n"),
+    // Same header and same validity source as the DM refusal. `/apikey` and `/webchat` render
+    // through the very same buildLinkActionCard, so leaving these two off gave one flow a titled
+    // card reading "10 分钟内有效" and the other an untitled one reading "9 分钟内有效" — for the
+    // same link, minted by the same issuer, seconds apart.
+    //
+    // The title names the OBSTACLE ("需要先关联账号"), not the action, which is why the DM copy
+    // transfers verbatim: what blocks you is the same whether you were chatting or fetching a key.
+    // The body still carries the per-action wording through `copies`.
+    title: PERSONAL_DENIAL_TITLE_BY_LOCALE[locale].get(denied.reason ?? ""),
     buttonLabel: PERSONAL_DENIAL_BUTTON_BY_LOCALE[locale].get(denied.reason ?? "")
       ?? PERSONAL_DENIAL_BUTTON_NEUTRAL_BY_LOCALE[locale],
     url: denied.actionUrl,
     expiresAtMs: denied.expiresAtMs,
+    ttlMinutes: denied.ttlMinutes,
   };
 }
 
@@ -2478,7 +2505,15 @@ async function deliverSingleUseLink(
   larkClient: any,
   messageId: string,
   locale: LarkLocale,
-  card: { body: string; title?: string; buttonLabel: string; url: string; expiresAtMs?: number; ttlMinutes?: number },
+  card: {
+    body: string;
+    title?: string;
+    headerTemplate?: "blue" | "green";
+    buttonLabel: string;
+    url: string;
+    expiresAtMs?: number;
+    ttlMinutes?: number;
+  },
   textFallback: string,
   expiredReply?: string,
 ): Promise<boolean> {
@@ -2501,6 +2536,7 @@ async function deliverSingleUseLink(
   const sent = await sendLinkActionCard(larkClient, messageId, {
     body: card.body,
     title: card.title,
+    headerTemplate: card.headerTemplate,
     note: singleUseValidityNote(locale, card.ttlMinutes, remaining),
     buttonLabel: card.buttonLabel,
     url: card.url,
@@ -2815,9 +2851,11 @@ function formatWebChatIssueReply(result: PersonalWebChatLinkResult, locale: Lark
  * will otherwise get wrong.
  */
 function formatWebChatIssueCardBody(locale: LarkLocale): string {
+  // Headline dropped — the title bar carries it now. What is left is the one thing a sender might
+  // not expect: the window starts empty.
   return locale === "en-US"
-    ? ["✅ Your web chat link is ready.", "This starts a brand-new, empty conversation — it does not continue this chat."].join("\n")
-    : ["✅ 网页对话链接已就绪", "打开后是一个全新的空白对话，不会延续这里的聊天记录"].join("\n");
+    ? "This starts a brand-new, empty conversation — it does not continue this chat."
+    : "打开后是一个全新的空白对话，不会延续这里的聊天记录";
 }
 
 /** `/webchat` takes no subcommand, so usage help is one line plus the bare form. */
@@ -2979,18 +3017,17 @@ function formatApiKeyIssueCardBody(result: PersonalApiKeyIssueResult, locale: La
   // The `status` hint is kept: unlike the URL and the validity window (which become the button and
   // the footnote), it has nowhere else to live, and the card is now the primary delivery path — so
   // dropping it here would quietly remove the affordance for checking the key's own expiry.
+  // No "✅ ... is ready" line: the title bar now says that, and repeating it cost the card a line
+  // without adding anything. The ROTATION warning is not a headline though — it is the one thing
+  // here that requires action, so it stays in the body where there is room to say what to do.
   if (locale === "en-US") {
     return [
-      result.rotated
-        ? "✅ New API key generated — your PREVIOUS key is now invalid. Update anything configured with it."
-        : "✅ Your API key is ready.",
+      ...(result.rotated ? ["Your PREVIOUS key is now invalid — update anything configured with it."] : []),
       "Send /apikey status any time to check the key's own expiry.",
     ].join("\n");
   }
   return [
-    result.rotated
-      ? "✅ 已为你生成新的 API Key（旧 Key 已失效，如有配置请更新）"
-      : "✅ 你的 API Key 已就绪",
+    ...(result.rotated ? ["旧 Key 已失效，如有配置请更新"] : []),
     "随时发送 /apikey status 查看 Key 本身的失效时间",
   ].join("\n");
 }

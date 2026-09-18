@@ -359,6 +359,14 @@ export interface PersonalApiKeyIssueResult {
   pickupUrl?: string;
   /** Epoch ms after which the pickup link is dead. */
   expiresAt?: number;
+  /**
+   * How long the link was minted for, in minutes. Print THIS in "valid for N minutes"; use
+   * `expiresAt` only to decide whether the link is still alive. Deriving one from the other is
+   * what made a fresh 5-minute link announce itself as "4 分钟内有效" — the round trip and
+   * render eat into the window before floor() sees it. Optional: an older frontend omits it and
+   * the renderer falls back to the remaining time. Never hard-code the number here.
+   */
+  ttlMinutes?: number;
   /** True ⇒ the requester's previous key was just invalidated. */
   rotated?: boolean;
   /** Non-localized English fallback. Surfaced verbatim only when `denied` yields no template. */
@@ -442,6 +450,14 @@ export interface PersonalWebChatLinkResult {
   actionUrl?: string;
   /** Epoch ms after which the redemption link is dead. */
   expiresAt?: number;
+  /**
+   * How long the link was minted for, in minutes. Print THIS in "valid for N minutes"; use
+   * `expiresAt` only to decide whether the link is still alive. Deriving one from the other is
+   * what made a fresh 10-minute link announce itself as "9 分钟内有效" — the round trip and
+   * render eat into the window before floor() sees it. Optional: an older frontend omits it and
+   * the renderer falls back to the remaining time. Never hard-code the number here.
+   */
+  ttlMinutes?: number;
   /** Non-localized English fallback. Surfaced verbatim only when `denied` yields no template. */
   error?: string;
   /** Present only on the AUTHORIZATION refusal; other failure exits carry `error` alone. */

@@ -353,6 +353,13 @@ export function buildLinkActionCard(opts: {
   body: string;
   /** Header line. Omitted, or when `withHeader` is false, the card has no title bar. */
   title?: string;
+  /**
+   * Title-bar colour. `blue` (the default) for a refusal or a next step, `green` for a delivery
+   * that already succeeded — the /apikey and /webchat cards hand over something the sender asked
+   * for, and painting that the same colour as "you cannot use this yet" loses the one bit of
+   * information the bar exists to carry at a glance.
+   */
+  headerTemplate?: "blue" | "green";
   /** Smaller grey line UNDER the button — validity window, "opens once", etc. */
   note?: string;
   buttonLabel: string;
@@ -420,7 +427,7 @@ export function buildLinkActionCard(opts: {
   if (withHeader && opts.title) {
     card.header = {
       title: { tag: "plain_text", content: opts.title },
-      template: "blue",
+      template: opts.headerTemplate ?? "blue",
     };
   }
   return card;
@@ -434,7 +441,7 @@ export function buildLinkActionCard(opts: {
 export async function sendLinkActionCard(
   larkClient: any,
   messageId: string,
-  opts: { body: string; title?: string; note?: string; buttonLabel: string; url: string },
+  opts: { body: string; title?: string; headerTemplate?: "blue" | "green"; note?: string; buttonLabel: string; url: string },
 ): Promise<boolean> {
   // Two shapes, best first. `header` is not among the fields proven against this tenant's CardKit,
   // and a rejected card JSON does not throw — create just comes back without a card_id, which used
