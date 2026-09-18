@@ -140,6 +140,8 @@ export interface CreateSiclawSessionOpts {
   /** Expose `request_input` to this top-level machine-driven session. */
   allowInputRequest?: boolean;
   handoffSupported?: boolean;
+  /** This dispatch carries a Ticket result contract; see agent-context. */
+  structuredResultRequired?: boolean;
   handoffPolicy?: import("../shared/agent-handoff.js").HandoffPolicy;
   /** Shared task-ledger id; sub-agents pass the parent's id to share its ledger. Default: fresh uuid. */
   taskListId?: string;
@@ -468,6 +470,7 @@ export async function createSiclawSession(
     isSubagent: opts?.isSubagent,
     systemPromptTemplate: opts?.systemPromptTemplate,
     handoffPolicy: opts?.handoffPolicy,
+    structuredResultRequired: opts?.structuredResultRequired === true,
     handoffAvailable: Boolean(opts?.handoffPolicy?.remaining !== 0 && opts?.handoffSupported && opts?.searchHandoffTargets && opts?.sessionEventEmitter && opts?.handoffTargets?.length && !opts?.isSubagent),
     interactiveProgress: mode === "web" && !opts?.isSubagent,
   });

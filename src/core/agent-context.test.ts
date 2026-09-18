@@ -244,3 +244,41 @@ describe("subagent prompt layers", () => {
     expect(parent.systemPrompt).not.toContain("Investigate independently; report gaps to the caller");
   });
 });
+
+describe("ticket result contract", () => {
+  it("instructs a dispatch that carries a result contract to submit one", () => {
+    const context = compileAgentContext({
+      agentType: "ticket", allowedTools: ["read"], memoryConfigured: false, mode: "web",
+      structuredResultRequired: true,
+    });
+    expect(context.systemPrompt).toContain("Submit a valid result through the configured result tool");
+  });
+
+  it("says nothing about a result tool when the instance declares no contract", () => {
+    const context = compileAgentContext({
+      agentType: "ticket", allowedTools: ["read"], memoryConfigured: false, mode: "web",
+    });
+    // A multi-turn Ticket assistant has no result tool, so naming one would send
+    // it looking for something that is not in its tool surface.
+    expect(context.systemPrompt).not.toContain("result tool");
+    // The rest of the Ticket contract is unconditional.
+    expect(context.systemPrompt).toContain("Never claim that a ticket was created, closed or updated");
+  });
+
+  it("keys the clause on the requirement rather than on the Agent type", () => {
+    // Only Ticket dispatches carry a result contract today, but the sentence
+    // describes the contract, not the type — so it follows the flag. Asserting
+    // the type here instead would pass for the wrong reason.
+    const withRequirement = compileAgentContext({
+      agentType: "sre", allowedTools: null, memoryConfigured: false, mode: "web",
+      structuredResultRequired: true,
+    });
+    const without = compileAgentContext({
+      agentType: "sre", allowedTools: null, memoryConfigured: false, mode: "web",
+    });
+    expect(withRequirement.systemPrompt).toContain("Submit a valid result through the configured result tool");
+    expect(without.systemPrompt).not.toContain("Submit a valid result through the configured result tool");
+    // The Ticket-specific half stays with the Ticket type.
+    expect(withRequirement.systemPrompt).not.toContain("Never claim that a ticket was created");
+  });
+});

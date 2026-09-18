@@ -248,6 +248,7 @@ export interface ManagedSession {
   /** Whether this session was built with top-level `request_input` available. */
   allowInputRequest: boolean;
   handoffSupported?: boolean;
+  structuredResultRequired?: boolean;
   handoffPolicy?: import("../shared/agent-handoff.js").HandoffPolicy;
   /** MCP client manager — per-session, shut down on release/close */
   mcpManager?: McpClientManager;
@@ -3504,6 +3505,7 @@ export class AgentBoxSessionManager {
     allowInputRequest = false,
     handoffSupported = false,
     handoffPolicy?: import("../shared/agent-handoff.js").HandoffPolicy,
+    structuredResultRequired = false,
   ): Promise<ManagedSession> {
     const id = sessionId || this.defaultSessionId;
     const effectiveUserId = requestUserId?.trim() || this.userId;
@@ -3546,6 +3548,7 @@ export class AgentBoxSessionManager {
         // Rebuild an idle session when its execution context changes.
         const sameInputCapability = existing.allowInputRequest === allowInputRequest
           && Boolean(existing.handoffSupported) === handoffSupported
+          && Boolean(existing.structuredResultRequired) === structuredResultRequired
           && JSON.stringify(existing.handoffPolicy) === JSON.stringify(handoffPolicy)
           && existing.mode === (mode ?? "web");
         if (
@@ -3699,6 +3702,7 @@ export class AgentBoxSessionManager {
       allowInputRequest,
       handoffSupported,
       handoffPolicy,
+      structuredResultRequired,
       // spawn_subagent is available in normal chat (top-level sessions only — child
       // sessions above omit this executor, so sub-agents cannot recurse).
       spawnSubagentExecutor: this.createSpawnSubagentExecutor(),
@@ -3761,6 +3765,7 @@ export class AgentBoxSessionManager {
       allowInputRequest,
       handoffSupported,
       handoffPolicy,
+      structuredResultRequired,
       // Per-session references point to shared instances (not owned by session)
       mcpManager: result.mcpManager,
       memoryIndexer: result.memoryIndexer,

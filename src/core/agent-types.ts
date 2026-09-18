@@ -172,6 +172,26 @@ export const PRODUCT_SUPPORT_DEFAULT_PROMPT =
   "When the current turn provides a result-submission tool, call it exactly once with a machine-readable outcome that follows its declared schema. " +
   "Do not claim that downstream actions such as ticket creation or human handoff succeeded unless the caller confirms them.";
 
+/**
+ * A Ticket instance defines its own workflow, and whether that workflow ends in
+ * one structured result is part of the definition: a closure dispatch produces
+ * exactly one, while an assistant holding a multi-turn conversation produces
+ * none and writes through ordinary tools when it has something worth writing.
+ *
+ * The result sentence is therefore NOT part of this contract — it is appended
+ * only for a dispatch that actually carries a result tool (see agent-context).
+ * Stating it unconditionally told every instance without a contract to call a
+ * tool that does not exist, and because the type contract is an immutable
+ * runtime layer rather than a seed, its own prompt could not take it back.
+ */
+const TICKET_DEFAULT_PROMPT =
+  "Follow the instance business instructions using its bound resources. " +
+  "Never claim that a ticket was created, closed or updated unless a tool actually performed that action.";
+
+/** Appended to the Ticket contract only when this dispatch requires a result. */
+export const TICKET_RESULT_CONTRACT =
+  "Submit a valid result through the configured result tool before completing.";
+
 const MATERIALIZED_TYPE_PROMPTS: Record<Exclude<AgentType, "custom">, ReadonlySet<string>> = {
   sre: new Set([SRE_DEFAULT_PROMPT]),
   knowledge_qa: REPLACED_KNOWLEDGE_QA_DEFAULT_PROMPTS,
@@ -235,9 +255,9 @@ export const AGENT_TYPES: Record<AgentType, AgentTypeDef> = {
   },
   ticket: {
     label: "Ticket Agent",
-    description: "Runs tenant-defined ticket workflows with a required structured result tool.",
+    description: "Runs tenant-defined ticket workflows, optionally behind a structured result contract.",
     capabilities: null,
-    defaultPrompt: "Follow the instance business instructions using its bound resources. Submit a valid result through the configured result tool before completing. Never claim that a ticket was created, closed or updated unless a tool actually performed that action.",
+    defaultPrompt: TICKET_DEFAULT_PROMPT,
     defaultNoSkills: true,
   },
   custom: {
