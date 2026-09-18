@@ -68,5 +68,8 @@
     "done": "已记录领域说明:{domain}",
     "too_long": "未记录:领域说明超过 {limit} 字。请缩成一句完整主题句后重调(目标约 {target} 字,不要清单、不要半截句)。系统不会截断代写。",
     "failed": "领域说明写入磁盘失败:{e}。在工作区可写之前不要用同一句重复提交。"
+  },
+  "candidate_lookup": {
+    "desc": "按精确 Raw 来源、标题/描述/正文的字面文本查询当前候选页,不加过滤可浏览全库。结果含描述和版本;用 next_offset 与 revision 分页取全,restart_required 时从 offset 0 重查。推荐结果不等于完整语义召回;用 Read 精读页面,需要时搜索完整可读 Raw/Candidate。只读导航,不证明覆盖或事实正确。"
   }
 }

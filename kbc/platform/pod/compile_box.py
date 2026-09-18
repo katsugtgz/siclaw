@@ -51,6 +51,8 @@ from pathlib import Path, PurePosixPath
 from aiohttp import web
 
 import batching
+import candidate_context
+import candidate_feedback
 import destream
 import model_access
 import incremental
@@ -1919,6 +1921,10 @@ def _compile_engine_tools(
             max_results=args.get("max_results"),
         )
 
+    async def candidate_lookup(args):
+        return json.dumps(await asyncio.to_thread(candidate_context.lookup, run.workdir, **args),
+                          ensure_ascii=False)
+
     async def source_read(args):
         return await asyncio.to_thread(
             inspector().read,
@@ -2314,6 +2320,14 @@ def _compile_engine_tools(
             resolve_ticket,
         ),
     ]
+
+    tools.append(EngineTool(
+        "candidate_lookup", ts["candidate_lookup"]["desc"],
+        {"type": "object", "properties": {
+            "sources": {"type": "array", "items": {"type": "string"}, "maxItems": 500},
+            "query": {"type": "string"}, "offset": {"type": "integer"},
+            "limit": {"type": "integer"}, "revision": {"type": "string"},
+        }, "additionalProperties": False}, candidate_lookup))
 
     # The inspector executes in the KBC process against the frozen Raw tree,
     # so Claude and Codex get the same consultation surface even when a writer
@@ -3479,6 +3493,7 @@ DEFAULT_COMPILE_ALLOWED_TOOLS = [
     "mcp__compile__source_inventory",
     "mcp__compile__source_read",
     "mcp__compile__source_search",
+    "mcp__compile__candidate_lookup",
 ]
 
 # Tools removed from a compiler session's context entirely, not merely left
@@ -3541,7 +3556,8 @@ def _compile_session_client(run: "CompileRun", wd: str, system_prompt: str, sess
     """
     allowed = DEFAULT_COMPILE_ALLOWED_TOOLS if run.allowed_tools is None else run.allowed_tools
     guard = _make_compile_path_guard(Path(wd), run.locale, pdf_page_ranges=pdf_page_ranges, raw_scope=raw_scope)
-    tools = FileTools(wd, allowed, guard).tools()
+    tools = FileTools(wd, allowed, guard,
+                      feedback=lambda target: candidate_feedback.check_page(wd, target)).tools()
     # Keep the published tool names and allowlist while using the single
     # KBC-owned handler/schema registry for every compiler phase.
     tools.extend(EngineTool(f"mcp__compile__{tool.name}", tool.description, tool.input_schema, tool.handler)
@@ -4300,6 +4316,22 @@ def semantic_review_raw_scope(plan: dict) -> dict:
 _RELAY_MAX_PAGES = 8
 
 
+def _batch_navigation_context(run: "CompileRun", batch: dict) -> tuple[bool, str]:
+    enabled = (run.allowed_tools is None
+               or "mcp__compile__candidate_lookup" in run.allowed_tools)
+    if not enabled:
+        return False, ""
+    try:
+        return True, "\n\nCandidate navigation:\n" + candidate_context.handoff(
+            run.workdir, batch.get("sources") or [])
+    except Exception as error:
+        # Optional navigation must not turn an otherwise recoverable page into
+        # a failed compile. Retain the full-state instructions and report why.
+        _print_compile_lifecycle("batch.context_unavailable", run,
+                                 extra=f"class={type(error).__name__}")
+        return False, ""
+
+
 def _batch_relay_brief(run: "CompileRun", plan: dict, batch: dict, k: int, n: int,
                        locale: str | None = None) -> str:
     """The hand-off a fresh batch session would otherwise have to guess.
@@ -4378,7 +4410,7 @@ def _batch_relay_brief(run: "CompileRun", plan: dict, batch: dict, k: int, n: in
 
 def _compose_batch_directive(batch: dict, k: int, n: int, notes: str,
                              locale: str | None = None,
-                             relay: str = "") -> str:
+                             relay: str = "", focused_context: bool = False) -> str:
     source_ranges = batch.get("source_ranges", {})
     source_page_ranges = batch.get("source_page_ranges", {})
     listing_lines: list[str] = []
@@ -4486,10 +4518,19 @@ def _compose_batch_directive(batch: dict, k: int, n: int, notes: str,
         return (
             f"[Batch compile · batch {k}/{n} · {batch['id']}] Compile ONLY the sources below "
             f"(see the batching discipline in the system prompt):\n{listing}\n"
+            + ("First read authoring/BRIEF.json and authoring/INTENT.md, then use the revision-bound "
+               "handoff below for global navigation and same-source pages. Use candidate_lookup to "
+               "page through ALL same-source matches (sources filter), discover other topics by literal "
+               "search (query), or browse all pages (no filters). Continue with next_offset and revision; "
+               "restart on restart_required. Read relevant pages in full; read index.md whenever the "
+               "outline is insufficient. Recommendations never limit your field of view. "
+               "The complete compilation state remains available for recovery and inspection. "
+               if focused_context else
             "First read authoring/BRIEF.json, authoring/INTENT.md, authoring/COMPILATION_STATE.json and "
             "candidate/index.md to inherit the complete task, Raw inventory, completed-batch ownership, "
-            "and current Wiki shape; the entire frozen Raw snapshot and Candidate tree remain readable/searchable. "
-            "in voice and structure; then read every source in this batch closely and fold its content fully "
+            "and current Wiki shape; ")
+            + "The entire frozen Raw snapshot and Candidate tree remain readable/searchable. "
+            "Then read every source in this batch closely and fold its content fully "
             "into candidate/ pages (create new pages or merge into existing ones; each page's frontmatter "
             "sources[].resource must list the sources it was actually compiled from); update the matching "
             "candidate/index.md entries; contradictions as usual — best-guess + ⚠️ uncertain + file a ticket, "
@@ -4501,8 +4542,14 @@ def _compose_batch_directive(batch: dict, k: int, n: int, notes: str,
         )
     return (
         f"【分批编译 · 批 {k}/{n} · {batch['id']}】只编译下列源(见系统提示的分批纪律):\n{listing}\n"
+        + ("先读 authoring/BRIEF.json、authoring/INTENT.md,再用下方带版本的交接信息了解全局导航与同源已有页。"
+           "用 candidate_lookup 的 sources 过滤分页查全同源页,用 query 做全文字面搜索,不加过滤可浏览全库;"
+           "携带 next_offset 和 revision 翻页,restart_required 时从头查。精读相关页,概览不足时主动读 index.md。"
+           "推荐页不是视野边界;完整编译状态仍可读取,用于恢复与核对。"
+           if focused_context else
         "先读 authoring/BRIEF.json、authoring/INTENT.md、authoring/COMPILATION_STATE.json 和 candidate/index.md,"
-        "继承完整任务、Raw 总清单、已完成批次归属和当前 Wiki 结构;冻结 Raw 全量与 Candidate 全树始终可读可搜索;"
+        "继承完整任务、Raw 总清单、已完成批次归属和当前 Wiki 结构;")
+        + "冻结 Raw 全量与 Candidate 全树始终可读可搜索;"
         "然后精读本批每个源,按定调把内容完整编入 candidate/ 页(可新建页或并入既有页,页 frontmatter 的 "
         "sources[].resource 必须列出实际编自的源);更新 candidate/index.md 的相应条目;矛盾照常 best-guess+⚠️存疑+落工单,绝不停。"
         "清单是你的**交付责任面**,不是你的视野边界:需要交叉印证时(某个附件被谁引用、邻近文档同一件事怎么表述、"
@@ -5039,11 +5086,13 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
                     else _unaccounted_batch_sources(run, batch.get("sources") or [])
                 )
                 raw_scope = _batch_raw_scope(batch, bounded)
+                focused_context, handoff = _batch_navigation_context(run, batch)
                 directive = _compose_batch_directive(
                     batch, k, n, _drain_batch_notes(run),
                     locale=getattr(run, "locale", None),
                     relay=_batch_relay_brief(run, plan, batch, k, n,
-                                             locale=getattr(run, "locale", None)),
+                                             locale=getattr(run, "locale", None)) + handoff,
+                    focused_context=focused_context,
                 )
                 reply = await _drive_batch_session(
                     run, directive, _loc(run, f"batch {k}/{n}", f"批 {k}/{n}"),
