@@ -2199,16 +2199,20 @@ def _remap_evidence_source_ids(text: str, original: str, manifest_ids: dict[str,
     fm, _, error = parse_okf_frontmatter(original)
     if error or not fm:
         return text
+    raw_sources = fm.get("sources")
+    stamped_fm, _, _ = parse_okf_frontmatter(text)
+    stamped_sources = (stamped_fm or {}).get("sources")
+    if not isinstance(raw_sources, list) or not isinstance(stamped_sources, list):
+        return text  # Preserve malformed declarations for the format-repair path.
     destinations: dict[str, set[str | None]] = {}
-    for source in fm.get("sources", []):
+    for source in raw_sources:
         if not isinstance(source, dict):
             continue
         old, resource = source.get("id"), source.get("resource")
         if isinstance(old, str) and isinstance(resource, str):
             entry = _managed_source_entry(resource, manifest_ids)
             destinations.setdefault(old.strip(), set()).add(manifest_ids.get(entry))
-    stamped_fm, _, _ = parse_okf_frontmatter(text)
-    stamped_ids = {source.get("id") for source in (stamped_fm or {}).get("sources", [])
+    stamped_ids = {source.get("id") for source in stamped_sources
                    if isinstance(source, dict) and isinstance(source.get("id"), str)}
     remap = {old: next(iter(values)) for old, values in destinations.items()
              if len(values) == 1 and None not in values and next(iter(values)) in stamped_ids}
@@ -2241,6 +2245,9 @@ def trusted_evidence_violations(workdir: str, pages: dict[str, dict]) -> list[di
         fm, body, error = parse_okf_frontmatter(page.get("text", ""))
         if error or not fm:
             continue
+        raw_sources = fm.get("sources")
+        if not isinstance(raw_sources, list):
+            continue  # Structural lint reports okf_sources; there are no trusted mappings to check.
         used = set()
         for match in _EVIDENCE_MARKER_RE.finditer(_markdown_prose(body)):
             try:
@@ -2249,7 +2256,7 @@ def trusted_evidence_violations(workdir: str, pages: dict[str, dict]) -> list[di
                 continue
             if isinstance(marker, dict) and isinstance(marker.get("sources"), list):
                 used.update(value.strip() for value in marker["sources"] if isinstance(value, str))
-        for source in fm.get("sources", []):
+        for source in raw_sources:
             if not isinstance(source, dict):
                 continue
             source_id, resource = source.get("id"), source.get("resource")
