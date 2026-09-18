@@ -150,6 +150,35 @@ describe("personal binding RPC wrappers", () => {
     expect(result).toEqual({ binding: null, denied });
   });
 
+  it("carries ttlMinutes through to the renderer", async () => {
+    // The bug this pins: normalizeDenied builds a NEW object field by field, so a field missing
+    // from that list is dropped no matter how correctly the interface declares it and the card
+    // renderer reads it. ttlMinutes shipped that way — type present, renderer present, value never
+    // arriving — and tsc could not see it because the field is optional at both ends.
+    const denied = {
+      reason: "binding_required",
+      actionUrl: "https://x/y",
+      expiresAtMs: 1785300000000,
+      ttlMinutes: 10,
+    };
+    frontend.responses.set("channel.resolvePersonalBinding", { binding: null, denied });
+    const result = await resolvePersonalBinding("pb1", "ou_1", frontend as unknown as FrontendWsClient);
+    expect(result.denied?.ttlMinutes).toBe(10);
+  });
+
+  it("drops a nonsensical ttlMinutes rather than printing it", async () => {
+    // Same rule as every other field here: wrong-typed is dropped, not coerced. A zero or negative
+    // TTL would render as "valid for 0 minutes" on a link that actually works.
+    for (const ttlMinutes of [0, -5, "10", NaN, null, {}]) {
+      frontend.responses.set("channel.resolvePersonalBinding", {
+        binding: null,
+        denied: { reason: "binding_required", ttlMinutes },
+      });
+      const result = await resolvePersonalBinding("pb1", "ou_1", frontend as unknown as FrontendWsClient);
+      expect(result.denied?.ttlMinutes, JSON.stringify(ttlMinutes)).toBeUndefined();
+    }
+  });
+
   it("drops wrong-typed denied fields instead of passing them to a renderer", async () => {
     // "Present" does not imply "the type we expect". A non-string `message` made `message.trim()`
     // throw downstream, the detached event wrapper only logged it, and the sender got NO reply.

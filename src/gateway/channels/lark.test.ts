@@ -5160,7 +5160,7 @@ describe("handleLarkMessage — personal access denial", () => {
     await sendGated(lark);
 
     const reply = denialText(lark);
-    expect(reply).toContain("需要先关联账号");
+    expect(reply).toContain("需要先关联你的 Sicore 账号");
     expect(reply).toContain(ACTION_URL);
     expect(reply).toContain("10 分钟内");        // from expiresAtMs, never a constant
     expect(promptMock).not.toHaveBeenCalled();  // never enters the conversation
@@ -5204,7 +5204,7 @@ describe("handleLarkMessage — personal access denial", () => {
       "en-US", makePersonalConfig("identified" as any),
     );
 
-    expect(denialText(lark)).toContain("linking your account");
+    expect(denialText(lark)).toContain("needs your Sicore account linked");
     expect(denialText(lark)).toContain("within 1 minute");
   });
 
@@ -5659,7 +5659,9 @@ describe("handleLarkMessage — /apikey", () => {
 
   it("delivers the pickup link as a card with a button, not as an unfurlable URL", async () => {
     issuePersonalApiKeyMock.mockResolvedValue({
-      success: true, pickupUrl: PICKUP, expiresAt: Date.now() + 5 * 60_000 + 5_000, rotated: true,
+      // ttlMinutes disagrees with the remaining window on purpose: only ~1 minute is left, but the
+      // link was minted for 5, and the note states what it was minted for.
+      success: true, pickupUrl: PICKUP, expiresAt: Date.now() + 60_000, ttlMinutes: 5, rotated: true,
     });
     const lark = {
       im: { message: { reply: vi.fn().mockResolvedValue({}) } },
@@ -5672,13 +5674,25 @@ describe("handleLarkMessage — /apikey", () => {
       "zh-CN", makePersonalConfig("open"),
     );
 
-    const card = JSON.stringify(JSON.parse(lark.cardkit.v1.card.create.mock.calls[0][0].data.data));
+    const parsed = JSON.parse(lark.cardkit.v1.card.create.mock.calls[0][0].data.data);
+    const card = JSON.stringify(parsed);
     expect(card).toContain("查看 API Key");     // button label
     expect(card).toContain("open_url");
     expect(card).toContain(PICKUP);             // on the button only
     expect(card).toContain("旧 Key 已失效");     // rotation warning survives the card form
-    expect(card).toContain("5 分钟内有效");      // derived from expiresAt
     expect(card).toContain("/apikey status");   // affordance survives the card form
+    // Title bar, green because this card hands over something that was asked for — a refusal gets
+    // the blue one. The rotation case gets its own wording: "已更新" is the thing to notice.
+    expect(parsed.header?.title?.content).toBe("API Key 已更新");
+    expect(parsed.header?.template).toBe("green");
+    // …and the body no longer repeats it.
+    const bodyText = parsed.body.elements
+      .filter((e: any) => e.tag === "markdown").map((e: any) => e.content).join("\n");
+    expect(bodyText).not.toContain("已就绪");
+    expect(bodyText).not.toContain("✅");
+    // ttlMinutes wins over the ~1 minute actually left: the note states the minted validity.
+    expect(card).toContain("5 分钟内有效");
+    expect(card).not.toContain("1 分钟内有效");
     const posted = lark.im.message.reply.mock.calls[0][0];
     expect(posted.data.msg_type).toBe("interactive");
     expect(posted.data.content).not.toContain(PICKUP);
@@ -5798,7 +5812,9 @@ describe("handleLarkMessage — /apikey", () => {
   it("sends an /apikey refusal as a card when it carries a live link", async () => {
     issuePersonalApiKeyMock.mockResolvedValue({
       success: false,
-      denied: { reason: "access_request_required", actionUrl: PICKUP, expiresAtMs: Date.now() + 60_000 },
+      // ttlMinutes deliberately disagrees with the remaining time: the link was minted for 10
+      // minutes and only 1 is left. The note must state what it was minted for.
+      denied: { reason: "access_request_required", actionUrl: PICKUP, expiresAtMs: Date.now() + 60_000, ttlMinutes: 10 },
     });
     const lark = {
       im: { message: { reply: vi.fn().mockResolvedValue({}) } },
@@ -5811,12 +5827,23 @@ describe("handleLarkMessage — /apikey", () => {
       "zh-CN", makePersonalConfig("open"),
     );
 
-    const card = JSON.stringify(JSON.parse(lark.cardkit.v1.card.create.mock.calls[0][0].data.data));
+    const parsed = JSON.parse(lark.cardkit.v1.card.create.mock.calls[0][0].data.data);
+    const card = JSON.stringify(parsed);
     expect(card).toContain("需要该 Agent 的使用授权");
     expect(card).toContain("审批通过后回来重发");
     expect(card).toContain("申请权限");     // button label
     expect(card).toContain(PICKUP);
     expect(lark.im.message.reply.mock.calls[0][0].data.content).not.toContain(PICKUP);
+    // Same header as the DM refusal. Both render through buildLinkActionCard, so one flow having
+    // a title bar and the other not is a difference with no reason behind it. The title names the
+    // obstacle, which is identical here; the per-action wording stays in the body above.
+    expect(parsed.header?.title?.content).toBe("需要申请使用权限");
+    expect(parsed.header?.template).toBe("blue");
+    // ttlMinutes wins over the remaining time: only 1 minute is left on this link, but it was
+    // minted for 10, and "仅可打开一次 · N 分钟内有效" is a statement about the ticket. Deriving N
+    // from the deadline is what printed "9 分钟" on a fresh 10-minute link.
+    expect(card).toContain("10 分钟内有效");
+    expect(card).not.toContain("1 分钟内有效");
   });
 
   it("delivers a future reason's link on the /apikey path too", async () => {
@@ -6221,7 +6248,9 @@ describe("handleLarkMessage — /webchat", () => {
 
   it("delivers the link as a card button when CardKit is available", async () => {
     issuePersonalWebChatLinkMock.mockResolvedValue({
-      success: true, actionUrl: ACTION_URL, expiresAt: Date.now() + 5 * 60_000 + 5_000,
+      // ttlMinutes disagrees with the remaining window on purpose: the link is down to ~1 minute
+      // but was minted for 10, and the note states the minted validity.
+      success: true, actionUrl: ACTION_URL, expiresAt: Date.now() + 60_000, ttlMinutes: 10,
     });
     const lark = {
       im: { message: { reply: vi.fn().mockResolvedValue({}) } },
@@ -6234,10 +6263,21 @@ describe("handleLarkMessage — /webchat", () => {
       "zh-CN", makePersonalConfig("platform_authorized"),
     );
 
-    const card = JSON.stringify(JSON.parse(lark.cardkit.v1.card.create.mock.calls[0][0].data.data));
+    const parsed = JSON.parse(lark.cardkit.v1.card.create.mock.calls[0][0].data.data);
+    const card = JSON.stringify(parsed);
     expect(card).toContain("打开网页对话");
     expect(card).toContain(ACTION_URL);
-    expect(card).toContain("5 分钟内有效");
+    // Green title bar, same as /apikey — both hand over what was asked for. The body keeps only
+    // the thing a sender might not expect (the window starts empty), not a repeat of the headline.
+    expect(parsed.header?.title?.content).toBe("网页对话链接已就绪");
+    expect(parsed.header?.template).toBe("green");
+    const bodyText = parsed.body.elements
+      .filter((e: any) => e.tag === "markdown").map((e: any) => e.content).join("\n");
+    expect(bodyText).toContain("全新的空白对话");
+    expect(bodyText).not.toContain("已就绪");
+    expect(bodyText).not.toContain("✅");
+    expect(card).toContain("10 分钟内有效");
+    expect(card).not.toContain("1 分钟内有效");
     expect(lark.im.message.reply.mock.calls[0][0].data.msg_type).toBe("interactive");
     expect(lark.im.message.reply.mock.calls[0][0].data.content).not.toContain(ACTION_URL);
   });

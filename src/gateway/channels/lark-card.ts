@@ -351,11 +351,20 @@ export function buildModeCard(
  */
 export function buildLinkActionCard(opts: {
   body: string;
-  /** Smaller line under the body — validity window, "opens once", etc. */
+  /** Header line. Omitted, or when `withHeader` is false, the card has no title bar. */
+  title?: string;
+  /**
+   * Title-bar colour. `blue` (the default) for a refusal or a next step, `green` for a delivery
+   * that already succeeded — the /apikey and /webchat cards hand over something the sender asked
+   * for, and painting that the same colour as "you cannot use this yet" loses the one bit of
+   * information the bar exists to carry at a glance.
+   */
+  headerTemplate?: "blue" | "green";
+  /** Smaller grey line UNDER the button — validity window, "opens once", etc. */
   note?: string;
   buttonLabel: string;
   url: string;
-}): Record<string, unknown> {
+}, withHeader = true): Record<string, unknown> {
   // The invariant that the URL is not repeated in the body is enforced HERE, in the function that
   // states it — not at each call site. A caller can legitimately pass frontend prose that already
   // embeds the exact link (an unfamiliar refusal reason renders it verbatim), which gave the
@@ -363,31 +372,65 @@ export function buildLinkActionCard(opts: {
   // what let this recur, so the guarantee lives with the claim.
   const body = opts.body.split(opts.url).join("").replace(/[ \t]+$/gm, "").trim();
   const elements: Record<string, unknown>[] = body ? [{ tag: "markdown", content: body }] : [];
-  // `markdown`, not a `note` element: every card this codebase ships uses only the element tags
-  // below, and a `note` was rejected outright by CardKit (create returned no card_id, so the
-  // handler silently degraded to plain text).
-  if (opts.note) elements.push({ tag: "markdown", content: opts.note });
-  // Wrapped in column_set exactly like the mode card and the feedback row — the two button layouts
-  // already proven in production. A bare `button` at body level was the other half of the rejection.
+  // Laid out exactly like the answer card's feedback row: `flex_mode: "none"` + a weighted column
+  // + `width: "fill"` on the button. Not a cosmetic copy — it is the one button geometry this
+  // tenant's CardKit is known to accept, and the two rows sit adjacent in the same conversation,
+  // so a button that hugs its label here reads as a different, lesser control than the full-width
+  // ones directly below it.
+  //
+  // A bare `button` at body level was rejected outright once; keep it wrapped.
   elements.push({
     tag: "column_set",
+    flex_mode: "none",
     columns: [
       {
         tag: "column",
-        width: "auto",
+        width: "weighted",
+        weight: 1,
         elements: [
           {
             tag: "button",
             element_id: "link_action",
+            // `primary` where the feedback row uses `default`, and deliberately so: those three are
+            // optional afterthoughts on an answer the reader already has, while this is the only
+            // way out of a refusal. Same geometry, different emphasis.
             text: { tag: "plain_text", content: opts.buttonLabel },
             type: "primary",
+            width: "fill",
             behaviors: [{ type: "open_url", default_url: opts.url }],
           },
         ],
       },
     ],
   });
-  return { schema: "2.0", body: { elements } };
+  // The note goes AFTER the button, and grey.
+  //
+  // Both were wrong before: rendered as a plain `markdown` element between the prose and the button,
+  // it came out the same size as the body, so "opens once · valid for N minutes" read as a second
+  // sentence of the message and split the explanation from the action it belongs to.
+  //
+  // `markdown` with an inline <font>, not a `note` element: every card this codebase ships uses only
+  // the tags used here, and a `note` was rejected outright by CardKit (create returned no card_id,
+  // so the handler silently degraded to plain text). The colour is the one thing that can be changed
+  // without leaving the proven tag set.
+  if (opts.note) elements.push({ tag: "markdown", content: `<font color='grey'>${opts.note}</font>` });
+  const card: Record<string, unknown> = { schema: "2.0", body: { elements } };
+  // A header gives the card the one thing a stack of left-aligned text lines cannot have: a glance
+  // value. `blue` rather than a warning colour on purpose — being asked to link an account is a step
+  // in a normal flow, not an error, and the red ✗ this replaces made a routine prompt read as a
+  // failure.
+  //
+  // Guarded by `withHeader` because `header` is NOT among the tags proven against this tenant's
+  // CardKit. If it is rejected the whole card fails to create, so the sender would get the plain
+  // text fallback — worse than what they have now. sendLinkActionCard retries without it rather
+  // than betting the delivery on an untested field.
+  if (withHeader && opts.title) {
+    card.header = {
+      title: { tag: "plain_text", content: opts.title },
+      template: opts.headerTemplate ?? "blue",
+    };
+  }
+  return card;
 }
 
 /**
@@ -398,20 +441,36 @@ export function buildLinkActionCard(opts: {
 export async function sendLinkActionCard(
   larkClient: any,
   messageId: string,
-  opts: { body: string; note?: string; buttonLabel: string; url: string },
+  opts: { body: string; title?: string; headerTemplate?: "blue" | "green"; note?: string; buttonLabel: string; url: string },
 ): Promise<boolean> {
-  try {
-    const createRes = await larkClient.cardkit.v1.card.create({
-      data: { type: "card_json", data: JSON.stringify(buildLinkActionCard(opts)) },
-    });
-    const cardId: string | undefined = createRes?.data?.card_id;
-    if (!cardId) {
+  // Two shapes, best first. `header` is not among the fields proven against this tenant's CardKit,
+  // and a rejected card JSON does not throw — create just comes back without a card_id, which used
+  // to mean the sender got plain text instead. Retrying WITHOUT the header keeps that failure from
+  // costing anything: worst case we deliver exactly the card this function shipped before.
+  //
+  // Only the create is retried. A failure at the reply step is not about the card's shape, so
+  // building a second one would just repeat it against the same condition.
+  const shapes = opts.title ? [true, false] : [false];
+  let cardId: string | undefined;
+  for (const withHeader of shapes) {
+    try {
+      const createRes = await larkClient.cardkit.v1.card.create({
+        data: { type: "card_json", data: JSON.stringify(buildLinkActionCard(opts, withHeader)) },
+      });
+      cardId = createRes?.data?.card_id;
+      if (cardId) break;
       // Include code/msg: CardKit rejects a bad card JSON without throwing, and a bare "no card_id"
       // line gives no way to tell a schema error from a permission problem.
       const res = createRes as { code?: unknown; msg?: unknown } | undefined;
-      console.warn(`[lark-card] link-action card create returned no card_id: code=${res?.code} msg=${res?.msg}`);
-      return false;
+      console.warn(
+        `[lark-card] link-action card create returned no card_id (header=${withHeader}): code=${res?.code} msg=${res?.msg}`,
+      );
+    } catch (err) {
+      console.error(`[lark-card] sendLinkActionCard create failed (header=${withHeader}):`, err);
     }
+  }
+  if (!cardId) return false;
+  try {
     const replyRes = await larkClient.im.message.reply({
       path: { message_id: messageId },
       data: { msg_type: "interactive", content: JSON.stringify({ type: "card", data: { card_id: cardId } }) },
