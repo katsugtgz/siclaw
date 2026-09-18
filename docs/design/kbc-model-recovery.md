@@ -46,8 +46,12 @@ conversation remains retryable. The persistent run's command-generation pin is
 not used to classify a later conversation.
 
 Before emitting the terminal failure, the compiler disconnects the model,
-quiesces media/PK writers and sends a full workspace checkpoint. This includes
-files already queued by periodic synchronization. The failed checkpoint removes
+quiesces media/PK writers and sends a full workspace checkpoint. A stopping
+fence is set before model disconnect or task cancellation can yield. It blocks
+verification chaining, repair injection and convergence publication. A lifetime
+task registry also tracks finalizers that have released their single-flight
+slot but are still writing; all tracked writers are cancelled and joined before
+the checkpoint. This includes files already queued by periodic synchronization. The failed checkpoint removes
 the convergence completion marker and does not commit the source baseline, so
 saving partial work cannot promote it as a successful draft. Existing check
 findings remain available.

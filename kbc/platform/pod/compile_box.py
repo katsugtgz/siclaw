@@ -784,6 +784,10 @@ class CompileRun:
         self._pk_task: asyncio.Task | None = None
         # Blind image verify (图像复核 v2): the in-flight background task.
         self._media_task: asyncio.Task | None = None
+        # Lifetime tracking is separate from the single-flight slots: a media
+        # finalizer releases its slot before it finishes syncing/chaining work.
+        self._verification_tasks: set[asyncio.Task] = set()
+        self._verification_stopping = False
         # Model-stall watchdog (L1) — turn-scoped state, updated by the receive
         # loop (_consume_turn_stream) and the watchdog task. A turn is "active"
         # from query() until its real ResultMessage; the watchdog only judges an
@@ -882,6 +886,8 @@ class CompileRun:
         """Engine seam: push a user turn into the live session. The Claude SDK
         driver is one line; a future engine driver (e.g. Codex) reimplements
         just this method — self-check orchestration stays engine-neutral."""
+        if self._verification_stopping:
+            raise RuntimeError("compile session is stopping")
         if self._active_step is not None:
             raise RuntimeError("an internal compile step owns execution")
         if self.client:
@@ -2615,6 +2621,8 @@ async def _set_converge_phase(run, phase: str) -> None:
     frontend reads an authoritative 校对中/修订中/settled signal instead of
     run_status (the phantom's root). Additive + fail-open — no control-flow
     change, so it cannot affect the never-stuck turn/repair logic."""
+    if getattr(run, "_verification_stopping", False):
+        return
     wd = getattr(run, "workdir", None)
     if not wd:
         return
@@ -2625,6 +2633,15 @@ async def _set_converge_phase(run, phase: str) -> None:
             await _sync_workspace(run, sent)
         except Exception:
             pass
+
+
+def _track_verification_task(run, task: asyncio.Task) -> asyncio.Task:
+    tasks = getattr(run, "_verification_tasks", None)
+    if tasks is None:
+        tasks = run._verification_tasks = set()
+    tasks.add(task)
+    task.add_done_callback(tasks.discard)
+    return task
 
 
 def _maybe_start_media_verify(run, drain: bool = False) -> bool:
@@ -2638,6 +2655,8 @@ def _maybe_start_media_verify(run, drain: bool = False) -> bool:
     failed pages through the attempt budget. A fresh (default) trigger — the
     turn seam, i.e. a genuinely later turn — clears the deferral, which is
     exactly the designed per-page retry cadence."""
+    if getattr(run, "_verification_stopping", False):
+        return False
     if not drain:
         run._media_deferred = set()
     try:
@@ -2647,8 +2666,8 @@ def _maybe_start_media_verify(run, drain: bool = False) -> bool:
     if not chunk:
         return False
     run._media_inflight = getattr(run, "_media_inflight", set()) | set(chunk)
-    run._media_task = asyncio.get_running_loop().create_task(
-        _run_media_verify_flow(run, chunk))
+    run._media_task = _track_verification_task(run, asyncio.create_task(
+        _run_media_verify_flow(run, chunk)))
     return True
 
 
@@ -2688,6 +2707,8 @@ async def _run_media_verify_flow(run, chunk: dict[str, list[str]]) -> None:
             progress=lambda s: loop.create_task(run.emit({"type": "summary", "text": s})),
             locale=getattr(run, "locale", None), run_id=run.run_id,
             on_progress=lambda: _sync_media_progress(run))
+        if getattr(run, "_verification_stopping", False):
+            return
         failed_pages = list(result.get("failed_pages") or [])
         exhausted = _settle_media_outcome(run, chunk, result)
         settled = True
@@ -2717,6 +2738,8 @@ async def _run_media_verify_flow(run, chunk: dict[str, list[str]]) -> None:
                 f"Self-check (images): {result['images']} image(s) checked, claims match the images ✓{tail}",
                 f"自检(图像):{result['images']} 张图已核,断言与图一致 ✓{tail}")})
     except Exception as e:
+        if getattr(run, "_verification_stopping", False):
+            return
         try:
             await run.emit({"type": "summary", "text": _loc(run,
                 f"Self-check (images) failed, skipping this round: {e!r}",
@@ -2761,7 +2784,7 @@ async def _run_media_verify_flow(run, chunk: dict[str, list[str]]) -> None:
         # 2..N's first attempt — the deferral above keeps this loop-free, and
         # the failed pages retry on a later turn's fresh trigger while their
         # attempt budget lasts (never-stuck).
-        if not injected_repair:
+        if not injected_repair and not getattr(run, "_verification_stopping", False):
             try:
                 if not (_maybe_start_media_verify(run, drain=True) or _maybe_start_pk(run)):
                     await _set_converge_phase(run, "settled")
@@ -2850,12 +2873,14 @@ def _pk_due(run) -> str | None:
 def _maybe_start_pk(run) -> bool:
     """Returns whether a PK round was started (so the turn seam can tell 'a verify
     is now pending' from 'nothing left to do → settled')."""
+    if getattr(run, "_verification_stopping", False):
+        return False
     try:
         kind = _pk_due(run)
     except Exception:
         return False  # a broken due-check must never break the turn seam
     if kind:
-        run._pk_task = asyncio.get_running_loop().create_task(_run_pk_flow(run, kind))
+        run._pk_task = _track_verification_task(run, asyncio.create_task(_run_pk_flow(run, kind)))
         return True
     return False
 
@@ -2934,6 +2959,8 @@ async def _run_pk_flow(run, kind: str) -> None:
             progress=lambda s: loop.create_task(
                 run.emit({"type": "summary", "text": s})),
             locale=getattr(run, "locale", None))
+        if getattr(run, "_verification_stopping", False):
+            return
         summary["tested_tree_hash"] = tree
         summary["kind"] = kind
 
@@ -2985,6 +3012,8 @@ async def _run_pk_flow(run, kind: str) -> None:
             # no repair was injected → the draft is stable and testable.
             await _set_converge_phase(run, "settled")
     except Exception as e:
+        if getattr(run, "_verification_stopping", False):
+            return
         try:
             selfcheck.update_pk_section(workdir, {
                 "state": "failed", "error": repr(e),
@@ -5645,6 +5674,7 @@ async def _consume_turn_stream(
                     or run._l1_repair_pending
                 )
                 if authoring_failed:
+                    run._verification_stopping = True
                     # The wrapper first disconnects the model and quiesces all
                     # background writers, then reconciles and saves the turn.
                     if status == _MODEL_QUOTA_STATUS:
@@ -5912,6 +5942,9 @@ async def run_session(run: CompileRun):
         # nudging — so a live session can never get stuck "compiling".
         await _consume_turn_stream(run, client, stop_on_result=False)
     finally:
+        # Fence before disconnect yields: a verifier may finish while model
+        # tools are draining, before the wrapper can cancel background tasks.
+        run._verification_stopping = True
         run.connected.set()  # unblock any /message waiters even if connect failed
         run.client = None
         await client.disconnect()
@@ -5933,17 +5966,23 @@ async def _reconcile_failed_turn(run: CompileRun) -> None:
 
 async def _cancel_verification_tasks(run: CompileRun) -> None:
     """Quiesce background writers before a failed operation's final snapshot."""
-    for name in ("_media_task", "_pk_task"):
-        task = getattr(run, name, None)
-        if task is not None and not task.done():
+    run._verification_stopping = True
+    tasks = set(getattr(run, "_verification_tasks", ()))
+    tasks.update(task for name in ("_media_task", "_pk_task")
+                 if (task := getattr(run, name, None)) is not None)
+    # Cancel all writers before yielding to any finalizer. The lifetime set
+    # includes a media task that has already released its single-flight slot.
+    for task in tasks:
+        if not task.done():
             task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-            except Exception as error:
-                _print_compile_lifecycle("verification.teardown_failed", run,
-                                         extra=f"exception_class={type(error).__name__}")
+    for task in tasks:
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as error:
+            _print_compile_lifecycle("verification.teardown_failed", run,
+                                     extra=f"exception_class={type(error).__name__}")
 
 
 async def _checkpoint_failed_workspace(run: CompileRun, sent: dict) -> None:
@@ -6029,6 +6068,7 @@ async def _run_wrapper(run: CompileRun):
                            or isinstance(e, (ModelResultError, ModelQuotaExhausted)))
         run._turn_active = False
     finally:
+        run._verification_stopping = True
         syncer.cancel()
         watchdog.cancel()
         for _t in (syncer, watchdog):
@@ -7436,6 +7476,8 @@ async def _await_session_live(run: CompileRun):
     /session returns, so a turn that races ahead must wait — otherwise the SDK
     raises "Not connected. Call connect() first." A failed connect sets the event
     too (run.client stays None → 409)."""
+    if getattr(run, "_verification_stopping", False):
+        return web.json_response({"error": "compile session is stopping"}, status=409)
     if _step_teardown_failed(run):
         return web.json_response({"error": "compile worker teardown was not confirmed; recreate the session"}, status=409)
     try:

@@ -159,3 +159,122 @@ async def test_ack_timeouts_retain_one_snapshot(tmp_path, monkeypatch):
         if not task.done():
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("next_chunk", [False, True])
+async def test_failed_run_fences_real_media_finalizer(tmp_path, monkeypatch, next_chunk):
+    """Exercise the real cancelled media finally, including its drain/settle seam."""
+    (tmp_path / "candidate").mkdir()
+    (tmp_path / "candidate" / "index.md").write_text("# Saved work\n")
+    run = compile_box.CompileRun("media-finalizer", str(tmp_path), 1)
+    entered = asyncio.Event()
+    providers = []
+    due_calls = 0
+
+    def due(_run):
+        nonlocal due_calls
+        due_calls += 1
+        return {"page.md": ["image.png"]} if due_calls == 1 or (next_chunk and due_calls == 2) else None
+
+    async def verify(*args, **kwargs):
+        providers.append(asyncio.current_task())
+        entered.set()
+        await asyncio.Future()
+
+    async def check(*args, **kwargs):
+        pass
+
+    async def driver(run):
+        run._begin_turn("update", authoring_action="compile.incremental")
+        assert compile_box._maybe_start_media_verify(run)
+        await entered.wait()
+        raise compile_box.ModelResultError("interrupted after writing")
+
+    monkeypatch.setattr(compile_box, "_media_verify_due", due)
+    monkeypatch.setattr(compile_box, "_pk_due", lambda run: None)
+    monkeypatch.setattr(compile_box.mediaverify, "run_blind_verify", verify)
+    monkeypatch.setattr(compile_box, "_post_turn_selfcheck", check)
+    monkeypatch.setattr(compile_box, "_COMPILE_IMPL", driver)
+    try:
+        await asyncio.wait_for(compile_box._run_wrapper(run), 2)
+        await asyncio.sleep(0)
+        assert len(providers) == 1 and all(t.done() for t in providers), "cancel spawned a new verifier"
+        events = []
+        while not run.events.empty():
+            events.append(run.events.get_nowait())
+        for event in events:
+            if event["type"] == "syncArtifacts":
+                for artifact in event["artifacts"]:
+                    if artifact["path"] == "authoring/SELFCHECK.json":
+                        assert json.loads(artifact["content"]).get("converge_phase") != "settled", "cancel promoted the failed draft"
+        assert next(e for e in events if e["type"] == "error")["code"] == "model_result_error"
+    finally:
+        monkeypatch.setattr(compile_box, "_media_verify_due", lambda run: None)
+        for task in providers:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*providers, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_shutdown_waits_for_real_media_finalizer_after_slot_release(tmp_path, monkeypatch):
+    """A finalizer waiting to sync is still a writer after _media_task is None."""
+    (tmp_path / "candidate").mkdir()
+    (tmp_path / "candidate" / "index.md").write_text("# Saved work\n")
+    run = compile_box.CompileRun("released-slot", str(tmp_path), 1)
+    run._sync_sent = {}
+    entered = asyncio.Event()
+    finish = asyncio.Event()
+    due_calls = 0
+
+    def due(_run):
+        nonlocal due_calls
+        due_calls += 1
+        return {"page.md": ["image.png"]} if due_calls == 1 else None
+
+    async def verify(*args, **kwargs):
+        entered.set()
+        await finish.wait()
+        return {"findings": [], "errors": [], "images": 1}
+
+    monkeypatch.setattr(compile_box, "_media_verify_due", due)
+    monkeypatch.setattr(compile_box, "_pk_due", lambda run: None)
+    monkeypatch.setattr(compile_box.mediaverify, "run_blind_verify", verify)
+    monkeypatch.setattr(compile_box, "_settle_media_outcome", lambda *args: [])
+    assert compile_box._maybe_start_media_verify(run)
+    task = run._media_task
+    try:
+        async with asyncio.timeout(2):
+            await entered.wait()
+            # Hold the sync lock only once this flow reaches its finalizer:
+            # ordinary result sync must complete before it releases the slot.
+            original_set = compile_box._set_converge_phase
+            at_settle = asyncio.Event()
+
+            async def set_phase(run, phase):
+                if phase == "settled":
+                    await run._sync_lock.acquire()
+                    at_settle.set()
+                await original_set(run, phase)
+
+            monkeypatch.setattr(compile_box, "_set_converge_phase", set_phase)
+            finish.set()
+            await at_settle.wait()
+            assert run._media_task is None and not task.done()
+            await compile_box._cancel_verification_tasks(run)
+            assert task.done(), "released-slot finalizer escaped the cancellation join"
+            run._sync_lock.release()
+            await compile_box._checkpoint_failed_workspace(run, run._sync_sent)
+        while not run.events.empty():
+            event = run.events.get_nowait()
+            for artifact in event.get("artifacts", []):
+                if artifact["path"] == "authoring/SELFCHECK.json":
+                    assert json.loads(artifact["content"]).get("converge_phase") != "settled"
+        assert not compile_box._maybe_start_media_verify(run)
+        assert not compile_box._maybe_start_pk(run)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        if run._sync_lock.locked():
+            run._sync_lock.release()
