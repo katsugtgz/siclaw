@@ -16,6 +16,7 @@ import {
   deliverChannelVisibleMessage,
 } from "./background-delivery.js";
 import { sessionRegistry } from "../session-registry.js";
+import { resetFeedbackEchoForTest } from "./lark-card.js";
 
 const supportsConversationsMock = vi.hoisted(() => vi.fn());
 vi.mock("../conversation-client.js", async (original) => ({
@@ -324,6 +325,7 @@ function makeCardAwareLarkClient() {
         cardElement: {
           content: vi.fn().mockResolvedValue({ code: 0 }),
           create: vi.fn().mockResolvedValue({ code: 0 }),
+          update: vi.fn().mockResolvedValue({ code: 0 }),
         },
       },
     },
@@ -357,6 +359,7 @@ beforeEach(() => {
   ensureChatSessionMock.mockResolvedValue(undefined);
   appendMessageMock.mockResolvedValue("msg-db-1");
   resetLarkBindingQueuesForTest();
+  resetFeedbackEchoForTest();
   clearBackgroundChannelDelivery("session-fixed");
   clearBackgroundChannelDelivery("session-agent-7");
   // Silence info logs that would otherwise clutter vitest output.
@@ -1561,6 +1564,150 @@ describe("handleLarkCardAction — 👍/👎 feedback", () => {
     expect(result).toEqual({ toast: { type: "success", content: expect.stringContaining("thanks") } });
     await flush();
     expect(recordChannelFeedbackMock).toHaveBeenLastCalledWith(expect.objectContaining({ rating: "down" }));
+  });
+});
+
+describe("handleLarkCardAction — direct-chat new session confirmation", () => {
+  it.each([
+    { chatType: "p2p", contextMode: undefined, count: 3 },
+    { chatType: "group", contextMode: "shared", count: 2 },
+    { chatType: "group", contextMode: "topic", count: 2 },
+    { chatType: "group", contextMode: "per_user", count: 2 },
+  ])("renders $count answer actions for $chatType / $contextMode", async ({ chatType, contextMode, count }) => {
+    resolveBindingMock.mockResolvedValue(makeBinding({ contextMode }));
+    resolvePersonalBindingMock.mockResolvedValue(wrapBinding(makeBinding({ routeType: "user" })));
+    promptMock.mockResolvedValue({ sessionId: "session-fixed" });
+    streamEventsMock.mockImplementation(async function* () {
+      yield { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Answer" }] } };
+    });
+    const lark = makeCardAwareLarkClient();
+    await handleLarkMessage(makeTextEvent("Question", {
+      chat_type: chatType,
+      mentions: [{ key: "@bot", id: { open_id: "test-bot" } }],
+    }), lark, "lark", makeAgentBoxManager("a1") as any, undefined, {} as any, "zh-CN",
+    chatType === "p2p" ? makePersonalConfig() : undefined, "test-bot");
+    const call = lark.cardkit.v1.cardElement.create.mock.calls.at(-1)![0];
+    const [row] = JSON.parse(call.data.elements);
+    expect(row.columns).toHaveLength(count);
+    const values = row.columns.map((c: any) => c.elements[0].behaviors[0].value);
+    if (chatType === "p2p") {
+      expect(values[2]).toMatchObject({ kind: "siclaw_new_session", new_session: { route: "personal" } });
+    } else {
+      expect(values.every((v: any) => v.kind === "siclaw_feedback" && !v.new_session)).toBe(true);
+    }
+  });
+
+  const scope = { route: "personal", routeKey: "oc_abc123", bindingId: "b", sessionKey: "open_id:ou_user_1" };
+  function newAction(overrides = {}) {
+    return {
+      operator: { open_id: "ou_user_1" },
+      context: { open_message_id: "om-answer-card" },
+      action: { tag: "button", value: {
+        kind: "siclaw_new_session", session_id: "session-fixed", card_id: "CARD-NEW", channel_id: "lark",
+        locale: "zh-CN", card_sequence: 3, new_session: { ...scope, ...overrides },
+      } },
+    };
+  }
+  const flush = () => new Promise((resolve) => setImmediate(resolve));
+
+  it("resets a direct-chat session and confirms once, and the next message uses it", async () => {
+    let current = "session-fixed";
+    resolvePersonalBindingMock.mockImplementation(async () => wrapBinding(makeBinding({ sessionId: current, routeType: "user" })));
+    const reset = resetPersonalSessionMock;
+    reset.mockImplementation(async () => {
+      current = "session-new";
+      return { success: true, agentId: "a1", oldSessionId: "session-fixed", sessionId: current };
+    });
+    const lark = makeCardAwareLarkClient();
+    const manager = makeAgentBoxManager("a1");
+    const frontend = {} as any;
+    const data = newAction();
+    expect(handleLarkCardAction(data, lark, frontend, manager as any)).toBeUndefined();
+    handleLarkCardAction(data, lark, frontend, manager as any);
+    await flush();
+    expect(reset).toHaveBeenCalledTimes(1);
+    expect(reset.mock.calls[0].at(-1)).toBe("session-fixed");
+    expect(lark.im.message.reply).toHaveBeenCalledExactlyOnceWith({
+      path: { message_id: "om-answer-card" },
+      data: { msg_type: "text", content: JSON.stringify({ text: "✅ 已开启新会话，此入口中的历史上下文已清空。" }) },
+    });
+    expect(promptMock).not.toHaveBeenCalled();
+    expect(closeSessionMock).toHaveBeenCalledWith("session-fixed");
+    const update = lark.cardkit.v1.cardElement.update.mock.calls.at(-1)![0];
+    expect(JSON.parse(update.data.element).columns[2].elements[0].disabled).toBe(true);
+
+    streamEventsMock.mockReturnValue((async function* () {
+      yield { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "A fresh answer" }] } };
+    })());
+    await handleLarkMessage(makeTextEvent("A different question", { chat_type: "p2p" }),
+      lark, "lark", manager as any, undefined, frontend, "zh-CN", makePersonalConfig());
+    expect(promptMock).toHaveBeenCalledWith(expect.objectContaining({ sessionId: "session-new" }));
+  });
+
+  it.each([
+    { sessionKey: "chat:oc_abc123", contextMode: "shared" },
+    { sessionKey: "lark_thread:root", contextMode: "topic" },
+    { sessionKey: "platform_user:u1:lark_thread:root", contextMode: "per_user" },
+  ])("ignores old group cards in $contextMode mode", async (scoped) => {
+    const lark = makeCardAwareLarkClient();
+    const data = newAction({ ...scoped, route: "group" });
+    (data.action as any).value = JSON.stringify(data.action.value);
+    expect(handleLarkCardAction(data, lark, {} as any, makeAgentBoxManager("a1") as any)).toBeUndefined();
+    await flush();
+    expect(resolveBindingMock).not.toHaveBeenCalled();
+    expect(resolvePersonalBindingMock).not.toHaveBeenCalled();
+    expect(resetBindingSessionMock).not.toHaveBeenCalled();
+    expect(resetPersonalSessionMock).not.toHaveBeenCalled();
+    expect(lark.cardkit.v1.cardElement.update).not.toHaveBeenCalled();
+    expect(closeSessionMock).not.toHaveBeenCalled();
+  });
+
+  it("requires a live user route, not a group binding labelled as personal", async () => {
+    resolvePersonalBindingMock.mockResolvedValue(wrapBinding(makeBinding({ routeType: "group" })));
+    handleLarkCardAction(newAction(), makeCardAwareLarkClient(), {} as any, makeAgentBoxManager("a1") as any);
+    await flush();
+    expect(resetPersonalSessionMock).not.toHaveBeenCalled();
+    expect(resetBindingSessionMock).not.toHaveBeenCalled();
+  });
+
+  it("does not repeat confirmation when the personal reset was already consumed", async () => {
+    resolvePersonalBindingMock.mockResolvedValue(wrapBinding(makeBinding({ routeType: "user" })));
+    resetPersonalSessionMock.mockResolvedValue({ success: true, unchanged: true });
+    const lark = makeCardAwareLarkClient();
+    handleLarkCardAction(newAction(), lark, {} as any, makeAgentBoxManager("a1") as any);
+    await flush();
+    expect(lark.im.message.reply).not.toHaveBeenCalled();
+    expect(lark.cardkit.v1.cardElement.update).toHaveBeenCalledTimes(1);
+    expect(closeSessionMock).not.toHaveBeenCalled();
+  });
+
+  it("ignores stale cards and another participant's card", async () => {
+    const lark = makeCardAwareLarkClient();
+    resolvePersonalBindingMock.mockResolvedValue(wrapBinding(makeBinding({ routeType: "user", sessionKey: "open_id:someone_else" })));
+    handleLarkCardAction(newAction(), lark, {} as any, makeAgentBoxManager("a1") as any);
+    await flush();
+    expect(lark.cardkit.v1.cardElement.update).not.toHaveBeenCalled();
+    resolvePersonalBindingMock.mockResolvedValue(wrapBinding(makeBinding({ routeType: "user", sessionId: "already-replaced" })));
+    handleLarkCardAction(newAction(), lark, {} as any, makeAgentBoxManager("a1") as any);
+    await flush();
+    expect(resetPersonalSessionMock).not.toHaveBeenCalled();
+    expect(lark.cardkit.v1.cardElement.update).toHaveBeenCalledTimes(1);
+    expect(lark.im.message.reply).not.toHaveBeenCalled();
+  });
+
+  it("ACKs immediately while reset is slow and leaves failed resets retryable", async () => {
+    resolvePersonalBindingMock.mockResolvedValue(wrapBinding(makeBinding({ routeType: "user" })));
+    let finish!: (result: unknown) => void;
+    resetPersonalSessionMock.mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+    const lark = makeCardAwareLarkClient();
+    expect(handleLarkCardAction(newAction(), lark, {} as any, makeAgentBoxManager("a1") as any)).toBeUndefined();
+    await flush();
+    expect(lark.cardkit.v1.cardElement.update).not.toHaveBeenCalled();
+    finish({ success: false, error: "unavailable" });
+    await flush();
+    expect(lark.cardkit.v1.cardElement.update).not.toHaveBeenCalled();
+    expect(lark.im.message.reply).not.toHaveBeenCalled();
+    expect(closeSessionMock).not.toHaveBeenCalled();
   });
 });
 

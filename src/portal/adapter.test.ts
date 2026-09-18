@@ -51,6 +51,21 @@ function flat(sql: string): string {
 
 beforeEach(() => vi.clearAllMocks());
 
+it("rejects group card resets through the HTTP adapter as well as RPC", async () => {
+  const router = createRestRouter();
+  registerAdapterRoutes(router, INTERNAL_SECRET);
+  const query = vi.fn().mockResolvedValue([[{ id: "b", agent_id: "a", session_id: "old" }], []]);
+  (getDb as any).mockReturnValue({ query });
+  const result = await runRoute(router, fakeReq({
+    url: "/api/internal/siclaw/channel/reset-session", method: "POST",
+    body: { channel_id: "lark", route_key: "group", session_key: "open_id:person", expected_session_id: "old" },
+  }));
+  expect(result.status).toBe(200);
+  expect(result.body).toMatchObject({ success: false });
+  expect(query).toHaveBeenCalledTimes(1);
+  expect(flat(query.mock.calls[0][0])).toContain("SELECT");
+});
+
 describe("registerAdapterRoutes — is_production filter", () => {
   let router: ReturnType<typeof createRestRouter>;
   let query: ReturnType<typeof vi.fn>;
