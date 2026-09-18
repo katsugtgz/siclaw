@@ -233,7 +233,11 @@ class ClaudeAgentClient:
         self._aborted, self._tool_calls, self._model_calls, self._status = False, 0, 0, None
         await self._emit("model_request", {"call": 1, "model": self.config["model"]["id"], "provider": self.config["model"]["provider"]})
         await self._emit("model_envelope", {"manifest": {"system_prompt_sha256": hashlib.sha256(self.system_prompt.encode()).hexdigest(),
-                                                       "tools": list(self.tools), "model": self.config["model"]["id"]}})
+                                                       "tools": list(self.tools), "model": self.config["model"]["id"],
+                                                       "configured_max_tokens": self.config["model"]["maxTokens"],
+                                                       "configured_context_window": self.config["model"]["contextWindow"],
+                                                       "thinking_level": self.config.get("thinking_level", "off"),
+                                                       "sdk_version": self.sdk_version}})
         await self._usage_recorder.begin(self._turn_id)
         try:
             await self._client.query(message)

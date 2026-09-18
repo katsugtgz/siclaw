@@ -99,3 +99,33 @@ For upgrades, inspect the actual parsers, regenerate the patch and hashes,
 and run parser fixtures, logical-call tests, clean install and packed-package
 install checks. Responses SSE and WebSocket share the patched finalization path.
 Do not derive missing evidence from SDK counters.
+
+## Failed Claude requests
+
+The execution observation `result.failure_code` provides a bounded diagnostic
+hint. The generic fallback remains `model_request_failed`. Explicit 401, 403,
+402 and 429 responses map to `model_authentication_failed`,
+`model_permission_denied`, `model_billing_rejected` and `model_rate_limited`.
+A compiler call-budget failure is `model_call_budget_exceeded`; interruption
+continues to take precedence over provider failure.
+
+The pinned Claude SDK flattens provider responses into text and does not expose
+the original provider code, parameter or request ID on the result. Two explicit
+leading 400 messages can still be classified: `max_tokens: N exceeds the maximum
+N` becomes `model_output_limit_rejected`, and `prompt is too long: N tokens > N
+maximum` becomes `model_context_limit_rejected`. These are provider-reported
+hints, not independently verified causes. Other text, including quota-related
+words inside an echoed request, remains unclassified. Never infer exhaustion
+from a generic 400. Raw text stays outside diagnostic observations.
+
+Each Claude turn's `model_envelope.manifest` also records
+`configured_max_tokens`, `configured_context_window`, `thinking_level` and
+`sdk_version`. These are configured limits, not observed wire payloads or actual
+token use. Join the envelope and result by run/session/turn, retaining the role
+so that a successful answer session cannot hide a separate judge failure.
+
+These additions reuse existing metadata fields accepted by SiCore and do not
+change retry, cancellation, publication or artifact persistence policy. Runtime
+and KBC updates are required before new boxes emit them; existing box processes
+do not gain diagnostics from a control-plane rollout. A historical failure
+without retained provider details cannot be reconstructed with this change.
