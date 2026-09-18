@@ -309,9 +309,13 @@ async function resetChannelBindingSession(
   channelId: string,
   routeKey: string,
   sessionKey?: string | null,
-): Promise<{ success: boolean; agentId?: string; oldSessionId?: string | null; sessionId?: string; error?: string }> {
+  expectedSessionId?: string,
+): Promise<{ success: boolean; agentId?: string; oldSessionId?: string | null; sessionId?: string; unchanged?: boolean; error?: string }> {
   const row = await selectChannelBinding(db, channelId, routeKey);
   if (!row) return { success: false, error: "Binding not found" };
+  if (expectedSessionId) {
+    return resetExpectedChannelSession(db, row.id, row.agent_id, sessionKey, expectedSessionId);
+  }
 
   const sessionId = crypto.randomUUID();
   if (sessionKey) {
@@ -344,6 +348,23 @@ async function resetChannelBindingSession(
     oldSessionId: row.session_id ?? null,
     sessionId,
   };
+}
+
+/** Compare-and-swap makes a card reset durable and safe to redeliver. */
+async function resetExpectedChannelSession(
+  db: Db, bindingId: string, agentId: string, sessionKey: string | null | undefined, expectedSessionId: string,
+) {
+  const sessionId = crypto.randomUUID();
+  const [result] = await db.query(
+    sessionKey
+      ? "UPDATE channel_binding_sessions SET session_id = ?, updated_at = CURRENT_TIMESTAMP WHERE binding_id = ? AND session_key = ? AND session_id = ?"
+      : "UPDATE channel_bindings SET session_id = ? WHERE id = ? AND session_id = ?",
+    sessionKey
+      ? [sessionId, bindingId, normalizeChannelSessionKey(sessionKey), expectedSessionId]
+      : [sessionId, bindingId, expectedSessionId],
+  ) as any;
+  if (!result?.affectedRows) return { success: true, unchanged: true };
+  return { success: true, agentId, oldSessionId: expectedSessionId, sessionId };
 }
 
 /**
@@ -580,11 +601,16 @@ async function resetPersonalChannelSession(
   db: Db,
   channelId: string,
   sessionKey: string,
-): Promise<{ success: boolean; agentId?: string; oldSessionId?: string | null; sessionId?: string; error?: string }> {
+  expectedSessionId?: string,
+): Promise<{ success: boolean; agentId?: string; oldSessionId?: string | null; sessionId?: string; unchanged?: boolean; error?: string }> {
   const channel = await selectPersonalChannel(db, channelId);
   const personalBot = channel?.config.personal_bot;
   if (!channel || !personalBot?.agent_id) return { success: false, error: "Personal bot not found" };
   const normalizedKey = normalizeChannelSessionKey(sessionKey);
+  if (expectedSessionId) {
+    if (!normalizedKey) return { success: false, error: "session_key is required" };
+    return resetExpectedChannelSession(db, channel.id, personalBot.agent_id, normalizedKey, expectedSessionId);
+  }
   const oldSessionId = await selectChannelBindingParticipantSession(db, channel.id, normalizedKey);
   const sessionId = crypto.randomUUID();
   const upsert = buildUpsert(
@@ -3167,7 +3193,7 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
 
   handlers.set("channel.resetSession", async (params) => {
     const db = getDb();
-    return resetChannelBindingSession(db, params.channel_id, params.route_key, params.session_key);
+    return resetChannelBindingSession(db, params.channel_id, params.route_key, params.session_key, params.expected_session_id);
   });
 
   handlers.set("channel.updateBindingMeta", async (params) => {
@@ -3192,7 +3218,7 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
 
   handlers.set("channel.resetPersonalSession", async (params) => {
     const db = getDb();
-    return resetPersonalChannelSession(db, params.channel_id, params.session_key);
+    return resetPersonalChannelSession(db, params.channel_id, params.session_key, params.expected_session_id);
   });
 
   handlers.set("channel.pairPersonal", async () => ({

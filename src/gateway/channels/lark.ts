@@ -29,6 +29,7 @@ import {
   isChannelAccessDenied,
   isOpenAccessTier,
   type ResolvedChannelBinding,
+  type ChannelSessionResetResult,
   type ChannelAccessDenied,
   type PersonalApiKeyIssueResult,
   type PersonalApiKeyStatusResult,
@@ -49,7 +50,9 @@ import {
   type FeedbackContext,
   buildMilestoneCardMarkdown,
   applyFeedbackSelection,
+  disableNewSessionButton,
   FEEDBACK_ACTION_KIND,
+  NEW_SESSION_ACTION_KIND,
   sendModeCard,
   MODE_ACTION_KIND,
   PLACEHOLDER_BY_LOCALE,
@@ -57,6 +60,7 @@ import {
   localeForDomain,
   sendLinkActionCard,
   type FeedbackActionValue,
+  type NewSessionActionValue,
   type ModeActionValue,
   type GroupContextMode,
   type LarkLocale,
@@ -424,7 +428,7 @@ export function createLarkHandler(
         // handleLarkCardAction doc comment / the 200671 fix).
         "card.action.trigger": (data: any) => {
           try {
-            return handleLarkCardAction(data, larkClient, frontendClient);
+            return handleLarkCardAction(data, larkClient, frontendClient, agentBoxManager, tlsOptions);
           } catch (err) {
             console.error(`[lark] Error handling card action for channel=${channelId}:`, err);
             return undefined;
@@ -726,9 +730,8 @@ const MODE_UNBOUND_NOTICE_BY_LOCALE: Record<LarkLocale, string> = {
   "en-US": "❌ This group isn't bound to an assistant yet, so there's no context mode to set. Pair it first.",
 };
 
-// Shared groups use one group-level session, so a single member's /new would
-// wipe everyone's context — disallowed. A confirmed "reset the whole room" is a
-// future, confirmation-gated action; for now, point the user at their options.
+// The unscoped /new command remains disallowed in shared groups. The answer-card
+// action separately supports a one-way reset of the exact session on that card.
 const SHARED_NEW_REJECTED_NOTICE_BY_LOCALE: Record<LarkLocale, string> = {
   "zh-CN": "团队模式(全群共享上下文)不支持单人重置——一个人 /new 会清空整群的上下文。如需独立对话,请用 /mode 切换为个人模式,或另建一个群。",
   "en-US": "Team mode (shared group context) doesn't support a per-person /new — one reset would wipe the whole group's context. For a private thread, switch to Personal mode with /mode, or start a separate group.",
@@ -740,9 +743,8 @@ const FEEDBACK_TOAST_BY_LOCALE: Record<LarkLocale, { ok: string; fail: string }>
 };
 
 /**
- * Handle a `card.action.trigger` callback. Only feedback buttons (our
- * FEEDBACK_ACTION_KIND discriminator) are processed; anything else returns
- * undefined so future card actions can add their own handling.
+ * Handle answer feedback, silent session resets, and context-mode switches.
+ * Unrecognized card actions return undefined.
  *
  * The return value is the card-callback response Feishu shows as a toast.
  * Feishu enforces a hard ~3s budget on that response measured END-TO-END
@@ -760,6 +762,8 @@ export function handleLarkCardAction(
   data: any,
   larkClient: any,
   frontendClient?: FrontendWsClient,
+  agentBoxManager?: AgentBoxManager,
+  tlsOptions?: { cert: string; key: string; ca: string },
 ): { toast: { type: string; content: string } } | undefined {
   // EventDispatcher flattens `event.*` onto the top level (same as messages).
   // Some Feishu/CardKit versions deliver `action.value` as a JSON string
@@ -773,6 +777,11 @@ export function handleLarkCardAction(
     value = rawValue as { kind?: string } | undefined;
   }
   if (!value) return undefined;
+
+  if (value.kind === NEW_SESSION_ACTION_KIND) {
+    handleNewSessionAction(value as Partial<NewSessionActionValue>, data, larkClient, frontendClient, agentBoxManager, tlsOptions);
+    return undefined;
+  }
 
   // Context-mode switch buttons take the same self-contained-value + optimistic
   // toast + detached side-effect shape as feedback (200671 discipline).
@@ -819,6 +828,60 @@ export function handleLarkCardAction(
   })();
 
   return { toast: { type: "success", content: toasts.ok } };
+}
+
+/** Silent, one-way reset scoped to the conversation that produced the card. */
+function handleNewSessionAction(
+  value: Partial<NewSessionActionValue>,
+  data: any,
+  larkClient: any,
+  frontendClient?: FrontendWsClient,
+  agentBoxManager?: AgentBoxManager,
+  tlsOptions?: { cert: string; key: string; ca: string },
+): void {
+  const scope = value.new_session;
+  const operator = data?.operator?.open_id;
+  if (!frontendClient || !agentBoxManager || !operator || !value.session_id || !value.card_id || !value.channel_id
+    || !scope || !["group", "personal"].includes(scope.route) || !scope.routeKey || !scope.bindingId
+    || typeof scope.sessionKey !== "string") {
+    console.warn(`[lark] Dropping malformed new-session action card=${value.card_id ?? "?"}`);
+    return;
+  }
+  const action = value as NewSessionActionValue;
+  // Use the same lane as incoming messages, so the next message sees the reset.
+  const queued = enqueueBindingTask(`${scope.bindingId}:${scope.sessionKey || "__binding__"}`, async () => {
+    const binding = await resolveQueuedBinding(
+      scope.route, action.channel_id, scope.routeKey, operator, frontendClient,
+      scope.sessionKey ? `open_id:${operator}` : "", scope.conversationKey, true, "user",
+    );
+    // A personal/per-user card cannot reset a different participant's session.
+    if (!binding || binding.bindingId !== scope.bindingId
+      || (binding.sessionKey ?? "") !== scope.sessionKey) return;
+    if (binding.sessionId !== value.session_id) {
+      await disableNewSessionButton(larkClient, action);
+      return;
+    }
+    const reset = scope.route === "personal"
+      ? await resetPersonalSession(action.channel_id, scope.sessionKey, frontendClient, action.session_id)
+      : await resetBindingSession(action.channel_id, scope.routeKey, frontendClient, scope.sessionKey, action.session_id);
+    if (!reset.success) {
+      console.warn(`[lark] New-session reset rejected card=${value.card_id}: ${reset.error ?? "unknown"}`);
+      return;
+    }
+    if (!reset.unchanged && (!reset.sessionId || !reset.agentId)) return;
+    if (!reset.unchanged && binding.contextMode === "shared") forgetGroupState(action.channel_id, scope.routeKey);
+    // Disable only after persistence. No message, toast, prompt, or undo action.
+    await disableNewSessionButton(larkClient, action);
+    if (!reset.unchanged) {
+      console.log(`[lark] New session from card=${value.card_id} old=${value.session_id} new=${reset.sessionId}`);
+      await closeResetSession(reset, agentBoxManager, tlsOptions, frontendClient, binding.createdBy ?? undefined);
+    }
+  });
+  if (queued.accepted) {
+    void queued.done.catch((err) => console.error(`[lark] New-session action failed card=${value.card_id}:`, err));
+  } else {
+    console.warn(`[lark] New-session queue full card=${value.card_id}`);
+  }
 }
 
 /**
@@ -1801,9 +1864,9 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
 
   if (/^\/new$/i.test(text)) {
     // A shared group has ONE group-level session, so a single member's /new
-    // would clear everyone's context — reject it instead of resetting. (A
-    // confirmation-gated "reset the whole room" is deferred.) Topic-scoped groups
-    // and personal chats reset the caller's own session as before.
+    // would clear everyone's context — keep the command rejected. The card
+    // action uses an expected session ID for shared-group resets. Topic-scoped
+    // groups and personal chats reset the caller's own session as before.
     if (contextMode === "shared" && !conversationKey) {
       await replyToLark(larkClient, messageId, SHARED_NEW_REJECTED_NOTICE_BY_LOCALE[locale], replyInThread);
       return;
@@ -2114,6 +2177,13 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
   // The final card is JUST the conclusion — the live step indicator is replaced
   // entirely, no milestone trail is kept on the card.
   const finalCardBody = buildMilestoneCardMarkdown({ milestones: [], finalText: displayBody });
+  const feedbackContext: FeedbackContext = {
+    sessionId, channelId, messageId: assistantMessageId ?? undefined,
+    newSession: {
+      route, routeKey: chatId, sessionKey: binding.sessionKey ?? sessionKey,
+      bindingId: binding.bindingId, ...(conversationKey ? { conversationKey } : {}),
+    },
+  };
 
   // Stop any further coalesced milestone renders and let the in-flight one
   // settle, so finalizeCard isn't overwritten by a later (higher-sequence)
@@ -2130,7 +2200,7 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
       && (sanitizedResultBody.trim().length > 0 || replyImages.length > 0);
     const { ok, contentOk } = await finalizeCard(larkClient, cardSession, finalCardBody,
       isAnswer && assistantMessageId
-        ? { ctx: { sessionId, channelId, messageId: assistantMessageId }, locale }
+        ? { ctx: feedbackContext, locale }
         : undefined);
     if (!contentOk) {
       // The body never landed (rejected update / oversized answer), so the card
@@ -2144,7 +2214,7 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
         finalCardBody,
         replyInThread,
         isAnswer && assistantMessageId
-          ? { ctx: { sessionId, channelId, messageId: assistantMessageId }, locale }
+          ? { ctx: feedbackContext, locale }
           : undefined,
       );
     } else if (!ok) {
@@ -2504,26 +2574,33 @@ async function handleNewCommand(
     return;
   }
 
-  if (reset.oldSessionId) {
+  await closeResetSession(reset, agentBoxManager, tlsOptions, frontendClient, resetUserId);
+  await replyToLark(larkClient, messageId, NEW_SESSION_NOTICE_BY_LOCALE[locale], replyInThread);
+}
+
+async function closeResetSession(
+  reset: ChannelSessionResetResult,
+  agentBoxManager: AgentBoxManager,
+  tlsOptions?: { cert: string; key: string; ca: string },
+  frontendClient?: FrontendWsClient,
+  resetUserId?: string,
+): Promise<void> {
+  if (reset.oldSessionId && reset.agentId) {
     sessionRegistry.forget(reset.oldSessionId);
     try {
       if (frontendClient && await supportsConversations(frontendClient)) {
         if (!resetUserId) throw new Error("Cannot authorize cancellation of the old conversation");
         await frontendClient.request("conversation.abort", { agentId: reset.agentId, sessionId: reset.oldSessionId, userId: resetUserId });
       } else {
-      // The OLD session id, not none: closeSession has to reach the box that actually
-      // holds it. Without it a pooled agent closes on an arbitrary box, the real session
-      // stays resident forever (pooled boxes never idle out), and that box never drains.
-      const handle = await agentBoxManager.getOrCreate(reset.agentId, undefined, reset.oldSessionId);
-      const client = new AgentBoxClient(handle.endpoint, 120_000, tlsOptions);
-      await client.closeSession(reset.oldSessionId);
+        // Route closure to the box holding the OLD session, including pooled agents.
+        const handle = await agentBoxManager.getOrCreate(reset.agentId, undefined, reset.oldSessionId);
+        const client = new AgentBoxClient(handle.endpoint, 120_000, tlsOptions);
+        await client.closeSession(reset.oldSessionId);
       }
     } catch (err) {
-      console.error(`[lark] Failed to close old session=${reset.oldSessionId} on /new:`, err);
+      console.error(`[lark] Failed to close old session=${reset.oldSessionId} after reset:`, err);
     }
   }
-
-  await replyToLark(larkClient, messageId, NEW_SESSION_NOTICE_BY_LOCALE[locale], replyInThread);
 }
 
 /**

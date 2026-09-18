@@ -227,16 +227,28 @@ export async function updateChannelName(
 }
 
 /** Reset the durable session attached to a channel binding. */
+export interface ChannelSessionResetResult {
+  success: boolean;
+  agentId?: string;
+  oldSessionId?: string | null;
+  sessionId?: string;
+  /** The expected session was already replaced; no reset took place. */
+  unchanged?: boolean;
+  error?: string;
+}
+
 export async function resetBindingSession(
   channelId: string,
   routeKey: string,
   frontendClient: FrontendWsClient,
   sessionKey?: string,
-): Promise<{ success: boolean; agentId?: string; oldSessionId?: string | null; sessionId?: string; error?: string }> {
+  expectedSessionId?: string,
+): Promise<ChannelSessionResetResult> {
   return frontendClient.request("channel.resetSession", {
     channel_id: channelId,
     route_key: routeKey,
     ...(sessionKey ? { session_key: sessionKey } : {}),
+    ...(expectedSessionId ? { expected_session_id: expectedSessionId } : {}),
   });
 }
 
@@ -308,10 +320,12 @@ export async function resetPersonalSession(
   channelId: string,
   sessionKey: string,
   frontendClient: FrontendWsClient,
-): Promise<{ success: boolean; agentId?: string; oldSessionId?: string | null; sessionId?: string; error?: string }> {
+  expectedSessionId?: string,
+): Promise<ChannelSessionResetResult> {
   return frontendClient.request("channel.resetPersonalSession", {
     channel_id: channelId,
     session_key: sessionKey,
+    ...(expectedSessionId ? { expected_session_id: expectedSessionId } : {}),
   });
 }
 

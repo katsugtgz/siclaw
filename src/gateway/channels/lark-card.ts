@@ -116,29 +116,52 @@ export interface CardSession {
 
 /** Discriminator inside `action.value` so unrelated card actions are ignored. */
 export const FEEDBACK_ACTION_KIND = "siclaw_feedback";
+export const NEW_SESSION_ACTION_KIND = "siclaw_new_session";
 
 /** Stable element id of the feedback row (needed for the post-click echo). */
 const FEEDBACK_ELEMENT_ID = "fb_row";
 
 export type FeedbackRating = "up" | "down";
 
+export interface NewSessionContext {
+  route: "group" | "personal";
+  routeKey: string;
+  sessionKey: string;
+  bindingId: string;
+  conversationKey?: string;
+}
+
 export interface FeedbackContext {
   sessionId: string;
   channelId: string;
   /** Exact persisted assistant reply rated by this card. Absent on legacy cards. */
   messageId?: string;
+  newSession?: NewSessionContext;
 }
 
 /** Payload embedded in each button; comes back verbatim in the callback. */
-export interface FeedbackActionValue {
-  kind: typeof FEEDBACK_ACTION_KIND;
-  rating: FeedbackRating;
+interface CardActionContext {
   session_id: string;
   card_id: string;
   channel_id: string;
   /** Added after channel audit persistence exposed the final assistant id. */
   message_id?: string;
   locale: LarkLocale;
+  new_session?: NewSessionContext;
+  /** Last rendered sequence/state lets callbacks survive runtime restarts. */
+  card_sequence?: number;
+  new_session_started?: boolean;
+  selected_rating?: FeedbackRating;
+}
+
+export interface FeedbackActionValue extends CardActionContext {
+  kind: typeof FEEDBACK_ACTION_KIND;
+  rating: FeedbackRating;
+}
+
+export interface NewSessionActionValue extends CardActionContext {
+  kind: typeof NEW_SESSION_ACTION_KIND;
+  new_session: NewSessionContext;
 }
 
 const FEEDBACK_LABELS: Record<LarkLocale, Record<FeedbackRating, { idle: string; selected: string }>> = {
@@ -152,50 +175,75 @@ const FEEDBACK_LABELS: Record<LarkLocale, Record<FeedbackRating, { idle: string;
   },
 };
 
-/** Schema-2.0 feedback row: two callback buttons side by side. */
+/** Schema-2.0 answer actions, each occupying an equal share of the row. */
 function buildFeedbackRow(
   cardId: string,
   ctx: FeedbackContext,
   locale: LarkLocale,
   selected?: FeedbackRating,
+  sequence?: number,
+  newSessionStarted = false,
 ): Record<string, unknown> {
+  const common: CardActionContext = {
+    session_id: ctx.sessionId,
+    card_id: cardId,
+    channel_id: ctx.channelId,
+    ...(ctx.messageId ? { message_id: ctx.messageId } : {}),
+    locale,
+    ...(ctx.newSession ? {
+      new_session: ctx.newSession,
+      card_sequence: sequence,
+      new_session_started: newSessionStarted,
+      selected_rating: selected,
+    } : {}),
+  };
   const button = (rating: FeedbackRating) => {
     const label = FEEDBACK_LABELS[locale][rating];
     const value: FeedbackActionValue = {
       kind: FEEDBACK_ACTION_KIND,
       rating,
-      session_id: ctx.sessionId,
-      card_id: cardId,
-      channel_id: ctx.channelId,
-      ...(ctx.messageId ? { message_id: ctx.messageId } : {}),
-      locale,
+      ...common,
     };
     return {
       tag: "button",
       element_id: `fb_${rating}`,
       text: { tag: "plain_text", content: selected === rating ? label.selected : label.idle },
       type: selected === rating ? "primary" : "default",
+      width: "fill",
       behaviors: [{ type: "callback", value }],
     };
   };
+  const buttons: Record<string, unknown>[] = [button("up"), button("down")];
+  if (ctx.newSession) {
+    buttons.push({
+      tag: "button",
+      element_id: "new_session",
+      text: { tag: "plain_text", content: locale === "zh-CN" ? "新会话" : "New session" },
+      type: "default",
+      width: "fill",
+      disabled: newSessionStarted,
+      behaviors: [{ type: "callback", value: { ...common, kind: NEW_SESSION_ACTION_KIND, new_session: ctx.newSession } }],
+    });
+  }
   return {
     tag: "column_set",
     element_id: FEEDBACK_ELEMENT_ID,
-    columns: [
-      { tag: "column", width: "auto", elements: [button("up")] },
-      { tag: "column", width: "auto", elements: [button("down")] },
-    ],
+    flex_mode: "none",
+    columns: buttons.map((b) => ({ tag: "column", width: "weighted", weight: 1, elements: [b] })),
   };
 }
 
 // Cards whose feedback row we can still edit (sequence must keep increasing
 // per card, and CardKit gives no way to read it back). Only the CardSession is
-// remembered — everything else the echo needs comes back verbatim in the
-// button's self-contained action.value. In-memory and bounded: after a gateway
-// restart the click still persists + toasts, only the visual button-state echo
-// is skipped.
+// remembered alongside the latest selection. New cards also carry the last
+// rendered sequence/state in action.value so their echo survives a restart.
+// Legacy cards without a sequence still persist feedback but skip that echo.
 const FEEDBACK_ECHO_CAP = 500;
-const feedbackEchoSessions = new Map<string, CardSession>();
+interface FeedbackCardSession extends CardSession {
+  selected?: FeedbackRating;
+  newSessionStarted?: boolean;
+}
+const feedbackEchoSessions = new Map<string, FeedbackCardSession>();
 
 function rememberFeedbackCard(session: CardSession): void {
   if (feedbackEchoSessions.size >= FEEDBACK_ECHO_CAP) {
@@ -449,7 +497,7 @@ async function appendFeedbackRow(
       data: {
         type: "append",
         sequence: ++session.sequence,
-        elements: JSON.stringify([buildFeedbackRow(session.cardId, ctx, locale)]),
+        elements: JSON.stringify([buildFeedbackRow(session.cardId, ctx, locale, undefined, session.sequence)]),
       },
     });
     if (cardApiFailed(res)) {
@@ -467,17 +515,37 @@ async function appendFeedbackRow(
  * highlighted, rebuilt entirely from the callback's own value payload (the
  * single source of truth). Note the echo reflects the LATEST click — on a
  * shared group card another member's later vote replaces the highlight; the
- * DB keeps one row per person regardless. Returns false when this process no
- * longer knows the card's sequence (e.g. after a restart) — the caller's
- * toast is then the only confirmation, which is acceptable.
+ * DB keeps one row per person regardless. Legacy cards without a sequence in
+ * their payload can only echo while this process still remembers the card.
  */
 export async function applyFeedbackSelection(
   larkClient: any,
-  value: Pick<FeedbackActionValue, "card_id" | "session_id" | "channel_id" | "message_id" | "locale">,
+  value: CardActionContext,
   rating: FeedbackRating,
 ): Promise<boolean> {
-  const session = feedbackEchoSessions.get(value.card_id);
+  return updateAnswerActions(larkClient, value, rating);
+}
+
+/** One-way state change: subsequent feedback updates must keep this disabled. */
+export async function disableNewSessionButton(larkClient: any, value: NewSessionActionValue): Promise<boolean> {
+  return updateAnswerActions(larkClient, value, undefined, true);
+}
+
+async function updateAnswerActions(
+  larkClient: any,
+  value: CardActionContext,
+  rating?: FeedbackRating,
+  newSessionStarted = false,
+): Promise<boolean> {
+  let session = feedbackEchoSessions.get(value.card_id);
+  if (!session && Number.isSafeInteger(value.card_sequence) && value.card_sequence! > 0) {
+    session = { cardId: value.card_id, elementId: MD_ELEMENT_ID, sequence: value.card_sequence! };
+    rememberFeedbackCard(session);
+  }
   if (!session) return false;
+  session.sequence = Math.max(session.sequence, value.card_sequence ?? 0);
+  session.selected = rating ?? session.selected ?? value.selected_rating;
+  session.newSessionStarted ||= newSessionStarted || value.new_session_started;
   const locale: LarkLocale = value.locale === "en-US" ? "en-US" : "zh-CN";
   try {
     const res = await larkClient.cardkit.v1.cardElement.update({
@@ -485,11 +553,13 @@ export async function applyFeedbackSelection(
       data: {
         element: JSON.stringify(buildFeedbackRow(
           value.card_id,
-          { sessionId: value.session_id, channelId: value.channel_id, messageId: value.message_id },
+          { sessionId: value.session_id, channelId: value.channel_id, messageId: value.message_id, newSession: value.new_session },
           locale,
-          rating,
+          session.selected,
+          ++session.sequence,
+          session.newSessionStarted,
         )),
-        sequence: ++session.sequence,
+        sequence: session.sequence,
       },
     });
     if (cardApiFailed(res)) {
