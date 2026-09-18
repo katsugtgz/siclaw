@@ -64,6 +64,8 @@ export interface CapabilityRunRecord {
    * done arrives can tell "the box finished" from "nobody was driving the run".
    */
   closeReason?: string;
+  /** Persisted only after the box's upgrade fence and snapshot ACK. */
+  imageUpgradePending?: boolean;
   /** Wall-clock ms of the last DATA event; drives the stale-run watchdog. */
   lastActivityMs: number;
   /**
@@ -111,6 +113,9 @@ export interface CapabilityRunManagerOptions {
    * on re-attach) and stale-looking to the watchdog. Fire-and-forget.
    */
   onAdopt?: (rec: CapabilityRunRecord) => void;
+  /** Optional at-rest maintenance. The box must independently confirm it is
+   * quiescent: Runtime idle can include a compiler's background finalizer. */
+  onIdle?: (rec: CapabilityRunRecord) => Promise<void>;
 }
 
 // A run whose reap re-check (getRun) throws is deferred to a later tick — but a
@@ -144,6 +149,9 @@ export class CapabilityRunManager {
   private readonly watchdogIntervalMs: number;
   private readonly onReap?: (rec: CapabilityRunRecord) => Promise<void> | void;
   private readonly onAdopt?: (rec: CapabilityRunRecord) => void;
+  private readonly onIdle?: (rec: CapabilityRunRecord) => Promise<void>;
+  private idleChecks = new Set<string>();
+  private idleCursor = 0;
   private watchdogTimer?: ReturnType<typeof setInterval>;
   private reconciling = false;
 
@@ -165,6 +173,7 @@ export class CapabilityRunManager {
     this.watchdogIntervalMs = opts.watchdogIntervalMs ?? 60_000; // 1 min
     this.onReap = opts.onReap;
     this.onAdopt = opts.onAdopt;
+    this.onIdle = opts.onIdle;
   }
 
   /** siclaw mints the run id (the consumer never does — option B). */
@@ -256,6 +265,7 @@ export class CapabilityRunManager {
         relayEventId: relayEventIdFromCheckpoint(row.checkpoint),
         persistedRelayEventId: relayEventIdFromCheckpoint(row.checkpoint),
         failure: failureFromCheckpoint(row.checkpoint),
+        imageUpgradePending: imageUpgradeFromCheckpoint(row.checkpoint),
         status,
         lastActivityMs: this.now(),
         lastHeartbeatMs: this.now(),
@@ -505,6 +515,7 @@ export class CapabilityRunManager {
           relayEventId: relayEventIdFromCheckpoint(r.checkpoint),
           persistedRelayEventId: relayEventIdFromCheckpoint(r.checkpoint),
           failure: failureFromCheckpoint(r.checkpoint),
+          imageUpgradePending: imageUpgradeFromCheckpoint(r.checkpoint),
           status: r.status || "running",
           lastActivityMs: this.now(),
           lastHeartbeatMs: this.now(),
@@ -531,6 +542,7 @@ export class CapabilityRunManager {
    */
   private stalenessOutcome(rec: CapabilityRunRecord, now: number): CapabilityTerminalStatus | null {
     if (isTerminalCapabilityStatus(rec.status)) return null;
+    if (rec.imageUpgradePending !== undefined) return null; // durable retirement owns cleanup
     if (rec.status === "idle") {
       return rec.lastActivityMs < now - this.idleTtlMs ? "done" : null;
     }
@@ -556,6 +568,7 @@ export class CapabilityRunManager {
   async reapStale(): Promise<string[]> {
     const candidates: string[] = [];
     for (const rec of [...this.runs.values()]) {
+      if (this.idleChecks.has(rec.runId)) continue;
       if (this.stalenessOutcome(rec, this.now())) candidates.push(rec.runId);
     }
     const reaped: string[] = [];
@@ -645,8 +658,41 @@ export class CapabilityRunManager {
       await this.flushTerminal();
       await this.recover();
       await this.reapStale();
+      this.checkIdleRuns();
     } finally {
       this.reconciling = false;
+    }
+  }
+
+  private checkIdleRuns(): void {
+    if (!this.onIdle) return;
+    const records = [...this.runs.values()];
+    if (!records.length) return;
+    let checked = 0;
+    for (let visited = 0; visited < records.length && checked < 4 && this.idleChecks.size < 4; visited++) {
+      const rec = records[this.idleCursor++ % records.length];
+      if (isTerminalCapabilityStatus(rec.status) || (rec.status !== "idle" && rec.imageUpgradePending === undefined) || this.idleChecks.has(rec.runId)) continue;
+      checked++;
+      this.idleChecks.add(rec.runId);
+      void this.onIdle(rec).catch((error) => {
+        // Old boxes/consumers without the handshake remain alive. No guessing
+        // based on idle, an HTTP error, or an unavailable image identity.
+        console.warn(`[capability] idle maintenance deferred run=${rec.runId}: ${error instanceof Error ? error.name : "Error"}`);
+      }).finally(() => this.idleChecks.delete(rec.runId));
+    }
+  }
+
+  /** Make retirement recoverable before deleting a prepared compiler box. */
+  async checkpointImageUpgrade(runId: string, continuation: boolean): Promise<void> {
+    const rec = this.runs.get(runId);
+    if (!rec || isTerminalCapabilityStatus(rec.status)) return;
+    const prior = rec.imageUpgradePending;
+    rec.imageUpgradePending = continuation;
+    try {
+      await this.persist(rec, { failFast: true });
+    } catch (error) {
+      rec.imageUpgradePending = prior;
+      throw error;
     }
   }
 
@@ -696,6 +742,7 @@ export class CapabilityRunManager {
       ...(rec.failure ? { failure: rec.failure } : {}),
       ...(rec.relayEventId ? { relay_event_id: rec.relayEventId } : {}),
       ...(rec.closeReason ? { close_reason: rec.closeReason } : {}),
+      ...(rec.imageUpgradePending !== undefined ? { image_upgrade: { continuation: rec.imageUpgradePending } } : {}),
     };
     const state: CapabilityRunState = {
       run_id: rec.runId,
@@ -817,4 +864,14 @@ function relayEventIdFromCheckpoint(checkpoint: unknown): string | undefined {
   if (!value || typeof value !== "object") return undefined;
   const id = (value as { relay_event_id?: unknown }).relay_event_id;
   return isRelayEventId(id) ? id : undefined;
+}
+
+function imageUpgradeFromCheckpoint(checkpoint: unknown): boolean | undefined {
+  let value = checkpoint;
+  if (typeof value === "string") {
+    try { value = JSON.parse(value); } catch { return undefined; }
+  }
+  if (!value || typeof value !== "object") return undefined;
+  const pending = (value as { image_upgrade?: { continuation?: unknown } }).image_upgrade;
+  return typeof pending?.continuation === "boolean" ? pending.continuation : undefined;
 }

@@ -89,6 +89,7 @@ TEST_SESSION_IDEMPOTENCY: dict[tuple[str, str], str] = {}
 # recommendation and reference-answer assistance share this guard so two owner
 # actions cannot spend overlapping model calls against the same workspace.
 RECOMMENDATIONS_ACTIVE: set[str] = set()
+_upgrade_active_requests = 0
 DEFAULT_HTTP_MAX_REQUEST_BYTES = 768 * 1024 * 1024
 
 # ── Prompt packs — locale-parameterized model-facing text ────────────────────
@@ -678,6 +679,12 @@ class CompileRun:
         self.event_relay = EventRelay(self.events)
         self.task: asyncio.Task | None = None
         self.done = False
+        self._upgrade_draining = False
+        self._upgrade_ready = False
+        # Cleared before a turn begins; set only after its finalizer has either
+        # finished or registered every background task. Runtime idle alone is
+        # not sufficient while a post-turn self-check is still being scheduled.
+        self._upgrade_idle_ready = True
         # Persistent Pi session (set by run_session). The box is a
         # long-lived conversational + compiling session, not a one-shot query();
         # POST /message injects follow-up user turns into this same session.
@@ -829,6 +836,7 @@ class CompileRun:
     ):
         """Arm the stall watchdog for a new model turn. Called for every turn —
         the owner's /message AND internal self-check/verify/batch injections."""
+        self._upgrade_idle_ready = False
         self._turn_selfcheck_key = selfcheck.state_key(self.workdir)
         if not preserve_page_baseline or not isinstance(self._turn_page_hashes, dict):
             # A previous failed logical turn can remain live in this process.
@@ -1069,6 +1077,7 @@ async def _sync_workspace(
     *,
     commit_input: bool = False,
     durable_barrier: bool = False,
+    force: bool = False,
 ) -> int:
     """Emit a syncArtifacts event for workspace files changed since `sent`
     (path → content sha), plus TOMBSTONES ({path, deleted: true}) for
@@ -1092,7 +1101,7 @@ async def _sync_workspace(
         for art in _collect_workspace_artifacts_for_sync(run):
             collected.add(art["path"])
             sha = hashlib.sha256(art["content"].encode("utf-8")).hexdigest()
-            if sent.get(art["path"]) == sha:
+            if not force and sent.get(art["path"]) == sha:
                 continue
             next_sent[art["path"]] = sha
             changed.append(art)
@@ -1108,7 +1117,7 @@ async def _sync_workspace(
         for path in [p for p in sent if p not in collected]:
             if (wd / path).is_file():
                 continue  # still on disk, just not collectable — keep the row
-            if sent.get(path) != _SYNC_TOMBSTONE:
+            if force or sent.get(path) != _SYNC_TOMBSTONE:
                 next_sent[path] = _SYNC_TOMBSTONE
                 changed.append({"path": path, "deleted": True})
         if changed or commit_input:
@@ -3429,6 +3438,7 @@ async def _emit_message(run: CompileRun, msg, *, step: CompileStep | None = None
             started = _maybe_start_media_verify(run) or _maybe_start_pk(run)
             if not started:
                 await _set_converge_phase(run, "settled")
+        run._upgrade_idle_ready = not run._turn_active
 
 
 async def _normalize_ticket_ledger_after_turn(run, workdir: str) -> None:
@@ -5423,6 +5433,7 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
     # the draft is stable (settled), same authoritative signal as the seam.
     if not _maybe_start_pk(run):
         await _set_converge_phase(run, "settled")
+    run._upgrade_idle_ready = not run._turn_active
 
 
 def _note_model_activity(run: CompileRun, msg) -> None:
@@ -5588,6 +5599,7 @@ async def _consume_turn_stream(
                 await run.emit({"type": "error", "code": "model_request_failed", "error": note,
                                 "message": "model_request_failed", "recoverable": True})
                 await run.emit({"type": "turn_done", "text": note})
+                run._upgrade_idle_ready = True
                 if stop_on_result:
                     return
                 continue
@@ -7565,7 +7577,91 @@ async def handle_events(request: web.Request):
 
 async def handle_health(request: web.Request):
     return web.json_response({"status": "ok", "runs": len(RUNS), "test_sessions": len(TEST_SESSIONS),
-                              "engine": _engine_kind()})
+                              "engine": _engine_kind(),
+                              "upgrade_ready_run": next((run.run_id for run in RUNS.values() if run._upgrade_ready), None)})
+
+
+@web.middleware
+async def _upgrade_admission(request, handler):
+    """Fence HTTP work while an at-rest workspace is handed to a new image.
+
+    ACK and credential responses must still reach the event relay. Track the
+    complete request, including body parsing and test/recommendation startup.
+    A capability box is single-use; shared local boxes conservatively defer.
+    """
+    global _upgrade_active_requests
+    control = request.path.startswith(("/events/ack/", "/artifacts/ack/", "/model-credentials/", "/prepare-upgrade/"))
+    if request.method != "POST" or control:
+        return await handler(request)
+    if any(getattr(run, "_upgrade_draining", False) for run in RUNS.values()):
+        return web.json_response({"error": "compiler image upgrade is in progress"}, status=409)
+    _upgrade_active_requests += 1
+    try:
+        return await handler(request)
+    finally:
+        _upgrade_active_requests -= 1
+
+
+async def handle_prepare_upgrade(request: web.Request):
+    run_id = request.match_info["run_id"]
+    reply = {"version": 1, "run_id": run_id}
+    body = await request.json()
+    persist_workspace = body.get("persist_workspace", True) if isinstance(body, dict) else None
+    if not isinstance(persist_workspace, bool):
+        return web.json_response({"error": "persist_workspace must be boolean"}, status=400)
+    run = RUNS.get(run_id)
+    if run is None:
+        return web.json_response({**reply, "state": "unavailable"})
+    if run._upgrade_ready:
+        return web.json_response({**reply, "state": "ready"})
+    pending = lambda task: task is not None and not task.done()
+    busy = (len(RUNS) != 1 or _upgrade_active_requests != 0 or run._upgrade_draining
+            or not run.connected.is_set() or not run._upgrade_idle_ready
+            or run._turn_active or run._batch_active or run._active_step is not None
+            or pending(run._media_task) or pending(run._pk_task)
+            or run._l1_repair_pending or run_id in RECOMMENDATIONS_ACTIVE
+            or any(t.parent_run_id == run_id and not t.done for t in TEST_SESSIONS.values()))
+    if busy or _step_teardown_failed(run):
+        return web.json_response({**reply, "state": "busy"})
+    if persist_workspace and (not run._artifact_ack_required or getattr(run, "_sync_sent", None) is None):
+        return web.json_response({**reply, "state": "unsupported"})
+    # No await separates the busy check from the fence. All new admissions are
+    # now rejected, and all internal producers have already reached their seam.
+    run._upgrade_draining = True
+    try:
+        if not persist_workspace:
+            # Only Runtime's consumer-approved terminal-operation path uses
+            # this. Its attempt is already fenced against further writes.
+            run._upgrade_ready = True
+            return web.json_response({**reply, "state": "ready"})
+        mediaverify.save_transcripts(run.workdir, mediaverify.load_transcripts(run.workdir))
+        if _blocked_provenance_paths(run):
+            raise ValueError("workspace provenance is not sealed")
+        collected = {a["path"] for a in _collect_workspace_artifacts_for_sync(run)}
+        for top in WORKSPACE_SYNC_DIRS:
+            for path in (Path(run.workdir) / top).rglob("*"):
+                rel = path.relative_to(run.workdir).as_posix()
+                # The aggregate has just been migrated into independently
+                # syncable shards; every other file must survive this handoff.
+                if path.is_file() and rel != mediaverify.TRANSCRIPTS_PATH and rel not in collected:
+                    raise ValueError("workspace contains an unsyncable artifact")
+        await asyncio.wait_for(_sync_workspace(
+            run, run._sync_sent, durable_barrier=True, force=True), timeout=25)
+        run._upgrade_ready = True
+        _print_compile_lifecycle("image_upgrade.ready", run)
+        return web.json_response({**reply, "state": "ready"})
+    except asyncio.CancelledError:
+        # The flush coroutine has stopped before admissions reopen. A queued
+        # snapshot can still be ACKed, ahead of any later events in the relay.
+        run._upgrade_draining = False
+        run._upgrade_ready = False
+        raise
+    except Exception as error:
+        run._upgrade_draining = False
+        run._upgrade_ready = False
+        _print_compile_lifecycle("image_upgrade.deferred", run,
+                                 extra=f"exception_class={type(error).__name__}")
+        return web.json_response({**reply, "state": "unavailable", "reason": "checkpoint_unavailable"}, status=503)
 
 
 def _install_wiki_snapshot(bundle: bytes, dest: Path, expected_sha256: str | None = None) -> tuple[str, int]:
@@ -8004,7 +8100,7 @@ async def _client_certificate_middleware(request: web.Request, handler):
 def build_app() -> web.Application:
     app = web.Application(
         client_max_size=_http_max_request_bytes(),
-        middlewares=[_client_certificate_middleware],
+        middlewares=[_client_certificate_middleware, _upgrade_admission],
     )
     app.on_startup.append(destream.start)
     app.on_startup.append(model_access.start)
@@ -8034,6 +8130,7 @@ def build_app() -> web.Application:
         web.get("/test-sessions", handle_list_test_sessions),
         web.post("/test-session/{tid}/close", handle_close_test),
         web.get("/health", handle_health),
+        web.post("/prepare-upgrade/{run_id}", handle_prepare_upgrade),
     ])
     return app
 

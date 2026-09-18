@@ -1022,6 +1022,20 @@ describe("AgentBoxManager — regressions found in review", () => {
 });
 
 describe("AgentBoxManager — a single-box agent still rolls onto a new image", () => {
+  it("reports compiler image drift without rolling or spawning the box", async () => {
+    const spawner = new PoolSpawner("k8s");
+    spawner.image = "kbc:new";
+    const box = poolBox("kbc-box-run-0", 0, { agentId: "run", profile: "kb-compile", image: "kbc:old" });
+    spawner.getReturns.set(box.boxId, box);
+    const manager = new AgentBoxManager(spawner);
+    expect(await manager.hasOutdatedImage("run", "kb-compile")).toBe(true);
+    box.image = "kbc:new";
+    expect(await manager.hasOutdatedImage("run", "kb-compile")).toBe(false);
+    box.image = undefined;
+    expect(await manager.hasOutdatedImage("run", "kb-compile")).toBe(false);
+    expect(spawner.spawnCalls).toHaveLength(0);
+    expect(spawner.stopCalls).toHaveLength(0);
+  });
   it("drains a stale box and serves from a replacement, rather than keeping the old image forever", async () => {
     // The single-box path compares phase, profile and CA but never the image, and a box
     // under continuous traffic never idles out — so before this, a Runtime rollout left
@@ -2372,4 +2386,3 @@ describe("AgentBoxManager — a wrong staleness judgement must not spin", () => 
     expect((mgr as any).draining.has("b-0")).toBe(true);  // a different agent is unaffected
   });
 });
-

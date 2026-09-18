@@ -1669,6 +1669,13 @@ export class AgentBoxManager {
     return this.get(agentId);
   }
 
+  /** Read-only image comparison; unlike acquisition this never rolls a live box. */
+  async hasOutdatedImage(agentId: string, profile: string): Promise<boolean> {
+    if (!this.isK8s) return false;
+    const info = await this.spawner.get(this.podName(agentId, profile));
+    return !!info && this.isReachable(info, profile) && this.isStaleImage(info, profile);
+  }
+
   async stop(agentId: string, profile?: string): Promise<void> {
     if (this.isK8s) {
       const name = this.podName(agentId, profile);
