@@ -311,6 +311,13 @@ export function normalizeDenied(raw: unknown): { denied: PersonalAccessDenied } 
     ...(typeof src.expiresAtMs === "number" && Number.isFinite(src.expiresAtMs)
       ? { expiresAtMs: src.expiresAtMs }
       : {}),
+    // This function builds a NEW object field by field, so anything not listed here is silently
+    // dropped no matter what the interface declares. `ttlMinutes` was added to PersonalAccessDenied
+    // and read by the card renderer, but never picked up here — the type checked, the renderer was
+    // correct, and the value still never arrived. Optional fields make that invisible to tsc.
+    ...(typeof src.ttlMinutes === "number" && Number.isFinite(src.ttlMinutes) && src.ttlMinutes > 0
+      ? { ttlMinutes: src.ttlMinutes }
+      : {}),
   };
   return { denied };
 }
