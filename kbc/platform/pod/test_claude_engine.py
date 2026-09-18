@@ -297,3 +297,45 @@ async def test_claude_assembles_text_blocks_before_returning_json(tmp_path, monk
         assert len(requests) == 2
         assert [e["data"]["stop_reason"] for e in observed if e["kind"] == "assistant"] == ["tool_use", "end_turn"]
         assert [e["data"]["model_calls"] for e in observed if e["kind"] == "result"] == [2]
+
+
+async def test_provider_rejection_records_safe_failure_diagnostics(tmp_path):
+    observed = []
+
+    async def observe(event):
+        observed.append(event)
+
+    def reject(*_):
+        return web.json_response({
+            'type': 'error',
+            'error': {'type': 'invalid_request_error', 'code': 'max_tokens_exceeded',
+                      'param': 'max_tokens',
+                      'message': 'max_tokens: 2048 exceeds the maximum 1024; private prompt fixture'},
+            'request_id': 'req_fixture_failure',
+        }, status=400, headers={'request-id': 'req_fixture_failure'})
+
+    async with provider(reject) as (config, requests):
+        config['role'] = 'blue'
+        with observe_sessions(observe):
+            client = ClaudeAgentClient(cwd=str(tmp_path), system_prompt='Synthetic source only.',
+                session_id=str(uuid.uuid4()), model_config=config, tools=[])
+            try:
+                async with asyncio.timeout(30):
+                    await client.connect()
+                    await client.query('Read the synthetic source.')
+                    events = [event async for event in client.receive_response()]
+            finally:
+                await client.disconnect()
+    result = next(e for e in observed if e['kind'] == 'result')
+    assert result['data']['api_error_status'] == 400
+    assert result['data']['failure_code'] == 'model_output_limit_rejected'
+    envelope = next(e['data']['manifest'] for e in observed if e['kind'] == 'model_envelope')
+    assert envelope['configured_max_tokens'] == 2048
+    assert envelope['configured_context_window'] == 200000
+    assert envelope['thinking_level'] == 'off'
+    assert envelope['sdk_version'] == client.sdk_version
+    assert result['session_id'] == client.session_id
+    assert result['turn_id']
+    assert result['role'] == 'blue'
+    assert 'private prompt fixture' not in json.dumps(observed)
+    assert 'fixture-private-key' not in json.dumps(observed)

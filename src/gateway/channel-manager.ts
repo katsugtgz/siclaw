@@ -107,8 +107,20 @@ export interface PersonalAccessDenied {
   reason?: string;
   /** Single-use next step (link/apply). Absent when the tier accepts no self-service. */
   actionUrl?: string;
-  /** Epoch ms the `actionUrl` dies. Render durations FROM this, never hard-code the TTL. */
+  /** Epoch ms the `actionUrl` dies. Use for EXPIRY checks — not for the displayed duration. */
   expiresAtMs?: number;
+  /**
+   * How long the link is valid for in total, in minutes, straight from the issuer.
+   *
+   * Separate from `expiresAtMs` because the two answer different questions. Expiry is a moment and
+   * has to be checked against the clock; validity is a property of the ticket and is what a card
+   * should show. Deriving the second from the first meant subtracting the delivery hop and then
+   * flooring, so a fresh 10-minute link announced itself as "9 分钟内有效" every time.
+   *
+   * Optional: an older frontend does not send it, and the renderer falls back to the remaining-time
+   * figure. Still never hard-coded here — the TTL is the issuer's to define.
+   */
+  ttlMinutes?: number;
   /** Non-localized English fallback, used only when `reason` has no template. May embed the URL. */
   message?: string;
 }
@@ -299,6 +311,13 @@ export function normalizeDenied(raw: unknown): { denied: PersonalAccessDenied } 
     ...(typeof src.expiresAtMs === "number" && Number.isFinite(src.expiresAtMs)
       ? { expiresAtMs: src.expiresAtMs }
       : {}),
+    // This function builds a NEW object field by field, so anything not listed here is silently
+    // dropped no matter what the interface declares. `ttlMinutes` was added to PersonalAccessDenied
+    // and read by the card renderer, but never picked up here — the type checked, the renderer was
+    // correct, and the value still never arrived. Optional fields make that invisible to tsc.
+    ...(typeof src.ttlMinutes === "number" && Number.isFinite(src.ttlMinutes) && src.ttlMinutes > 0
+      ? { ttlMinutes: src.ttlMinutes }
+      : {}),
   };
   return { denied };
 }
@@ -340,6 +359,14 @@ export interface PersonalApiKeyIssueResult {
   pickupUrl?: string;
   /** Epoch ms after which the pickup link is dead. */
   expiresAt?: number;
+  /**
+   * How long the link was minted for, in minutes. Print THIS in "valid for N minutes"; use
+   * `expiresAt` only to decide whether the link is still alive. Deriving one from the other is
+   * what made a fresh 5-minute link announce itself as "4 分钟内有效" — the round trip and
+   * render eat into the window before floor() sees it. Optional: an older frontend omits it and
+   * the renderer falls back to the remaining time. Never hard-code the number here.
+   */
+  ttlMinutes?: number;
   /** True ⇒ the requester's previous key was just invalidated. */
   rotated?: boolean;
   /** Non-localized English fallback. Surfaced verbatim only when `denied` yields no template. */
@@ -423,6 +450,14 @@ export interface PersonalWebChatLinkResult {
   actionUrl?: string;
   /** Epoch ms after which the redemption link is dead. */
   expiresAt?: number;
+  /**
+   * How long the link was minted for, in minutes. Print THIS in "valid for N minutes"; use
+   * `expiresAt` only to decide whether the link is still alive. Deriving one from the other is
+   * what made a fresh 10-minute link announce itself as "9 分钟内有效" — the round trip and
+   * render eat into the window before floor() sees it. Optional: an older frontend omits it and
+   * the renderer falls back to the remaining time. Never hard-code the number here.
+   */
+  ttlMinutes?: number;
   /** Non-localized English fallback. Surfaced verbatim only when `denied` yields no template. */
   error?: string;
   /** Present only on the AUTHORIZATION refusal; other failure exits carry `error` alone. */

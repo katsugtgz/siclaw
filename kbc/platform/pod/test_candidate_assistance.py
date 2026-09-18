@@ -229,3 +229,49 @@ def test_optional_navigation_falls_back_without_hiding_failure(tmp_path, monkeyp
     assert compile_box._batch_navigation_context(run, batch) == (False, "")
     output = capsys.readouterr().out
     assert "batch.context_unavailable" in output and "private page contents" not in output
+
+
+@pytest.mark.parametrize("sources", ["null", "42", "false"])
+def test_invalid_sources_remain_layer1_diagnostics(tmp_path, sources):
+    workspace(tmp_path)
+    target = page(tmp_path, "broken.md")
+    target.write_text(f"---\ntype: Topic\ntitle: Broken\nsources: {sources}\n---\nDraft.\n")
+    report = compile_box.selfcheck.run_layer1(str(tmp_path))
+    assert not report["lint"]["ok"]
+    assert any(v["page"] == "broken.md" and v["kind"] == "okf_sources"
+               for v in report["lint"]["violations"])
+
+
+@pytest.mark.parametrize("sources", ["null", "42", "false"])
+def test_evidence_remapping_preserves_invalid_source_shapes(sources):
+    invalid = f"---\ntype: Topic\nsources: {sources}\n---\nDraft.\n"
+    valid = ('---\ntype: Topic\nsources:\n  - resource: raw/a.md\n'
+             '    id: old\n---\n<!-- okf:evidence {"id":"claim","sources":["old"]} -->\n')
+    remap = compile_box.selfcheck._remap_evidence_source_ids
+    assert remap(valid, invalid, {"a.md": "new"}) == valid
+    assert remap(invalid, valid, {"a.md": "new"}) == invalid
+
+
+@pytest.mark.parametrize("sources", ["null", "42", "false"])
+async def test_batch_ledger_repairs_reports_invalid_sources_without_interrupting(tmp_path, monkeypatch, sources):
+    workspace(tmp_path)
+    target = page(tmp_path, "broken.md")
+    target.write_text(f"---\ntype: Topic\ntitle: Broken\nsources: {sources}\n---\nDraft.\n")
+    run = compile_box.CompileRun("invalid-sources", str(tmp_path), 1)
+    prompts = []
+
+    async def no_op_repair(run, prompt, label):
+        report = compile_box.selfcheck.read_selfcheck(run.workdir)
+        assert report["state"] == "repairing"
+        assert any(v["page"] == "broken.md" and v["kind"] == "okf_sources"
+                   for v in report["lint"]["violations"])
+        prompts.append(prompt)
+        return "No changes."
+
+    monkeypatch.setattr(compile_box, "_drive_batch_session", no_op_repair)
+    await compile_box._run_ledger_repairs(run, [])
+    report = compile_box.selfcheck.read_selfcheck(str(tmp_path))
+    assert prompts
+    assert report["state"] == "unconverged"
+    assert not report["lint"]["ok"]
+    assert not run._ledger_forced

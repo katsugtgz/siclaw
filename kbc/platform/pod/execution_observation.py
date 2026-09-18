@@ -1,11 +1,34 @@
 """Metadata-only observations shared by compiler execution adapters."""
 
+import re
 import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime, timezone
 
 _OBSERVER: ContextVar = ContextVar("compiler_execution_observer", default=None)
+
+
+def _failure_code(data):
+    """Bounded diagnostic hints, never provider text or retry policy.
+
+    The Claude SDK flattens provider errors and drops structured codes/IDs.
+    Recognize only explicit, leading limit rejections; an unknown 400 must
+    not become a quota diagnosis based on words in an echoed request body.
+    """
+    if data.get("outcome") == "aborted":
+        return "interrupted"
+    status = data.get("api_error_status")
+    error = str(data.get("error") or "")[:2000]
+    if error == "KBC_MODEL_CALL_BUDGET_EXCEEDED":
+        return "model_call_budget_exceeded"
+    if status == 400:
+        if re.match(r"^API Error: 400 max_tokens: [0-9]+ exceeds the maximum [0-9]+\b", error):
+            return "model_output_limit_rejected"
+        if re.match(r"^API Error: 400 prompt is too long: [0-9]+ tokens > [0-9]+ maximum\b", error):
+            return "model_context_limit_rejected"
+    return {401: "model_authentication_failed", 403: "model_permission_denied",
+            402: "model_billing_rejected", 429: "model_rate_limited"}.get(status, "model_request_failed")
 
 
 def _observation_metadata(value):
@@ -56,7 +79,7 @@ class ExecutionObserver:
         if kind == "ready" and self.config.get("agent_type"):
             metadata["agent_type"] = self.config["agent_type"]
         if kind == "result" and data.get("outcome") != "completed":
-            metadata["failure_code"] = "interrupted" if data.get("outcome") == "aborted" else "model_request_failed"
+            metadata["failure_code"] = _failure_code(data)
         elif kind == "transport_error":
             metadata["failure_code"] = "worker_transport_failed"
         await self._observer({

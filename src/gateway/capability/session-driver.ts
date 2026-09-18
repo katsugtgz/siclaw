@@ -322,7 +322,7 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
         emit("log", { text: evt.text ?? "" });
         break;
       case "summary":
-        emit("summary", { text: evt.summary ?? "" });
+        emit("summary", { text: evt.summary ?? evt.text ?? "" });
         break;
       case "turn_done":
         // A conversational/compile turn ended. Surface the reply LIVE, then persist
