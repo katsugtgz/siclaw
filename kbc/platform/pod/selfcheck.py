@@ -942,9 +942,12 @@ def _okf_evidence_violations(rel: str, fm: dict, body: str) -> list[dict]:
     the same deterministic shape without interpreting surrounding prose.
     """
     violations: list[dict] = []
+    # Invalid source shapes are reported as okf_sources by the metadata check.
+    # Continue checking evidence without treating malformed values as a list.
+    raw_sources = fm.get("sources")
     declared = {
         source.get("id").strip()
-        for source in fm.get("sources", [])
+        for source in (raw_sources if isinstance(raw_sources, list) else [])
         if isinstance(source, dict)
         and isinstance(source.get("id"), str)
         and source.get("id").strip()

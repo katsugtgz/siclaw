@@ -175,6 +175,29 @@ def test_lookup_output_budget_still_allows_every_result_to_be_retrieved(tmp_path
     assert len(seen) == 46
 
 
+@pytest.mark.parametrize("sources", ["null", "42", "false"])
+async def test_invalid_source_types_keep_navigation_and_write_feedback_usable(tmp_path, sources):
+    workspace(tmp_path)
+    page(tmp_path, "good.md", body="Healthy navigation target")
+    content = f"---\ntype: Topic\ntitle: Broken\nsources: {sources}\n---\nDraft.\n"
+    result = await files(tmp_path).write({"file_path": "candidate/broken.md", "content": content})
+    assert not result.get("isError")
+    assert (tmp_path / "candidate/broken.md").read_text() == content
+    report = json.loads(result["content"][1]["text"])
+    assert report["persisted"] and report["status"] == "needs_attention"
+    assert "okf_sources" in {issue["kind"] for issue in report["issues"]}
+
+    found = candidate_context.lookup(tmp_path, query="Healthy navigation target")
+    assert [row["path"] for row in found["pages"]] == ["candidate/good.md"]
+    assert found["metadata_issue_count"] == 1
+    assert found["metadata_issue_pages"] == ["broken.md"]
+    broken = candidate_context.lookup(tmp_path, query="Draft.")["pages"][0]
+    assert broken["metadata_error"] and broken["sources"] == []
+    handoff = json.loads(candidate_context.handoff(tmp_path, ["a.md"]))
+    assert handoff["same_source_pages"]["total"] == 1
+    assert handoff["same_source_pages"]["metadata_issue_pages"] == ["broken.md"]
+
+
 async def test_compiler_registry_exposes_lookup_and_write_feedback(tmp_path, monkeypatch):
     workspace(tmp_path)
     monkeypatch.setattr(compile_box.pi_config, "for_role", lambda *a, **kw: {})
