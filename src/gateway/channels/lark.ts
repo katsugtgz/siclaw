@@ -743,7 +743,7 @@ const FEEDBACK_TOAST_BY_LOCALE: Record<LarkLocale, { ok: string; fail: string }>
 };
 
 /**
- * Handle answer feedback, silent session resets, and context-mode switches.
+ * Handle answer feedback, session resets, and context-mode switches.
  * Unrecognized card actions return undefined.
  *
  * The return value is the card-callback response Feishu shows as a toast.
@@ -830,7 +830,7 @@ export function handleLarkCardAction(
   return { toast: { type: "success", content: toasts.ok } };
 }
 
-/** Silent, one-way reset scoped to the conversation that produced the card. */
+/** One-way reset with the same bot confirmation as /new. */
 function handleNewSessionAction(
   value: Partial<NewSessionActionValue>,
   data: any,
@@ -841,7 +841,8 @@ function handleNewSessionAction(
 ): void {
   const scope = value.new_session;
   const operator = data?.operator?.open_id;
-  if (!frontendClient || !agentBoxManager || !operator || !value.session_id || !value.card_id || !value.channel_id
+  const messageId: string | undefined = data?.context?.open_message_id;
+  if (!frontendClient || !agentBoxManager || !operator || !messageId || !value.session_id || !value.card_id || !value.channel_id
     || !scope || !["group", "personal"].includes(scope.route) || !scope.routeKey || !scope.bindingId
     || typeof scope.sessionKey !== "string") {
     console.warn(`[lark] Dropping malformed new-session action card=${value.card_id ?? "?"}`);
@@ -870,11 +871,16 @@ function handleNewSessionAction(
     }
     if (!reset.unchanged && (!reset.sessionId || !reset.agentId)) return;
     if (!reset.unchanged && binding.contextMode === "shared") forgetGroupState(action.channel_id, scope.routeKey);
-    // Disable only after persistence. No message, toast, prompt, or undo action.
+    // Disable only after persistence; duplicate/stale clicks never re-announce.
     await disableNewSessionButton(larkClient, action);
     if (!reset.unchanged) {
       console.log(`[lark] New session from card=${value.card_id} old=${value.session_id} new=${reset.sessionId}`);
       await closeResetSession(reset, agentBoxManager, tlsOptions, frontendClient, binding.createdBy ?? undefined);
+      await replyToLark(
+        larkClient, messageId,
+        NEW_SESSION_NOTICE_BY_LOCALE[action.locale === "en-US" ? "en-US" : "zh-CN"],
+        scope.route === "group" && !!scope.conversationKey,
+      );
     }
   });
   if (queued.accepted) {

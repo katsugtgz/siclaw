@@ -373,7 +373,7 @@ describe("feedback buttons", () => {
       expect(col.elements[0].width).toBe("fill");
     }
     const button = row.columns[2].elements[0];
-    expect(button.text.content).toBe(locale === "zh-CN" ? "新会话" : "New session");
+    expect(button.text.content).toBe(locale === "zh-CN" ? "🗨️ 新会话" : "🗨️ New session");
     expect(button.disabled).toBe(false);
     expect(button.behaviors[0].value.kind).toBe("siclaw_new_session");
 

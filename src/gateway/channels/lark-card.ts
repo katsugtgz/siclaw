@@ -218,7 +218,7 @@ function buildFeedbackRow(
     buttons.push({
       tag: "button",
       element_id: "new_session",
-      text: { tag: "plain_text", content: locale === "zh-CN" ? "新会话" : "New session" },
+      text: { tag: "plain_text", content: locale === "zh-CN" ? "🗨️ 新会话" : "🗨️ New session" },
       type: "default",
       width: "fill",
       disabled: newSessionStarted,

@@ -103,8 +103,8 @@ No additional Topic switch is required in the UI. The one-human/one-bot Topic
 path without `@bot` requires the app's group-message event permission.
 
 Final answer cards have three equally sized actions: **Helpful**, **Not helpful**,
-and **New session**. New session silently switches the card's conversation to an
-empty context. It sends no message or toast and does not run the agent. The button
+and **🗨️ New session**. New session switches the card's conversation to an
+empty context and sends the same bot confirmation as `/new`, without a toast or agent run. The button
 becomes disabled after the reset and cannot undo it; feedback remains available.
 In Team mode it starts a new shared group conversation, in Topic mode only that
 Topic, and in Personal mode only that participant's conversation. Repeated clicks

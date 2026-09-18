@@ -1567,11 +1567,12 @@ describe("handleLarkCardAction — 👍/👎 feedback", () => {
   });
 });
 
-describe("handleLarkCardAction — silent new session", () => {
+describe("handleLarkCardAction — new session confirmation", () => {
   const scope = { route: "group", routeKey: "oc_abc123", bindingId: "b", sessionKey: "open_id:ou_user_1" };
   function newAction(overrides = {}) {
     return {
       operator: { open_id: "ou_user_1" },
+      context: { open_message_id: "om-answer-card" },
       action: { tag: "button", value: {
         kind: "siclaw_new_session", session_id: "session-fixed", card_id: "CARD-NEW", channel_id: "lark",
         locale: "zh-CN", card_sequence: 3, new_session: { ...scope, ...overrides },
@@ -1580,7 +1581,7 @@ describe("handleLarkCardAction — silent new session", () => {
   }
   const flush = () => new Promise((resolve) => setImmediate(resolve));
 
-  it.each(["group", "personal"])("silently resets a %s session once, and the next message uses it", async (route) => {
+  it.each(["group", "personal"])("resets a %s session and announces it once, and the next message uses it", async (route) => {
     let current = "session-fixed";
     resolveBindingMock.mockImplementation(async () => makeBinding({ sessionId: current }));
     resolvePersonalBindingMock.mockImplementation(async () => wrapBinding(makeBinding({ sessionId: current })));
@@ -1598,7 +1599,10 @@ describe("handleLarkCardAction — silent new session", () => {
     await flush();
     expect(reset).toHaveBeenCalledTimes(1);
     expect(reset.mock.calls[0].at(-1)).toBe("session-fixed");
-    expect(lark.im.message.reply).not.toHaveBeenCalled();
+    expect(lark.im.message.reply).toHaveBeenCalledExactlyOnceWith({
+      path: { message_id: "om-answer-card" },
+      data: { msg_type: "text", content: JSON.stringify({ text: "✅ 已开启新会话，此入口中的历史上下文已清空。" }) },
+    });
     expect(promptMock).not.toHaveBeenCalled();
     expect(closeSessionMock).toHaveBeenCalledWith("session-fixed");
     const update = lark.cardkit.v1.cardElement.update.mock.calls.at(-1)![0];
@@ -1626,7 +1630,23 @@ describe("handleLarkCardAction — silent new session", () => {
     await flush();
     expect(resetBindingSessionMock).toHaveBeenCalledWith("lark", "oc_abc123", expect.anything(), scoped.sessionKey, "session-fixed");
     expect(resolveBindingMock).toHaveBeenCalledWith("lark", "oc_abc123", expect.anything(), "open_id:ou_user_1", "ou_user_1", scoped.conversationKey, true, "user");
+    expect(lark.im.message.reply).toHaveBeenCalledExactlyOnceWith({
+      path: { message_id: "om-answer-card" },
+      data: {
+        msg_type: "text", content: JSON.stringify({ text: "✅ 已开启新会话，此入口中的历史上下文已清空。" }),
+        ...(scoped.conversationKey ? { reply_in_thread: true } : {}),
+      },
+    });
+  });
+
+  it("does not announce an already-consumed reset returned by the server", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding());
+    resetBindingSessionMock.mockResolvedValue({ success: true, unchanged: true });
+    const lark = makeCardAwareLarkClient();
+    handleLarkCardAction(newAction(), lark, {} as any, makeAgentBoxManager("a1") as any);
+    await flush();
     expect(lark.im.message.reply).not.toHaveBeenCalled();
+    expect(lark.cardkit.v1.cardElement.update).toHaveBeenCalledTimes(1);
   });
 
   it("ignores stale cards and another participant's card", async () => {
