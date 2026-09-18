@@ -356,13 +356,26 @@ describe("finalizeCard", () => {
 // ── 👍/👎 feedback buttons ─────────────────────────────────────
 
 describe("feedback buttons", () => {
+  it("removes New session when rebuilding feedback from a legacy group card", async () => {
+    resetFeedbackEchoForTest();
+    const { client, elementUpdateSpy } = makeLarkClient();
+    await applyFeedbackSelection(client, {
+      card_id: "OLD-GROUP", session_id: "s", channel_id: "c", locale: "zh-CN", card_sequence: 3,
+      new_session: { route: "group", routeKey: "chat", sessionKey: "lark_thread:root", bindingId: "b" } as any,
+    }, "up");
+    const row = JSON.parse(elementUpdateSpy.mock.calls[0][0].data.element);
+    expect(row.columns).toHaveLength(2);
+    expect(row.columns[0].elements[0].type).toBe("primary");
+    expect(row.columns.every((c: any) => !c.elements[0].behaviors[0].value.new_session)).toBe(true);
+  });
+
   it.each(["zh-CN", "en-US"] as const)("renders three equal-width actions and keeps reset disabled after feedback/restart (%s)", async (locale) => {
     resetFeedbackEchoForTest();
     const { client, elementCreateSpy, elementUpdateSpy } = makeLarkClient();
     await finalizeCard(client, { cardId: "CARD-NEW", elementId: "md_main", sequence: 0 }, "Answer", {
       ctx: {
         sessionId: "session-old", channelId: "channel", messageId: "reply",
-        newSession: { route: "group", routeKey: "chat", sessionKey: "lark_thread:root", bindingId: "binding", conversationKey: "lark_thread:root" },
+        newSession: { route: "personal", routeKey: "chat", sessionKey: "open_id:person", bindingId: "binding" },
       }, locale,
     });
     const [row] = JSON.parse(elementCreateSpy.mock.calls[0][0].data.elements);

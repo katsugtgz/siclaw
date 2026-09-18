@@ -730,8 +730,8 @@ const MODE_UNBOUND_NOTICE_BY_LOCALE: Record<LarkLocale, string> = {
   "en-US": "❌ This group isn't bound to an assistant yet, so there's no context mode to set. Pair it first.",
 };
 
-// The unscoped /new command remains disallowed in shared groups. The answer-card
-// action separately supports a one-way reset of the exact session on that card.
+// Shared groups use one session, so /new cannot reset an individual's context.
+// The answer-card New session action is available only in direct chats.
 const SHARED_NEW_REJECTED_NOTICE_BY_LOCALE: Record<LarkLocale, string> = {
   "zh-CN": "团队模式(全群共享上下文)不支持单人重置——一个人 /new 会清空整群的上下文。如需独立对话,请用 /mode 切换为个人模式,或另建一个群。",
   "en-US": "Team mode (shared group context) doesn't support a per-person /new — one reset would wipe the whole group's context. For a private thread, switch to Personal mode with /mode, or start a separate group.",
@@ -830,7 +830,7 @@ export function handleLarkCardAction(
   return { toast: { type: "success", content: toasts.ok } };
 }
 
-/** One-way reset with the same bot confirmation as /new. */
+/** One-way direct-chat reset with the existing /new confirmation. */
 function handleNewSessionAction(
   value: Partial<NewSessionActionValue>,
   data: any,
@@ -840,47 +840,39 @@ function handleNewSessionAction(
   tlsOptions?: { cert: string; key: string; ca: string },
 ): void {
   const scope = value.new_session;
+  // Product scope is direct chat, not the group's similarly named Personal
+  // context mode. Old group cards must also stop performing this action.
+  if (scope?.route !== "personal") return;
   const operator = data?.operator?.open_id;
   const messageId: string | undefined = data?.context?.open_message_id;
   if (!frontendClient || !agentBoxManager || !operator || !messageId || !value.session_id || !value.card_id || !value.channel_id
-    || !scope || !["group", "personal"].includes(scope.route) || !scope.routeKey || !scope.bindingId
-    || typeof scope.sessionKey !== "string") {
+    || !scope.routeKey || !scope.bindingId || typeof scope.sessionKey !== "string" || !scope.sessionKey) {
     console.warn(`[lark] Dropping malformed new-session action card=${value.card_id ?? "?"}`);
     return;
   }
   const action = value as NewSessionActionValue;
   // Use the same lane as incoming messages, so the next message sees the reset.
   const queued = enqueueBindingTask(`${scope.bindingId}:${scope.sessionKey || "__binding__"}`, async () => {
-    const binding = await resolveQueuedBinding(
-      scope.route, action.channel_id, scope.routeKey, operator, frontendClient,
-      scope.sessionKey ? `open_id:${operator}` : "", scope.conversationKey, true, "user",
-    );
-    // A personal/per-user card cannot reset a different participant's session.
-    if (!binding || binding.bindingId !== scope.bindingId
+    const { binding } = await resolvePersonalBinding(action.channel_id, operator, frontendClient, "user");
+    // Re-resolve the clicking user, then require the exact direct-chat scope.
+    if (!binding || binding.routeType !== "user" || binding.bindingId !== scope.bindingId
       || (binding.sessionKey ?? "") !== scope.sessionKey) return;
     if (binding.sessionId !== value.session_id) {
       await disableNewSessionButton(larkClient, action);
       return;
     }
-    const reset = scope.route === "personal"
-      ? await resetPersonalSession(action.channel_id, scope.sessionKey, frontendClient, action.session_id)
-      : await resetBindingSession(action.channel_id, scope.routeKey, frontendClient, scope.sessionKey, action.session_id);
+    const reset = await resetPersonalSession(action.channel_id, scope.sessionKey, frontendClient, action.session_id);
     if (!reset.success) {
       console.warn(`[lark] New-session reset rejected card=${value.card_id}: ${reset.error ?? "unknown"}`);
       return;
     }
     if (!reset.unchanged && (!reset.sessionId || !reset.agentId)) return;
-    if (!reset.unchanged && binding.contextMode === "shared") forgetGroupState(action.channel_id, scope.routeKey);
-    // Disable only after persistence; duplicate/stale clicks never re-announce.
+    // Disable after persistence; old/duplicate clicks never repeat the notice.
     await disableNewSessionButton(larkClient, action);
     if (!reset.unchanged) {
       console.log(`[lark] New session from card=${value.card_id} old=${value.session_id} new=${reset.sessionId}`);
       await closeResetSession(reset, agentBoxManager, tlsOptions, frontendClient, binding.createdBy ?? undefined);
-      await replyToLark(
-        larkClient, messageId,
-        NEW_SESSION_NOTICE_BY_LOCALE[action.locale === "en-US" ? "en-US" : "zh-CN"],
-        scope.route === "group" && !!scope.conversationKey,
-      );
+      await replyToLark(larkClient, messageId, NEW_SESSION_NOTICE_BY_LOCALE[action.locale === "en-US" ? "en-US" : "zh-CN"]);
     }
   });
   if (queued.accepted) {
@@ -1871,8 +1863,7 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
   if (/^\/new$/i.test(text)) {
     // A shared group has ONE group-level session, so a single member's /new
     // would clear everyone's context — keep the command rejected. The card
-    // action uses an expected session ID for shared-group resets. Topic-scoped
-    // groups and personal chats reset the caller's own session as before.
+    // action is direct-chat-only; existing Topic/per-user /new stays separate.
     if (contextMode === "shared" && !conversationKey) {
       await replyToLark(larkClient, messageId, SHARED_NEW_REJECTED_NOTICE_BY_LOCALE[locale], replyInThread);
       return;
@@ -2185,10 +2176,10 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
   const finalCardBody = buildMilestoneCardMarkdown({ milestones: [], finalText: displayBody });
   const feedbackContext: FeedbackContext = {
     sessionId, channelId, messageId: assistantMessageId ?? undefined,
-    newSession: {
+    ...(route === "personal" ? { newSession: {
       route, routeKey: chatId, sessionKey: binding.sessionKey ?? sessionKey,
-      bindingId: binding.bindingId, ...(conversationKey ? { conversationKey } : {}),
-    },
+      bindingId: binding.bindingId,
+    } } : {}),
   };
 
   // Stop any further coalesced milestone renders and let the in-flight one

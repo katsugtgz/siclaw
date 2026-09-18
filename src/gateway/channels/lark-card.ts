@@ -124,11 +124,11 @@ const FEEDBACK_ELEMENT_ID = "fb_row";
 export type FeedbackRating = "up" | "down";
 
 export interface NewSessionContext {
-  route: "group" | "personal";
+  /** Direct chat only; a group's per_user context mode is still a group. */
+  route: "personal";
   routeKey: string;
   sessionKey: string;
   bindingId: string;
-  conversationKey?: string;
 }
 
 export interface FeedbackContext {
@@ -184,14 +184,17 @@ function buildFeedbackRow(
   sequence?: number,
   newSessionStarted = false,
 ): Record<string, unknown> {
+  // Old group cards can send this payload back in feedback callbacks. Never
+  // reintroduce their reset action while rebuilding the answer row.
+  const newSession = ctx.newSession?.route === "personal" ? ctx.newSession : undefined;
   const common: CardActionContext = {
     session_id: ctx.sessionId,
     card_id: cardId,
     channel_id: ctx.channelId,
     ...(ctx.messageId ? { message_id: ctx.messageId } : {}),
     locale,
-    ...(ctx.newSession ? {
-      new_session: ctx.newSession,
+    ...(newSession ? {
+      new_session: newSession,
       card_sequence: sequence,
       new_session_started: newSessionStarted,
       selected_rating: selected,
@@ -214,7 +217,7 @@ function buildFeedbackRow(
     };
   };
   const buttons: Record<string, unknown>[] = [button("up"), button("down")];
-  if (ctx.newSession) {
+  if (newSession) {
     buttons.push({
       tag: "button",
       element_id: "new_session",
@@ -222,7 +225,7 @@ function buildFeedbackRow(
       type: "default",
       width: "fill",
       disabled: newSessionStarted,
-      behaviors: [{ type: "callback", value: { ...common, kind: NEW_SESSION_ACTION_KIND, new_session: ctx.newSession } }],
+      behaviors: [{ type: "callback", value: { ...common, kind: NEW_SESSION_ACTION_KIND, new_session: newSession } }],
     });
   }
   return {

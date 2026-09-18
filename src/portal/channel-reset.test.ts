@@ -17,8 +17,6 @@ describe("card session reset persistence", () => {
   afterEach(closeDb);
 
   it.each([
-    { method: "channel.resetSession", key: "lark_thread:root", old: "topic-old", binding: "binding" },
-    { method: "channel.resetSession", key: "", old: "legacy-old", binding: "binding" },
     { method: "channel.resetPersonalSession", key: "open_id:person", old: "dm-old", binding: "channel" },
   ])("atomically consumes the expected session through $method ($key)", async ({ method, key, old, binding }) => {
     const reset = buildAdapterRpcHandlers().get(method)!;
@@ -38,5 +36,15 @@ describe("card session reset persistence", () => {
     expect(current[0].session_id).toBe(changed[0].sessionId);
     const [other] = await getDb().query("SELECT session_id FROM channel_binding_sessions WHERE id = 'two'");
     expect(other[0].session_id).toBe("other-topic");
+  });
+
+  it.each(["", "lark_thread:root", "open_id:person"])("rejects legacy group card resets for session key %s", async (sessionKey) => {
+    const reset = buildAdapterRpcHandlers().get("channel.resetSession")!;
+    expect(await reset({ channel_id: "channel", route_key: "chat", session_key: sessionKey, expected_session_id: "topic-old" }, "agent"))
+      .toMatchObject({ success: false });
+    const [group] = await getDb().query("SELECT session_id FROM channel_bindings WHERE id = 'binding'");
+    const [topic] = await getDb().query("SELECT session_id FROM channel_binding_sessions WHERE id = 'one'");
+    expect(group[0].session_id).toBe("legacy-old");
+    expect(topic[0].session_id).toBe("topic-old");
   });
 });

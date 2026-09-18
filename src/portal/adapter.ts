@@ -314,7 +314,7 @@ async function resetChannelBindingSession(
   const row = await selectChannelBinding(db, channelId, routeKey);
   if (!row) return { success: false, error: "Binding not found" };
   if (expectedSessionId) {
-    return resetExpectedChannelSession(db, row.id, row.agent_id, sessionKey, expectedSessionId);
+    return { success: false, error: "Card session reset is only available in direct chats" };
   }
 
   const sessionId = crypto.randomUUID();
@@ -1861,9 +1861,9 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
       sendJson(res, 401, { error: "Invalid internal token" });
       return;
     }
-    const body = await parseBody<{ channel_id: string; route_key: string; session_key?: string }>(req);
+    const body = await parseBody<{ channel_id: string; route_key: string; session_key?: string; expected_session_id?: string }>(req);
     const db = getDb();
-    sendJson(res, 200, await resetChannelBindingSession(db, body.channel_id, body.route_key, body.session_key));
+    sendJson(res, 200, await resetChannelBindingSession(db, body.channel_id, body.route_key, body.session_key, body.expected_session_id));
   });
 
   // ================================================================
