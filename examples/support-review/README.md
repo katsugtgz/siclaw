@@ -27,7 +27,18 @@ The result servers are stdio MCPs packaged with AgentBox:
 | Instance | MCP command | Required tool |
 | --- | --- | --- |
 | Support | `mcp-product-support-result` | `submit_product_support_result` |
+| Support (closure summary) | `mcp-ticket-closure-result` | `submit_ticket_closure_result` |
 | Review | `mcp-ticket-review-result` | `submit_ticket_review_result` |
+
+The support instance binds **two** result MCPs because which result is mandatory
+is decided per dispatch, not per instance: an ordinary support turn requires the
+intake result, while a closure request — the customer ended the ticket before
+any human took it over — requires the closure result instead. Its harness
+declares the intake contract, which is what an ordinary `/run` turn resolves;
+the closure caller names the other tool for that one dispatch. The prompt's
+`【结单总结】` branch is the matching half — without it the assistant keeps
+trying to submit the intake result on a closure turn. See
+[ticket-closure-result](../../mcp/ticket-closure-result/README.md).
 
 The Ticket type is configured through the integrated host tenant UI. Its result
 tool is mandatory; the configuration page has no result opt-out checkbox.

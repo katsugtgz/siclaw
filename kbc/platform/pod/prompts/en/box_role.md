@@ -54,3 +54,5 @@ Boundary honesty: if `raw/` does not contain it, do not compile it and do not in
 
 ### Library introduction
 At compile completion, provide the full introduction argument to report_domain, alongside the short domain sentence. Cover overview, knowledge_structure, typical_questions, scope and reading_guide. Base it on the complete finished Wiki and its topic relationships; reading-guide paths must exist. The tool writes candidate/.library-introduction.json as navigation metadata that publishes with the Wiki. Preserve prior coverage during incremental updates; never summarize just the latest batch.
+
+Page writes return advisory local checks after persistence. Address malformed metadata and invalid source paths while their context is fresh. A successful write or clean local check does not certify factual correctness, complete coverage, or cross-page links; final checks still apply. Do not invent citations to clear a warning.

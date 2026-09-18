@@ -54,3 +54,5 @@
 
 ### 库介绍
 编译完成时，调用 report_domain 同时提供简短 domain 和完整 introduction，涵盖 overview、knowledge_structure、typical_questions、scope、reading_guide。依据编完后的整库及主题关系生成，阅读路径必须实际存在。工具将导航信息写入 candidate/.library-introduction.json，并随 Wiki 一起发布。增量更新保留已有覆盖，不要只总结最后一批。
+
+页面写入后会返回已保存状态及局部检查结果。趁当前上下文仍在,修正格式与来源路径问题。写入成功或局部无问题不代表事实正确、全量覆盖或跨页链接合格;终审仍执行。不要为消除提示而编造引用。

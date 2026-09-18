@@ -51,6 +51,8 @@ from pathlib import Path, PurePosixPath
 from aiohttp import web
 
 import batching
+import candidate_context
+import candidate_feedback
 import destream
 import model_access
 import incremental
@@ -89,6 +91,7 @@ TEST_SESSION_IDEMPOTENCY: dict[tuple[str, str], str] = {}
 # recommendation and reference-answer assistance share this guard so two owner
 # actions cannot spend overlapping model calls against the same workspace.
 RECOMMENDATIONS_ACTIVE: set[str] = set()
+_upgrade_active_requests = 0
 DEFAULT_HTTP_MAX_REQUEST_BYTES = 768 * 1024 * 1024
 
 # ── Prompt packs — locale-parameterized model-facing text ────────────────────
@@ -678,6 +681,12 @@ class CompileRun:
         self.event_relay = EventRelay(self.events)
         self.task: asyncio.Task | None = None
         self.done = False
+        self._upgrade_draining = False
+        self._upgrade_ready = False
+        # Cleared before a turn begins; set only after its finalizer has either
+        # finished or registered every background task. Runtime idle alone is
+        # not sufficient while a post-turn self-check is still being scheduled.
+        self._upgrade_idle_ready = True
         # Persistent Pi session (set by run_session). The box is a
         # long-lived conversational + compiling session, not a one-shot query();
         # POST /message injects follow-up user turns into this same session.
@@ -829,6 +838,7 @@ class CompileRun:
     ):
         """Arm the stall watchdog for a new model turn. Called for every turn —
         the owner's /message AND internal self-check/verify/batch injections."""
+        self._upgrade_idle_ready = False
         self._turn_selfcheck_key = selfcheck.state_key(self.workdir)
         if not preserve_page_baseline or not isinstance(self._turn_page_hashes, dict):
             # A previous failed logical turn can remain live in this process.
@@ -1069,6 +1079,7 @@ async def _sync_workspace(
     *,
     commit_input: bool = False,
     durable_barrier: bool = False,
+    force: bool = False,
 ) -> int:
     """Emit a syncArtifacts event for workspace files changed since `sent`
     (path → content sha), plus TOMBSTONES ({path, deleted: true}) for
@@ -1092,7 +1103,7 @@ async def _sync_workspace(
         for art in _collect_workspace_artifacts_for_sync(run):
             collected.add(art["path"])
             sha = hashlib.sha256(art["content"].encode("utf-8")).hexdigest()
-            if sent.get(art["path"]) == sha:
+            if not force and sent.get(art["path"]) == sha:
                 continue
             next_sent[art["path"]] = sha
             changed.append(art)
@@ -1108,7 +1119,7 @@ async def _sync_workspace(
         for path in [p for p in sent if p not in collected]:
             if (wd / path).is_file():
                 continue  # still on disk, just not collectable — keep the row
-            if sent.get(path) != _SYNC_TOMBSTONE:
+            if force or sent.get(path) != _SYNC_TOMBSTONE:
                 next_sent[path] = _SYNC_TOMBSTONE
                 changed.append({"path": path, "deleted": True})
         if changed or commit_input:
@@ -1919,6 +1930,10 @@ def _compile_engine_tools(
             max_results=args.get("max_results"),
         )
 
+    async def candidate_lookup(args):
+        return json.dumps(await asyncio.to_thread(candidate_context.lookup, run.workdir, **args),
+                          ensure_ascii=False)
+
     async def source_read(args):
         return await asyncio.to_thread(
             inspector().read,
@@ -2314,6 +2329,14 @@ def _compile_engine_tools(
             resolve_ticket,
         ),
     ]
+
+    tools.append(EngineTool(
+        "candidate_lookup", ts["candidate_lookup"]["desc"],
+        {"type": "object", "properties": {
+            "sources": {"type": "array", "items": {"type": "string"}, "maxItems": 500},
+            "query": {"type": "string"}, "offset": {"type": "integer"},
+            "limit": {"type": "integer"}, "revision": {"type": "string"},
+        }, "additionalProperties": False}, candidate_lookup))
 
     # The inspector executes in the KBC process against the frozen Raw tree,
     # so Claude and Codex get the same consultation surface even when a writer
@@ -3429,6 +3452,7 @@ async def _emit_message(run: CompileRun, msg, *, step: CompileStep | None = None
             started = _maybe_start_media_verify(run) or _maybe_start_pk(run)
             if not started:
                 await _set_converge_phase(run, "settled")
+        run._upgrade_idle_ready = not run._turn_active
 
 
 async def _normalize_ticket_ledger_after_turn(run, workdir: str) -> None:
@@ -3479,6 +3503,7 @@ DEFAULT_COMPILE_ALLOWED_TOOLS = [
     "mcp__compile__source_inventory",
     "mcp__compile__source_read",
     "mcp__compile__source_search",
+    "mcp__compile__candidate_lookup",
 ]
 
 # Tools removed from a compiler session's context entirely, not merely left
@@ -3541,7 +3566,8 @@ def _compile_session_client(run: "CompileRun", wd: str, system_prompt: str, sess
     """
     allowed = DEFAULT_COMPILE_ALLOWED_TOOLS if run.allowed_tools is None else run.allowed_tools
     guard = _make_compile_path_guard(Path(wd), run.locale, pdf_page_ranges=pdf_page_ranges, raw_scope=raw_scope)
-    tools = FileTools(wd, allowed, guard).tools()
+    tools = FileTools(wd, allowed, guard,
+                      feedback=lambda target: candidate_feedback.check_page(wd, target)).tools()
     # Keep the published tool names and allowlist while using the single
     # KBC-owned handler/schema registry for every compiler phase.
     tools.extend(EngineTool(f"mcp__compile__{tool.name}", tool.description, tool.input_schema, tool.handler)
@@ -4300,6 +4326,22 @@ def semantic_review_raw_scope(plan: dict) -> dict:
 _RELAY_MAX_PAGES = 8
 
 
+def _batch_navigation_context(run: "CompileRun", batch: dict) -> tuple[bool, str]:
+    enabled = (run.allowed_tools is None
+               or "mcp__compile__candidate_lookup" in run.allowed_tools)
+    if not enabled:
+        return False, ""
+    try:
+        return True, "\n\nCandidate navigation:\n" + candidate_context.handoff(
+            run.workdir, batch.get("sources") or [])
+    except Exception as error:
+        # Optional navigation must not turn an otherwise recoverable page into
+        # a failed compile. Retain the full-state instructions and report why.
+        _print_compile_lifecycle("batch.context_unavailable", run,
+                                 extra=f"class={type(error).__name__}")
+        return False, ""
+
+
 def _batch_relay_brief(run: "CompileRun", plan: dict, batch: dict, k: int, n: int,
                        locale: str | None = None) -> str:
     """The hand-off a fresh batch session would otherwise have to guess.
@@ -4378,7 +4420,7 @@ def _batch_relay_brief(run: "CompileRun", plan: dict, batch: dict, k: int, n: in
 
 def _compose_batch_directive(batch: dict, k: int, n: int, notes: str,
                              locale: str | None = None,
-                             relay: str = "") -> str:
+                             relay: str = "", focused_context: bool = False) -> str:
     source_ranges = batch.get("source_ranges", {})
     source_page_ranges = batch.get("source_page_ranges", {})
     listing_lines: list[str] = []
@@ -4486,10 +4528,19 @@ def _compose_batch_directive(batch: dict, k: int, n: int, notes: str,
         return (
             f"[Batch compile · batch {k}/{n} · {batch['id']}] Compile ONLY the sources below "
             f"(see the batching discipline in the system prompt):\n{listing}\n"
+            + ("First read authoring/BRIEF.json and authoring/INTENT.md, then use the revision-bound "
+               "handoff below for global navigation and same-source pages. Use candidate_lookup to "
+               "page through ALL same-source matches (sources filter), discover other topics by literal "
+               "search (query), or browse all pages (no filters). Continue with next_offset and revision; "
+               "restart on restart_required. Read relevant pages in full; read index.md whenever the "
+               "outline is insufficient. Recommendations never limit your field of view. "
+               "The complete compilation state remains available for recovery and inspection. "
+               if focused_context else
             "First read authoring/BRIEF.json, authoring/INTENT.md, authoring/COMPILATION_STATE.json and "
             "candidate/index.md to inherit the complete task, Raw inventory, completed-batch ownership, "
-            "and current Wiki shape; the entire frozen Raw snapshot and Candidate tree remain readable/searchable. "
-            "in voice and structure; then read every source in this batch closely and fold its content fully "
+            "and current Wiki shape; ")
+            + "The entire frozen Raw snapshot and Candidate tree remain readable/searchable. "
+            "Then read every source in this batch closely and fold its content fully "
             "into candidate/ pages (create new pages or merge into existing ones; each page's frontmatter "
             "sources[].resource must list the sources it was actually compiled from); update the matching "
             "candidate/index.md entries; contradictions as usual — best-guess + ⚠️ uncertain + file a ticket, "
@@ -4501,8 +4552,14 @@ def _compose_batch_directive(batch: dict, k: int, n: int, notes: str,
         )
     return (
         f"【分批编译 · 批 {k}/{n} · {batch['id']}】只编译下列源(见系统提示的分批纪律):\n{listing}\n"
+        + ("先读 authoring/BRIEF.json、authoring/INTENT.md,再用下方带版本的交接信息了解全局导航与同源已有页。"
+           "用 candidate_lookup 的 sources 过滤分页查全同源页,用 query 做全文字面搜索,不加过滤可浏览全库;"
+           "携带 next_offset 和 revision 翻页,restart_required 时从头查。精读相关页,概览不足时主动读 index.md。"
+           "推荐页不是视野边界;完整编译状态仍可读取,用于恢复与核对。"
+           if focused_context else
         "先读 authoring/BRIEF.json、authoring/INTENT.md、authoring/COMPILATION_STATE.json 和 candidate/index.md,"
-        "继承完整任务、Raw 总清单、已完成批次归属和当前 Wiki 结构;冻结 Raw 全量与 Candidate 全树始终可读可搜索;"
+        "继承完整任务、Raw 总清单、已完成批次归属和当前 Wiki 结构;")
+        + "冻结 Raw 全量与 Candidate 全树始终可读可搜索;"
         "然后精读本批每个源,按定调把内容完整编入 candidate/ 页(可新建页或并入既有页,页 frontmatter 的 "
         "sources[].resource 必须列出实际编自的源);更新 candidate/index.md 的相应条目;矛盾照常 best-guess+⚠️存疑+落工单,绝不停。"
         "清单是你的**交付责任面**,不是你的视野边界:需要交叉印证时(某个附件被谁引用、邻近文档同一件事怎么表述、"
@@ -5039,11 +5096,13 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
                     else _unaccounted_batch_sources(run, batch.get("sources") or [])
                 )
                 raw_scope = _batch_raw_scope(batch, bounded)
+                focused_context, handoff = _batch_navigation_context(run, batch)
                 directive = _compose_batch_directive(
                     batch, k, n, _drain_batch_notes(run),
                     locale=getattr(run, "locale", None),
                     relay=_batch_relay_brief(run, plan, batch, k, n,
-                                             locale=getattr(run, "locale", None)),
+                                             locale=getattr(run, "locale", None)) + handoff,
+                    focused_context=focused_context,
                 )
                 reply = await _drive_batch_session(
                     run, directive, _loc(run, f"batch {k}/{n}", f"批 {k}/{n}"),
@@ -5423,6 +5482,7 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
     # the draft is stable (settled), same authoritative signal as the seam.
     if not _maybe_start_pk(run):
         await _set_converge_phase(run, "settled")
+    run._upgrade_idle_ready = not run._turn_active
 
 
 def _note_model_activity(run: CompileRun, msg) -> None:
@@ -5588,6 +5648,7 @@ async def _consume_turn_stream(
                 await run.emit({"type": "error", "code": "model_request_failed", "error": note,
                                 "message": "model_request_failed", "recoverable": True})
                 await run.emit({"type": "turn_done", "text": note})
+                run._upgrade_idle_ready = True
                 if stop_on_result:
                     return
                 continue
@@ -7565,7 +7626,91 @@ async def handle_events(request: web.Request):
 
 async def handle_health(request: web.Request):
     return web.json_response({"status": "ok", "runs": len(RUNS), "test_sessions": len(TEST_SESSIONS),
-                              "engine": _engine_kind()})
+                              "engine": _engine_kind(),
+                              "upgrade_ready_run": next((run.run_id for run in RUNS.values() if run._upgrade_ready), None)})
+
+
+@web.middleware
+async def _upgrade_admission(request, handler):
+    """Fence HTTP work while an at-rest workspace is handed to a new image.
+
+    ACK and credential responses must still reach the event relay. Track the
+    complete request, including body parsing and test/recommendation startup.
+    A capability box is single-use; shared local boxes conservatively defer.
+    """
+    global _upgrade_active_requests
+    control = request.path.startswith(("/events/ack/", "/artifacts/ack/", "/model-credentials/", "/prepare-upgrade/"))
+    if request.method != "POST" or control:
+        return await handler(request)
+    if any(getattr(run, "_upgrade_draining", False) for run in RUNS.values()):
+        return web.json_response({"error": "compiler image upgrade is in progress"}, status=409)
+    _upgrade_active_requests += 1
+    try:
+        return await handler(request)
+    finally:
+        _upgrade_active_requests -= 1
+
+
+async def handle_prepare_upgrade(request: web.Request):
+    run_id = request.match_info["run_id"]
+    reply = {"version": 1, "run_id": run_id}
+    body = await request.json()
+    persist_workspace = body.get("persist_workspace", True) if isinstance(body, dict) else None
+    if not isinstance(persist_workspace, bool):
+        return web.json_response({"error": "persist_workspace must be boolean"}, status=400)
+    run = RUNS.get(run_id)
+    if run is None:
+        return web.json_response({**reply, "state": "unavailable"})
+    if run._upgrade_ready:
+        return web.json_response({**reply, "state": "ready"})
+    pending = lambda task: task is not None and not task.done()
+    busy = (len(RUNS) != 1 or _upgrade_active_requests != 0 or run._upgrade_draining
+            or not run.connected.is_set() or not run._upgrade_idle_ready
+            or run._turn_active or run._batch_active or run._active_step is not None
+            or pending(run._media_task) or pending(run._pk_task)
+            or run._l1_repair_pending or run_id in RECOMMENDATIONS_ACTIVE
+            or any(t.parent_run_id == run_id and not t.done for t in TEST_SESSIONS.values()))
+    if busy or _step_teardown_failed(run):
+        return web.json_response({**reply, "state": "busy"})
+    if persist_workspace and (not run._artifact_ack_required or getattr(run, "_sync_sent", None) is None):
+        return web.json_response({**reply, "state": "unsupported"})
+    # No await separates the busy check from the fence. All new admissions are
+    # now rejected, and all internal producers have already reached their seam.
+    run._upgrade_draining = True
+    try:
+        if not persist_workspace:
+            # Only Runtime's consumer-approved terminal-operation path uses
+            # this. Its attempt is already fenced against further writes.
+            run._upgrade_ready = True
+            return web.json_response({**reply, "state": "ready"})
+        mediaverify.save_transcripts(run.workdir, mediaverify.load_transcripts(run.workdir))
+        if _blocked_provenance_paths(run):
+            raise ValueError("workspace provenance is not sealed")
+        collected = {a["path"] for a in _collect_workspace_artifacts_for_sync(run)}
+        for top in WORKSPACE_SYNC_DIRS:
+            for path in (Path(run.workdir) / top).rglob("*"):
+                rel = path.relative_to(run.workdir).as_posix()
+                # The aggregate has just been migrated into independently
+                # syncable shards; every other file must survive this handoff.
+                if path.is_file() and rel != mediaverify.TRANSCRIPTS_PATH and rel not in collected:
+                    raise ValueError("workspace contains an unsyncable artifact")
+        await asyncio.wait_for(_sync_workspace(
+            run, run._sync_sent, durable_barrier=True, force=True), timeout=25)
+        run._upgrade_ready = True
+        _print_compile_lifecycle("image_upgrade.ready", run)
+        return web.json_response({**reply, "state": "ready"})
+    except asyncio.CancelledError:
+        # The flush coroutine has stopped before admissions reopen. A queued
+        # snapshot can still be ACKed, ahead of any later events in the relay.
+        run._upgrade_draining = False
+        run._upgrade_ready = False
+        raise
+    except Exception as error:
+        run._upgrade_draining = False
+        run._upgrade_ready = False
+        _print_compile_lifecycle("image_upgrade.deferred", run,
+                                 extra=f"exception_class={type(error).__name__}")
+        return web.json_response({**reply, "state": "unavailable", "reason": "checkpoint_unavailable"}, status=503)
 
 
 def _install_wiki_snapshot(bundle: bytes, dest: Path, expected_sha256: str | None = None) -> tuple[str, int]:
@@ -8004,7 +8149,7 @@ async def _client_certificate_middleware(request: web.Request, handler):
 def build_app() -> web.Application:
     app = web.Application(
         client_max_size=_http_max_request_bytes(),
-        middlewares=[_client_certificate_middleware],
+        middlewares=[_client_certificate_middleware, _upgrade_admission],
     )
     app.on_startup.append(destream.start)
     app.on_startup.append(model_access.start)
@@ -8034,6 +8179,7 @@ def build_app() -> web.Application:
         web.get("/test-sessions", handle_list_test_sessions),
         web.post("/test-session/{tid}/close", handle_close_test),
         web.get("/health", handle_health),
+        web.post("/prepare-upgrade/{run_id}", handle_prepare_upgrade),
     ])
     return app
 

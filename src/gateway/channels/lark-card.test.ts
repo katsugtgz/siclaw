@@ -6,6 +6,7 @@ import {
   finalizeCard,
   buildMilestoneCardMarkdown,
   applyFeedbackSelection,
+  disableNewSessionButton,
   resetFeedbackEchoForTest,
   FEEDBACK_ACTION_KIND,
   DEFAULT_PLACEHOLDER,
@@ -355,6 +356,60 @@ describe("finalizeCard", () => {
 // ── 👍/👎 feedback buttons ─────────────────────────────────────
 
 describe("feedback buttons", () => {
+  it("removes New session when rebuilding feedback from a legacy group card", async () => {
+    resetFeedbackEchoForTest();
+    const { client, elementUpdateSpy } = makeLarkClient();
+    await applyFeedbackSelection(client, {
+      card_id: "OLD-GROUP", session_id: "s", channel_id: "c", locale: "zh-CN", card_sequence: 3,
+      new_session: { route: "group", routeKey: "chat", sessionKey: "lark_thread:root", bindingId: "b" } as any,
+    }, "up");
+    const row = JSON.parse(elementUpdateSpy.mock.calls[0][0].data.element);
+    expect(row.columns).toHaveLength(2);
+    expect(row.columns[0].elements[0].type).toBe("primary");
+    expect(row.columns.every((c: any) => !c.elements[0].behaviors[0].value.new_session)).toBe(true);
+  });
+
+  it.each(["zh-CN", "en-US"] as const)("renders three equal-width actions and keeps reset disabled after feedback/restart (%s)", async (locale) => {
+    resetFeedbackEchoForTest();
+    const { client, elementCreateSpy, elementUpdateSpy } = makeLarkClient();
+    await finalizeCard(client, { cardId: "CARD-NEW", elementId: "md_main", sequence: 0 }, "Answer", {
+      ctx: {
+        sessionId: "session-old", channelId: "channel", messageId: "reply",
+        newSession: { route: "personal", routeKey: "chat", sessionKey: "open_id:person", bindingId: "binding" },
+      }, locale,
+    });
+    const [row] = JSON.parse(elementCreateSpy.mock.calls[0][0].data.elements);
+    expect(row.flex_mode).toBe("none");
+    expect(row.columns).toHaveLength(3);
+    for (const col of row.columns) {
+      expect(col).toMatchObject({ width: "weighted", weight: 1 });
+      expect(col.elements[0].width).toBe("fill");
+    }
+    const button = row.columns[2].elements[0];
+    expect(button.text.content).toBe(locale === "zh-CN" ? "🗨️ 新会话" : "🗨️ New session");
+    expect(button.disabled).toBe(false);
+    expect(button.behaviors[0].value.kind).toBe("siclaw_new_session");
+
+    // Even a gateway restart before the first click must support disabling.
+    resetFeedbackEchoForTest();
+    expect(await disableNewSessionButton(client, button.behaviors[0].value)).toBe(true);
+    const disabledRow = JSON.parse(elementUpdateSpy.mock.calls.at(-1)![0].data.element);
+    expect(disabledRow.columns[2].elements[0].disabled).toBe(true);
+    expect(elementUpdateSpy.mock.calls.at(-1)![0].data.sequence).toBe(4);
+
+    // An in-flight vote from the old card must not undo the reset.
+    await applyFeedbackSelection(client, row.columns[0].elements[0].behaviors[0].value, "up");
+    expect(JSON.parse(elementUpdateSpy.mock.calls.at(-1)![0].data.element).columns[2].elements[0].disabled).toBe(true);
+
+    const votedRow = JSON.parse(elementUpdateSpy.mock.calls.at(-1)![0].data.element);
+    resetFeedbackEchoForTest();
+    await applyFeedbackSelection(client, votedRow.columns[1].elements[0].behaviors[0].value, "down");
+    const afterRestart = JSON.parse(elementUpdateSpy.mock.calls.at(-1)![0].data.element);
+    expect(afterRestart.columns[2].elements[0].disabled).toBe(true);
+    expect(afterRestart.columns[1].elements[0].type).toBe("primary");
+    expect(elementUpdateSpy.mock.calls.at(-1)![0].data.sequence).toBe(6);
+  });
+
   it("finalizeCard with feedback appends a self-contained button row after the content", async () => {
     resetFeedbackEchoForTest();
     const { client, contentSpy, settingsSpy, elementCreateSpy } = makeLarkClient();

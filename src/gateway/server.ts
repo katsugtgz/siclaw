@@ -36,12 +36,13 @@ import { getBoxProfile } from "./agentbox/box-profile.js";
 import { buildSpawnEnv } from "./agentbox/spawn-env.js";
 import { recoverCapabilityUsage } from "./capability/model-usage.js";
 import { CapabilityRunManager } from "./capability/run-manager.js";
+import { CapabilityImageUpgrade, type ImageUpgradeAdmission } from "./capability/image-upgrade.js";
 import { acquireCapabilityBox } from "./capability/box-acquire.js";
 import { CAPABILITY_OBSERVE_CONTAINER } from "./capability/contract.js";
 import { driveCapabilitySession } from "./capability/session-driver.js";
 import { asFailureToken } from "./capability/failure.js";
 import { driveTestSession, shouldRelayTestSession } from "./capability/test-relay.js";
-import { CAPABILITY_GET_RUN, CAPABILITY_FETCH_INPUT, isTerminalCapabilityStatus } from "./capability/contract.js";
+import { CAPABILITY_GET_RUN, CAPABILITY_FETCH_INPUT, INPUT_REF_UPGRADE_ADMISSION, isTerminalCapabilityStatus } from "./capability/contract.js";
 import type {
   CapabilityCancelRequest,
   CapabilityCancelResponse,
@@ -1295,7 +1296,8 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
   // capability wire (capability.event / persistArtifact / fetchInput) with the
   // manager owning lifecycle. This is the ONLY KB box control plane — the legacy
   // compile.* path was deleted in B4; authoring-chat runs entirely on capability.*.
-  const capabilityRunManager = new CapabilityRunManager(frontendClient, {
+  const capabilityRunManager: CapabilityRunManager = new CapabilityRunManager(frontendClient, {
+    onIdle: (rec) => capabilityImageUpgrade.check(rec),
     // A reaped run must not leave its box behind: stop the pod before the run's
     // terminal mark, so the store and the cluster agree. Local escape-hatch boxes
     // aren't managed by the spawner — stop() is a no-op/404 there, hence catch.
@@ -1314,6 +1316,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // next message respawns them (with workspace rehydration); we don't
     // resurrect pods for possibly-abandoned runs.
     onAdopt: (rec) => {
+      if (rec.imageUpgradePending !== undefined) return;
       void (async () => {
         try {
           const alive = await agentBoxManager.getAsync(rec.runId, rec.profile);
@@ -1345,6 +1348,9 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     instruction: string | undefined,
     opts: { replayWorkspace?: boolean } = {},
   ) => {
+    if (capabilityRunManager.get(runId)?.imageUpgradePending !== undefined) {
+      throw new RpcResponseError({ code: ErrorCodes.CONFLICT, message: "compiler image upgrade is in progress; retry after recovery", retriable: true, status: 409 });
+    }
     // An empty profile would silently resolve to the all-tools default agent
     // profile (getBoxProfile("") → AGENT) — the wrong shape AND a trust
     // escalation. Runs minted via capability.start always carry one; refuse
@@ -1418,6 +1424,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         }
         driveCapabilitySession({ client, runId, frontendClient, manager: capabilityRunManager, replayWorkspace })
           .catch(async (err) => {
+            if (capabilityImageUpgrade.ownsRetirement(runId)) return;
             capabilityRelayFailuresTotal.inc();
             console.error(`[capability] session relay failed run=${runId}:`, err);
             const exceptionClass = err instanceof Error
@@ -1455,6 +1462,41 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     }
     return pending;
   };
+
+  const capabilityImageUpgrade: CapabilityImageUpgrade = new CapabilityImageUpgrade({
+    current: (runId) => capabilityRunManager.get(runId),
+    outdated: async (rec) => {
+      if (localCapabilityBoxEndpoint) return false;
+      if (await agentBoxManager.hasOutdatedImage(rec.runId, rec.profile)) return true;
+      // Recover a prepared handoff even when Runtime restarted or its desired
+      // image was rolled back. A fenced box must not remain frozen forever.
+      const session = capabilitySessions.get(rec.runId);
+      if (!session) return false;
+      const { client } = await session;
+      const health = await client.getJson<{ upgrade_ready_run?: string }>("/health");
+      return health.upgrade_ready_run === rec.runId;
+    },
+    admission: (rec) => frontendClient.request(CAPABILITY_FETCH_INPUT, {
+      run_id: rec.runId, ref: INPUT_REF_UPGRADE_ADMISSION,
+    }) as Promise<ImageUpgradeAdmission>,
+    prepare: async (rec, continuation) => {
+      // Never create a box just to retire it. Adoption first reconnects its
+      // existing relay, which must carry the checkpoint ACK for this handshake.
+      const session = capabilitySessions.get(rec.runId);
+      if (!session) return { version: 1, run_id: rec.runId, state: "unavailable" };
+      const { client } = await session;
+      return client.postJson<{ version: number; run_id: string; state: string }>(`/prepare-upgrade/${rec.runId}`, { persist_workspace: continuation }, 35_000);
+    },
+    checkpoint: (rec, continuation) => capabilityRunManager.checkpointImageUpgrade(rec.runId, continuation),
+    stop: (rec) => agentBoxManager.stop(rec.runId, rec.profile),
+    complete: async (rec, continuation) => {
+      console.log(`[capability] image upgrade retired run=${rec.runId} continuation=${continuation}`);
+      rec.closeReason = "image_upgrade";
+      await capabilityRunManager.endRun(rec.runId, continuation ? "failed" : "done", continuation ? {
+        code: "runtime_failure", stage: "image_upgrade", message: "runtime_failure:image_upgrade",
+      } : undefined);
+    },
+  });
 
   // Recover AFTER ensureCapabilitySession exists — onAdopt re-attaches through it.
   let retryContainerEvidence: (() => void) | undefined;
