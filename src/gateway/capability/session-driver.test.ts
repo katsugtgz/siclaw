@@ -95,6 +95,43 @@ describe("driveCapabilitySession — box event → capability wire mapping", () 
     expect(fe.request.mock.calls.some(([, p]: any[]) => p?.status === "failed")).toBe(false);
   });
 
+  it("saves a failed compiler checkpoint before terminalizing and never revives it on turn_done", async () => {
+    const fe = fakeFrontend();
+    const manager = new CapabilityRunManager(fe);
+    const { runId } = await manager.startRun({ profile: "kb-compile", orgId: "org", correlationId: "attempt" });
+    let releaseSave!: () => void;
+    const save = new Promise<void>((resolve) => { releaseSave = resolve; });
+    let startedSave!: () => void;
+    const saving = new Promise<void>((resolve) => { startedSave = resolve; });
+    fe.request.mockImplementation(async (method: string) => {
+      if (method === CAPABILITY_PERSIST_ARTIFACTS) {
+        startedSave();
+        await save;
+      }
+      return { ok: true };
+    });
+    const client = reliableClient(fakeClient([
+      { type: "summary", text: "Compilation stopped; saving its work." },
+      { type: "syncArtifacts", sync_id: "final-save", artifacts: [{ path: "candidate/page.md", content: "saved work" }] },
+      { type: "error", code: "model_result_error", stage: "model_turn", message: "model_result_error" },
+      { type: "turn_done", text: "Saved work is available for recovery." },
+      { type: "end" },
+    ]));
+    const driving = driveCapabilitySession({ client, runId, frontendClient: fe, manager });
+    await saving;
+    expect(manager.get(runId)?.status).not.toBe("failed");
+    expect(client.postJson.mock.calls.some(([path]: any[]) => path.includes("/artifacts/ack/"))).toBe(false);
+    expect(emits(fe)).toContainEqual({ run_id: runId, type: "summary", payload: { text: "Compilation stopped; saving its work." } });
+    releaseSave();
+    await driving;
+    expect(client.postJson).toHaveBeenCalledWith(`/artifacts/ack/${runId}`, { sync_id: "final-save" }, 10_000);
+    const states = fe.request.mock.calls.filter(([method]: any[]) => method === CAPABILITY_PERSIST_RUN_STATE).map(([, p]: any[]) => p);
+    const failureIndex = states.findIndex((p: any) => p.status === "failed");
+    expect(failureIndex).toBeGreaterThanOrEqual(0);
+    expect(states[failureIndex].checkpoint.failure.code).toBe("model_result_error");
+    expect(states.slice(failureIndex).every((p: any) => p.status === "failed")).toBe(true);
+  });
+
   it("requests workspace replay only when re-attaching to a live box", async () => {
     const paths: string[] = [];
     const client = {

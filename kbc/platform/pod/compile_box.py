@@ -514,11 +514,10 @@ class ModelStallError(Exception):
 
 
 class ModelResultError(Exception):
-    """An internal compile session ended with an SDK error result.
+    """An authoring turn ended with an SDK error result.
 
-    Ordinary conversational turns keep their existing never-block behavior,
-    but a batch session must fail closed: otherwise an authentication or model
-    execution failure can be mistaken for a successful no-op and stamped done.
+    Ordinary conversational turns remain retryable, but compiler operations
+    must fail closed instead of retaining a write slot or stamping a no-op done.
     """
 
 
@@ -790,6 +789,7 @@ class CompileRun:
         # from query() until its real ResultMessage; the watchdog only judges an
         # active turn, and only against model latency (see _MODEL_* above).
         self._turn_active = False
+        self._turn_authoring_action = ""
         self._tool_pending = False          # last assistant msg asked for a tool
         self._last_model_activity = 0.0     # monotonic ts of the last inbound SDK msg / query
         self._last_directive = ""           # the in-flight turn's text, for retry
@@ -835,10 +835,12 @@ class CompileRun:
         *,
         grandfather_legacy_format: bool = False,
         preserve_page_baseline: bool = False,
+        authoring_action: str = "",
     ):
         """Arm the stall watchdog for a new model turn. Called for every turn —
         the owner's /message AND internal self-check/verify/batch injections."""
         self._upgrade_idle_ready = False
+        self._turn_authoring_action = authoring_action
         self._turn_selfcheck_key = selfcheck.state_key(self.workdir)
         if not preserve_page_baseline or not isinstance(self._turn_page_hashes, dict):
             # A previous failed logical turn can remain live in this process.
@@ -883,7 +885,7 @@ class CompileRun:
         if self._active_step is not None:
             raise RuntimeError("an internal compile step owns execution")
         if self.client:
-            self._begin_turn(text)
+            self._begin_turn(text, authoring_action=self._turn_authoring_action)
             await self.client.query(text)
 
 
@@ -1080,6 +1082,7 @@ async def _sync_workspace(
     commit_input: bool = False,
     durable_barrier: bool = False,
     force: bool = False,
+    retain_until_ack: bool = False,
 ) -> int:
     """Emit a syncArtifacts event for workspace files changed since `sent`
     (path → content sha), plus TOMBSTONES ({path, deleted: true}) for
@@ -1140,15 +1143,21 @@ async def _sync_workspace(
                     "checkpoint.await_ack", run,
                     extra=f"sync={sync_id} artifacts={len(changed)} commit={str(commit_input).lower()}",
                 )
-                try:
-                    await asyncio.wait_for(
-                        asyncio.shield(ack), timeout=ARTIFACT_ACK_TIMEOUT_SECS)
-                except asyncio.TimeoutError as error:
-                    _print_compile_lifecycle(
-                        "checkpoint.ack_timeout", run, extra=f"sync={sync_id}")
-                    raise TimeoutError(
-                        f"consumer did not acknowledge artifact checkpoint {sync_id}"
-                    ) from error
+                while True:
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(ack), timeout=ARTIFACT_ACK_TIMEOUT_SECS)
+                        break
+                    except asyncio.TimeoutError as error:
+                        _print_compile_lifecycle(
+                            "checkpoint.ack_timeout", run, extra=f"sync={sync_id}")
+                        if retain_until_ack:
+                            # The relay retains/replays this exact snapshot.
+                            # Do not enqueue another full copy per timeout.
+                            continue
+                        raise TimeoutError(
+                            f"consumer did not acknowledge artifact checkpoint {sync_id}"
+                        ) from error
                 _print_compile_lifecycle(
                     "checkpoint.acked", run,
                     extra=f"sync={sync_id} artifacts={len(changed)} commit={str(commit_input).lower()}",
@@ -3726,7 +3735,7 @@ async def _start_domain_refresh(run: "CompileRun", text: str = "") -> None:
             "领域描述：通读完整目录后调用一次 report_domain。",
         ),
     })
-    run._begin_turn(directive)
+    run._begin_turn(directive, authoring_action="compile.refresh_domain")
     await run.client.query(directive)
 
 
@@ -3807,7 +3816,7 @@ async def _start_incremental(run: "CompileRun", text: str, *, strict: bool = Fal
         # incremental and the model must not self-restrict to an old scope.
         (Path(run.workdir) / incremental.CHANGESET_PATH).unlink(missing_ok=True)
         run._full_compile_pending = True
-        run._begin_turn(text)
+        run._begin_turn(text, authoring_action="compile.full")
         try:
             await run.client.query(text)
         except BaseException:
@@ -3837,7 +3846,7 @@ async def _start_incremental(run: "CompileRun", text: str, *, strict: bool = Fal
                      f"Incremental recompile: {len(cs['affected_pages'])} page(s) affected — touching only those, everything else stays untouched.",
                      f"增量重编:{len(cs['affected_pages'])} 页受影响,只改这些,其余不动。")})
     directive = incremental.build_scoped_directive(cs, locale=getattr(run, "locale", None))
-    run._begin_turn(directive)  # arm the stall watchdog — same as every other kickoff
+    run._begin_turn(directive, authoring_action="compile.incremental")
     try:
         await run.client.query(directive)
     except BaseException:
@@ -5583,11 +5592,10 @@ async def _consume_turn_stream(
             is_error = bool(message_field(msg, "is_error", False))
             # A spend cap, before the rate-limit branch it would otherwise fall
             # past: backing off 5 times over 30s cannot clear a billing refusal.
-            # Gated on fail_on_error_result so this changes NOTHING outside the
-            # batch orchestrator — a live session keeps ending the turn and
-            # staying up, because whether to try again under a spend cap is the
-            # account holder's call (the limit can be raised at any moment) and
-            # a box that kills itself has taken that decision away.
+            # Internal workers fail immediately. An outer authoring turn first
+            # reconciles and saves its edits below, then reports the same typed
+            # refusal so the consumer suspends automatic retries. Ordinary
+            # owner conversations remain available for another turn.
             if is_error and status == _MODEL_QUOTA_STATUS and fail_on_error_result:
                 run._turn_active = False
                 text.clear()
@@ -5627,20 +5635,23 @@ async def _consume_turn_stream(
                 subtype = str(message_field(msg, "subtype", "unknown") or "unknown")[:80]
                 if fail_on_error_result:
                     raise ModelResultError(f"model result failed (subtype={subtype}, api_status={status})")
-                # The failed turn can already have edited files. Reconcile its
-                # scope now, without scheduling another model call or committing
-                # full-generation provenance. An unrelated owner turn must never
-                # inherit this operation's restoration snapshot.
-                try:
-                    await _post_turn_selfcheck(run, allow_repair=False)
-                finally:
-                    run._incr_pending = None
-                    run._full_compile_pending = False
-                    run._l1_repair_pending = False
-                    run._turn_page_hashes = None
-                    run._turn_format_guard = None
-                    run._turn_selfcheck_key = None
-                    run.apply_dispatch_nonce = ""
+                # Session reusability is not operation liveness. Capture the
+                # actual turn, not the run's retained command-generation pin:
+                # an unrelated owner conversation must remain retryable.
+                authoring_failed = bool(
+                    getattr(run, "_turn_authoring_action", "")
+                    or run._incr_pending is not None
+                    or run._full_compile_pending
+                    or run._l1_repair_pending
+                )
+                if authoring_failed:
+                    # The wrapper first disconnects the model and quiesces all
+                    # background writers, then reconciles and saves the turn.
+                    if status == _MODEL_QUOTA_STATUS:
+                        raise ModelQuotaExhausted("model provider refused on billing")
+                    raise ModelResultError(
+                        f"model result failed (subtype={subtype}, api_status={status})")
+                await _reconcile_failed_turn(run)
                 if getattr(run, "_sync_sent", None) is not None:
                     await _sync_workspace(run, run._sync_sent)
                 note = _loc(run, "The model request failed; this session remains available for retry.",
@@ -5906,10 +5917,70 @@ async def run_session(run: CompileRun):
         await client.disconnect()
 
 
+async def _reconcile_failed_turn(run: CompileRun) -> None:
+    """Restore scoped edits without another model call or baseline commit."""
+    try:
+        await _post_turn_selfcheck(run, allow_repair=False)
+    finally:
+        run._incr_pending = None
+        run._full_compile_pending = False
+        run._l1_repair_pending = False
+        run._turn_page_hashes = None
+        run._turn_format_guard = None
+        run._turn_selfcheck_key = None
+        run.apply_dispatch_nonce = ""
+
+
+async def _cancel_verification_tasks(run: CompileRun) -> None:
+    """Quiesce background writers before a failed operation's final snapshot."""
+    for name in ("_media_task", "_pk_task"):
+        task = getattr(run, name, None)
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as error:
+                _print_compile_lifecycle("verification.teardown_failed", run,
+                                         extra=f"exception_class={type(error).__name__}")
+
+
+async def _checkpoint_failed_workspace(run: CompileRun, sent: dict) -> None:
+    """Keep the failed workspace live until its complete checkpoint is saved.
+
+    Force includes files a previous periodic enqueue already put in `sent`.
+    ACK-capable runtimes confirm the consumer transaction before we retire;
+    older runtimes serialize artifact persistence ahead of terminal events.
+    No source-baseline commit or successful-verification claim is made here.
+    """
+    warned = False
+    while True:
+        try:
+            # A copied or freshly checked report can still carry `settled`.
+            # Saving a failed turn must not promote it as a successful mutation.
+            report = selfcheck.read_selfcheck(run.workdir)
+            if report is not None and "converge_phase" in report:
+                report.pop("converge_phase")
+                selfcheck.write_selfcheck(run.workdir, report)
+            await _sync_workspace(run, sent, force=True, durable_barrier=True, retain_until_ack=True)
+            return
+        except Exception as error:
+            _print_compile_lifecycle("checkpoint.retry", run,
+                                     extra=f"exception_class={type(error).__name__}")
+            if not warned:
+                await run.emit({"type": "summary", "text": _loc(run,
+                    "Compilation stopped; saving its work failed. Retaining the workspace and retrying the save.",
+                    "编译已停止，但成果保存失败。正在保留工作区并重试保存。")})
+                warned = True
+            await asyncio.sleep(5)
+
+
 @_observe_pi_sessions
 async def _run_wrapper(run: CompileRun):
     """Unified lifecycle: run the driver + periodically sync mid-flight state →
-    catch-all error → always finish with end. A CLEAN driver exit (max_turns
+    catch-all error → save its workspace → finish with end. Failed runs retain
+    their workspace while checkpoint persistence is unavailable. A CLEAN driver exit (max_turns
     exhaustion, subprocess EOF) additionally emits an explicit `done` before
     `end`: the session can never take another turn, and a bare `end` left the
     runtime guessing — the run lingered idle, 409'd every /message, and was
@@ -5921,6 +5992,8 @@ async def _run_wrapper(run: CompileRun):
     # unchanged candidate/index.md and impersonate a completed compile.
     sent: dict = _workspace_sync_cursor(run.workdir)
     clean = False
+    failure_event = None
+    failed_turn = False
     run._sync_sent = sent  # shared with _emit_message's pre-turn_done sync
     syncer = asyncio.create_task(_sync_loop(run, sent))
     watchdog = asyncio.create_task(_model_stall_watchdog(run))
@@ -5932,8 +6005,8 @@ async def _run_wrapper(run: CompileRun):
         cls = type(e).__name__
         error_event = _error_event(
             repr(e),
-            code="unhandled",
-            stage="run",
+            code=_batch_error_code(e) if isinstance(e, (ModelResultError, ModelQuotaExhausted)) else "unhandled",
+            stage="model_turn" if isinstance(e, (ModelResultError, ModelQuotaExhausted)) else "run",
             exception_class=cls,
             last_sdk_message=getattr(run, "_last_sdk_message_type", None),
         )
@@ -5951,17 +6024,10 @@ async def _run_wrapper(run: CompileRun):
             error_event["code"] = diag.get("code") or "model_turn_stalled"
             error_event["stage"] = diag.get("stage") or "model_turn"
             error_event["message"] = f"{error_event['code']}:{cls}"
-        await run.emit(error_event)
-        if getattr(run, "_turn_active", False):
-            # never-block symmetry (review fix): a consumer gating on turn_done
-            # must not hang because the driver died mid-turn (stall-fatal etc.).
-            run._turn_active = False
-            try:
-                await run.emit({"type": "turn_done", "text": _loc(run,
-                    "The turn failed before completing — send the message again to retry.",
-                    "本轮在完成前失败——重新发送消息即可重试。")})
-            except Exception:
-                pass
+        failure_event = error_event
+        failed_turn = bool(run._turn_active or run._turn_authoring_action
+                           or isinstance(e, (ModelResultError, ModelQuotaExhausted)))
+        run._turn_active = False
     finally:
         syncer.cancel()
         watchdog.cancel()
@@ -5973,26 +6039,42 @@ async def _run_wrapper(run: CompileRun):
         # Detached verify tasks die with the run (audit finding): a media/PK
         # pass mid-flight on a run that just ended kept burning model calls
         # for minutes, then no-op'd its repair injection into a dead session.
-        for _name in ("_media_task", "_pk_task"):
-            _bg = getattr(run, _name, None)
-            if _bg is not None and not _bg.done():
-                _bg.cancel()
+        await _cancel_verification_tasks(run)
+        if failure_event is not None:
+            if (run._turn_authoring_action or run._incr_pending is not None
+                    or run._full_compile_pending or run._l1_repair_pending):
                 try:
-                    await _bg
-                except BaseException:
-                    pass  # cancellation/teardown errors must not mask the run's outcome
-        # Final sync so the last writes are durable even if no tick caught them —
-        # especially on the crash path where no bundle was submitted.
-        try:
-            await _sync_workspace(run, sent)
-        except Exception as e:
-            clean = False
-            await run.emit(_error_event(
-                f"final workspace sync failed: {e!r}",
-                code="workspace_sync_failed",
-                stage="persist",
-                exception_class=type(e).__name__,
-            ))
+                    await _reconcile_failed_turn(run)
+                except Exception as error:
+                    failure_event = _error_event(
+                        f"failed turn reconciliation failed: {error!r}",
+                        code="workspace_reconcile_failed", stage="persist",
+                        exception_class=type(error).__name__,
+                    )
+            # A terminal event can retire this box and release the author's
+            # write slot. It must follow the full, quiescent workspace save.
+            await run.emit({"type": "summary", "text": _loc(run,
+                "Compilation stopped; saving its work before recovery.",
+                "编译已停止，正在保存成果以便恢复。")})
+            await _checkpoint_failed_workspace(run, sent)
+            await run.emit(failure_event)
+            if failed_turn:
+                await run.emit({"type": "turn_done", "text": _loc(run,
+                    "Compilation stopped. Its saved work is available for recovery.",
+                    "编译已停止，成果已保存，可用于恢复。")})
+        else:
+            # Final sync so the last writes are durable even if no tick caught them —
+            # especially on the crash path where no bundle was submitted.
+            try:
+                await _sync_workspace(run, sent)
+            except Exception as e:
+                clean = False
+                await run.emit(_error_event(
+                    f"final workspace sync failed: {e!r}",
+                    code="workspace_sync_failed",
+                    stage="persist",
+                    exception_class=type(e).__name__,
+                ))
         if clean:
             await run.emit({"type": "done"})
         await run.emit({"type": "end"})
@@ -7456,6 +7538,7 @@ async def _dispatch_authoring_turn(
         # legacy pages into a whole-library format migration. Explicit compile,
         # incremental, repair, verify, and batch turns remain strict.
         grandfather_legacy_format=not full_compile,
+        authoring_action=action or ("compile.full" if full_compile else ""),
     )  # arm the stall watchdog — every model turn, incl. the owner's
     try:
         await run.client.query(text)
