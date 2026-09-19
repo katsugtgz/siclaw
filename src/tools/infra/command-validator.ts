@@ -525,6 +525,67 @@ export function getContextCommands(context: ExecContext): ReadonlySet<string> {
  * Returns an error message string if blocked, or null if allowed.
  */
 
+const SHELL_CONSTRUCT_HINT =
+  "Shell loops, conditionals and command substitution are not available — every command is "
+  + "checked against the allow-list, and a construct that builds commands at runtime cannot be. "
+  + "Semicolon-separated commands ARE supported, so expand the loop yourself: "
+  + "`cmd pod-a; cmd pod-b; cmd pod-c`. For a list you do not know in advance, read it with one "
+  + "call first, then issue the expanded commands.";
+
+/**
+ * What to run INSTEAD of a binary excluded on purpose (security.md §4.5).
+ *
+ * Same reasoning as `sensitivePathHint`: a refusal naming no alternative gets retried with a
+ * different spelling and refused again. A refused `awk` is typically 3-5 parallel calls, and the
+ * traces show all of them retried.
+ *
+ * Two rules these were written under, both learned from the traces they came from:
+ *
+ *   - The advice is per USE, not per command, because the uses have different answers. The four
+ *     real awk calls behind this text are three different tasks — selecting columns, bounding a
+ *     log window, and summing a stream — and only the first has an equivalent.
+ *   - Where there is no equivalent, it SAYS SO. Naming a near-substitute that behaves differently
+ *     is worse than refusing: `cut` on `kubectl get` output looks like it works and silently reads
+ *     the wrong column, because that output is space-padded and the field index moves with the
+ *     widest value. The agent would then carry a wrong answer forward as evidence.
+ */
+const BINARY_HINTS: Record<string, string> = {
+  awk:
+    "awk is excluded on purpose — system(), `cmd | getline` and `print > file` make it an "
+    + "execution and file-write primitive, not a text filter. What it is normally used for here, "
+    + "and what to use instead:\n"
+    + "• Selecting columns from `kubectl get`: ask the SERVER for them — "
+    + "`-o custom-columns=NAME:.metadata.name,STATUS:.status.phase`, or `-o jsonpath=...`. Do NOT "
+    + "substitute `cut` there: that output is space-PADDED, so the field index moves with the "
+    + "widest value in the column.\n"
+    + "• Bounding a log window on the UPPER side: `kubectl logs` has no `--until`, and there is no "
+    + "equivalent here. Narrow `--since-time` and read the tail instead, or use a log-query tool if "
+    + "this agent has one — those take both ends.\n"
+    + "• Arithmetic over a stream (sums, averages, histograms): not available — no awk, no bc, no "
+    + "datamash. Extract the values (`grep -o ... | cut -d= -f2`) and compute from the output "
+    + "yourself; if there are too many values to read, narrow the window first.",
+  sed:
+    "sed is excluded on purpose — `-i` writes in place, `r`/`w` read and write files, and `e` "
+    + "executes. For its read-only uses: filter lines with `grep`, take a line range with "
+    + "`head`/`tail` (`sed -n '10,20p'` is `head -20 | tail -11`), drop a header with `tail -n +2`, "
+    + "and translate or squeeze characters with `tr`. In-place editing has no substitute here, "
+    + "which is the point.",
+};
+
+/**
+ * `allowed` carries ~130 command names, and JSON.stringify's 2-space indent puts each on its own
+ * line — roughly a thousand tokens of every refusal, repeated once per rejected command in a batch.
+ * The list itself earns its place: it is the only thing telling the agent what IS available. Its
+ * SHAPE does not, so it is rendered on one line while staying a JSON array, which is what the
+ * callers and the tests parse.
+ */
+const ALLOWED_PLACEHOLDER = "\u0000allowed\u0000";
+
+function renderRefusal(body: Record<string, unknown>, allowed: string[]): string {
+  return JSON.stringify(body, null, 2)
+    .replace(JSON.stringify(ALLOWED_PLACEHOLDER), JSON.stringify(allowed));
+}
+
 /**
  * What to do INSTEAD, per kind of secret. A refusal that names no alternative gets retried with a
  * different command and refused again — which is the loop this exists to break.
@@ -666,19 +727,22 @@ export function validateCommand(command: string, options?: ValidateCommandOption
                               "function", "select", "time", "coproc"]);
     const keywords = names.filter((n) => KEYWORDS.has(n));
     const binaries = names.filter((n) => !KEYWORDS.has(n));
-    return JSON.stringify({
+
+    // Both kinds can be rejected by one command (`for … awk … done` is a real trace), so the
+    // guidance is concatenated rather than chosen: the keyword hint explains the model, the
+    // per-binary hints answer "then what do I run".
+    const hints = [
+      ...(keywords.length > 0 ? [SHELL_CONSTRUCT_HINT] : []),
+      ...binaries.map((b) => BINARY_HINTS[b]).filter((h): h is string => h !== undefined),
+    ];
+
+    return renderRefusal({
       error: `Blocked: disallowed command(s) — "${names.join(", ")}" is not in the allowed command list`,
-      ...(keywords.length > 0 && {
-        shell_constructs_rejected: keywords,
-        hint: "Shell loops, conditionals and command substitution are not available — every command is "
-          + "checked against the allow-list, and a construct that builds commands at runtime cannot be. "
-          + "Semicolon-separated commands ARE supported, so expand the loop yourself: "
-          + "`cmd pod-a; cmd pod-b; cmd pod-c`. For a list you do not know in advance, read it with one "
-          + "call first, then issue the expanded commands.",
-      }),
+      ...(keywords.length > 0 && { shell_constructs_rejected: keywords }),
+      ...(hints.length > 0 && { hint: hints.join("\n\n") }),
       ...(binaries.length > 0 && { binaries_not_allowed: binaries }),
-      allowed: [...contextCmds, ...(options?.extraAllowed ?? [])].sort(),
-    }, null, 2);
+      allowed: ALLOWED_PLACEHOLDER,
+    }, [...contextCmds, ...(options?.extraAllowed ?? [])].sort());
   }
 
   // 3b. A sensitive-output source feeding a pipe: the redactor keys on the source's shape, and a
