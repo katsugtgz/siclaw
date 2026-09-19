@@ -386,6 +386,7 @@ Allowed subcommands: `topo`, `nvlink`
 | `diff` | None | Unrestricted |
 | `md5sum` | None | Unrestricted |
 | `sha256sum` | None | Unrestricted |
+| `sha512sum` | None | Unrestricted |
 
 ---
 
@@ -522,6 +523,7 @@ Also allows: `ctr version`, `ctr info` as standalone commands.
 |---------|-----------|-------------|
 | `date` | `validateDate` | Flags whitelist; blocks set operations |
 | `whoami` | None | Unrestricted |
+| `who` | None | No positional operands (`who <file>` parses that file as utmp and prints the ut_user/ut_host of records whose ut_type matches, making it a partial reader of any file; `who am i` is `whoami`) |
 | `id` | None | Unrestricted |
 | `env` | `validateEnv` | Blocks command execution; only viewing variables |
 | `printenv` | None | Unrestricted |

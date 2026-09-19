@@ -53,6 +53,7 @@ describe("COMMANDS registry", () => {
     "mst", "mlxlink", "perfquery", "ibqueryerrors", "saquery", "ibping",
     "dcgmi", "smartctl", "nvme", "sensors", "getconf",
     "pidstat", "pstree", "numastat", "ipcs", "nstat", "tree", "hexdump", "od", "tac", "nl",
+    "sha512sum", "who",
   ];
   for (const cmd of newCommands) {
     it(`contains "${cmd}"`, () => {
@@ -1254,6 +1255,32 @@ describe("validateCommandRestrictions", () => {
       const err = validateCommandRestrictions("mount -a");
       expect(err).not.toBeNull();
       expect(err).toContain("-a");
+    });
+  });
+
+  describe("sha512sum / who (read-only siblings of already-permitted commands)", () => {
+    it("sha512sum is permitted wherever md5sum and sha256sum are", () => {
+      for (const ctx of ["node", "pod", "host"]) {
+        expect(validateCommand("sha512sum /etc/hosts", { context: ctx })).toBeNull();
+        expect(validateCommand("md5sum /etc/hosts", { context: ctx })).toBeNull();
+      }
+    });
+
+    it("sha512sum stays out of local, like the rest of the file category", () => {
+      // AgentBox's own filesystem has the dedicated read/ls tools instead.
+      expect(validateCommand("sha512sum /etc/hosts", { context: "local" })).not.toBeNull();
+    });
+
+    it("who reads the system's own utmp, and may not be pointed at a file", () => {
+      expect(validateCommand("who", { context: "host" })).toBeNull();
+      expect(validateCommand("who -b", { context: "node" })).toBeNull();
+      // `who <file>` parses THAT file as utmp and prints the ut_user/ut_host of
+      // every record whose ut_type happens to parse as USER_PROCESS — an operand
+      // turns it into a partial reader of any file, so operands are blocked.
+      expect(validateCommand("who /etc/shadow", { context: "host" })).not.toBeNull();
+      expect(validateCommand("who /var/log/wtmp", { context: "host" })).not.toBeNull();
+      // `who am i` is the one operand form worth having, and it is `whoami`.
+      expect(validateCommand("whoami", { context: "host" })).toBeNull();
     });
   });
 

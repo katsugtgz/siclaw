@@ -2017,6 +2017,7 @@ export const COMMANDS: Record<string, CommandDef> = {
   diff:      { category: "file" },
   md5sum:    { category: "file" },
   sha256sum: { category: "file" },
+  sha512sum: { category: "file" },
   tree:      { category: "file", allowedFlags: TREE_FLAGS }, // default-deny: -o (write output to file) rejected; positional dirs are read targets
 
   // ── system logs & services ──
@@ -2087,6 +2088,15 @@ export const COMMANDS: Record<string, CommandDef> = {
   date:   { category: "general", validate: validateDate },
   whoami: { category: "general" },
   id:     { category: "general" },
+  // Reads utmp — who is logged in, and with -b the boot time. Sibling of the two
+  // above, which answer the same question about the calling process instead.
+  //
+  // No operands: `who <file>` reads THAT file as utmp and prints the ut_user /
+  // ut_host fields of every record whose ut_type parses as USER_PROCESS, so an
+  // arbitrary file becomes a handful of strings lifted out of it at the offsets
+  // where the byte happens to match. The one operand form worth having is
+  // `who am i`, and that is `whoami`, which is already permitted.
+  who:    { category: "general", positionals: "block" },
   which:  { category: "general" },
 
   // ── general-env — category blocked in local context ──
