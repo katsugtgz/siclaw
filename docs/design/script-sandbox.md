@@ -534,12 +534,14 @@ namespace. It gets no production RBAC from this chart addition. Private images
 must be preloaded on execution nodes in this version; imagePullSecrets are not
 supplied by script requests.
 
-Whether Agents actually receive `run_script`, and which runner image is used, is
-per-Runtime state in the control plane, read through `config.getRuntimeConfig`.
-One Runtime serves one region, so opening a region, closing it, or repointing
-its runner image is an operational action rather than a redeploy. A Runtime
-polls this on a short TTL: a change takes effect on the next session build, with
-no pod recycle.
+Whether Agents actually receive `run_script` is per-Runtime state in the control
+plane, read through `config.getRuntimeConfig`. One Runtime serves one region, so
+opening or closing a region is an operational action rather than a redeploy. A
+Runtime polls this on a short TTL: a change takes effect on the next session
+build, with no pod recycle.
+
+The switch is all the control plane owns. The runner IMAGE belongs to the
+release — see below — and a control plane that still sends one is ignored.
 
 The split exists because the two answers have different owners and different
 failure modes. Provisioned-but-closed is the safe resting state. Opened without
@@ -550,12 +552,23 @@ also stays closed; one that loses a control plane which had already opened it
 keeps serving, because dropping a working feature mid-turn is the worse of the
 two failures.
 
-`scriptSandbox.image` is only a fallback for a Runtime whose region carries no
-image in the control plane. Left empty it derives
-`{image.registry}/siclaw-script-sandbox:{image.tag}`, so the runner is pulled
-from the same registry as the Runtime that pulls it — copying a values file to
-another region cannot leave it pointing at the source region's registry. The
-runner is an opt-in build: `WITH_SCRIPT_SANDBOX=true make docker push`.
+The runner image is release-coupled, exactly like AgentBox: leave
+`scriptSandbox.image` empty and the chart derives
+`{image.registry}/siclaw-script-sandbox:{image.tag}`. A Runtime therefore runs
+the runner it shipped with, an upgrade moves both together, and the runner is
+pulled from the same registry as the Runtime that pulls it — copying a values
+file to another region cannot leave it pointing at the source region's
+registry. `make docker push` builds and pushes it with every release, so every
+deployable tag has a runner behind it.
+
+Set `scriptSandbox.image` only to override that: a private registry that mirrors
+under another name, or a runner hot-fixed between releases.
+
+This is deliberately NOT control-plane state. It was, briefly: the console
+carried a per-Runtime image and refused to open the switch without one. That
+made the image survive upgrades — a Runtime moved to a new release kept
+launching whatever runner someone had typed into a console months earlier, and
+nothing anywhere said so.
 
 The execution namespace defaults to `<release-namespace>-execution`. The
 release namespace is the only identifier that is both always present and
@@ -588,9 +601,9 @@ enablement environment variables. There is no fallback to running arbitrary
 code on the developer host. Helm
 fields map to `SICLAW_SCRIPT_SANDBOX_*` environment variables; MCP policy and
 host pins are JSON files selected by `MCP_POLICY_FILE` and `HOST_KEYS_FILE`.
-Deployment-side changes (provider, isolation, limits, policy files) still
-require a Runtime restart; warmed profiles are replaced. The control plane's
-switch and runner image do not — they are re-read per session build.
+Deployment-side changes (provider, isolation, limits, policy files, and the
+runner image) still require a Runtime restart; warmed profiles are replaced. The
+control plane's switch does not — it is re-read per session build.
 
 Example tool request:
 

@@ -92,6 +92,23 @@ would let a stale file silently disagree with the console.
 {{- end }}
 
 {{/*
+Script sandbox runner image. Release-coupled, same registry/tag as the gateway —
+exactly like agentbox: `make docker` builds siclaw-script-sandbox with every
+release, so upgrading a Runtime moves its sandbox onto the matching runner and
+nobody has to copy an image reference anywhere.
+scriptSandbox.image overrides the whole string: a private registry that mirrors
+under different names, or hot-fixing the runner between releases.
+*/}}
+{{- define "siclaw.scriptSandboxImage" -}}
+{{- $sandbox := .Values.scriptSandbox | default dict -}}
+{{- if $sandbox.image -}}
+{{- $sandbox.image -}}
+{{- else -}}
+{{- include "siclaw.image" (dict "component" "script-sandbox" "ctx" .) -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 Execution namespace for runner Pods. Derived from the RELEASE NAMESPACE, which
 is the only identifier that is both always present and already unique per
 Runtime: two Runtimes in one cluster cannot share a namespace (their Deployments

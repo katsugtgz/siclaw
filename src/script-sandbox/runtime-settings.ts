@@ -1,12 +1,16 @@
 import { ScriptSandboxError } from "./types.js";
 
-/** Per-Runtime sandbox settings owned by the control plane, not by the deployment.
- * The chart provisions the execution namespace, RBAC and quota; whether the
- * feature is OPEN, and which runner image it uses, is an operational decision
- * that must be changeable per region without a redeploy. */
+/** The per-Runtime sandbox switch, owned by the control plane rather than by the
+ * deployment: whether a region gets run_script is an operational decision that
+ * must be changeable without a redeploy. The chart provisions the execution
+ * namespace, RBAC and quota, and ships the runner image with the release.
+ *
+ * The switch is ALL the control plane owns. It used to send a runner image too;
+ * that made an upgraded Runtime keep launching a runner someone had typed into a
+ * console months earlier, so the image moved back to the chart. A control plane
+ * that still sends one is simply ignored. */
 export interface RuntimeSandboxSettings {
   enabled: boolean;
-  image?: string;
 }
 
 export interface RuntimeSettingsSource {
@@ -15,15 +19,6 @@ export interface RuntimeSettingsSource {
 
 const CLOSED: RuntimeSandboxSettings = { enabled: false };
 
-/** An image reference the runner Job can actually be built with. The control
- * plane is trusted, but a typo here surfaces as an unschedulable Job minutes
- * later, so reject it at the boundary instead. */
-function readImage(value: unknown): string | undefined {
-  if (typeof value !== "string") return undefined;
-  const image = value.trim();
-  return image && !/\s/.test(image) ? image : undefined;
-}
-
 export function parseRuntimeSandboxSettings(payload: unknown): RuntimeSandboxSettings {
   if (!payload || typeof payload !== "object") throw new ScriptSandboxError("Invalid runtime sandbox settings");
   const sandbox = (payload as Record<string, unknown>).script_sandbox;
@@ -31,9 +26,11 @@ export function parseRuntimeSandboxSettings(payload: unknown): RuntimeSandboxSet
   // "not configured", which is CLOSED — never "inherit whatever the pod has".
   if (sandbox === undefined || sandbox === null) return CLOSED;
   if (typeof sandbox !== "object") throw new ScriptSandboxError("Invalid runtime sandbox settings");
-  const { enabled, image } = sandbox as Record<string, unknown>;
+  // Only `enabled` is read. An older control plane also sends `image`; ignoring
+  // it is the point — the runner comes from this Runtime's own release.
+  const { enabled } = sandbox as Record<string, unknown>;
   if (enabled !== undefined && typeof enabled !== "boolean") throw new ScriptSandboxError("Invalid runtime sandbox switch");
-  return { enabled: enabled === true, image: readImage(image) };
+  return { enabled: enabled === true };
 }
 
 /** Caches the control plane's answer and keeps serving it while the control
@@ -89,14 +86,8 @@ export class ScriptSandboxRuntimeSettings {
       // switch in the console has no observable effect on this side at all:
       // the runner Pods are created per run, so a Runtime that silently
       // disagrees with the console looks identical to one that agrees.
-      if (!previous || previous.enabled !== settings.enabled || previous.image !== settings.image) {
-        // An open switch with no image is a state the console refuses to save, so
-        // seeing it means something wrote the row directly — say so rather than
-        // implying a fallback exists, because none does any more.
-        console.info(`[script-sandbox] control plane says ${settings.enabled ? "OPEN" : "CLOSED"}` +
-          (settings.image ? `, runner image ${settings.image}`
-            : settings.enabled ? ", but no runner image is set — staying closed"
-            : ", no runner image set"));
+      if (!previous || previous.enabled !== settings.enabled) {
+        console.info(`[script-sandbox] control plane says ${settings.enabled ? "OPEN" : "CLOSED"}`);
       }
     } catch (error) {
       // Back off for one TTL either way: a control plane that is down must not
