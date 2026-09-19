@@ -12,6 +12,7 @@ import {
   getToolResultArtifactReference,
   isToolResultArtifactPath,
   withToolResultArtifactCapture,
+  diagnoseNoMatch,
 } from "./tool-result-artifact.js";
 
 describe("ToolResultArtifactStore", () => {
@@ -224,6 +225,42 @@ describe("tool-result artifact tools", () => {
     }
   });
 
+  it("puts the no-match reading in front of the model, not just in the return type", async () => {
+    // The diagnosis only counts if it reaches the tool's rendered text — that is the whole
+    // surface the model sees. Asserting the internal shape alone would pass with the field
+    // never rendered.
+    const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), "siclaw-tool-result-nomatch-"));
+    try {
+      const store = new ToolResultArtifactStore({
+        rootDir,
+        getScope: () => ({ agentId: "agent", sessionId: "session" }),
+      });
+      const captured = await store.capture({
+        text: JSON.stringify({ entries: [{ user: "yhli", action: "delete" }] }),
+        toolCallId: "call", toolName: "mcp__x__y",
+      });
+      if (!("reference" in captured)) throw new Error("capture failed");
+      const [, searchTool] = createToolResultArtifactTools(store);
+
+      // The literal an agent actually tried, from a trace: the words are all there, the
+      // spelling is not, because the artifact stores them escaped.
+      // Both words are stored, but not with a space after the colon — the miss is the spelling.
+      const miss = await searchTool.execute(
+        "search", { artifact_id: captured.reference.id, query: '"user": "yhli"' }, undefined, undefined, undefined);
+      const parsed = JSON.parse((miss.content[0] as any).text as string);
+      expect(parsed.matches).toEqual([]);
+      expect(parsed.no_match.absentParts).toEqual([]);
+      expect(parsed.no_match.reading).toMatch(/SPELLING is what failed/);
+
+      // A hit carries no diagnosis — it would be noise on every successful search.
+      const hit = await searchTool.execute(
+        "search", { artifact_id: captured.reference.id, query: "yhli" }, undefined, undefined, undefined);
+      expect(JSON.parse((hit.content[0] as any).text)).not.toHaveProperty("no_match");
+    } finally {
+      await fs.rm(rootDir, { recursive: true, force: true });
+    }
+  });
+
   it("keeps the serialized search response within the tool output bound", async () => {
     const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), "siclaw-tool-result-search-bound-"));
     try {
@@ -381,5 +418,53 @@ describe("native read through artifact capture", () => {
     const wrapped = withToolResultArtifactCapture(tool, artifacts, 4096);
     await expect(wrapped.execute("denied", { path: "private.txt" }, undefined, undefined, undefined))
       .rejects.toThrow("read denied by path policy");
+  });
+});
+
+
+describe("a search that found nothing says which of the two reasons it was", () => {
+  // An empty `matches` was the whole answer, and it has two causes the caller cannot tell
+  // apart: the text is absent, or it is present in a spelling the literal missed. The traces
+  // show which one the agent assumes — it rewrites the literal. One searches `"user":"yhli"`
+  // then `user=yhli` on the same artifact; the reviews describe runs of 13 and 15 searches.
+
+  it("says the spelling failed when every word IS there", () => {
+    // Note the shape: `{"user":"yhli"}` CONTAINS `"user":"yhli"` literally, so that search hits.
+    // The miss comes from a real difference — here the whitespace after the colon.
+    const text = JSON.stringify({ entries: [{ user: "yhli", action: "delete" }] });
+    const d = diagnoseNoMatch(text, '"user": "yhli"');
+    expect(d.absentParts).toEqual([]);
+    expect(d.presentParts).toEqual(expect.arrayContaining(["user", "yhli"]));
+    expect(d.reading).toMatch(/SPELLING is what failed/);
+    // It must NOT pick a cause: separator, whitespace and escaping are indistinguishable from
+    // out here, and naming the wrong one sends the caller rewriting in the wrong direction.
+    expect(d.reading).toMatch(/Search ONE word on its own/);
+  });
+
+  it("names the absent words, which is what ends the rewriting", () => {
+    const text = JSON.stringify({ entries: [{ user: "yhli" }] });
+    const d = diagnoseNoMatch(text, "user=zzztop");
+    expect(d.presentParts).toContain("user");
+    expect(d.absentParts).toContain("zzztop");
+    // A fact about the ARTIFACT, not the query: no rewriting can find it.
+    expect(d.reading).toMatch(/Absent: zzztop/);
+  });
+
+  it("says so when nothing in the query appears at all", () => {
+    const d = diagnoseNoMatch("kubelet is healthy", "postgres connection pool");
+    expect(d.presentParts).toEqual([]);
+    expect(d.reading).toMatch(/does not carry the subject/);
+  });
+
+  it("reports the content type as a fact without letting it invent a cause", () => {
+    expect(diagnoseNoMatch("plain log line with user yhli", '"user":"yhli"').contentIsJson).toBe(false);
+    expect(diagnoseNoMatch(JSON.stringify({ user: "yhli" }), "nothing-here").contentIsJson).toBe(true);
+  });
+
+  it("handles a punctuation-only query without pretending to have checked parts", () => {
+    const d = diagnoseNoMatch("{}", "=>");
+    expect(d.presentParts).toEqual([]);
+    expect(d.absentParts).toEqual([]);
+    expect(d.reading).toMatch(/punctuation only/);
   });
 });

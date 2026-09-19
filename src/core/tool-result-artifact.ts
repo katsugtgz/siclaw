@@ -102,6 +102,69 @@ export interface ToolResultArtifactSearchResult {
   query: string;
   matches: ToolResultArtifactSearchMatch[];
   truncated: boolean;
+  /** Only on a zero-hit search — see diagnoseNoMatch. */
+  noMatch?: ToolResultArtifactNoMatch;
+}
+
+export interface ToolResultArtifactNoMatch {
+  /** Words from the query that ARE present on their own. */
+  presentParts: string[];
+  /** Words from the query that appear nowhere in the artifact. */
+  absentParts: string[];
+  /** Whether the stored text parses as JSON, where a literal's quotes are escaped. */
+  contentIsJson: boolean;
+  /** What the combination of the above means, and what to do next. */
+  reading: string;
+}
+
+/**
+ * Why a search found nothing.
+ *
+ * An empty `matches` was the entire answer, and it has two completely different causes that the
+ * caller cannot tell apart: the text is genuinely absent, or it is there in a spelling the literal
+ * did not match. The traces show which one the agent assumes — it keeps rewriting the literal.
+ * One shows `"user":"yhli"` followed by `user=yhli` on the same artifact, and the reviews describe
+ * runs of 13 and 15 searches on two or three artifacts.
+ *
+ * The split is decidable and costs nothing: the text is already in memory, so each word of the
+ * query is checked on its own. All present ⇒ the words are there and the SPELLING is what failed.
+ * Some absent ⇒ those words are nowhere, and no further rewriting of the literal will help —
+ * naming them is what stops the loop, because it is a fact about the artifact rather than about
+ * the query.
+ *
+ * What it does NOT do is name the spelling difference. The first draft asserted "the quotes are
+ * escaped" for a JSON artifact and a test refuted it at once: `{"user":"yhli"}` contains
+ * `"user":"yhli"` literally, so that search HITS. The differences that actually bite are
+ * whitespace (`"user": "yhli"` against `"user":"yhli"`), a separator (`=` against `:`), and
+ * escaping only where a payload is nested as a string — one cause cannot be picked from the
+ * outside, and picking wrong sends the caller off rewriting in the wrong direction. So it reports
+ * what is DECIDABLE (which words are present) and what to do next, and leaves the cause open.
+ */
+export function diagnoseNoMatch(text: string, query: string): ToolResultArtifactNoMatch {
+  const haystack = text.toLocaleLowerCase();
+  const contentIsJson = (() => {
+    const head = text.trimStart()[0];
+    if (head !== "{" && head !== "[") return false;
+    try { JSON.parse(text); return true; } catch { return false; }
+  })();
+
+  // Split on everything that is not part of a word: the punctuation IS what usually differs
+  // between the query and the stored spelling (`"user":"yhli"` vs `user=yhli`).
+  const parts = [...new Set(query.toLocaleLowerCase().split(/[^\p{L}\p{N}_.-]+/u).filter((w) => w.length > 1))];
+  const presentParts = parts.filter((w) => haystack.includes(w));
+  const absentParts = parts.filter((w) => !haystack.includes(w));
+
+  let reading: string;
+  if (parts.length === 0) {
+    reading = "The query is punctuation only, so there is nothing to check a part at a time. Read around an offset instead.";
+  } else if (absentParts.length === 0) {
+    reading = "Every word of the query is in the artifact, so the exact SPELLING is what failed — the separator, the whitespace around it, or escaping where a payload is nested as a string. Search ONE word on its own, then tool_result_read around the offset it reports; that shows the spelling actually stored, which no amount of guessing at the literal will.";
+  } else if (presentParts.length === 0) {
+    reading = "None of the query's words appear anywhere in the artifact. This is a fact about the ARTIFACT, not the query — rewriting the literal will not help; this artifact does not carry the subject.";
+  } else {
+    reading = `Present: ${presentParts.join(", ")}. Absent: ${absentParts.join(", ")}. The absent words are nowhere in the artifact, so no rewriting of the literal will find them — search on a present word instead.`;
+  }
+  return { presentParts, absentParts, contentIsJson, reading };
 }
 
 function safeInteger(value: unknown, fallback: number, min: number, max: number): number {
@@ -137,6 +200,7 @@ function formatSearchToolOutput(search: ToolResultArtifactSearchResult): string 
     truncated: search.truncated,
     size_chars: search.reference.sizeChars,
     sha256: search.reference.sha256,
+    ...(search.noMatch ? { no_match: search.noMatch } : {}),
   };
   let rendered = JSON.stringify(payload, null, 2);
   while (rendered.length > MAX_READ_CHARS && payload.matches.length > 0) {
@@ -372,6 +436,8 @@ export class ToolResultArtifactStore {
       query: needle,
       matches,
       truncated: foundMore,
+      // The text is already loaded, so the diagnosis is free — and it is only ever needed here.
+      ...(matches.length === 0 ? { noMatch: diagnoseNoMatch(text, needle) } : {}),
     };
   }
 
