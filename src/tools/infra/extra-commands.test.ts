@@ -1,10 +1,12 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   parseExtraCommandsConfig,
   loadExtraCommands,
+  DEFAULT_EXTRA_COMMANDS_PATH,
 } from "./extra-commands.js";
 import {
   setExtraCommands,
@@ -263,5 +265,63 @@ describe("loadExtraCommands", () => {
   it("throws on an invalid file even at the default path", () => {
     const p = make(JSON.stringify({ version: 1, commands: { curl2: { category: "bogus" } } }));
     expect(() => loadExtraCommands({ defaultPath: p })).toThrow(/category/);
+  });
+});
+
+// ── The file that actually ships in the image ───────────────────────
+
+// The file that carries THIS deployment's internal commands into the image. It is
+// a four-link chain and every link is silent when it breaks: Dockerfile.agentbox
+// COPYs it to the loader's default path, agent-factory loads it once at startup,
+// the merged registry reaches all three exec tools. A wrong path is not an error —
+// loadExtraCommands treats an absent default path as a no-op, so the commands just
+// quietly stop being whitelisted. Each link is asserted here rather than reviewed.
+describe("docker/extra-commands.json (internal commands shipped in the image)", () => {
+  const repoRoot = new URL("../../../", import.meta.url);
+  const shipped = fileURLToPath(new URL("docker/extra-commands.json", repoRoot));
+
+  it("passes schema validation — a typo here is a broken image, not a rejected command", () => {
+    expect(() => loadExtraCommands({ envPath: shipped })).not.toThrow();
+  });
+
+  it("is COPYed to the path the loader actually reads", () => {
+    const dockerfile = readFileSync(fileURLToPath(new URL("Dockerfile.agentbox", repoRoot)), "utf8");
+    const copy = dockerfile.match(/^COPY\s+docker\/extra-commands\.json\s+(\S+)\s*$/m);
+    expect(copy, "Dockerfile.agentbox must COPY docker/extra-commands.json").not.toBeNull();
+    expect(copy![1]).toBe(DEFAULT_EXTRA_COMMANDS_PATH);
+  });
+
+  it("registers every declared command into the node/host exec contexts", () => {
+    const loaded = loadExtraCommands({ envPath: shipped }) ?? {};
+    expect(Object.keys(loaded).length).toBeGreaterThan(0);
+    setExtraCommands(loaded);
+    for (const name of Object.keys(loaded)) {
+      expect(getContextAllowedSet("node").has(name)).toBe(true);
+      expect(getContextAllowedSet("host").has(name)).toBe(true);
+    }
+  });
+
+  it("sichek admits the read-only components and refuses the rest", () => {
+    setExtraCommands(loadExtraCommands({ envPath: shipped }) ?? {});
+    for (const sub of ["all", "gpu", "g", "infiniband", "i", "gpfs", "f", "lldp", "l"]) {
+      expect(validateCommand(`sichek ${sub}`, { context: "node" })).toBeNull();
+    }
+    // Everything whose position-0 subcommand is not on the list: the daemon, the
+    // exporter, config sync, and the perf tests that put load on a live node.
+    for (const sub of ["daemon", "exporter", "config", "ibtest", "rocetest", "nccltest"]) {
+      expect(validateCommand(`sichek ${sub}`, { context: "node" })).not.toBeNull();
+    }
+  });
+
+  it("mmlscluster reads GPFS config by absolute path, with no operands", () => {
+    setExtraCommands(loadExtraCommands({ envPath: shipped }) ?? {});
+    // Nothing puts it on PATH — the agent calls it where GPFS installs it.
+    expect(validateCommand("/usr/lpp/mmfs/bin/mmlscluster --noinit", { context: "host" })).toBeNull();
+    expect(validateCommand("mmlscluster --ces", { context: "node" })).toBeNull();
+    // positionals: "block" — it takes none, so an operand is a typo or an injection.
+    expect(validateCommand("mmlscluster /etc/shadow", { context: "host" })).not.toBeNull();
+    // Its writer siblings are separate binaries and none of them is whitelisted.
+    expect(validateCommand("mmchcluster -p node1", { context: "host" })).not.toBeNull();
+    expect(validateCommand("mmshutdown -a", { context: "host" })).not.toBeNull();
   });
 });

@@ -12,6 +12,7 @@ import {
   getToolResultArtifactReference,
   isToolResultArtifactPath,
   withToolResultArtifactCapture,
+  diagnoseNoMatch,
 } from "./tool-result-artifact.js";
 
 describe("ToolResultArtifactStore", () => {
@@ -224,6 +225,163 @@ describe("tool-result artifact tools", () => {
     }
   });
 
+  it("puts the no-match reading in front of the model, not just in the return type", async () => {
+    // The diagnosis only counts if it reaches the tool's rendered text — that is the whole
+    // surface the model sees. Asserting the internal shape alone would pass with the field
+    // never rendered.
+    const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), "siclaw-tool-result-nomatch-"));
+    try {
+      const store = new ToolResultArtifactStore({
+        rootDir,
+        getScope: () => ({ agentId: "agent", sessionId: "session" }),
+      });
+      const captured = await store.capture({
+        text: JSON.stringify({ entries: [{ user: "yhli", action: "delete" }] }),
+        toolCallId: "call", toolName: "mcp__x__y",
+      });
+      if (!("reference" in captured)) throw new Error("capture failed");
+      const [, searchTool] = createToolResultArtifactTools(store);
+
+      // The literal an agent actually tried, from a trace: the words are all there, the
+      // spelling is not, because the artifact stores them escaped.
+      // Both words are stored, but not with a space after the colon — the miss is the spelling.
+      const miss = await searchTool.execute(
+        "search", { artifact_id: captured.reference.id, query: '"user": "yhli"' }, undefined, undefined, undefined);
+      const parsed = JSON.parse((miss.content[0] as any).text as string);
+      expect(parsed.matches).toEqual([]);
+      expect(parsed.no_match.absentParts).toEqual([]);
+      expect(parsed.no_match.reading).toMatch(/SPELLING is what failed/);
+
+      // A hit carries no diagnosis — it would be noise on every successful search.
+      const hit = await searchTool.execute(
+        "search", { artifact_id: captured.reference.id, query: "yhli" }, undefined, undefined, undefined);
+      expect(JSON.parse((hit.content[0] as any).text)).not.toHaveProperty("no_match");
+    } finally {
+      await fs.rm(rootDir, { recursive: true, force: true });
+    }
+  });
+
+  it("answers several distinct literals in one call, grouped per query", async () => {
+    // The shape from the traces: five different terms against one 4-million-character artifact,
+    // all hitting, spread over three or four model turns because each needed its own call.
+    const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), "siclaw-tool-result-batch-"));
+    try {
+      const store = new ToolResultArtifactStore({
+        rootDir, getScope: () => ({ agentId: "agent", sessionId: "session" }),
+      });
+      const captured = await store.capture({
+        text: "alpha here\nthen credit_balance_exhausted\nand gpt-5.6-sol@example\n",
+        toolCallId: "call", toolName: "mcp__x__y",
+      });
+      if (!("reference" in captured)) throw new Error("capture failed");
+      const [, searchTool] = createToolResultArtifactTools(store);
+
+      const res = await searchTool.execute("search", {
+        artifact_id: captured.reference.id,
+        query: ["credit_balance_exhausted", "gpt-5.6-sol@example", "nowhere-to-be-found"],
+      }, undefined, undefined, undefined);
+      const parsed = JSON.parse((res.content[0] as any).text);
+
+      expect(parsed.results.map((r: any) => r.query)).toEqual([
+        "credit_balance_exhausted", "gpt-5.6-sol@example", "nowhere-to-be-found",
+      ]);
+      expect(parsed.results[0].matches).toHaveLength(1);
+      expect(parsed.results[1].matches).toHaveLength(1);
+      // A miss inside a batch still explains itself, exactly like a single-query miss.
+      expect(parsed.results[2].matches).toEqual([]);
+      expect(parsed.results[2].no_match.reading).toBeTruthy();
+    } finally {
+      await fs.rm(rootDir, { recursive: true, force: true });
+    }
+  });
+
+  it("a single literal keeps the flat response, so the common case does not change", async () => {
+    const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), "siclaw-tool-result-single-"));
+    try {
+      const store = new ToolResultArtifactStore({
+        rootDir, getScope: () => ({ agentId: "agent", sessionId: "session" }),
+      });
+      const captured = await store.capture({ text: "alpha NEEDLE omega", toolCallId: "c", toolName: "t" });
+      if (!("reference" in captured)) throw new Error("capture failed");
+      const [, searchTool] = createToolResultArtifactTools(store);
+      const res = await searchTool.execute(
+        "search", { artifact_id: captured.reference.id, query: "needle" }, undefined, undefined, undefined);
+      const parsed = JSON.parse((res.content[0] as any).text);
+      expect(parsed.query).toBe("needle");
+      expect(parsed.matches).toHaveLength(1);
+      expect(parsed).not.toHaveProperty("results");
+    } finally {
+      await fs.rm(rootDir, { recursive: true, force: true });
+    }
+  });
+
+  it("sheds matches fairly, never reporting a query that HIT as having found nothing", async () => {
+    // The single-query renderer trims the end of one list. Across several that spends the whole
+    // allowance on the first query and hands back the last with an empty `matches` — which reads
+    // as "not in the artifact". That is a false answer, not a short one.
+    const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), "siclaw-tool-result-fair-"));
+    try {
+      const store = new ToolResultArtifactStore({
+        rootDir, getScope: () => ({ agentId: "agent", sessionId: "session" }),
+      });
+      // The budget must actually be exceeded or the shedding loop never runs and the test is
+      // vacuous — which is what the first version of it was. 3 queries x 20 matches x ~4k of
+      // snippet is ~240k against a 32k ceiling, so shedding is forced.
+      const filler = "z".repeat(3_000);
+      const text = Array.from({ length: 40 }, () => `${filler} AAA ${filler} BBB ${filler} CCC`).join("\n");
+      const captured = await store.capture({ text, toolCallId: "c", toolName: "t" });
+      if (!("reference" in captured)) throw new Error("capture failed");
+      const [, searchTool] = createToolResultArtifactTools(store);
+
+      const res = await searchTool.execute("search", {
+        artifact_id: captured.reference.id, query: ["AAA", "BBB", "CCC"],
+        context_chars: 2_000, max_matches: 20,
+      }, undefined, undefined, undefined);
+      const text_ = (res.content[0] as any).text as string;
+      const parsed = JSON.parse(text_);
+      expect(text_.length).toBeLessThanOrEqual(32_000);
+      // The point: the LAST query still carries evidence, not an empty list.
+      for (const result of parsed.results) {
+        expect(result.matches.length).toBeGreaterThan(0);
+        expect(result).not.toHaveProperty("no_match");
+      }
+    } finally {
+      await fs.rm(rootDir, { recursive: true, force: true });
+    }
+  });
+
+  it("never sheds a query's LAST match, which would read as 'not in the artifact'", async () => {
+    // The fair-shedding test above has every query hitting many times, so shedding stops while
+    // all of them still hold several — which makes `> 1` and `> 0` indistinguishable there, and
+    // a mutation of exactly that survived it. The case the floor exists for is a LOPSIDED batch:
+    // one query with a single hit alongside one with many. Dropping that single hit turns a
+    // genuine match into "this term is not in the artifact" — a false answer, not a short one.
+    const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), "siclaw-tool-result-floor-"));
+    try {
+      const store = new ToolResultArtifactStore({
+        rootDir, getScope: () => ({ agentId: "agent", sessionId: "session" }),
+      });
+      const filler = "z".repeat(3_000);
+      const bulk = Array.from({ length: 40 }, () => `${filler} COMMON ${filler}`).join("\n");
+      // RARE occurs exactly once, at the very end.
+      const captured = await store.capture({ text: `${bulk}\n${filler} RARE ${filler}`, toolCallId: "c", toolName: "t" });
+      if (!("reference" in captured)) throw new Error("capture failed");
+      const [, searchTool] = createToolResultArtifactTools(store);
+
+      const res = await searchTool.execute("search", {
+        artifact_id: captured.reference.id, query: ["COMMON", "RARE"],
+        context_chars: 2_000, max_matches: 30,
+      }, undefined, undefined, undefined);
+      const parsed = JSON.parse((res.content[0] as any).text);
+      const rare = parsed.results.find((r: any) => r.query === "RARE");
+      expect(rare.matches, "the single hit survives shedding").toHaveLength(1);
+      // And it must not be dressed up as a miss.
+      expect(rare).not.toHaveProperty("no_match");
+    } finally {
+      await fs.rm(rootDir, { recursive: true, force: true });
+    }
+  });
+
   it("keeps the serialized search response within the tool output bound", async () => {
     const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), "siclaw-tool-result-search-bound-"));
     try {
@@ -381,5 +539,53 @@ describe("native read through artifact capture", () => {
     const wrapped = withToolResultArtifactCapture(tool, artifacts, 4096);
     await expect(wrapped.execute("denied", { path: "private.txt" }, undefined, undefined, undefined))
       .rejects.toThrow("read denied by path policy");
+  });
+});
+
+
+describe("a search that found nothing says which of the two reasons it was", () => {
+  // An empty `matches` was the whole answer, and it has two causes the caller cannot tell
+  // apart: the text is absent, or it is present in a spelling the literal missed. The traces
+  // show which one the agent assumes — it rewrites the literal. One searches `"user":"yhli"`
+  // then `user=yhli` on the same artifact; the reviews describe runs of 13 and 15 searches.
+
+  it("says the spelling failed when every word IS there", () => {
+    // Note the shape: `{"user":"yhli"}` CONTAINS `"user":"yhli"` literally, so that search hits.
+    // The miss comes from a real difference — here the whitespace after the colon.
+    const text = JSON.stringify({ entries: [{ user: "yhli", action: "delete" }] });
+    const d = diagnoseNoMatch(text, '"user": "yhli"');
+    expect(d.absentParts).toEqual([]);
+    expect(d.presentParts).toEqual(expect.arrayContaining(["user", "yhli"]));
+    expect(d.reading).toMatch(/SPELLING is what failed/);
+    // It must NOT pick a cause: separator, whitespace and escaping are indistinguishable from
+    // out here, and naming the wrong one sends the caller rewriting in the wrong direction.
+    expect(d.reading).toMatch(/Search ONE word on its own/);
+  });
+
+  it("names the absent words, which is what ends the rewriting", () => {
+    const text = JSON.stringify({ entries: [{ user: "yhli" }] });
+    const d = diagnoseNoMatch(text, "user=zzztop");
+    expect(d.presentParts).toContain("user");
+    expect(d.absentParts).toContain("zzztop");
+    // A fact about the ARTIFACT, not the query: no rewriting can find it.
+    expect(d.reading).toMatch(/Absent: zzztop/);
+  });
+
+  it("says so when nothing in the query appears at all", () => {
+    const d = diagnoseNoMatch("kubelet is healthy", "postgres connection pool");
+    expect(d.presentParts).toEqual([]);
+    expect(d.reading).toMatch(/does not carry the subject/);
+  });
+
+  it("reports the content type as a fact without letting it invent a cause", () => {
+    expect(diagnoseNoMatch("plain log line with user yhli", '"user":"yhli"').contentIsJson).toBe(false);
+    expect(diagnoseNoMatch(JSON.stringify({ user: "yhli" }), "nothing-here").contentIsJson).toBe(true);
+  });
+
+  it("handles a punctuation-only query without pretending to have checked parts", () => {
+    const d = diagnoseNoMatch("{}", "=>");
+    expect(d.presentParts).toEqual([]);
+    expect(d.absentParts).toEqual([]);
+    expect(d.reading).toMatch(/punctuation only/);
   });
 });

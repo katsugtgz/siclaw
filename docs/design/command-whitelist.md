@@ -199,6 +199,7 @@ Blocked actions (via whitelist — anything not listed above is blocked):
 -u  --user  --cacert  --cert  -x  --proxy
 --retry  --retry-delay  --retry-max-time
 -f  --fail  -4  -6  -N  --no-buffer
+-i  --include
 ```
 
 #### curl — allowed HTTP methods (with `-X`/`--request`)
@@ -213,6 +214,15 @@ Blocked: `POST`, `PUT`, `DELETE`, `PATCH`, and any other method.
 
 - `-d`/`--data`/`--data-raw`/`--data-urlencode` are not in the whitelist (removed with POST)
 - `-o`/`--output` (write to file) is not in the whitelist
+- `-X`/`--request` is checked wherever curl READS its value, including inside a short-option
+  cluster: `-Xsi` is `-X si`, so the method allow-list applies to `si`. Screening the cluster letter
+  by letter saw three permitted letters and checked the method only when X landed last, which let
+  any method through as `-Xs` / `-Xsi` / `-vXpost` — and refused curl's own inline `-XGET`, whose
+  `G` is part of the value rather than a flag.
+- `-D`/`--dump-header` is admitted by VALUE, not by flag: only `-D -` (dump to stdout) passes,
+  because every other argument names a file to write. In a short-option cluster it must be
+  written last — curl reads `-Dv` as `-D v`, so a value-taking letter with anything after it
+  writes a file whose name is the rest of the cluster.
 
 ---
 
@@ -381,6 +391,7 @@ Allowed subcommands: `topo`, `nvlink`
 | `diff` | None | Unrestricted |
 | `md5sum` | None | Unrestricted |
 | `sha256sum` | None | Unrestricted |
+| `sha512sum` | None | Unrestricted |
 
 ---
 
@@ -404,7 +415,7 @@ Allowed subcommands: `topo`, `nvlink`
 -S  -U  -e  --pager-end  -a  --all
 -q  --quiet  --no-hostname  --no-full
 -m  --merge  -D  --directory  --file
---list-boots
+--list-boots  --utc
 ```
 
 Also allows `KEY=VALUE` field matching (e.g. `_SYSTEMD_UNIT=foo.service`).
@@ -517,6 +528,7 @@ Also allows: `ctr version`, `ctr info` as standalone commands.
 |---------|-----------|-------------|
 | `date` | `validateDate` | Flags whitelist; blocks set operations |
 | `whoami` | None | Unrestricted |
+| `who` | None | No positional operands (`who <file>` parses that file as utmp and prints the ut_user/ut_host of records whose ut_type matches, making it a partial reader of any file; `who am i` is `whoami`) |
 | `id` | None | Unrestricted |
 | `env` | `validateEnv` | Blocks command execution; only viewing variables |
 | `printenv` | None | Unrestricted |

@@ -86,6 +86,27 @@ export function createMyTool(dep: SomeDependency): ToolDefinition {
 - Mutable refs (`kubeconfigRef`, `llmConfigRef`, `memoryRef`) allow runtime config changes
 - Return format is always `{ content: [{ type: "text", text }], details?: {} }`
 
+**⚠️ How a tool reports failure, and who reads it:**
+
+A failing tool sets `details.error: true`; a tool refusing on policy grounds sets
+`details.blocked: true`. It does **not** need to set `isError` — 93 of the 94 failure returns
+under `src/tools/` use `details` alone. The single reader of those flags is
+`toolResultOutcome(details, isError)` in `src/shared/tool-result-metadata.ts`, which maps them
+onto the three values of the persisted `outcome` column (`success | error | blocked`).
+
+Never re-derive that judgement at a call site. It existed in two forms for a while — the
+gateway's SSE consumer called the shared function, while agentbox spelled out
+`isError ? "error" : "success"` in three places — and since both write the **same column of the
+same table**, every refusal and almost every error inside a delegated or background turn was
+persisted as a success. What made it expensive is that the corrupted column is what the trace
+UI, the failure metrics and the automated trace review all read, so the defect hid inside the
+very data anyone would use to find it. `tool-result-metadata.test.ts` now fails the build on a
+second implementation.
+
+The same three values are re-read when a session is rebuilt after a pod restart
+(`session-rehydrate.ts`), where `blocked` must count as a failure: a refused command restored
+as a success tells the model that path is open, and it reissues it verbatim.
+
 **⚠️ Description–Code Consistency Rule:**
 
 The `description` field is **the LLM's only understanding of what a tool does

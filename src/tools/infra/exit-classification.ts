@@ -463,6 +463,30 @@ export function classifyExit(opts: {
     };
   }
 
+  // A /proc/<pid> path that is gone means the PROCESS is gone — an existence answer, the same
+  // shape as an API NotFound, and the single most-reported node_exec finding. Reading a diagnostic
+  // of an alerting PID is inherently racy: by the time the agent gets there the process has often
+  // exited, which is frequently the answer the investigation wanted. Reported as a generic failure
+  // it reads as "the command was wrong", so the agent retries the identical read.
+  //
+  // Narrow on purpose. It requires the numeric /proc/<pid>/ form, so /proc/meminfo or a missing
+  // file anywhere else is untouched, and it does NOT fire in the `local` context — the AgentBox's
+  // own /proc says nothing about a target node. `nsenter: cannot open /proc/<pid>/ns/...` is
+  // matched EARLIER as a namespace-entry channel failure and must keep that classification: there
+  // the vanished pid is the wrapper's entry point, not the subject of the question.
+  if (context !== "local" && /(?:^|[\s:"'`])\/proc\/\d+\//.test(command)
+      && /No such file or directory/m.test(stderr) && !stdout.trim()) {
+    return {
+      exitClass: "no_match",
+      isError: false,
+      annotation:
+        "[no_match: that /proc entry does not exist, which means the PROCESS has exited. The read "
+        + "reached the target and this is its answer — a transient state change, not a failed "
+        + "command, and re-running it will return the same thing. If the process mattered, its exit "
+        + "is itself the finding; look for it in the parent's logs or the node's journal instead.]",
+    };
+  }
+
   if (exitCode === 1 && EXIT_1_MEANS_NOTHING_FOUND.has(lastPipelineCommand(command))) {
     return {
       exitClass: "no_match",

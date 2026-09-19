@@ -480,6 +480,15 @@ expression screen is the only layer that applies.
 | `wget` | File write, recursive crawl |
 | `bash`/`sh` (direct) | Unrestricted shell — `restricted-bash` wraps with validation |
 
+Exclusion is the decision; the refusal is a separate question. `awk` and `sed` carry a hint naming
+what to run instead (`BINARY_HINTS` in `command-validator.ts`), because a refusal that names no
+alternative gets retried with a different spelling and refused again — a refused `awk` is typically
+3-5 parallel calls and the traces show all of them retried. Two constraints on that text: the advice
+is per USE rather than per command (the awk calls in one week's traces are three unrelated tasks, and
+only one has an equivalent), and where there is no equivalent it says so — naming a near-substitute
+that behaves differently is worse than refusing, because the agent carries the wrong answer forward
+as evidence.
+
 ### 4.6 Role After OS Isolation
 
 With OS-level user isolation (Layer 1), the application-level command validation becomes a

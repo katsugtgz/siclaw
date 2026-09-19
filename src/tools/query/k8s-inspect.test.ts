@@ -7,7 +7,7 @@
  * restricted_bash would have refused, and that is only checkable by looking at what it tried to run.
  */
 import { describe, it, expect } from "vitest";
-import { runProbe, collectObject, worstCaseChars, BUDGET, DEADLINES, type ProbeDeps } from "./k8s-inspect.js";
+import { runProbe, collectObject, worstCaseChars, BUDGET, DEADLINES, createK8sInspectTool, type ProbeDeps } from "./k8s-inspect.js";
 import { KINDS } from "./k8s-relations.js";
 
 /** A fake exec that records every command line and answers from a table. */
@@ -792,5 +792,37 @@ describe("collectObject — the size budget", () => {
     const { text } = await collectObject(KINDS.pod, { kind: "pod", name: "web", namespace: "default" }, d);
     expect(text).not.toContain("hunter2");
     expect(text).toContain("REDACTED");
+  });
+});
+
+
+describe("an optional parameter's empty string means 'not provided'", () => {
+  // A caller that serializes every key rather than omitting the empty ones sends namespace: "".
+  // The command builder already treats that as absent (nsFlag tests truthiness), so the only
+  // thing that saw a difference was the object-name screen — which refused a cluster-scoped
+  // `kind: node` read, the one case that HAS no namespace to give, as a malformed name.
+  const tool = createK8sInspectTool();
+
+  async function errorOf(params: Record<string, unknown>): Promise<string> {
+    const res = await tool.execute("call-1", params as never);
+    const text = (res.content?.[0] as { text?: string })?.text ?? "";
+    try { return String(JSON.parse(text).error ?? ""); } catch { return text; }
+  }
+
+  it("does not refuse a cluster-scoped read for carrying an empty namespace", async () => {
+    // It may still fail later for want of a bound cluster — what it must not do is fail HERE,
+    // on the shape of the argument.
+    expect(await errorOf({ kind: "node", name: "node-1", namespace: "" }))
+      .not.toMatch(/Invalid namespace/);
+  });
+
+  it("still refuses a namespace that is genuinely malformed", async () => {
+    expect(await errorOf({ kind: "pod", name: "p1", namespace: "Not A Namespace" }))
+      .toMatch(/Invalid namespace/);
+  });
+
+  it("still refuses an empty NAME — that one is required, and empty is not a name", async () => {
+    expect(await errorOf({ kind: "pod", name: "", namespace: "default" }))
+      .toMatch(/Invalid name/);
   });
 });

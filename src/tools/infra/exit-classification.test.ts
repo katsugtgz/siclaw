@@ -330,6 +330,60 @@ describe("the negative half of an existence check", () => {
   });
 });
 
+describe("a /proc entry that is gone means the PROCESS is gone", () => {
+  // The single most-reported node_exec finding. Reading a diagnostic of an alerting PID is racy by
+  // nature: by the time the agent gets there the process has often exited, which is frequently the
+  // answer the investigation wanted. Reported as a generic failure it reads as "the command was
+  // wrong", and the agent reissues the identical read.
+  it("reads a vanished pid as an answer, not a failure", () => {
+    for (const command of [
+      "cat /proc/3077412/status",
+      "ls -l /proc/3077412/fd",
+      "head -50 /proc/994/stack",
+    ]) {
+      const j = classifyExit({
+        command, exitCode: 1, stdout: "",
+        stderr: `cat: /proc/3077412/status: No such file or directory`, context: "node",
+      });
+      expect(j.exitClass, command).toBe("no_match");
+      expect(j.isError, command).toBe(false);
+      expect(j.annotation, command).toMatch(/PROCESS has exited/);
+    }
+  });
+
+  it("leaves a missing file that is NOT a pid entry alone", () => {
+    // /proc/meminfo, /proc/self and anything outside /proc keep their generic classification —
+    // "not there" only means "the process exited" for the numeric per-pid form.
+    for (const command of ["cat /proc/meminfo", "cat /etc/whatever", "cat /proc/self/status"]) {
+      const j = classifyExit({
+        command, exitCode: 1, stdout: "",
+        stderr: "cat: no such file: No such file or directory", context: "node",
+      });
+      expect(j.exitClass, command).toBe("target_reported_failure");
+    }
+  });
+
+  it("does not fire in local context, where /proc is the AgentBox's own", () => {
+    const j = classifyExit({
+      command: "cat /proc/3077412/status", exitCode: 1, stdout: "",
+      stderr: "cat: /proc/3077412/status: No such file or directory", context: "local",
+    });
+    expect(j.exitClass).toBe("target_reported_failure");
+  });
+
+  it("does not steal a namespace-entry failure, where the pid is the WRAPPER's entry point", () => {
+    // `nsenter: cannot open /proc/<pid>/ns/...` carries the same words but means something else
+    // entirely: the channel opened and the wrapper could not enter the namespace, so the target
+    // never saw the command. That branch runs first and must keep it.
+    const j = classifyExit({
+      command: "nsenter -t 999999 -n -- ss -tlnp", exitCode: 1, stdout: "",
+      stderr: "nsenter: cannot open /proc/999999/ns/ipc: No such file or directory", context: "node",
+    });
+    expect(j.exitClass).toBe("channel_error");
+    expect(j.channelLeg).toBe("namespace_entry");
+  });
+});
+
 describe("answers the API gave, and commands the client refused", () => {
   // Read from the traces behind the findings, not from the finding text.
   it("treats a NotFound on a named object as the result", () => {

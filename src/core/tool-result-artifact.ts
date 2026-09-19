@@ -32,6 +32,10 @@ const DEFAULT_SEARCH_CONTEXT_CHARS = 240;
 const MAX_SEARCH_CONTEXT_CHARS = 2_000;
 const DEFAULT_SEARCH_MATCHES = 20;
 const MAX_SEARCH_MATCHES = 50;
+/** Batch ceiling: past this the response is all boilerplate and no evidence. */
+const MAX_SEARCH_QUERIES = 8;
+/** However many queries share the budget, each keeps enough matches to answer something. */
+const MIN_SEARCH_MATCHES_PER_QUERY = 3;
 
 export function toolResultArtifactRoot(sessionDir: string): string {
   return path.join(path.resolve(sessionDir), ".tool-results");
@@ -97,11 +101,87 @@ export interface ToolResultArtifactSearchMatch {
   snippet: string;
 }
 
+/** One query's outcome inside a batch — the same shape a single search reports. */
+export interface ToolResultArtifactQueryResult {
+  query: string;
+  matches: ToolResultArtifactSearchMatch[];
+  truncated: boolean;
+  noMatch?: ToolResultArtifactNoMatch;
+}
+
+export interface ToolResultArtifactBatchSearchResult {
+  reference: ToolResultArtifactReference;
+  results: ToolResultArtifactQueryResult[];
+}
+
 export interface ToolResultArtifactSearchResult {
   reference: ToolResultArtifactReference;
   query: string;
   matches: ToolResultArtifactSearchMatch[];
   truncated: boolean;
+  /** Only on a zero-hit search — see diagnoseNoMatch. */
+  noMatch?: ToolResultArtifactNoMatch;
+}
+
+export interface ToolResultArtifactNoMatch {
+  /** Words from the query that ARE present on their own. */
+  presentParts: string[];
+  /** Words from the query that appear nowhere in the artifact. */
+  absentParts: string[];
+  /** Whether the stored text parses as JSON, where a literal's quotes are escaped. */
+  contentIsJson: boolean;
+  /** What the combination of the above means, and what to do next. */
+  reading: string;
+}
+
+/**
+ * Why a search found nothing.
+ *
+ * An empty `matches` was the entire answer, and it has two completely different causes that the
+ * caller cannot tell apart: the text is genuinely absent, or it is there in a spelling the literal
+ * did not match. The traces show which one the agent assumes — it keeps rewriting the literal.
+ * One shows `"user":"yhli"` followed by `user=yhli` on the same artifact, and the reviews describe
+ * runs of 13 and 15 searches on two or three artifacts.
+ *
+ * The split is decidable and costs nothing: the text is already in memory, so each word of the
+ * query is checked on its own. All present ⇒ the words are there and the SPELLING is what failed.
+ * Some absent ⇒ those words are nowhere, and no further rewriting of the literal will help —
+ * naming them is what stops the loop, because it is a fact about the artifact rather than about
+ * the query.
+ *
+ * What it does NOT do is name the spelling difference. The first draft asserted "the quotes are
+ * escaped" for a JSON artifact and a test refuted it at once: `{"user":"yhli"}` contains
+ * `"user":"yhli"` literally, so that search HITS. The differences that actually bite are
+ * whitespace (`"user": "yhli"` against `"user":"yhli"`), a separator (`=` against `:`), and
+ * escaping only where a payload is nested as a string — one cause cannot be picked from the
+ * outside, and picking wrong sends the caller off rewriting in the wrong direction. So it reports
+ * what is DECIDABLE (which words are present) and what to do next, and leaves the cause open.
+ */
+export function diagnoseNoMatch(text: string, query: string): ToolResultArtifactNoMatch {
+  const haystack = text.toLocaleLowerCase();
+  const contentIsJson = (() => {
+    const head = text.trimStart()[0];
+    if (head !== "{" && head !== "[") return false;
+    try { JSON.parse(text); return true; } catch { return false; }
+  })();
+
+  // Split on everything that is not part of a word: the punctuation IS what usually differs
+  // between the query and the stored spelling (`"user":"yhli"` vs `user=yhli`).
+  const parts = [...new Set(query.toLocaleLowerCase().split(/[^\p{L}\p{N}_.-]+/u).filter((w) => w.length > 1))];
+  const presentParts = parts.filter((w) => haystack.includes(w));
+  const absentParts = parts.filter((w) => !haystack.includes(w));
+
+  let reading: string;
+  if (parts.length === 0) {
+    reading = "The query is punctuation only, so there is nothing to check a part at a time. Read around an offset instead.";
+  } else if (absentParts.length === 0) {
+    reading = "Every word of the query is in the artifact, so the exact SPELLING is what failed — the separator, the whitespace around it, or escaping where a payload is nested as a string. Search ONE word on its own, then tool_result_read around the offset it reports; that shows the spelling actually stored, which no amount of guessing at the literal will.";
+  } else if (presentParts.length === 0) {
+    reading = "None of the query's words appear anywhere in the artifact. This is a fact about the ARTIFACT, not the query — rewriting the literal will not help; this artifact does not carry the subject.";
+  } else {
+    reading = `Present: ${presentParts.join(", ")}. Absent: ${absentParts.join(", ")}. The absent words are nowhere in the artifact, so no rewriting of the literal will find them — search on a present word instead.`;
+  }
+  return { presentParts, absentParts, contentIsJson, reading };
 }
 
 function safeInteger(value: unknown, fallback: number, min: number, max: number): number {
@@ -129,6 +209,43 @@ function errorResult(message: string) {
   };
 }
 
+/**
+ * Render a batch, shedding evidence FAIRLY when it does not fit.
+ *
+ * The single-query renderer trims from the end of one list, which is right when there is one
+ * list. Across several it would spend the whole allowance on the first query and hand back the
+ * last with an empty `matches` — indistinguishable from "this term is not in the artifact",
+ * which is a false answer rather than a short one. So matches are dropped one per query in
+ * rounds, and a query that had hits keeps at least one.
+ */
+function formatBatchSearchToolOutput(batch: ToolResultArtifactBatchSearchResult): string {
+  const groups = batch.results.map((result) => ({
+    query: result.query,
+    matches: result.matches.map((match) => ({ ...match })),
+    truncated: result.truncated,
+    ...(result.noMatch ? { no_match: result.noMatch } : {}),
+  }));
+  const payload = {
+    artifact_id: batch.reference.id,
+    size_chars: batch.reference.sizeChars,
+    sha256: batch.reference.sha256,
+    results: groups,
+  };
+  let rendered = JSON.stringify(payload, null, 2);
+  while (rendered.length > MAX_READ_CHARS) {
+    // One round, taking a single match from every group that can still spare one. A group down
+    // to its last hit is left alone: reporting zero where there was one would be a lie.
+    const shed = groups.filter((group) => group.matches.length > 1);
+    if (shed.length === 0) break;
+    for (const group of shed) {
+      group.matches.pop();
+      group.truncated = true;
+    }
+    rendered = JSON.stringify(payload, null, 2);
+  }
+  return rendered;
+}
+
 function formatSearchToolOutput(search: ToolResultArtifactSearchResult): string {
   const payload = {
     artifact_id: search.reference.id,
@@ -137,6 +254,7 @@ function formatSearchToolOutput(search: ToolResultArtifactSearchResult): string 
     truncated: search.truncated,
     size_chars: search.reference.sizeChars,
     sha256: search.reference.sha256,
+    ...(search.noMatch ? { no_match: search.noMatch } : {}),
   };
   let rendered = JSON.stringify(payload, null, 2);
   while (rendered.length > MAX_READ_CHARS && payload.matches.length > 0) {
@@ -344,35 +462,69 @@ export class ToolResultArtifactStore {
     contextChars = DEFAULT_SEARCH_CONTEXT_CHARS,
     maxMatches = DEFAULT_SEARCH_MATCHES,
   ): Promise<ToolResultArtifactSearchResult> {
-    const needle = query.trim();
-    if (!needle) throw new Error("query must not be empty");
-    if (needle.length > 512) throw new Error("query must be at most 512 characters");
+    const batch = await this.searchMany(id, [query], contextChars, maxMatches);
+    return { reference: batch.reference, ...batch.results[0] };
+  }
+
+  /**
+   * Several literals over ONE artifact, in a single read.
+   *
+   * The traces show the shape this exists for: five distinct literals against the same
+   * 4-million-character artifact, every one of them hitting, spread over three or four model
+   * turns because each needed its own call. None of it was retry — they were five different
+   * questions about one body of text, each answered by a different offset.
+   *
+   * The per-query match budget is DIVIDED, not repeated, with a floor so a large batch cannot
+   * cut every query down to nothing.
+   */
+  async searchMany(
+    id: string,
+    queries: string[],
+    contextChars = DEFAULT_SEARCH_CONTEXT_CHARS,
+    maxMatches?: number,
+  ): Promise<ToolResultArtifactBatchSearchResult> {
+    const needles = queries.map((q) => q.trim());
+    if (needles.length === 0) throw new Error("at least one query is required");
+    if (needles.length > MAX_SEARCH_QUERIES) throw new Error(`at most ${MAX_SEARCH_QUERIES} queries are allowed`);
+    for (const needle of needles) {
+      if (!needle) throw new Error("query must not be empty");
+      if (needle.length > 512) throw new Error("query must be at most 512 characters");
+    }
     const { metadata, text } = await this.load(id);
     const safeContext = safeInteger(contextChars, DEFAULT_SEARCH_CONTEXT_CHARS, 0, MAX_SEARCH_CONTEXT_CHARS);
-    const safeMaxMatches = safeInteger(maxMatches, DEFAULT_SEARCH_MATCHES, 1, MAX_SEARCH_MATCHES);
+    const requested = maxMatches ?? Math.max(
+      MIN_SEARCH_MATCHES_PER_QUERY, Math.floor(DEFAULT_SEARCH_MATCHES / needles.length),
+    );
+    const safeMaxMatches = safeInteger(requested, DEFAULT_SEARCH_MATCHES, 1, MAX_SEARCH_MATCHES);
     const haystack = text.toLocaleLowerCase();
-    const normalizedNeedle = needle.toLocaleLowerCase();
-    const matches: ToolResultArtifactSearchMatch[] = [];
-    let cursor = 0;
-    let foundMore = false;
-    while (cursor <= haystack.length) {
-      const found = haystack.indexOf(normalizedNeedle, cursor);
-      if (found < 0) break;
-      if (matches.length >= safeMaxMatches) {
-        foundMore = true;
-        break;
+
+    const results = needles.map((needle) => {
+      const normalizedNeedle = needle.toLocaleLowerCase();
+      const matches: ToolResultArtifactSearchMatch[] = [];
+      let cursor = 0;
+      let foundMore = false;
+      while (cursor <= haystack.length) {
+        const found = haystack.indexOf(normalizedNeedle, cursor);
+        if (found < 0) break;
+        if (matches.length >= safeMaxMatches) {
+          foundMore = true;
+          break;
+        }
+        const start = Math.max(0, found - safeContext);
+        const end = Math.min(text.length, found + needle.length + safeContext);
+        matches.push({ offset: found, snippet: text.slice(start, end) });
+        cursor = found + Math.max(1, normalizedNeedle.length);
       }
-      const start = Math.max(0, found - safeContext);
-      const end = Math.min(text.length, found + needle.length + safeContext);
-      matches.push({ offset: found, snippet: text.slice(start, end) });
-      cursor = found + Math.max(1, normalizedNeedle.length);
-    }
-    return {
-      reference: publicReference(metadata),
-      query: needle,
-      matches,
-      truncated: foundMore,
-    };
+      return {
+        query: needle,
+        matches,
+        truncated: foundMore,
+        // The text is already loaded, so the diagnosis is free — and it is only needed here.
+        ...(matches.length === 0 ? { noMatch: diagnoseNoMatch(text, needle) } : {}),
+      };
+    });
+
+    return { reference: publicReference(metadata), results };
   }
 
   private scopeHash(scope: ToolResultArtifactScope): string {
@@ -559,16 +711,33 @@ export function createToolResultArtifactTools(store: ToolResultArtifactStore): R
   const searchTool: ResolvedToolDefinition = {
     name: "tool_result_search",
     label: "Search tool result artifact",
-    description: "Search a complete tool-result artifact using a case-insensitive literal query. Returns bounded snippets and character offsets for follow-up tool_result_read calls.",
+    description: "Search a complete tool-result artifact using case-insensitive literal queries. Returns bounded snippets and character offsets for follow-up tool_result_read calls. "
+      + "Pass an ARRAY of queries to ask several independent questions of the same artifact in one call — different terms, not rewordings of one term. "
+      + "The match budget is shared out among them, so a batch answers each query with fewer matches than a single query would get.",
     toolset: "artifact",
     parameters: Type.Object({
       artifact_id: Type.String({ description: "Opaque tool-result artifact ID." }),
-      query: Type.String({ minLength: 1, maxLength: 512, description: "Literal text to find (case-insensitive)." }),
+      query: Type.Union([
+        Type.String({ minLength: 1, maxLength: 512 }),
+        Type.Array(Type.String({ minLength: 1, maxLength: 512 }), { minItems: 1, maxItems: MAX_SEARCH_QUERIES }),
+      ], {
+        description: `Literal text to find (case-insensitive), or up to ${MAX_SEARCH_QUERIES} of them as an array. `
+          + "Several literals are searched in one pass over the artifact and reported separately — use it for distinct terms, not to retry one term in different spellings.",
+      }),
       context_chars: Type.Optional(Type.Integer({ minimum: 0, maximum: MAX_SEARCH_CONTEXT_CHARS, description: `Characters included on each side; defaults to ${DEFAULT_SEARCH_CONTEXT_CHARS}.` })),
       max_matches: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_SEARCH_MATCHES, description: `Maximum matches; defaults to ${DEFAULT_SEARCH_MATCHES}.` })),
     }),
     execute: async (_toolCallId, args: any) => {
       try {
+        // The shape of the ANSWER follows the shape of the ASK: one literal keeps the flat
+        // response every existing caller reads, several get grouped per query.
+        if (Array.isArray(args.query)) {
+          const batch = await store.searchMany(args.artifact_id, args.query, args.context_chars, args.max_matches);
+          return {
+            content: [{ type: "text" as const, text: formatBatchSearchToolOutput(batch) }],
+            details: { [TOOL_RESULT_ARTIFACT_DETAIL_KEY]: batch.reference },
+          };
+        }
         const search = await store.search(args.artifact_id, args.query, args.context_chars, args.max_matches);
         return {
           content: [{ type: "text" as const, text: formatSearchToolOutput(search) }],

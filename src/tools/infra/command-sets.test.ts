@@ -53,6 +53,7 @@ describe("COMMANDS registry", () => {
     "mst", "mlxlink", "perfquery", "ibqueryerrors", "saquery", "ibping",
     "dcgmi", "smartctl", "nvme", "sensors", "getconf",
     "pidstat", "pstree", "numastat", "ipcs", "nstat", "tree", "hexdump", "od", "tac", "nl",
+    "sha512sum", "who",
   ];
   for (const cmd of newCommands) {
     it(`contains "${cmd}"`, () => {
@@ -445,6 +446,69 @@ describe("validateCommandRestrictions", () => {
       expect(validateCommandRestrictions("curl -X GET --max-time 10 http://example.com")).toBeNull();
       expect(validateCommandRestrictions("curl -L -I http://example.com")).toBeNull();
       expect(validateCommandRestrictions("curl -w '%{http_code}' http://example.com")).toBeNull();
+    });
+
+    it("allows -i / --include (headers on stdout, weaker than the permitted -I)", () => {
+      expect(validateCommandRestrictions("curl -sS -i http://example.com")).toBeNull();
+      expect(validateCommandRestrictions("curl --include http://example.com")).toBeNull();
+      expect(validateCommandRestrictions("curl -si http://example.com")).toBeNull();
+    });
+
+    it("allows -D - (dump headers to stdout)", () => {
+      expect(validateCommandRestrictions("curl -sS -D - http://example.com")).toBeNull();
+      expect(validateCommandRestrictions("curl --dump-header - http://example.com")).toBeNull();
+      expect(validateCommandRestrictions("curl --dump-header=- http://example.com")).toBeNull();
+      expect(validateCommandRestrictions("curl -sD - http://example.com")).toBeNull();
+      // curl's own inline spelling of the same thing.
+      expect(validateCommandRestrictions("curl -D- http://example.com")).toBeNull();
+      expect(validateCommandRestrictions("curl -sD- http://example.com")).toBeNull();
+    });
+
+    it("blocks -D <file> — the argument is what makes it a write", () => {
+      const err = validateCommandRestrictions("curl -D /tmp/headers http://example.com");
+      expect(err).not.toBeNull();
+      expect(err).toContain("FILE");
+      expect(validateCommandRestrictions("curl --dump-header /tmp/h http://example.com")).not.toBeNull();
+      expect(validateCommandRestrictions("curl --dump-header=/tmp/h http://example.com")).not.toBeNull();
+    });
+
+    it("blocks -D inside a cluster, where the rest of the cluster is the filename", () => {
+      // curl reads `-Dv` as `-D v` — it writes a file called "v" while every
+      // letter in the cluster is individually permitted.
+      const err = validateCommandRestrictions("curl -Dv http://example.com");
+      expect(err).not.toBeNull();
+      expect(err).toContain("-D");
+      expect(validateCommandRestrictions("curl -sDout.txt http://example.com")).not.toBeNull();
+    });
+
+    it("blocks -X hidden inside a short-option cluster", () => {
+      // curl reads `-Xsi` as `-X si`: X takes a value and swallows the REST OF THE CLUSTER.
+      // A per-letter screen sees three permitted letters and the method check only ran when X
+      // happened to be LAST, so any method could be smuggled past GET/HEAD/OPTIONS this way.
+      // Predates -i (`-Xs` alone does it) but the same hole.
+      for (const command of ["curl -Xsi http://example.com", "curl -Xs http://example.com",
+                             "curl -vXpost http://example.com"]) {
+        const err = validateCommandRestrictions(command);
+        expect(err, command).not.toBeNull();
+      }
+    });
+
+    it("still allows a safe method given inline or as the next token", () => {
+      expect(validateCommandRestrictions("curl -XGET http://example.com")).toBeNull();
+      expect(validateCommandRestrictions("curl -sX GET http://example.com")).toBeNull();
+      expect(validateCommandRestrictions("curl -X HEAD http://example.com")).toBeNull();
+    });
+
+    it("blocks an unsafe method however it is spelled", () => {
+      for (const command of ["curl -XPOST http://x", "curl -sX DELETE http://x",
+                             "curl -X PUT http://x", "curl --request=PATCH http://x"]) {
+        expect(validateCommandRestrictions(command), command).not.toBeNull();
+      }
+    });
+
+    it("blocks -D with no value at all", () => {
+      const err = validateCommandRestrictions("curl -D");
+      expect(err).not.toBeNull();
     });
 
     it("blocks curl -d (data flag removed with POST)", () => {
@@ -913,6 +977,11 @@ describe("validateCommandRestrictions", () => {
       expect(validateCommandRestrictions("journalctl _SYSTEMD_UNIT=sshd.service")).toBeNull();
     });
 
+    it("allows --utc (display-only timestamp rendering)", () => {
+      expect(validateCommandRestrictions("journalctl -k --utc --since '2026-09-09 00:00:00'")).toBeNull();
+      expect(validateCommandRestrictions("journalctl --utc -u kubelet -n 200")).toBeNull();
+    });
+
     it("blocks journalctl -f (follow)", () => {
       const err = validateCommandRestrictions("journalctl -f");
       expect(err).not.toBeNull();
@@ -1211,6 +1280,32 @@ describe("validateCommandRestrictions", () => {
       const err = validateCommandRestrictions("mount -a");
       expect(err).not.toBeNull();
       expect(err).toContain("-a");
+    });
+  });
+
+  describe("sha512sum / who (read-only siblings of already-permitted commands)", () => {
+    it("sha512sum is permitted wherever md5sum and sha256sum are", () => {
+      for (const ctx of ["node", "pod", "host"]) {
+        expect(validateCommand("sha512sum /etc/hosts", { context: ctx })).toBeNull();
+        expect(validateCommand("md5sum /etc/hosts", { context: ctx })).toBeNull();
+      }
+    });
+
+    it("sha512sum stays out of local, like the rest of the file category", () => {
+      // AgentBox's own filesystem has the dedicated read/ls tools instead.
+      expect(validateCommand("sha512sum /etc/hosts", { context: "local" })).not.toBeNull();
+    });
+
+    it("who reads the system's own utmp, and may not be pointed at a file", () => {
+      expect(validateCommand("who", { context: "host" })).toBeNull();
+      expect(validateCommand("who -b", { context: "node" })).toBeNull();
+      // `who <file>` parses THAT file as utmp and prints the ut_user/ut_host of
+      // every record whose ut_type happens to parse as USER_PROCESS — an operand
+      // turns it into a partial reader of any file, so operands are blocked.
+      expect(validateCommand("who /etc/shadow", { context: "host" })).not.toBeNull();
+      expect(validateCommand("who /var/log/wtmp", { context: "host" })).not.toBeNull();
+      // `who am i` is the one operand form worth having, and it is `whoami`.
+      expect(validateCommand("whoami", { context: "host" })).toBeNull();
     });
   });
 

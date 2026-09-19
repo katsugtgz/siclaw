@@ -81,6 +81,29 @@ describe("factory resource boundaries", () => {
     await skill("agent-config/skills", "ambient-helper");
     expect((await create(type, false)).skillNames).toContain("ambient-helper");
   });
+  it("tells a refused grep the path is off-limits, not that it is absent", async () => {
+    // grep is the only file tool that rewrites its operations' errors: a bare `catch {}` around
+    // its isDirectory probe answers "Path not found" for every failure. So a path that EXISTS and
+    // is merely outside the allow-list read as absent — and the two have opposite next steps.
+    // `/app` is this image's WORKDIR and is not readable; three traces show an agent told the
+    // source tree does not exist and going off to look for it elsewhere.
+    const result = await create("sre");
+    const grep = result.customTools.find(tool => tool.name === "grep")!;
+
+    // Not under the fixture root: that lives in os.tmpdir(), which IS on the read allow-list,
+    // so a directory beneath it would sail through the gate and prove nothing. /etc exists on
+    // every platform this runs on and is on no allow-list — the same shape as /app in the image.
+    await expect(grep.execute("off-limits", { pattern: "needle", path: "/etc" }))
+      .rejects.toThrow(/outside allowed directories/);
+
+    // A path inside the allow-list that genuinely does not exist keeps the original answer.
+    await expect(grep.execute("absent", { pattern: "needle", path: path.join(fixture.root, ".siclaw/user-data/nope") }))
+      .rejects.toThrow(/Path not found/);
+
+    // Either way it REJECTS — that is what makes it an error rather than an empty search.
+    // (pi maps a thrown tool onto isError:true, which is what the outcome column reads.)
+  });
+
   it("keeps QA working files inside user-data through the factory's real Write tool", async () => {
     const result = await create("knowledge_qa");
     const write = result.customTools.find(tool => tool.name === "write")!;
