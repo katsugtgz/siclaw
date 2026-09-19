@@ -350,6 +350,38 @@ describe("tool-result artifact tools", () => {
     }
   });
 
+  it("never sheds a query's LAST match, which would read as 'not in the artifact'", async () => {
+    // The fair-shedding test above has every query hitting many times, so shedding stops while
+    // all of them still hold several — which makes `> 1` and `> 0` indistinguishable there, and
+    // a mutation of exactly that survived it. The case the floor exists for is a LOPSIDED batch:
+    // one query with a single hit alongside one with many. Dropping that single hit turns a
+    // genuine match into "this term is not in the artifact" — a false answer, not a short one.
+    const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), "siclaw-tool-result-floor-"));
+    try {
+      const store = new ToolResultArtifactStore({
+        rootDir, getScope: () => ({ agentId: "agent", sessionId: "session" }),
+      });
+      const filler = "z".repeat(3_000);
+      const bulk = Array.from({ length: 40 }, () => `${filler} COMMON ${filler}`).join("\n");
+      // RARE occurs exactly once, at the very end.
+      const captured = await store.capture({ text: `${bulk}\n${filler} RARE ${filler}`, toolCallId: "c", toolName: "t" });
+      if (!("reference" in captured)) throw new Error("capture failed");
+      const [, searchTool] = createToolResultArtifactTools(store);
+
+      const res = await searchTool.execute("search", {
+        artifact_id: captured.reference.id, query: ["COMMON", "RARE"],
+        context_chars: 2_000, max_matches: 30,
+      }, undefined, undefined, undefined);
+      const parsed = JSON.parse((res.content[0] as any).text);
+      const rare = parsed.results.find((r: any) => r.query === "RARE");
+      expect(rare.matches, "the single hit survives shedding").toHaveLength(1);
+      // And it must not be dressed up as a miss.
+      expect(rare).not.toHaveProperty("no_match");
+    } finally {
+      await fs.rm(rootDir, { recursive: true, force: true });
+    }
+  });
+
   it("keeps the serialized search response within the tool output bound", async () => {
     const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), "siclaw-tool-result-search-bound-"));
     try {
