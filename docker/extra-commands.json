@@ -1,4 +1,18 @@
 {
   "version": 1,
-  "commands": {}
+  "commands": {
+    "sichek": {
+      "category": "diagnostic",
+      "description": "scitix node health checker — read-only checks only: all + the gpu/infiniband/gpfs/lldp components (and their aliases g/i/f/l). daemon, config sync, exporter, and standalone perf tests (ibtest/rocetest/nccltest) are blocked because their position-0 subcommand is not in the allowlist. Note: `sichek all` runs the full default read-only component set (cpu/ethernet/dmesg/transceiver too), and triggers a small NCCL benchmark + PCIe topo only if the node's user-config enables those components (not the default).",
+      "allowedSubcommands": {
+        "position": 0,
+        "allowed": ["all", "gpu", "g", "infiniband", "i", "gpfs", "f", "lldp", "l"]
+      }
+    },
+    "mmlscluster": {
+      "category": "diagnostic",
+      "description": "IBM Spectrum Scale (GPFS) cluster configuration query — the node/manager layout behind a shared filesystem, read next to mount/findmnt when a node's GPFS mount is the subject. Read-only: the mm* family splits along its verb and every writer is a SEPARATE binary (mmchcluster, mmcrfs, mmdelnode, mmshutdown), none of which is whitelisted. Invoked by its absolute path (/usr/lpp/mmfs/bin/mmlscluster), which resolves to this basename. Takes no operands — only --ces / --cnfs / --cloud-gateway — so operands are blocked.",
+      "positionals": "block"
+    }
+  }
 }

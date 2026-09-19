@@ -93,9 +93,17 @@ env var if they want extras; the AgentBox image bakes a file at the default path
 
 ## Distribution
 
-- **Build-time bake (K8s mode)**: `docker/extra-commands.json` ships in the repo with an
-  empty `commands` object and is copied to `/etc/siclaw/extra-commands.json` in
-  `Dockerfile.agentbox`. Deployments replace the file content before `make docker push`.
+- **Build-time bake (K8s mode)**: `docker/extra-commands.json` is copied to
+  `/etc/siclaw/extra-commands.json` in `Dockerfile.agentbox`, so it carries the
+  deployment's site-specific binaries into the image. The COPY destination and the
+  loader's default path are the same string in two files, and a mismatch is SILENT —
+  an absent default path is a no-op, not an error, so the commands simply stop being
+  whitelisted. `extra-commands.test.ts` asserts the two agree, loads the real file,
+  and checks each declared command reaches the node/host contexts.
+- A deployment that layers this repo (rsync-style overlay, ConfigMap, fork) replaces
+  the file wholesale rather than merging, so the same binary declared in two layers
+  keeps only the outermost declaration. Whichever layer wins must carry the complete
+  set — a command dropped there is not refused loudly, it is just absent.
 - **Runtime override (future, not in scope)**: mounting a ConfigMap over
   `/etc/siclaw/extra-commands.json` in the AgentBox pod spec would avoid rebuilds; this
   needs k8s-spawner pod-spec changes and is deliberately deferred.
