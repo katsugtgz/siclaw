@@ -146,6 +146,7 @@ vi.mock("../core/config.js", () => ({
 
 // Import SUT after mocks
 import { AgentBoxSessionManager } from "./session.js";
+import { onDiagnostic } from "../shared/diagnostic-events.js";
 import { tracingRecorder } from "../shared/tracing/agent-trace-recorder.js";
 import { createMemoryIndexer } from "../memory/index.js";
 import { saveSessionKnowledge } from "../memory/session-summarizer.js";
@@ -303,6 +304,32 @@ describe("AgentBoxSessionManager — getOrCreate", () => {
     expect(lastCreateSiclawSession.calls[0].scriptExecutor).toBeUndefined();
     expect(lastCreateSiclawSession.calls[0].scriptSandboxInfo).toBeUndefined();
     await mgr.closeAll();
+  });
+
+  it("a refused tool is an ERROR in the tool_call diagnostic, not a success", async () => {
+    // The third hand-rolled copy of the outcome judgement lived here, on the telemetry
+    // channel, and an invariant test is the only reason it was found. An invariant proves
+    // nobody spelled it out again; it cannot prove THIS call site passes the right argument
+    // (the original code never touched `event.result` at all), so the behaviour is pinned too.
+    let emitter: any;
+    (globalThis as any).__fakeBrainFactories.push((e: any) => { emitter = e; return {}; });
+    const mgr = new AgentBoxSessionManager() as any;
+    await mgr.getOrCreate("diag-1");
+    const seen: any[] = [];
+    const unsub = onDiagnostic((evt) => { if (evt.type === "tool_call") seen.push(evt); });
+    try {
+      emitter.emit("event", { type: "tool_execution_start", toolCallId: "c1", toolName: "restricted_bash", args: {} });
+      emitter.emit("event", { type: "tool_execution_end", toolCallId: "c1", toolName: "restricted_bash",
+        isError: false, result: { content: [], details: { blocked: true } } });
+      emitter.emit("event", { type: "tool_execution_start", toolCallId: "c2", toolName: "restricted_bash", args: {} });
+      emitter.emit("event", { type: "tool_execution_end", toolCallId: "c2", toolName: "restricted_bash",
+        isError: false, result: { content: [], details: {} } });
+    } finally {
+      unsub();
+      await mgr.closeAll();
+    }
+    // Binary channel: a refusal is "did not run", which is the error side of it.
+    expect(seen.map((e) => e.outcome)).toEqual(["error", "success"]);
   });
 
   it("creates a new session on first call and caches it", async () => {
@@ -1058,11 +1085,14 @@ describe("AgentBoxSessionManager — Stop / abort latches", () => {
   }
 
   it("a sub-agent's policy refusal persists as blocked, not success", async () => {
-    const { row } = await subagentToolRow({
+    const { row, res } = await subagentToolRow({
       isError: false,
       result: { content: [{ type: "text", text: '{"error":"awk is not in the allowed command list"}' }], details: { blocked: true } },
     });
     expect(row?.message.outcome).toBe("blocked");
+    // The step list the parent model reads carries two states, not three — but a refusal
+    // must not fold back into the SUCCESS side of that binary, which is where it sat before.
+    expect(res.steps?.find((s: any) => s.kind === "tool")?.outcome).toBe("error");
   });
 
   it("a sub-agent's details-only error persists as error", async () => {
