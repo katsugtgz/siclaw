@@ -1030,6 +1030,57 @@ describe("AgentBoxSessionManager — Stop / abort latches", () => {
     });
   });
 
+  // A delegated turn's tool rows are written by agentbox itself (the gateway's SSE consumer is
+  // not attached to it), and that path derived the outcome from `isError` alone. Tools report
+  // failure through `details` -- 93 of the 94 failure returns under src/tools/ do, and exactly
+  // one of those also sets `isError` -- so every refusal and almost every error inside a
+  // sub-agent was persisted as a SUCCESS, into the same column the gateway fills correctly.
+  async function subagentToolRow(toolResult: Record<string, unknown>) {
+    const mgr = new AgentBoxSessionManager() as any;
+    const sent: any[] = [];
+    mgr.gatewayClient = { sendDelegationPersistenceEvent: async (e: any) => { sent.push(e); return { ok: true, id: "m1" }; } };
+    mgr.agentId = "agent-1";
+    (globalThis as any).__fakeBrainFactories.push((emitter: any) => ({
+      prompt: async () => {
+        emitter.emit("event", { type: "tool_execution_start", toolCallId: "c1", toolName: "restricted_bash" });
+        emitter.emit("event", { type: "tool_execution_end", toolCallId: "c1", toolName: "restricted_bash", ...toolResult });
+        emitter.emit("event", { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "done" }] } });
+      },
+    }));
+    const res = await mgr.runSpawnedSubagent(
+      { spawnId: "s1", parentSessionId: "p1", description: "d", prompt: "do x", userId: "u" },
+      { childSessionId: "c1" },
+    );
+    const row = sent
+      .filter((e: any) => e?.type === "delegation.append_message")
+      .find((e: any) => e.message?.role === "tool");
+    return { row, res };
+  }
+
+  it("a sub-agent's policy refusal persists as blocked, not success", async () => {
+    const { row } = await subagentToolRow({
+      isError: false,
+      result: { content: [{ type: "text", text: '{"error":"awk is not in the allowed command list"}' }], details: { blocked: true } },
+    });
+    expect(row?.message.outcome).toBe("blocked");
+  });
+
+  it("a sub-agent's details-only error persists as error", async () => {
+    const { row } = await subagentToolRow({
+      isError: false,
+      result: { content: [{ type: "text", text: "boom" }], details: { error: true, reason: "command_failed" } },
+    });
+    expect(row?.message.outcome).toBe("error");
+  });
+
+  it("a sub-agent's ordinary success stays success", async () => {
+    const { row } = await subagentToolRow({
+      isError: false,
+      result: { content: [{ type: "text", text: "NAME READY" }] },
+    });
+    expect(row?.message.outcome).toBe("success");
+  });
+
   it("#9 background sub-agent bails when parent _aborted during setup (no child prompt)", async () => {
     const mgr = new AgentBoxSessionManager() as any;
     // Parent already aborted by the time the child's setup (createSiclawSession) completes.

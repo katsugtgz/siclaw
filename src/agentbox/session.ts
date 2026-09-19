@@ -14,7 +14,7 @@ import { UsageOutbox } from "./usage-outbox.js";
 
 import { BackgroundWorkTurn, lateSubagentResultPrompt } from "./background-work-turn.js";
 import type { RequestMode } from "../shared/request-mode.js";
-import { persistableToolDetails } from "../shared/tool-result-metadata.js";
+import { persistableToolDetails, toolResultOutcome } from "../shared/tool-result-metadata.js";
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -2637,7 +2637,11 @@ export class AgentBoxSessionManager {
       // in a synthetic (background-completion) turn was written with outcome=null, which the
       // frontend maps to "running" → a spinner that never resolves and a recovered-run poller stuck
       // on "Thinking…" after refresh. Only tool rows carry an outcome; user/assistant rows stay null.
-      outcome: role === "tool" ? (message.isError ? "error" : "success") : null,
+      //
+      // Derived, not spelled out: `isError` alone misses the way tools actually report failure
+      // (`details.error` / `details.blocked`), and this row goes to the same column the gateway
+      // fills with toolResultOutcome for an ordinary turn.
+      outcome: role === "tool" ? toolResultOutcome(message.details, message.isError) : null,
     });
   }
 
@@ -3108,9 +3112,18 @@ export class AgentBoxSessionManager {
         pendingTools.delete(id);
         const toolName = (event.toolName as string) || (event.name as string) || pending?.toolName || "tool";
         const durationMs = pending ? Date.now() - pending.startMs : null;
-        const outcome: "success" | "error" = event.isError ? "error" : "success";
+        // The SAME judgement the gateway's SSE consumer makes for a non-delegated turn
+        // (sse-consumer.ts -> toolResultOutcome). It was spelled out by hand here, minus the
+        // `details` half, so a tool that reports failure the documented way -- `details.error`
+        // / `details.blocked`, which 93 of the 94 failure returns in src/tools use and which
+        // `isError` accompanies in exactly one of them -- was persisted as a SUCCESS. Both
+        // paths write the same column of the same table, so the two must not diverge again.
+        const outcome = toolResultOutcome(event.result?.details, event.isError);
         const resultText = redactText(extractEventText(event.result?.content), redactionConfig);
-        liveSteps.push({ kind: "tool", toolName, toolInput: pending?.toolInput, content: resultText.slice(0, 1000), outcome, durationMs });
+        // SubagentStep carries two states, not three: a refusal is "not a success" to a reader
+        // of the live card, and the third state would have to cross into portal-web to mean
+        // anything there. The PERSISTED row keeps all three.
+        liveSteps.push({ kind: "tool", toolName, toolInput: pending?.toolInput, content: resultText.slice(0, 1000), outcome: outcome === "success" ? "success" : "error", durationMs });
         emitProgress(`Finished ${toolName}`);
         enqueuePersist(async () => {
           await this.persistAppendMessage({
@@ -3825,7 +3838,10 @@ export class AgentBoxSessionManager {
         emitDiagnostic({
           type: "tool_call",
           toolName: event.toolName ?? entry?.name ?? "unknown",
-          outcome: event.isError ? "error" : "success",
+          // Derived, not spelled out — see toolResultOutcome. A refusal reports itself through
+          // `details`, so reading `isError` alone under-counts failures in the telemetry too.
+          // This channel's outcome is binary, so a refusal folds into "error": it did not run.
+          outcome: toolResultOutcome(event.result?.details, event.isError) === "success" ? "success" : "error",
           // 0 used to mean both "instant" and "we could not pair this" — indistinguishable downstream.
           durationMs: entry ? Date.now() - entry.startMs : undefined,
           userId: effectiveUserId ?? "unknown",

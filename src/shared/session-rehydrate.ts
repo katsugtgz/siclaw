@@ -95,10 +95,14 @@ function tsOf(row: RehydrateRow): number {
 }
 
 /** 工具行的 outcome → 是否失败。未知值按**成功**处理:把一次成功的调用标成失败,
- *  会让模型以为那条路走不通而改道,比丢掉 outcome 更糟。 */
+ *  会让模型以为那条路走不通而改道,比丢掉 outcome 更糟。
+ *
+ *  "blocked" 不是未知值,它是这一列的三个合法取值之一(策略拒绝,命令根本没跑)。
+ *  漏掉它,重建出来的历史里每一次被拒绝的调用都显示为成功 —— 模型据此认为那条路
+ *  走得通,于是原样再试一次。这正是上面那句保守默认要避免的情形,只是方向相反。 */
 function isErrorOutcome(outcome?: string | null): boolean {
   const o = (outcome ?? "").trim().toLowerCase();
-  return o === "error" || o === "failed" || o === "failure";
+  return o === "error" || o === "failed" || o === "failure" || o === "blocked";
 }
 
 /** tool_input 是存下来的 JSON 字符串;坏值不能让整段历史回灌失败。 */
