@@ -56,6 +56,19 @@ describe("toRehydratedMessages", () => {
     results.forEach((r, i) => expect(r.role === "toolResult" && r.toolCallId).toBe(callIds[i]));
   });
 
+  it("treats a blocked row as a failure — a refusal is the strongest 'this path is closed' signal", () => {
+    // "blocked" is one of the three legal values of this column (success | error | blocked), not an
+    // unknown one, and the gateway writes it for every policy refusal. Reading it as a success means
+    // a rebuilt history shows every refused command as having worked, so the model concludes the
+    // path is open and reissues it verbatim — the exact failure the "unknown → success" default
+    // above exists to avoid, only pointing the other way.
+    const out = toRehydratedMessages([
+      row({ role: "tool", toolName: "bash", content: '{"error":"awk is not in the allowed command list"}', outcome: "blocked" }),
+    ]);
+    const result = out.find((m: any) => m.role === "toolResult") as any;
+    expect(result.isError).toBe(true);
+  });
+
   it("marks a failed tool row as isError and treats unknown outcomes as success", () => {
     const out = toRehydratedMessages([
       row({ role: "tool", toolName: "bash", content: "boom", outcome: "error" }),

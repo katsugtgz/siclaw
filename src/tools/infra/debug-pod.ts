@@ -606,10 +606,35 @@ export interface DebugPodSpec {
  * pod and then build its own (detached, streamed) `kubectl exec`. Throws on failure
  * (creation error carries .stdout/.stderr/.code; "didn't start" is a plain Error).
  */
+/**
+ * The countdown shared by BOTH startup waits.
+ *
+ * Exported for one reason: the thing worth testing here is the SEMANTICS — a total, not a
+ * per-step allowance — and that is invisible in the two call sites on their own. It was per
+ * step, each wait getting the full ceiling, so the worst case was twice what the ceiling
+ * promised and the ordinary case returned at ~65s to a caller that asked for 30.
+ *
+ * `callerBudgetMs` LOWERS the ceiling and never raises it: a caller asking for less is stating
+ * its patience, while a 600s command timeout must not license a 600s wait on a pod that is
+ * stuck pulling an image.
+ */
+export function startStartupDeadline(
+  ceilingMs: number,
+  callerBudgetMs: number | undefined,
+  now: () => number = Date.now,
+): { budgetMs: number; remainingMs: () => number } {
+  const budgetMs = Math.min(ceilingMs, callerBudgetMs ?? Number.POSITIVE_INFINITY);
+  const endsAt = now() + budgetMs;
+  // Floored at 0: both waits poll on `while (Date.now() < deadline)`, so a spent budget makes
+  // the next one give up at once. A negative would read as "already past" just the same, but
+  // it would also reach any future caller that treats the number as a duration.
+  return { budgetMs, remainingMs: () => Math.max(0, endsAt - now()) };
+}
+
 export async function ensureDebugPodReady(
   spec: DebugPodSpec,
   env: ExecEnv,
-  opts: { signal?: AbortSignal },
+  opts: { signal?: AbortSignal; startupBudgetMs?: number },
 ): Promise<CachedPod> {
   const config = loadConfig();
   const image = spec.image || config.debugImage;
@@ -662,19 +687,33 @@ export async function ensureDebugPodReady(
           manifest,
         );
 
+        // 🔴 ONE budget across BOTH waits, not one each.
+        //
+        // Startup is two sequential waits — the Job controller has to create the pod before
+        // anything can wait for it to run — and each was given the FULL
+        // config.debugPodStartupTimeout. The comment below promised "fails fast within ~a
+        // minute" while the worst case was TWICE that, and the traces show the ordinary case:
+        // ~5s to resolve the name, then the full 60s wait, returning at ~65s to a caller that
+        // had asked for 30. Same defect as the AgentBox pre-listen budget (startup-budget.ts),
+        // which was also per step -- three at 30s each -- and is documented there at length.
+        //
+        // Startup still does NOT draw on the command's timeout the way a per-step budget would:
+        // a pod stuck pulling an image must not hold the call for a 600s command timeout, and
+        // detectFatalPodStartupFailure short-circuits the known-fatal reasons sooner still. But
+        // a caller asking for LESS than the ceiling is stating its patience, and waiting twice
+        // that long ignores it -- so the budget is the smaller of the two. Both waits poll on
+        // `while (Date.now() < deadline)`, so a spent budget makes the second one give up
+        // immediately rather than arm a timer that fires late.
+        const startup = startStartupDeadline(config.debugPodStartupTimeout * 1000, opts.startupBudgetMs);
+
         // The Job controller creates the pod asynchronously — resolve its name by
         // our unique label (works across K8s versions, not relying on job-name).
         const podName = await resolveJobPodName(
-          debugId, env, debugNamespace, config.debugPodStartupTimeout * 1000, opts.signal,
+          debugId, env, debugNamespace, startup.remainingMs(), opts.signal,
         );
 
-        // Pod startup gets its OWN bounded budget (config.debugPodStartupTimeout),
-        // not the command's timeoutMs — so a pod stuck pulling/scheduling fails fast
-        // within ~a minute instead of holding the tool call for the full command
-        // timeout. detectFatalPodStartupFailure also short-circuits known fatal
-        // reasons (ImagePullBackOff / Unschedulable / config errors) even sooner.
         const phase = await waitForPodDone(
-          podName, config.debugPodStartupTimeout * 1000, env.childEnv, opts.signal,
+          podName, startup.remainingMs(), env.childEnv, opts.signal,
           env.kubeconfigPath ?? undefined, debugNamespace, "Running",
         );
 
@@ -944,7 +983,9 @@ export async function runInDebugPod(
   // ── Phase 0: Get or create a reusable pod ─────────────────────────
   let cachedPod: CachedPod;
   try {
-    cachedPod = await ensureDebugPodReady(spec, env, { signal: opts.signal });
+    // The caller's timeout is its stated patience. It still does not EXTEND the startup
+    // ceiling (see ensureDebugPodReady) — it only lowers it when the caller asked for less.
+    cachedPod = await ensureDebugPodReady(spec, env, { signal: opts.signal, startupBudgetMs: opts.timeoutMs });
   } catch (err: any) {
     return {
       stdout: err.stdout?.trim() ?? "",

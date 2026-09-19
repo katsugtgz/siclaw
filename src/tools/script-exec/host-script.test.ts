@@ -1,4 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 vi.mock("../infra/ssh-client.js", () => ({
   acquireSshTarget: vi.fn(),
@@ -134,5 +136,23 @@ describe("host_script — one-step pod netns", () => {
     // A SECOND sshExec carried the reap script over a fresh connection.
     const kill = vi.mocked(sshExec).mock.calls.find((c) => String(c[1]).includes("pkill -TERM -s"));
     expect(kill).toBeTruthy();
+  });
+});
+
+describe("the SSH fallback names its own side effect", () => {
+  // A review caught this in the worst place for it: a run under an explicit "create no pods"
+  // constraint was told to retry with node_script, which works by creating a PRIVILEGED debug pod
+  // on the node. The suggestion read as a free alternative, and the agent had to know on its own
+  // that it was not one.
+  it("says node_script creates a privileged debug pod, and what to do when that is not allowed", () => {
+    const source = readFileSync(fileURLToPath(new URL("./host-script.ts", import.meta.url)), "utf8");
+    // Only the text handed to the model — a comment mentioning node_script is not a suggestion.
+    const suggestions = source.split("\n").filter(
+      (line) => line.includes("node_script") && line.includes("text:") && line.includes("Error:"));
+    expect(suggestions.length).toBeGreaterThan(0);
+    for (const line of suggestions) {
+      expect(line, "every node_script suggestion discloses the pod").toMatch(/CREATING a privileged debug pod/);
+      expect(line, "and offers a route for where that is disallowed").toMatch(/read-only API|unreachable/);
+    }
   });
 });

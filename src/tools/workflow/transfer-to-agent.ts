@@ -48,7 +48,11 @@ export function createTransferToAgentTool(refs: ToolRefs): ToolDefinition {
       "you may briefly tell the user what you are checking, without explaining internal routing.\n\n" +
       "`brief` is what the destination reads as its instruction. It has the full conversation history, so do " +
       "not retell it — state what needs doing and anything you already established (the exact cluster/host, " +
-      "what you already ruled out).\n\n" +
+      "what you already ruled out). What it does NOT get is your task plan: the ledger is not part of the " +
+      "conversation and does not transfer, so the destination opens on an EMPTY plan. If you have unfinished " +
+      "tasks that still need doing, read them with task_list and put them in the brief — otherwise the " +
+      "destination rebuilds a near-identical plan from scratch, and whatever you already marked done is " +
+      "silently redone.\n\n" +
       "A return to an agent that already participated requires new_evidence: cite a newly verified finding " +
       "and explain why it lets that agent proceed. Rewording the request, uncertainty, or the same failure " +
       "is not new evidence.\n\n" +

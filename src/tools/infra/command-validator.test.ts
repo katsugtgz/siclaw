@@ -465,6 +465,68 @@ describe("refusals name what does work", () => {
     expect(parsed.hint).toMatch(/Semicolon-separated/);
   });
 
+  it("answers a refused awk per USE, and says so where there is no equivalent", () => {
+    // Four real awk calls in a week's traces are three different tasks, and only one of them has
+    // an equivalent — so the hint is split by use rather than offering one substitute.
+    const err = validateCommand("kubectl get pods --no-headers | awk '{print $1}'", {
+      context: "local", sensitivePathPatterns: [], extraAllowed: new Set(["kubectl"]),
+    }) ?? "";
+    const hint = JSON.parse(err).hint as string;
+    // Columns: the server can select them, and the result does not depend on column position.
+    expect(hint).toContain("custom-columns");
+    // And the near-substitute that silently reads the wrong column is called out by name.
+    expect(hint).toMatch(/Do NOT substitute `cut`/);
+    // Upper bound on a log window: kubectl logs genuinely has no --until.
+    expect(hint).toContain("--until");
+    // Stream arithmetic: no awk, no bc, no datamash — say it rather than point somewhere wrong.
+    expect(hint).toMatch(/no bc, no datamash/);
+  });
+
+  it("answers a refused sed, and still refuses it", () => {
+    const err = validateCommand("kubectl logs pod | sed -n '10,20p'", {
+      context: "local", sensitivePathPatterns: [], extraAllowed: new Set(["kubectl"]),
+    }) ?? "";
+    expect(err).not.toBe("");
+    const parsed = JSON.parse(err);
+    expect(parsed.binaries_not_allowed).toContain("sed");
+    expect(parsed.hint).toContain("head -20 | tail -11");
+  });
+
+  it("concatenates the keyword hint and the binary hint when one command trips both", () => {
+    // `for … awk … done` is a real trace: choosing one of the two hints would drop half the answer.
+    const err = validateCommand("for p in a b; do kubectl logs $p | awk '{print $1}'; done", {
+      context: "local", sensitivePathPatterns: [], extraAllowed: new Set(["kubectl"]),
+    }) ?? "";
+    const parsed = JSON.parse(err);
+    expect(parsed.hint).toContain("Semicolon-separated");
+    expect(parsed.hint).toContain("custom-columns");
+  });
+
+  it("carries no hint for a binary that has no alternative to name", () => {
+    // The hint table is guidance, not decoration: an entry exists only where there is something
+    // to run instead, so a refusal without one must not grow an empty field.
+    const err = validateCommand("dstat -cdn", {
+      context: "local", sensitivePathPatterns: [],
+    }) ?? "";
+    const parsed = JSON.parse(err);
+    expect(parsed.binaries_not_allowed).toContain("dstat");
+    expect(parsed.hint).toBeUndefined();
+  });
+
+  it("renders the allow-list on one line while keeping it a JSON array", () => {
+    // ~130 names at one per line is about a thousand tokens of every refusal, and a refused awk is
+    // typically 3-5 parallel calls. The list stays (it is the only place the agent learns what IS
+    // available); the indentation goes.
+    const err = validateCommand("awk '{print}'", {
+      context: "local", sensitivePathPatterns: [],
+    }) ?? "";
+    expect(err).toMatch(/"allowed": \[[^\n]*\]/);
+    const parsed = JSON.parse(err);
+    expect(Array.isArray(parsed.allowed)).toBe(true);
+    expect(parsed.allowed.length).toBeGreaterThan(100);
+    expect(err.split("\n").length).toBeLessThan(20);
+  });
+
   it("names ps as the substitute for a blocked cmdline", () => {
     // node_exec b4d9c4b9: status and stack were permitted for the same PID while cmdline was refused,
     // with no alternative given. The asymmetry is deliberate — a command line carries credentials in its

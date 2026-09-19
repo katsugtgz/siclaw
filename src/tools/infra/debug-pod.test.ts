@@ -1,5 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import {
+  startStartupDeadline,
   buildDebugPodLabels,
   buildDebugJobManifest,
   DebugPodCache,
@@ -481,5 +484,51 @@ describe("a failure is remembered before the creation lock is released", () => {
     expect(out).toBe(replay);
     // One suffix, not two — the message is not rewritten on every caller.
     expect(out.message.match(/unchanged from an attempt/g) ?? []).toHaveLength(1);
+  });
+});
+
+
+describe("the startup budget is a TOTAL, not one allowance per wait", () => {
+  // Startup is two sequential waits: the Job controller must create the pod before anything
+  // can wait for it to be Running. Each used to get the FULL ceiling, so the worst case was
+  // twice what the ceiling promised. The traces show the ordinary case — ~5s to resolve the
+  // pod name, then the full 60s wait — returning at ~65s to a caller that asked for 30.
+  // Same defect the AgentBox pre-listen budget had (startup-budget.ts), three steps at 30s.
+
+  it("spends one allowance across both waits", () => {
+    let now = 1_000;
+    const startup = startStartupDeadline(60_000, undefined, () => now);
+    expect(startup.remainingMs()).toBe(60_000);
+    now += 5_000;                              // first wait: resolving the pod name
+    expect(startup.remainingMs()).toBe(55_000); // second wait gets the REST, not another 60s
+    now += 55_000;
+    expect(startup.remainingMs()).toBe(0);
+  });
+
+  it("floors at zero so a spent budget gives up at once", () => {
+    let now = 0;
+    const startup = startStartupDeadline(10_000, undefined, () => now);
+    now += 25_000;
+    // Both waits poll on `while (Date.now() < deadline)`, so 0 makes the loop skip entirely.
+    // A negative would behave the same there but misleads anything reading it as a duration.
+    expect(startup.remainingMs()).toBe(0);
+  });
+
+  it("lets the caller LOWER the ceiling but never raise it", () => {
+    // A caller asking for 30s is stating its patience; waiting 65 ignores it.
+    expect(startStartupDeadline(60_000, 30_000).budgetMs).toBe(30_000);
+    // ...but a 600s command timeout must not license a 600s wait on a pod stuck pulling.
+    expect(startStartupDeadline(60_000, 600_000).budgetMs).toBe(60_000);
+    // No caller budget: the ceiling stands (background paths have no command timeout).
+    expect(startStartupDeadline(60_000, undefined).budgetMs).toBe(60_000);
+  });
+
+  it("is the only place the startup ceiling is turned into a duration", () => {
+    // The defect's SHAPE was one constant read twice, once per wait. A second reading is how
+    // it comes back, and it would come back silently — the symptom is only ever "slow".
+    const source = readFileSync(fileURLToPath(new URL("./debug-pod.ts", import.meta.url)), "utf8");
+    const uses = source.split("\n")
+      .filter((line) => line.includes("debugPodStartupTimeout") && !line.trimStart().startsWith("//"));
+    expect(uses, "derive both waits from one startStartupDeadline()").toHaveLength(1);
   });
 });

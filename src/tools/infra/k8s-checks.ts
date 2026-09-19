@@ -90,6 +90,61 @@ function detectFatalPodStartupFailure(status: any): string | null {
   return null;
 }
 
+/** Keep a single condition/waiting message from swallowing the error line. */
+function clip(text: unknown, max = 160): string {
+  const value = typeof text === "string" ? text.trim() : "";
+  return value.length > max ? `${value.slice(0, max - 1)}…` : value;
+}
+
+/**
+ * What the pod was doing when the wait ran out.
+ *
+ * The poll loop parses the whole `.status` on every iteration and the timeout threw it all
+ * away: "Timed out waiting for pod X to complete" was the entire answer, so every startup
+ * stall read the same whether the image was still pulling, the pod was unscheduled, or the
+ * node's runtime had stopped creating containers. Those have different next steps, and the
+ * caller had to spend another round trip to tell them apart.
+ *
+ * Only the NON-obvious parts are rendered: a condition that is True and a container that is
+ * running explain nothing about a stall. The fatal reasons (ImagePullBackOff, Unschedulable,
+ * container config errors) never reach here at all -- detectFatalPodStartupFailure fails fast
+ * on those -- so what lands here is exactly the "stuck, but not for a reason kubernetes calls
+ * terminal" case, which is the one that needed the detail.
+ */
+export function describePodStartupState(status: unknown): string {
+  const s = status as {
+    phase?: unknown;
+    conditions?: Array<{ type?: unknown; status?: unknown; reason?: unknown; message?: unknown }>;
+    initContainerStatuses?: Array<Record<string, any>>;
+    containerStatuses?: Array<Record<string, any>>;
+  } | undefined;
+  // Never observed: the pod was gone or unreadable for the whole wait, which is itself the
+  // finding — and saying nothing would misread as "we did not look".
+  if (!s || typeof s !== "object") return " — the pod's status was never readable";
+
+  const parts: string[] = [];
+  const phase = typeof s.phase === "string" ? s.phase.trim() : "";
+  parts.push(`phase=${phase || "unknown"}`);
+
+  for (const c of s.conditions ?? []) {
+    if (c?.status === "True") continue; // a satisfied condition explains nothing about a stall
+    const type = typeof c?.type === "string" ? c.type : "condition";
+    const reason = clip(c?.reason, 60);
+    const message = clip(c?.message);
+    parts.push(`${type}=${c?.status ?? "?"}${reason ? ` (${reason})` : ""}${message ? `: ${message}` : ""}`);
+  }
+
+  for (const cs of [...(s.initContainerStatuses ?? []), ...(s.containerStatuses ?? [])]) {
+    const waiting = cs?.state?.waiting;
+    if (!waiting) continue;
+    const reason = clip(waiting.reason, 60);
+    const message = clip(waiting.message);
+    parts.push(`container ${cs?.name ?? "?"} waiting${reason ? `=${reason}` : ""}${message ? `: ${message}` : ""}`);
+  }
+
+  return ` — ${parts.join("; ")}`;
+}
+
 /** Adaptive polling constants — start fast (500ms) and back off to 5s cap. */
 const POLL_INITIAL_MS = 500;
 const POLL_MAX_MS = 5_000;
@@ -119,6 +174,8 @@ export async function waitForPodDone(
 ): Promise<string> {
   let pollInterval = POLL_INITIAL_MS;
   const deadline = Date.now() + timeoutMs;
+  // The last status actually read, kept for the timeout message — see describePodStartupState.
+  let lastStatus: unknown;
 
   while (Date.now() < deadline) {
     if (signal?.aborted) throw new Error("Aborted");
@@ -136,6 +193,7 @@ export async function waitForPodDone(
         { timeout: KUBECTL_TIMEOUT, env },
       );
       const status = JSON.parse(stdout)?.status ?? {};
+      lastStatus = status;
       const phase = (status.phase ?? "").trim();
       if (targetPhase === "Running") {
         if (phase === "Running" || TERMINAL_PHASES.has(phase)) return phase;
@@ -162,7 +220,9 @@ export async function waitForPodDone(
     pollInterval = Math.min(pollInterval * POLL_BACKOFF_FACTOR, POLL_MAX_MS);
   }
 
-  throw new Error(`Timed out waiting for pod "${podName}" to complete`);
+  throw new Error(
+    `Timed out waiting for pod "${podName}" to complete${describePodStartupState(lastStatus)}`,
+  );
 }
 
 /**
@@ -180,7 +240,7 @@ async function runningContainers(
   namespace: string,
   env?: NodeJS.ProcessEnv,
   kubeconfigPath?: string,
-): Promise<string[]> {
+): Promise<{ regular: string[]; init: string[] }> {
   try {
     const { stdout } = await execFileAsync(
       "kubectl",
@@ -194,11 +254,14 @@ async function runningContainers(
       status?: { containerStatuses?: Array<{ name?: string; state?: Record<string, unknown> }>;
                  initContainerStatuses?: Array<{ name?: string; state?: Record<string, unknown> }> };
     };
-    const all = [...(obj.status?.initContainerStatuses ?? []), ...(obj.status?.containerStatuses ?? [])];
-    return all.filter((c) => c.state && "running" in c.state).map((c) => c.name ?? "").filter(Boolean);
+    const names = (list: Array<{ name?: string; state?: Record<string, unknown> }> | undefined) =>
+      (list ?? []).filter((c) => c.state && "running" in c.state).map((c) => c.name ?? "").filter(Boolean);
+    // Kept apart because they answer different questions: a REGULAR container running is what
+    // makes an unnamed exec land somewhere, an INIT one only counts when it is asked for.
+    return { regular: names(obj.status?.containerStatuses), init: names(obj.status?.initContainerStatuses) };
   } catch {
     // Unreadable ⇒ report nothing rather than guessing a container is up.
-    return [];
+    return { regular: [], init: [] };
   }
 }
 
@@ -236,12 +299,20 @@ export async function checkPodRunning(
     // The extra request runs only on the unhappy path: the phase check above still answers the common
     // case in one call.
     const running = await runningContainers(pod, namespace, env, kubeconfigPath);
-    if (container && running.includes(container)) return null;
-    if (!container && running.length > 0) return null;
+    // Naming a container is what makes exec land on it, so an explicit request is honoured for
+    // either kind. Without one, kubectl picks the default REGULAR container — so only those
+    // clear the check. Counting a running INIT container here cleared the precheck and then let
+    // the exec fail anyway, one round trip later and with a worse error, because -c was never
+    // added (pod-exec / pod-script only pass it when the caller did).
+    if (container && [...running.regular, ...running.init].includes(container)) return null;
+    if (!container && running.regular.length > 0) return null;
 
-    const detail = running.length > 0
-      ? ` Containers that ARE running: ${running.join(", ")} — name one with the container parameter.`
-      : " No container in it is running either.";
+    const detail = running.regular.length > 0
+      ? ` Containers that ARE running: ${running.regular.join(", ")} — name one with the container parameter.`
+      : running.init.length > 0
+        // The actionable half: it IS reachable, but only by asking for it by name.
+        ? ` Only an init container is running: ${running.init.join(", ")}. An exec without a container lands on the default app container, not this one — pass it as the container parameter to look inside it.`
+        : " No container in it is running either.";
     return `Pod "${pod}" in namespace "${namespace}" is not Running (phase: ${phase || "unknown"}).${detail}`;
   } catch (err: any) {
     const stderr = (err.stderr?.trim() || err.message) as string;

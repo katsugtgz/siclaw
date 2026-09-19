@@ -374,6 +374,46 @@ function assertToolPathAllowed(
   }
 }
 
+/**
+ * Give a refused grep its real reason back.
+ *
+ * grep is the only file tool that rewrites its operations' errors. Its `isDirectory` probe sits
+ * in a bare `catch {}` that answers "Path not found" for EVERY failure, so a path that exists and
+ * is merely OUTSIDE the allowed directories is reported as absent. find and ls pass the same
+ * errors through untouched.
+ *
+ * That difference is not cosmetic: the two facts have opposite next steps. "It is not there"
+ * sends the agent looking somewhere else; "you may not read it" tells it to stop looking. `/app`
+ * is this image's WORKDIR and is not in the read allow-list, and three separate traces show an
+ * agent told the source tree does not exist and going off to hunt for it.
+ *
+ * The original error is unrecoverable by the time it reaches us, so the verdict is re-derived
+ * from the path. It still REJECTS either way -- the call failed, and that rejection is what makes
+ * it an error rather than an empty search.
+ */
+function withGrepPathReason(
+  tool: ToolDefinition,
+  allowedDirs: string[],
+  blockedDirs: Array<{ dir: string; reason: string }>,
+): ToolDefinition {
+  const originalExecute = tool.execute.bind(tool) as ToolDefinition["execute"];
+  return {
+    ...tool,
+    execute: async (...executeArgs: Parameters<ToolDefinition["execute"]>) => {
+      try {
+        return await originalExecute(...executeArgs);
+      } catch (err) {
+        const matched = /^Path not found: (.+)$/.exec(err instanceof Error ? err.message : "");
+        if (!matched) throw err;
+        // Re-run the gate the injected operation ran. If it refuses, ITS message is the true
+        // one -- and it already names the directories that would have worked.
+        assertToolPathAllowed(matched[1], allowedDirs, "grep", blockedDirs);
+        throw err; // the gate passed, so the path really is absent
+      }
+    },
+  };
+}
+
 export async function createSiclawSession(
   opts?: CreateSiclawSessionOpts,
 ): Promise<SiclawSessionResult> {
@@ -679,12 +719,12 @@ export async function createSiclawSession(
           mkdir: async (d) => { assertToolPathAllowed(d, writeAllowedDirs, "write", blockedFileDirs); await fsMkdir(d, { recursive: true }); },
         },
       }),
-    createGrepTool(cwd, {
+    withGrepPathReason(createGrepTool(cwd, {
       operations: {
         isDirectory: (p) => { assertToolPathAllowed(p, readAllowedDirs, "grep", blockedFileDirs); return fs.statSync(p).isDirectory(); },
         readFile: (p) => { assertToolPathAllowed(p, readAllowedDirs, "grep", blockedFileDirs); return fs.readFileSync(p, "utf-8"); },
       },
-    }),
+    }), readAllowedDirs, blockedFileDirs),
     createFindTool(cwd, {
       operations: {
         exists: (p) => { assertToolPathAllowed(p, readAllowedDirs, "find", blockedFileDirs); return fs.existsSync(p); },

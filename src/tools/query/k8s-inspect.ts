@@ -636,7 +636,15 @@ Kinds: ${KNOWN_KINDS.join(", ")}.`,
       cluster: Type.Optional(Type.String({ description: "Target cluster name from cluster_list. Required when more than one cluster is bound." })),
     }),
     async execute(_toolCallId, rawParams, signal?: AbortSignal) {
-      const params = rawParams as K8sInspectParams;
+      const raw = rawParams as K8sInspectParams;
+      // An OPTIONAL field arrives as "" from a caller that serializes every key rather than
+      // omitting the ones it has no value for, and "" is that caller spelling "not provided".
+      // Everything downstream already agrees: nsFlag() tests the string for truthiness, so ""
+      // and absent build the same command. Only the object-name screen below saw a difference,
+      // and it refused `kind: node` — cluster-scoped, no namespace to give — as though "" were
+      // a malformed name. Normalised once, here, so the two spellings cannot diverge again.
+      // `name` is REQUIRED and is deliberately NOT normalised: an empty one stays refused.
+      const params: K8sInspectParams = raw.namespace === "" ? { ...raw, namespace: undefined } : raw;
 
       const spec = resolveKind(params.kind ?? "");
       if (!spec) {

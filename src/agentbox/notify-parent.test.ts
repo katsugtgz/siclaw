@@ -695,6 +695,59 @@ describe("notifyParent", () => {
   });
 });
 
+describe("a synthetic turn's tool row records the failure the tool actually reported", () => {
+  // persistSyntheticMessage derived its outcome from `isError` alone. Tools report failure
+  // through `details` (93 of 94 failure returns under src/tools/ do, and only one of those
+  // also sets isError), so a background-completion turn wrote refusals and errors alike as
+  // outcome=success -- into the same column the gateway fills correctly for an ordinary turn.
+  async function toolRowFor(toolResult: Record<string, unknown>) {
+    const mgr = new AgentBoxSessionManager() as any;
+    let cb: ((e: any) => void) | undefined;
+    const brain = {
+      followUp: vi.fn(async () => {}),
+      subscribe: vi.fn((fn: (e: any) => void) => { cb = fn; return () => {}; }),
+      prompt: vi.fn(async () => {
+        cb?.({ type: "tool_execution_start", toolCallId: "c1", toolName: "restricted_bash" });
+        cb?.({ type: "message_end", message: { role: "toolResult", toolCallId: "c1", toolName: "restricted_bash", ...toolResult } });
+        cb?.({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "ok" }] } });
+      }),
+    };
+    const managed = fakeManaged("s1", brain as any, true);
+    mgr.sessions.set("s1", managed);
+    mgr.jobs.register({ jobId: "j1", type: "bash", parentSessionId: "s1", description: "d", status: "completed", startedAt: 0, notified: false, outputFile: "/o" });
+    const send = vi.fn(async () => ({ ok: true, id: "x" }));
+    mgr.gatewayClient = { sendDelegationPersistenceEvent: send };
+    mgr.agentId = "agent-1";
+    await mgr.notifyParent("s1", "j1", { taskId: "j1", outputFile: "/o", status: "completed", summary: "done" });
+    await flushCoalesce();
+    return send.mock.calls
+      .map((c) => c[0])
+      .filter((e: any) => e?.type === "delegation.append_message")
+      .find((e: any) => e.message?.role === "tool");
+  }
+
+  it("persists a policy refusal as blocked", async () => {
+    const row = await toolRowFor({
+      content: [{ type: "text", text: '{"error":"awk is not in the allowed command list"}' }],
+      details: { blocked: true },
+    });
+    expect(row?.message.outcome).toBe("blocked");
+  });
+
+  it("persists a details-only error as error, with isError absent", async () => {
+    const row = await toolRowFor({
+      content: [{ type: "text", text: "boom" }],
+      details: { error: true, reason: "command_failed" },
+    });
+    expect(row?.message.outcome).toBe("error");
+  });
+
+  it("still records an ordinary success as success", async () => {
+    const row = await toolRowFor({ content: [{ type: "text", text: "PING ... 0.264 ms" }] });
+    expect(row?.message.outcome).toBe("success");
+  });
+});
+
 describe("stopSessionJobs (the Stop button halts all of a session's background jobs)", () => {
   it("stops only THIS session's RUNNING jobs (bg exec + bg sub-agents), leaving others alone", () => {
     const mgr = new AgentBoxSessionManager() as any;

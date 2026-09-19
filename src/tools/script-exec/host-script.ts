@@ -139,7 +139,7 @@ Examples (pass the id from host_list; names shown here for readability):
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         return {
-          content: [{ type: "text", text: `Error: ${msg}\n\nCould not reach "${params.host}" over SSH (not bound / no credential — not a script error). If "${params.host}" is a Kubernetes node, retry this script with node_script (debug pod, no SSH).` }],
+          content: [{ type: "text", text: `Error: ${msg}\n\nCould not reach "${params.host}" over SSH (not bound / no credential — not a script error). If "${params.host}" is a Kubernetes node, node_script can run this without SSH — but it does so by CREATING a privileged debug pod on that node, so only take that route where creating one is allowed. Where it is not, read what you can through the read-only API instead, or report the host as unreachable.` }],
           details: { error: true, reason: "host_acquire_failed" },
         };
       }
@@ -226,7 +226,7 @@ Examples (pass the id from host_list; names shown here for readability):
         }
         const msg = err instanceof Error ? err.message : String(err);
         return {
-          content: [{ type: "text", text: `Error: ${msg}\n\nSSH connection to "${params.host}" failed (a connection failure, not a script error). If "${params.host}" is a Kubernetes node, retry this script with node_script (debug pod, no SSH).` }],
+          content: [{ type: "text", text: `Error: ${msg}\n\nSSH connection to "${params.host}" failed (a connection failure, not a script error). If "${params.host}" is a Kubernetes node, node_script can run this without SSH — but it does so by CREATING a privileged debug pod on that node, so only take that route where creating one is allowed. Where it is not, read what you can through the read-only API instead, or report the host as unreachable.` }],
           details: { error: true, reason: "ssh_exec_failed", host: params.host },
         };
       } finally {
