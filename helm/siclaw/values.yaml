@@ -24,6 +24,12 @@ database:
 # Scale horizontally by deploying multiple releases with distinct identities.
 runtime:
   enabled: true
+  # Optional. This Runtime's own label for itself (logs, the AgentBoxes it
+  # spawns). NOT its identity to the control plane — SiCore resolves that from
+  # portalSecret (the adapter secret), so most deployments leave this empty.
+  # Older releases set SICLAW_AGENT_ID through runtime.env below; that still
+  # works and still wins.
+  agentId: ""
   portalSecret: ""      # Runtime → Portal/Upstream API auth (X-Auth-Token on phone-home WS)
   # Where Runtime gets Agent/Credential info from:
   #   Standalone mode: http://siclaw-portal:3003
@@ -314,8 +320,22 @@ metrics:
     costThresholdPerHour: 10
 
 # Optional, disposable Python/Bash execution. No AgentBox or production secrets.
+#
+# `provision` builds this Runtime's execution namespace, RBAC and quota. It does
+# NOT open the feature: whether Agents get run_script, and which runner image is
+# used, is set PER RUNTIME in the control plane, so a region can be opened,
+# closed or repointed without redeploying. Both must agree — provisioned
+# infrastructure with the switch off stays closed, and a switch turned on
+# without provisioning leaves the Runtime reporting the feature as unavailable
+# rather than handing Agents a tool whose every call fails.
 scriptSandbox:
-  enabled: false
+  # Builds this Runtime's execution namespace, RBAC and quota. On by default:
+  # it exposes nothing (the control plane owns the switch), and leaving it to
+  # each deployment to remember meant the feature could be turned on in the
+  # console against a Runtime that cannot run it. Set false to skip the
+  # infrastructure — the Runtime then reports the sandbox unavailable no matter
+  # what the console says.
+  provision: true
   provider: k8s # k8s or e2b; both use the same controlled tools.
   publicUrl: "" # Canonical HTTPS origin of the standalone Portal callback ingress.
   e2b:
@@ -324,8 +344,17 @@ scriptSandbox:
     domain: e2b.app
     apiKeySecret: "" # Existing Secret in Runtime namespace; never mounted in a runner.
     apiKeySecretKey: api-key
-  image: "" # Set to the built Dockerfile.script-sandbox image, preferably a digest.
-  namespace: "" # Default: <release-fullname>-execution; dedicated to runners.
+  # Runner image. In UPSTREAM mode leave this empty — the image is per-Runtime
+  # state in the control plane, and turning the sandbox on there requires it.
+  # Nothing is derived from image.registry/tag: a derived default is invisible
+  # from the console and silently points at a tag that may never have been built
+  # (the runner is an opt-in build: WITH_SCRIPT_SANDBOX=true make docker push).
+  # STANDALONE deployments have no control plane, so they set it here.
+  image: ""
+  # Default: <release-namespace>-execution; dedicated to runners. Two Runtimes
+  # may not share one — override only to point at a namespace that already
+  # enforces the restricted Pod Security Standard.
+  namespace: ""
   createNamespace: true
   serviceAccount: siclaw-script-runner
   runtimeClass: "" # Optional gVisor/Kata class already installed on the cluster.

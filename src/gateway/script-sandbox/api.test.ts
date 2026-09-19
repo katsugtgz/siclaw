@@ -12,6 +12,10 @@ vi.mock("./k8s-provider.js", () => ({ K8sScriptSandboxProvider: class { construc
 vi.mock("./e2b-provider.js", () => ({ E2bScriptSandboxProvider: class { constructor() { constructed.e2b(); } } }));
 
 const identity = { agentId: "a", boxId: "b" } as CertificateIdentity;
+// The control plane owns the switch, so a K8s fixture that wants the sandbox
+// open has to say so — provisioning alone no longer opens it.
+const openControl = (sandbox: unknown = { enabled: true }) =>
+  ({ request: vi.fn(async (method: string) => method === "config.getRuntimeConfig" ? { script_sandbox: sandbox } : undefined) });
 async function request(api: ReturnType<typeof createScriptSandboxApi>, method: string, authenticated = true) {
   let status = 0; let body: any;
   const res = { writeHead: (code: number) => { status = code; }, end: (text: string) => { body = JSON.parse(text); } };
@@ -19,7 +23,7 @@ async function request(api: ReturnType<typeof createScriptSandboxApi>, method: s
   return { status, body };
 }
 
-afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); vi.clearAllMocks(); });
+afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); vi.clearAllMocks(); vi.useRealTimers(); });
 describe("Runtime sandbox deployment gate", () => {
   it("disabled K8s ignores malformed provider, limits and inaccessible policy files", async () => {
     vi.stubEnv("SICLAW_SCRIPT_SANDBOX_ENABLED", "false");
@@ -59,9 +63,44 @@ describe("Runtime sandbox deployment gate", () => {
     vi.stubEnv("SICLAW_SCRIPT_SANDBOX_PROVIDER", "k8s");
     vi.stubEnv("SICLAW_SCRIPT_SANDBOX_IMAGE", "runner:test");
     const prewarm = vi.spyOn(ScriptSandboxPool.prototype, "prewarm").mockImplementation(() => {});
-    const api = createScriptSandboxApi("k8s", { request: vi.fn() });
+    const api = createScriptSandboxApi("k8s", openControl());
     expect((await request(api, "GET")).body.enabled).toBe(true);
     expect(constructed.k8s).toHaveBeenCalledOnce(); expect(prewarm).toHaveBeenCalledOnce();
+    await api.shutdown();
+  });
+
+  it("provisioned but not opened by the control plane reports disabled and warms nothing", async () => {
+    vi.stubEnv("SICLAW_SCRIPT_SANDBOX_PROVISIONED", "true");
+    vi.stubEnv("SICLAW_SCRIPT_SANDBOX_PROVIDER", "k8s");
+    vi.stubEnv("SICLAW_SCRIPT_SANDBOX_IMAGE", "runner:test");
+    const prewarm = vi.spyOn(ScriptSandboxPool.prototype, "prewarm").mockImplementation(() => {});
+    const api = createScriptSandboxApi("k8s", openControl({ enabled: false }));
+    expect((await request(api, "GET")).body).toEqual({ enabled: false, network_isolation: false, require_network_isolation: false });
+    // Idle runner pods cost the execution quota; a closed sandbox must not hold any.
+    expect(prewarm).not.toHaveBeenCalled();
+    expect((await request(api, "POST")).status).toBe(503);
+    await api.shutdown();
+  });
+
+  it("warms the pool when the control plane opens a Runtime that started closed", async () => {
+    vi.stubEnv("SICLAW_SCRIPT_SANDBOX_PROVISIONED", "true");
+    vi.stubEnv("SICLAW_SCRIPT_SANDBOX_IMAGE", "runner:test");
+    const prewarm = vi.spyOn(ScriptSandboxPool.prototype, "prewarm").mockImplementation(() => {});
+    let open = false;
+    const control = { request: vi.fn(async (method: string) =>
+      method === "config.getRuntimeConfig" ? { script_sandbox: { enabled: open } } : undefined) };
+    // Stubbed before the API is built: the settings cache captures Date.now on
+    // construction, so a later stub would not be the clock it reads.
+    const base = Date.now();
+    const now = vi.spyOn(Date, "now").mockReturnValue(base);
+    const api = createScriptSandboxApi("k8s", control);
+    expect((await request(api, "GET")).body.enabled).toBe(false);
+
+    // Flipped in the console; no redeploy, no pod recycle.
+    open = true;
+    now.mockReturnValue(base + 60_000);
+    expect((await request(api, "GET")).body.enabled).toBe(true);
+    expect(prewarm).toHaveBeenCalledOnce();
     await api.shutdown();
   });
 
@@ -74,7 +113,7 @@ describe("Runtime sandbox deployment gate", () => {
     vi.stubEnv("SICLAW_SCRIPT_SANDBOX_MAX_OUTPUT_BYTES", "8192");
     vi.stubEnv("SICLAW_SCRIPT_SANDBOX_REQUIRE_NETWORK_ISOLATION", "true");
     vi.spyOn(ScriptSandboxPool.prototype, "prewarm").mockImplementation(() => {});
-    const api = createScriptSandboxApi("k8s", { request: vi.fn() });
+    const api = createScriptSandboxApi("k8s", openControl());
     try {
       expect(await request(api, "GET")).toEqual({ status: 200, body: {
         enabled: true, network_isolation: true, require_network_isolation: true,
@@ -92,7 +131,8 @@ describe("current caller binding", () => {
     vi.stubEnv("SICLAW_SCRIPT_SANDBOX_PROVIDER", "k8s");
     vi.stubEnv("SICLAW_SCRIPT_SANDBOX_IMAGE", "runner:test");
     vi.spyOn(ScriptSandboxPool.prototype, "prewarm").mockImplementation(() => {});
-    const control = { request: vi.fn(async (method: string) => method === "config.getAgent" ? { status: "active" } : { user_id: claimedOwner }) };
+    const control = { request: vi.fn(async (method: string) => method === "config.getRuntimeConfig" ? { script_sandbox: { enabled: true } }
+      : method === "config.getAgent" ? { status: "active" } : { user_id: claimedOwner }) };
     const api = createScriptSandboxApi("k8s", control, undefined, currentUser);
     const req = Readable.from([Buffer.from(JSON.stringify({ session_id: "s", request: { language: "python", code: "pass" } }))]) as IncomingMessage;
     req.method = "POST";
@@ -109,7 +149,10 @@ describe("current caller binding", () => {
     const result = await post(currentUser);
     expect(result.status).toBe(403);
     expect(run).not.toHaveBeenCalled();
-    expect(result.control.request).not.toHaveBeenCalled();
+    // The switch may have been read while the API was built; what must not
+    // happen is this request resolving ownership for an unidentified caller.
+    expect(result.control.request).not.toHaveBeenCalledWith("sandbox.resolve", expect.anything(), expect.anything());
+    expect(result.control.request).not.toHaveBeenCalledWith("config.getAgent", expect.anything(), expect.anything());
   });
 
   it("rejects a live caller who presents another user's stored session", async () => {
