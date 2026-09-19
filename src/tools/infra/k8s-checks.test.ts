@@ -23,7 +23,9 @@ vi.mock("node:child_process", async () => {
   return { execFile: execFileMock };
 });
 
-import { checkNodeReady, checkPodRunning, waitForPodDone } from "./k8s-checks.js";
+import {
+  checkNodeReady, checkPodRunning, waitForPodDone, describePodStartupState,
+} from "./k8s-checks.js";
 
 beforeEach(() => {
   mockExecFile.mockReset();
@@ -159,6 +161,61 @@ describe("waitForPodDone", () => {
     const promise = waitForPodDone("p", 5_000, undefined, controller.signal, undefined, "ns", "terminal");
     controller.abort();
     await expect(promise).rejects.toThrow(/Aborted|Timed out/);
+  });
+});
+
+describe("a startup that ran out of time says what the pod was doing", () => {
+  // The poll loop parses the whole .status every iteration and the timeout threw it away:
+  // "Timed out waiting for pod X to complete" was the entire answer, so a stalled image pull,
+  // an unscheduled pod and a node whose runtime stopped creating containers all read the same.
+  // They have different next steps, and the caller had to spend another round trip to tell
+  // them apart. The fatal reasons never reach here (detectFatalPodStartupFailure fails fast on
+  // those), so what lands here is precisely the stuck-but-not-terminal case.
+  const podJson = (phase: string, status: Record<string, unknown> = {}) =>
+    ({ stdout: JSON.stringify({ status: { phase, ...status } }) });
+
+  it("names the stage a stuck container is in", async () => {
+    mockExecFile.mockResolvedValue(podJson("Pending", {
+      conditions: [{ type: "PodScheduled", status: "True" }],
+      containerStatuses: [{ name: "debug", state: { waiting: { reason: "ContainerCreating" } } }],
+    }));
+    const err = await waitForPodDone("p", 120, undefined, undefined, undefined, "ns", "Running")
+      .catch((e: Error) => e.message);
+    expect(err).toMatch(/Timed out/);
+    expect(err).toContain("phase=Pending");
+    // Scheduled fine, container never created — that is the node's runtime, not scheduling.
+    expect(err).toContain("ContainerCreating");
+    // A satisfied condition explains nothing about a stall and would only crowd the line.
+    expect(err).not.toContain("PodScheduled=True");
+  }, 5000);
+
+  it("carries an unsatisfied condition's reason and message", async () => {
+    mockExecFile.mockResolvedValue(podJson("Pending", {
+      conditions: [{ type: "PodScheduled", status: "False", reason: "SchedulerError",
+        message: "0/5 nodes are available: 5 node(s) had untolerated taint" }],
+    }));
+    const err = await waitForPodDone("p", 120, undefined, undefined, undefined, "ns", "Running")
+      .catch((e: Error) => e.message);
+    expect(err).toContain("PodScheduled=False");
+    expect(err).toContain("SchedulerError");
+    expect(err).toContain("untolerated taint");
+  }, 5000);
+
+  it("says so when the status was never readable, rather than saying nothing", async () => {
+    mockExecFile.mockRejectedValue(new Error("connection refused"));
+    const err = await waitForPodDone("p", 120, undefined, undefined, undefined, "ns", "Running")
+      .catch((e: Error) => e.message);
+    // Silence here would read as "we did not look"; the pod being unreadable IS the finding.
+    expect(err).toMatch(/never readable/);
+  }, 5000);
+
+  it("clips a long message so one condition cannot swallow the line", () => {
+    const described = describePodStartupState({
+      phase: "Pending",
+      conditions: [{ type: "PodScheduled", status: "False", reason: "Unschedulable", message: "x".repeat(400) }],
+    });
+    expect(described.length).toBeLessThan(300);
+    expect(described).toContain("…");
   });
 });
 
