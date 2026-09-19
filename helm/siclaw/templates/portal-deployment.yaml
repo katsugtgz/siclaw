@@ -25,7 +25,7 @@ spec:
               containerPort: 3003
               protocol: TCP
           env:
-            {{- if .Values.scriptSandbox.enabled }}
+            {{- if include "siclaw.scriptSandbox.provisioned" . }}
             {{- if .Values.scriptSandbox.publicUrl }}
             - name: SICLAW_SANDBOX_PUBLIC_URL
               value: {{ .Values.scriptSandbox.publicUrl | quote }}

@@ -521,20 +521,56 @@ Build the image outside production:
 docker build -f Dockerfile.script-sandbox -t registry.example/siclaw-script:VERSION .
 ```
 
-Opt in through Helm `scriptSandbox` values. Set `enabled: true` and `image` to an
-operator-built image (prefer an immutable digest). A dedicated execution
-namespace, tokenless ServiceAccount, controller Role/RoleBinding and quota are
-created. `createNamespace: false` uses an existing dedicated namespace, which
-must already enforce the restricted Pod Security Standard. The runner account
-has **no RoleBinding**. The Runtime account receives only Job create/get/delete,
-Pod get/list and Pod attach in this namespace. It gets no production RBAC from
-this chart addition. Private images must be preloaded on execution nodes in this
-version; imagePullSecrets are not supplied by script requests.
+Enabling the feature takes **two independent decisions, and both must agree**.
+The chart provisions infrastructure; the control plane owns the switch.
+
+`scriptSandbox.provision: true` creates a dedicated execution namespace,
+tokenless ServiceAccount, controller Role/RoleBinding and quota for THIS
+Runtime. It does not expose `run_script` to any Agent. `createNamespace: false`
+uses an existing dedicated namespace, which must already enforce the restricted
+Pod Security Standard. The runner account has **no RoleBinding**. The Runtime
+account receives only Job create/get/delete, Pod get/list and Pod attach in this
+namespace. It gets no production RBAC from this chart addition. Private images
+must be preloaded on execution nodes in this version; imagePullSecrets are not
+supplied by script requests.
+
+Whether Agents actually receive `run_script`, and which runner image is used, is
+per-Runtime state in the control plane, read through `config.getRuntimeConfig`.
+One Runtime serves one region, so opening a region, closing it, or repointing
+its runner image is an operational action rather than a redeploy. A Runtime
+polls this on a short TTL: a change takes effect on the next session build, with
+no pod recycle.
+
+The split exists because the two answers have different owners and different
+failure modes. Provisioned-but-closed is the safe resting state. Opened without
+provisioning stays closed at the Runtime and says so in its log, because handing
+an Agent a `run_script` whose every call dies on a missing namespace is worse
+than not offering the tool. A Runtime that has never reached its control plane
+also stays closed; one that loses a control plane which had already opened it
+keeps serving, because dropping a working feature mid-turn is the worse of the
+two failures.
+
+`scriptSandbox.image` is only a fallback for a Runtime whose region carries no
+image in the control plane. Left empty it derives
+`{image.registry}/siclaw-script-sandbox:{image.tag}`, so the runner is pulled
+from the same registry as the Runtime that pulls it — copying a values file to
+another region cannot leave it pointing at the source region's registry. The
+runner is an opt-in build: `WITH_SCRIPT_SANDBOX=true make docker push`.
+
+The execution namespace defaults to `<release-namespace>-execution`. The
+release namespace is the only identifier that is both always present and
+already unique per Runtime — two Runtimes in one cluster cannot share one,
+their Deployments would collide. It is deliberately NOT derived from
+`runtime.agentId`, which is optional (SiCore resolves a Runtime's identity from
+its adapter secret, so deployments routinely leave it unset), nor from
+`siclaw.fullname`, which carries only the RELEASE NAME — two regional Runtimes
+both released as `siclaw` then resolved to the same namespace and fought over
+its RBAC. Runners of two Runtimes must not share a namespace.
 
 ```yaml
 scriptSandbox:
-  enabled: true
-  image: registry.example/siclaw-script:VERSION
+  provision: true
+  # image: left empty derives {image.registry}/siclaw-script-sandbox:{image.tag}
   networkIsolation: false
   requireNetworkIsolation: false
   warmPoolSize: 1
@@ -552,7 +588,9 @@ enablement environment variables. There is no fallback to running arbitrary
 code on the developer host. Helm
 fields map to `SICLAW_SCRIPT_SANDBOX_*` environment variables; MCP policy and
 host pins are JSON files selected by `MCP_POLICY_FILE` and `HOST_KEYS_FILE`.
-Configuration changes require a Runtime restart; warmed profiles are replaced.
+Deployment-side changes (provider, isolation, limits, policy files) still
+require a Runtime restart; warmed profiles are replaced. The control plane's
+switch and runner image do not — they are re-read per session build.
 
 Example tool request:
 

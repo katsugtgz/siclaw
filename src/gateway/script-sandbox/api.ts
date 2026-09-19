@@ -12,21 +12,34 @@ import { K8sScriptSandboxProvider } from "./k8s-provider.js";
 import { E2bScriptSandboxProvider } from "./e2b-provider.js";
 import { ExternalScriptTools } from "./external-tools.js";
 import { RemoteScriptTraffic } from "../../script-sandbox/traffic.js";
+import { ScriptSandboxRuntimeSettings } from "../../script-sandbox/runtime-settings.js";
 
 export function createScriptSandboxApi(deploymentMode: string, controlPlane: SandboxControlPlane, builtin?: SandboxBuiltinExecutor,
   currentUser?: (sessionId: string, agentId: string) => string) {
   // The actual spawner, not environment flags, determines whether this Runtime
   // can expose untrusted code execution. Ignore even malformed provider/secret
   // configuration in local mode; it must neither initialize nor prewarm runners.
-  const config = loadScriptSandboxConfig(deploymentMode === "k8s" ? process.env : {});
-  if (config.enabled && config.provider === "docker") throw new Error("Docker sandbox is only supported by the standalone smoke harness");
+  // Provisioning (chart) and the switch (control plane) are separate decisions:
+  // the runners, RBAC and quota are built by whoever deployed this Runtime, while
+  // opening the feature and choosing its image is per-region operations work.
+  const settings = deploymentMode === "k8s" ? new ScriptSandboxRuntimeSettings(controlPlane) : undefined;
+  const config = loadScriptSandboxConfig(deploymentMode === "k8s" ? process.env : {}, settings);
+  if (config.provisioned && config.provider === "docker") throw new Error("Docker sandbox is only supported by the standalone smoke harness");
   const external = new ExternalScriptTools(controlPlane);
-  const provider = config.enabled ? new ScriptSandboxPool(new ReadyScriptSandboxProvider(config.provider === "e2b"
+  // Built whenever the infrastructure exists. Nothing runs until `config.enabled`
+  // agrees, but building it up front is what lets the switch take effect without
+  // recycling the pod.
+  const provider = config.provisioned ? new ScriptSandboxPool(new ReadyScriptSandboxProvider(config.provider === "e2b"
     ? new E2bScriptSandboxProvider(config, external) : new K8sScriptSandboxProvider(config)), config) : undefined;
   const service = provider ? new ScriptSandboxService(config, provider, new ReadOnlyScriptBroker(controlPlane, config, builtin, p => {
     if (!p.userId || currentUser?.(p.sessionId, p.agentId) !== p.userId) throw new ScriptSandboxError("Active Web caller required", 403);
   }, new RemoteScriptTraffic(controlPlane))) : undefined;
-  provider?.prewarm();
+  // Idle runners cost pods, so they are only warmed once the feature is actually
+  // open — which may be long after start-up, or never.
+  let warmed = false;
+  const warmIfOpen = () => { if (!warmed && provider && config.enabled) { warmed = true; provider.prewarm(); } };
+  const refresh = async () => { await settings?.ensureFresh().catch(() => undefined); warmIfOpen(); };
+  void refresh();
   return {
     externalTool: async (params: unknown) => {
       if (!service) throw new ScriptSandboxError("Script sandbox is disabled", 503);
@@ -36,14 +49,21 @@ export function createScriptSandboxApi(deploymentMode: string, controlPlane: San
       const send = (status: number, value: unknown) => { if (!res.destroyed) { res.writeHead(status, { "Content-Type": "application/json" }); res.end(JSON.stringify(value)); } };
       if (!identity) { send(401, { error: "Client identity required" }); return; }
       if (req.method === "GET") {
-        send(200, { enabled: !!service, network_isolation: config.requireNetworkIsolation || config.networkIsolation,
+        await refresh();
+        send(200, { enabled: !!service && config.enabled, network_isolation: config.requireNetworkIsolation || config.networkIsolation,
           require_network_isolation: config.requireNetworkIsolation,
-          ...(service ? { limits: { default_timeout_seconds: Math.min(60, config.maxTimeoutSeconds),
+          ...(service && config.enabled ? { limits: { default_timeout_seconds: Math.min(60, config.maxTimeoutSeconds),
             max_timeout_seconds: config.maxTimeoutSeconds, max_tool_calls: config.maxToolCalls, max_output_bytes: config.maxOutputBytes,
             max_concurrent_tools: 10 } } : {}) });
         return;
       }
-      if (!service) { send(503, { error: "Script sandbox is disabled" }); return; }
+      // Cold start only: a Runtime that has never heard from its control plane
+      // must not report a configured sandbox as disabled. Once an answer exists
+      // this reads the cache — refreshing here would let an unidentified caller
+      // drive calls to the control plane, and GET (once per session build)
+      // already keeps the switch current.
+      if (service && settings && !settings.primed) await refresh();
+      if (!service || !config.enabled) { send(503, { error: "Script sandbox is disabled" }); return; }
       const controller = new AbortController();
       const abort = () => controller.abort();
       res.once("close", abort);
