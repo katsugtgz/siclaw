@@ -54,12 +54,12 @@ spec:
               value: "true"
             - name: SICLAW_SCRIPT_SANDBOX_PROVIDER
               value: {{ .Values.scriptSandbox.provider | quote }}
-            {{- /* Standalone deployments (no control plane) set this. In upstream
-                   mode the runner image is per-Runtime state in the control plane
-                   and MUST be filled in there — nothing is derived or guessed. */}}
-            {{- if and .Values.scriptSandbox.image (ne .Values.scriptSandbox.provider "e2b") }}
+            {{- /* Derived from this release unless scriptSandbox.image overrides it.
+                   The control plane owns the switch, never the image: a Runtime
+                   runs the runner it shipped with. */}}
+            {{- if ne .Values.scriptSandbox.provider "e2b" }}
             - name: SICLAW_SCRIPT_SANDBOX_IMAGE
-              value: {{ .Values.scriptSandbox.image | quote }}
+              value: {{ include "siclaw.scriptSandboxImage" . | quote }}
             {{- end }}
             {{- if eq .Values.scriptSandbox.provider "e2b" }}
             - name: SICLAW_SCRIPT_SANDBOX_E2B_TEMPLATE

@@ -20,8 +20,8 @@ export function createScriptSandboxApi(deploymentMode: string, controlPlane: San
   // can expose untrusted code execution. Ignore even malformed provider/secret
   // configuration in local mode; it must neither initialize nor prewarm runners.
   // Provisioning (chart) and the switch (control plane) are separate decisions:
-  // the runners, RBAC and quota are built by whoever deployed this Runtime, while
-  // opening the feature and choosing its image is per-region operations work.
+  // the runner image, RBAC and quota come from whoever deployed this Runtime,
+  // while opening the feature for a region is operations work.
   const settings = deploymentMode === "k8s" ? new ScriptSandboxRuntimeSettings(controlPlane) : undefined;
   const config = loadScriptSandboxConfig(deploymentMode === "k8s" ? process.env : {}, settings);
   if (config.provisioned && config.provider === "docker") throw new Error("Docker sandbox is only supported by the standalone smoke harness");

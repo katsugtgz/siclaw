@@ -69,7 +69,7 @@ export interface ScriptSandboxConfig {
    * A prerequisite for `enabled`, never a substitute: provisioned infrastructure
    * with the control-plane switch off must stay closed. */
   provisioned: boolean;
-  /** Live: provisioned AND opened by the control plane AND a runner image resolved. */
+  /** Live: provisioned AND opened by the control plane AND this release has a runner image. */
   enabled: boolean;
   provider: "k8s" | "docker" | "e2b";
   /** Service configuration only; never exposed in the tool schema or runner environment. */

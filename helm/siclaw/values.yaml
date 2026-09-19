@@ -322,12 +322,13 @@ metrics:
 # Optional, disposable Python/Bash execution. No AgentBox or production secrets.
 #
 # `provision` builds this Runtime's execution namespace, RBAC and quota. It does
-# NOT open the feature: whether Agents get run_script, and which runner image is
-# used, is set PER RUNTIME in the control plane, so a region can be opened,
-# closed or repointed without redeploying. Both must agree — provisioned
-# infrastructure with the switch off stays closed, and a switch turned on
-# without provisioning leaves the Runtime reporting the feature as unavailable
-# rather than handing Agents a tool whose every call fails.
+# NOT open the feature: whether Agents get run_script is set PER RUNTIME in the
+# control plane, so a region can be opened or closed without redeploying. The
+# runner IMAGE is not an operations decision — it ships with this release (see
+# `image` below). Both must agree — provisioned infrastructure with the switch
+# off stays closed, and a switch turned on without provisioning leaves the
+# Runtime reporting the feature as unavailable rather than handing Agents a tool
+# whose every call fails.
 scriptSandbox:
   # Builds this Runtime's execution namespace, RBAC and quota. On by default:
   # it exposes nothing (the control plane owns the switch), and leaving it to
@@ -344,12 +345,12 @@ scriptSandbox:
     domain: e2b.app
     apiKeySecret: "" # Existing Secret in Runtime namespace; never mounted in a runner.
     apiKeySecretKey: api-key
-  # Runner image. In UPSTREAM mode leave this empty — the image is per-Runtime
-  # state in the control plane, and turning the sandbox on there requires it.
-  # Nothing is derived from image.registry/tag: a derived default is invisible
-  # from the console and silently points at a tag that may never have been built
-  # (the runner is an opt-in build: WITH_SCRIPT_SANDBOX=true make docker push).
-  # STANDALONE deployments have no control plane, so they set it here.
+  # Runner image. LEAVE EMPTY. It is derived from image.registry/tag as
+  # {registry}/siclaw-script-sandbox:{tag} — the same rule as agentbox — so a
+  # Runtime always runs the runner it shipped with, and an upgrade moves both
+  # together. `make docker push` builds and pushes it with every release.
+  # Set it only to override that: a private registry that mirrors under another
+  # name, or a runner hot-fixed between releases.
   image: ""
   # Default: <release-namespace>-execution; dedicated to runners. Two Runtimes
   # may not share one — override only to point at a namespace that already
