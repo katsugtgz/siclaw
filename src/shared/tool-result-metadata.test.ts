@@ -130,3 +130,41 @@ describe("outcome derivation has exactly one implementation", () => {
     expect(offenders, "derive it with toolResultOutcome(details, isError) instead").toEqual([]);
   });
 });
+
+
+describe("a tool that says it failed also SAYS so machine-readably", () => {
+  // The twin of the invariant above, and neither is sufficient alone. That one keeps the
+  // judgement to a single implementation; this one keeps there being anything to judge.
+  // `text: "Error: ..."` is the sentence a human reads. `details.error` / `details.blocked`
+  // is what the outcome column, the failure metrics, the retry logic and the trace UI read.
+  // A return carrying only the first is a failure that every counter sees as a success —
+  // which is precisely the state the persistence bug left every delegated turn in, and it
+  // would be indistinguishable from the tool having no failures at all.
+  const TOOLS = fileURLToPath(new URL("../tools/", import.meta.url));
+
+  function* walk(dir: string): Generator<string> {
+    for (const entry of readdirSync(dir)) {
+      const full = join(dir, entry);
+      if (statSync(full).isDirectory()) yield* walk(full);
+      else if (full.endsWith(".ts") && !full.endsWith(".test.ts")) yield full;
+    }
+  }
+
+  it("no tool return announces an error without a flag on it", () => {
+    // Matches a return whose TEXT LITERAL opens with an error word — not a result that merely
+    // happens to contain one, which is why the pattern is anchored to the start of the string.
+    const ANNOUNCES = /text:\s*[`"'][\s]*(Error:|Failed|Cannot |Unable )|`Error: \$\{/;
+    const FLAGGED = /details:\s*\{[^}]*\b(error|blocked)\b|isError/;
+    const offenders: string[] = [];
+    for (const file of walk(TOOLS)) {
+      const text = readFileSync(file, "utf8");
+      for (const match of text.matchAll(/return\s*\{[^;]{0,800}?\};/gs)) {
+        const block = match[0];
+        if (!block.includes("content") || !ANNOUNCES.test(block)) continue;
+        if (FLAGGED.test(block)) continue;
+        offenders.push(`${file.slice(TOOLS.length)}:${text.slice(0, match.index).split("\n").length}`);
+      }
+    }
+    expect(offenders, "add details:{error:true} (or blocked) — the sentence alone reaches no counter").toEqual([]);
+  });
+});
