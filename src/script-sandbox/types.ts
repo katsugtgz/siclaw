@@ -65,6 +65,11 @@ export interface ScriptSandboxInfo {
 }
 
 export interface ScriptSandboxConfig {
+  /** The chart created the execution namespace, RBAC and quota for this Runtime.
+   * A prerequisite for `enabled`, never a substitute: provisioned infrastructure
+   * with the control-plane switch off must stay closed. */
+  provisioned: boolean;
+  /** Live: provisioned AND opened by the control plane AND a runner image resolved. */
   enabled: boolean;
   provider: "k8s" | "docker" | "e2b";
   /** Service configuration only; never exposed in the tool schema or runner environment. */

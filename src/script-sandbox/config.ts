@@ -17,16 +17,26 @@ function integer(value: string | undefined, fallback: number, max: number): numb
   return parsed;
 }
 
-export function loadScriptSandboxConfig(env: NodeJS.ProcessEnv = process.env): ScriptSandboxConfig {
-  // Disabled deployments must not read secrets or validate unused providers.
-  if (!bool(env.SICLAW_SCRIPT_SANDBOX_ENABLED)) env = {};
+export function loadScriptSandboxConfig(env: NodeJS.ProcessEnv = process.env,
+  settings?: { get(): { enabled: boolean; image?: string } }): ScriptSandboxConfig {
+  // PROVISIONED says the chart created this Runtime's execution namespace, RBAC
+  // and quota. It is NOT the feature switch — the control plane owns that, so
+  // that a region can be opened, closed or repointed without a redeploy. The
+  // legacy _ENABLED name keeps provisioning an already-deployed values file.
+  const provisioned = bool(env.SICLAW_SCRIPT_SANDBOX_PROVISIONED ?? env.SICLAW_SCRIPT_SANDBOX_ENABLED);
+  // Unprovisioned deployments must not read secrets or validate unused providers.
+  if (!provisioned) env = {};
   const provider = env.SICLAW_SCRIPT_SANDBOX_PROVIDER ?? "k8s";
   if (!["k8s", "docker", "e2b"].includes(provider)) throw new ScriptSandboxError("Unknown script sandbox provider");
-  const enabled = bool(env.SICLAW_SCRIPT_SANDBOX_ENABLED);
-  const image = env.SICLAW_SCRIPT_SANDBOX_IMAGE ?? "";
-  if (enabled && provider !== "e2b" && (!image || /\s/.test(image))) throw new ScriptSandboxError("SICLAW_SCRIPT_SANDBOX_IMAGE is required");
+  // STANDALONE deployments only (no control plane to ask). In upstream mode the
+  // image is per-Runtime state and the console requires it before the switch can
+  // be turned on — nothing is derived from the release's registry/tag, because a
+  // derived default is invisible from the console and can name a tag that was
+  // never built (the runner is an opt-in build).
+  const fallbackImage = env.SICLAW_SCRIPT_SANDBOX_IMAGE ?? "";
+  if (fallbackImage && /\s/.test(fallbackImage)) throw new ScriptSandboxError("SICLAW_SCRIPT_SANDBOX_IMAGE is invalid");
   let e2b: ScriptSandboxConfig["e2b"];
-  if (enabled && provider === "e2b") {
+  if (provisioned && provider === "e2b") {
     const apiKey = env.SICLAW_SCRIPT_SANDBOX_E2B_API_KEY_FILE
       ? readFileSync(env.SICLAW_SCRIPT_SANDBOX_E2B_API_KEY_FILE, "utf8").trim()
       : env.E2B_API_KEY ?? "";
@@ -66,7 +76,21 @@ export function loadScriptSandboxConfig(env: NodeJS.ProcessEnv = process.env): S
     // Read the current projected file on each authorization. Failed reloads
     // deny access; a stale allowlist must never survive a policy replacement.
     get hostKeyPins() { return env.SICLAW_SCRIPT_SANDBOX_HOST_KEYS_FILE ? readHostKeys() : hostKeyPins; },
-    enabled, provider: provider as ScriptSandboxConfig["provider"], image, e2b,
+    provisioned,
+    // Both are re-read on every access: flipping the switch or repointing the
+    // image in the control plane must take effect without recycling a Runtime,
+    // and the K8s provider reads `image` while building each runner Job.
+    get enabled() {
+      if (!provisioned) return false;
+      // No control plane wired (smoke harness, standalone test rig): the
+      // deployment flag is the only switch that ever existed there.
+      if (settings && !settings.get().enabled) return false;
+      // Open with no runner image would hand the model a tool that fails on
+      // every call. Report it closed instead, and let the operator see why.
+      return provider === "e2b" || !!(settings?.get().image || fallbackImage);
+    },
+    get image() { return settings?.get().image || fallbackImage; },
+    provider: provider as ScriptSandboxConfig["provider"], e2b,
     namespace: env.SICLAW_SCRIPT_SANDBOX_NAMESPACE ?? "siclaw-execution",
     serviceAccount: env.SICLAW_SCRIPT_SANDBOX_SERVICE_ACCOUNT ?? "siclaw-script-runner",
     runtimeClass: env.SICLAW_SCRIPT_SANDBOX_RUNTIME_CLASS || undefined,

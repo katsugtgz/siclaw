@@ -80,6 +80,38 @@ Build agentbox image string — same registry/tag as gateway, different componen
 {{- end }}
 
 {{/*
+Whether this release provisions the script sandbox's Kubernetes resources.
+Empty string means no (helm treats it as falsey in `if`); "true" means yes.
+A pre-existing values file's `scriptSandbox.enabled` is IGNORED: it used to mean
+"expose the feature", the control plane owns that now, and honouring it here
+would let a stale file silently disagree with the console.
+*/}}
+{{- define "siclaw.scriptSandbox.provisioned" -}}
+{{- $sandbox := .Values.scriptSandbox | default dict -}}
+{{- if $sandbox.provision -}}true{{- end -}}
+{{- end }}
+
+{{/*
+Execution namespace for runner Pods. Derived from the RELEASE NAMESPACE, which
+is the only identifier that is both always present and already unique per
+Runtime: two Runtimes in one cluster cannot share a namespace (their Deployments
+would collide), while runtime.agentId is optional — SiCore resolves a Runtime's
+identity from its adapter secret, not from that field, so deployments routinely
+leave it unset. Deriving from siclaw.fullname was worse still: it carries only
+the RELEASE NAME, and two regional Runtimes released as "siclaw" then resolved
+to the same namespace and fought over its RBAC.
+An explicit scriptSandbox.namespace still wins.
+*/}}
+{{- define "siclaw.scriptSandboxNamespace" -}}
+{{- $sandbox := .Values.scriptSandbox | default dict -}}
+{{- if $sandbox.namespace -}}
+{{- $sandbox.namespace -}}
+{{- else -}}
+{{- printf "%s-execution" .Release.Namespace | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 KB compile-box image (spawned per compile run by the runtime; NOT a helm-managed
 pod). Release-coupled by default: agentbox.compileBoxEnabled=true derives
 {registry}/siclaw-kbc-box:{image.tag} — the image ships with every release

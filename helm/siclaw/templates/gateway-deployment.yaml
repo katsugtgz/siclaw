@@ -26,7 +26,7 @@ spec:
       {{- include "siclaw.selectorLabels" (dict "ctx" . "component" "runtime") | nindent 6 }}
   template:
     metadata:
-      {{- if .Values.scriptSandbox.enabled }}
+      {{- if include "siclaw.scriptSandbox.provisioned" . }}
       annotations:
         checksum/script-policy: {{ include (print $.Template.BasePath "/script-sandbox.yaml") . | sha256sum }}
       {{- end }}
@@ -46,13 +46,21 @@ spec:
               containerPort: 3002
               protocol: TCP
           env:
-            {{- if .Values.scriptSandbox.enabled }}
-            - name: SICLAW_SCRIPT_SANDBOX_ENABLED
+            {{- if include "siclaw.scriptSandbox.provisioned" . }}
+            # Infrastructure exists. The control plane owns the actual switch —
+            # see config.getRuntimeConfig — so this does not by itself expose
+            # run_script to any Agent.
+            - name: SICLAW_SCRIPT_SANDBOX_PROVISIONED
               value: "true"
             - name: SICLAW_SCRIPT_SANDBOX_PROVIDER
               value: {{ .Values.scriptSandbox.provider | quote }}
+            {{- /* Standalone deployments (no control plane) set this. In upstream
+                   mode the runner image is per-Runtime state in the control plane
+                   and MUST be filled in there — nothing is derived or guessed. */}}
+            {{- if and .Values.scriptSandbox.image (ne .Values.scriptSandbox.provider "e2b") }}
             - name: SICLAW_SCRIPT_SANDBOX_IMAGE
-              value: {{ if eq .Values.scriptSandbox.provider "e2b" }}""{{ else }}{{ required "scriptSandbox.image is required when enabled" .Values.scriptSandbox.image | quote }}{{ end }}
+              value: {{ .Values.scriptSandbox.image | quote }}
+            {{- end }}
             {{- if eq .Values.scriptSandbox.provider "e2b" }}
             - name: SICLAW_SCRIPT_SANDBOX_E2B_TEMPLATE
               value: {{ required "scriptSandbox.e2b.template is required" .Values.scriptSandbox.e2b.template | quote }}
@@ -67,7 +75,7 @@ spec:
                   key: {{ .Values.scriptSandbox.e2b.apiKeySecretKey | quote }}
             {{- end }}
             - name: SICLAW_SCRIPT_SANDBOX_NAMESPACE
-              value: {{ .Values.scriptSandbox.namespace | default (printf "%s-execution" (include "siclaw.fullname" .)) | quote }}
+              value: {{ include "siclaw.scriptSandboxNamespace" . | quote }}
             - name: SICLAW_SCRIPT_SANDBOX_SERVICE_ACCOUNT
               value: {{ .Values.scriptSandbox.serviceAccount | quote }}
             - name: SICLAW_SCRIPT_SANDBOX_RUNTIME_CLASS
@@ -105,6 +113,11 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            {{- if .Values.runtime.agentId }}
+            # This Runtime's control-plane identity (one Runtime per region).
+            - name: SICLAW_AGENT_ID
+              value: {{ .Values.runtime.agentId | quote }}
+            {{- end }}
             - name: SICLAW_AGENTBOX_IMAGE
               value: {{ include "siclaw.agentboxImage" . }}
             {{- /* Resources for the pods the Runtime SPAWNS, not for this pod —
@@ -268,7 +281,7 @@ spec:
           resources:
             {{- toYaml .Values.runtime.resources | nindent 12 }}
           volumeMounts:
-            {{- if .Values.scriptSandbox.enabled }}
+            {{- if include "siclaw.scriptSandbox.provisioned" . }}
             - name: script-policy
               mountPath: /etc/siclaw-script-policy
               readOnly: true
@@ -292,7 +305,7 @@ spec:
             initialDelaySeconds: 5
             periodSeconds: 10
       volumes:
-        {{- if .Values.scriptSandbox.enabled }}
+        {{- if include "siclaw.scriptSandbox.provisioned" . }}
         - name: script-policy
           configMap:
             name: {{ include "siclaw.fullname" . }}-script-policy
