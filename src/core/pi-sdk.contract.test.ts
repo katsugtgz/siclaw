@@ -150,6 +150,41 @@ describe("installed Pi SDK contract", () => {
     expect(JSON.stringify(requests[1].body.messages)).not.toContain("missing tool result");
     expect(JSON.stringify(sessionManager.buildSessionContext().messages)).toContain("agent_mailbox");
   });
+  it("maps a THROWN tool onto isError, and carries no flag in details", async () => {
+    // Everything that makes a failed tool visible hangs off this one behaviour. A tool that
+    // throws (pi's own grep does, for a path it cannot stat) must arrive as isError:true, because
+    // that is the ONLY signal it sends -- createErrorToolResult() gives the result an EMPTY
+    // `details`, so toolResultOutcome has nothing else to read and the row would persist as a
+    // success. This is a third-party behaviour that already changed once under us: three traces
+    // from 2026-09-11 show exactly that success, and pi had been upgraded 0.80.7 -> 0.85.1 the
+    // day before. A silent return to the old shape would look like "no failures", never an error.
+    const thrower: ToolDefinition = {
+      name: "always_throws", label: "Always throws", description: "Throws on purpose.",
+      parameters: Type.Object({}),
+      execute: async () => { throw new Error("Path not found: /app"); },
+    };
+    const requests = mockNetwork(() => requests.length === 1
+      ? completion({ tool_calls: [{ index: 0, id: "call-throw", type: "function",
+        function: { name: "always_throws", arguments: "{}" } }] }, "tool_calls")
+      : completion({ content: "Noted." }));
+    const { brain } = await createFixture([thrower]);
+    const ends: Array<Record<string, unknown>> = [];
+    const unsub = brain.subscribe((event: Record<string, unknown>) => {
+      if (event.type === "tool_execution_end") ends.push(event);
+    });
+    try { await brain.prompt("Call the tool"); } finally { unsub(); }
+
+    const end = ends.find((e) => e.toolName === "always_throws");
+    expect(end, "the thrown tool still reports a tool_execution_end").toBeDefined();
+    expect(end!.isError, "a thrown tool is an ERROR").toBe(true);
+    // The message survives, so the agent can still read what went wrong...
+    expect(JSON.stringify(end!.result)).toContain("Path not found: /app");
+    // ...but `details` carries NO failure flag, which is why isError has to be consulted.
+    const details = (end!.result as { details?: Record<string, unknown> })?.details ?? {};
+    expect(details.error, "pi does not set details.error — isError is the only signal").toBeUndefined();
+    expect(details.blocked).toBeUndefined();
+  });
+
   it("sends QA research tools to the provider and writes a working result", async () => {
     let outputPath = "";
     const requests = mockNetwork(() => requests.length === 1
