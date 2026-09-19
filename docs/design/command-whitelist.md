@@ -214,6 +214,11 @@ Blocked: `POST`, `PUT`, `DELETE`, `PATCH`, and any other method.
 
 - `-d`/`--data`/`--data-raw`/`--data-urlencode` are not in the whitelist (removed with POST)
 - `-o`/`--output` (write to file) is not in the whitelist
+- `-X`/`--request` is checked wherever curl READS its value, including inside a short-option
+  cluster: `-Xsi` is `-X si`, so the method allow-list applies to `si`. Screening the cluster letter
+  by letter saw three permitted letters and checked the method only when X landed last, which let
+  any method through as `-Xs` / `-Xsi` / `-vXpost` — and refused curl's own inline `-XGET`, whose
+  `G` is part of the value rather than a flag.
 - `-D`/`--dump-header` is admitted by VALUE, not by flag: only `-D -` (dump to stdout) passes,
   because every other argument names a file to write. In a short-option cluster it must be
   written last — curl reads `-Dv` as `-D v`, so a value-taking letter with anything after it

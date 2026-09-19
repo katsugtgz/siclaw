@@ -674,6 +674,18 @@ function validateCurl(args: string[]): string | null {
         if (inline) break;   // the cluster ended at the value
         continue;
       }
+      // -X takes a value the same way, and the method allow-list is only enforced where the
+      // value is READ. Screening the cluster letter by letter saw `-Xsi` as three permitted
+      // letters and checked the method only when X happened to land LAST, so any method could
+      // be smuggled past GET/HEAD/OPTIONS as `-Xs`, `-Xsi`, `-vXpost`. It also refused curl's
+      // own inline spelling `-XGET`, because G is not a flag letter — it is part of the value.
+      if (ch === "X") {
+        const inline = chars.slice(c + 1);
+        const err = checkCurlMethod(inline || args[i + 1]);
+        if (err) return err;
+        if (inline) break;   // the cluster ended at the method
+        continue;
+      }
       if (!CURL_SAFE_SHORT_CHARS.has(ch)) {
         return JSON.stringify({
           error: `curl "-${ch}" (in "${arg}") is not allowed. Only read-only curl flags are permitted.`,
@@ -681,14 +693,10 @@ function validateCurl(args: string[]): string | null {
       }
     }
 
+    // Consume the value of a trailing value-taking letter. X and D validated theirs in the
+    // loop above; this only advances past the token so it is not re-read as a URL.
     const lastChar = chars[chars.length - 1];
-    if (lastChar && "HXmwAbeuxD".includes(lastChar)) {
-      if (lastChar === "X") {
-        const err = checkCurlMethod(args[i + 1]);
-        if (err) return err;
-      }
-      i++;
-    }
+    if (lastChar && "HXmwAbeuxD".includes(lastChar)) i++;
   }
   return null;
 }

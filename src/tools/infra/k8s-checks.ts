@@ -240,7 +240,7 @@ async function runningContainers(
   namespace: string,
   env?: NodeJS.ProcessEnv,
   kubeconfigPath?: string,
-): Promise<string[]> {
+): Promise<{ regular: string[]; init: string[] }> {
   try {
     const { stdout } = await execFileAsync(
       "kubectl",
@@ -254,11 +254,14 @@ async function runningContainers(
       status?: { containerStatuses?: Array<{ name?: string; state?: Record<string, unknown> }>;
                  initContainerStatuses?: Array<{ name?: string; state?: Record<string, unknown> }> };
     };
-    const all = [...(obj.status?.initContainerStatuses ?? []), ...(obj.status?.containerStatuses ?? [])];
-    return all.filter((c) => c.state && "running" in c.state).map((c) => c.name ?? "").filter(Boolean);
+    const names = (list: Array<{ name?: string; state?: Record<string, unknown> }> | undefined) =>
+      (list ?? []).filter((c) => c.state && "running" in c.state).map((c) => c.name ?? "").filter(Boolean);
+    // Kept apart because they answer different questions: a REGULAR container running is what
+    // makes an unnamed exec land somewhere, an INIT one only counts when it is asked for.
+    return { regular: names(obj.status?.containerStatuses), init: names(obj.status?.initContainerStatuses) };
   } catch {
     // Unreadable ⇒ report nothing rather than guessing a container is up.
-    return [];
+    return { regular: [], init: [] };
   }
 }
 
@@ -296,12 +299,20 @@ export async function checkPodRunning(
     // The extra request runs only on the unhappy path: the phase check above still answers the common
     // case in one call.
     const running = await runningContainers(pod, namespace, env, kubeconfigPath);
-    if (container && running.includes(container)) return null;
-    if (!container && running.length > 0) return null;
+    // Naming a container is what makes exec land on it, so an explicit request is honoured for
+    // either kind. Without one, kubectl picks the default REGULAR container — so only those
+    // clear the check. Counting a running INIT container here cleared the precheck and then let
+    // the exec fail anyway, one round trip later and with a worse error, because -c was never
+    // added (pod-exec / pod-script only pass it when the caller did).
+    if (container && [...running.regular, ...running.init].includes(container)) return null;
+    if (!container && running.regular.length > 0) return null;
 
-    const detail = running.length > 0
-      ? ` Containers that ARE running: ${running.join(", ")} — name one with the container parameter.`
-      : " No container in it is running either.";
+    const detail = running.regular.length > 0
+      ? ` Containers that ARE running: ${running.regular.join(", ")} — name one with the container parameter.`
+      : running.init.length > 0
+        // The actionable half: it IS reachable, but only by asking for it by name.
+        ? ` Only an init container is running: ${running.init.join(", ")}. An exec without a container lands on the default app container, not this one — pass it as the container parameter to look inside it.`
+        : " No container in it is running either.";
     return `Pod "${pod}" in namespace "${namespace}" is not Running (phase: ${phase || "unknown"}).${detail}`;
   } catch (err: any) {
     const stderr = (err.stderr?.trim() || err.message) as string;

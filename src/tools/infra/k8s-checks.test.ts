@@ -100,6 +100,43 @@ describe("checkPodRunning", () => {
     expect(err).toContain("Pending");
   });
 
+  it("does not clear a Pending pod on an INIT container alone when none was named", async () => {
+    // exec without -c lands on the default REGULAR container, never the init one — so clearing
+    // the precheck because an init container happens to be running sends the caller into a
+    // kubectl exec that fails anyway, one round trip later and with a worse error.
+    mockExecFile
+      .mockResolvedValueOnce({ stdout: "Pending" })
+      .mockResolvedValueOnce({ stdout: JSON.stringify({ status: {
+        initContainerStatuses: [{ name: "wait-for-db", state: { running: {} } }],
+        containerStatuses: [{ name: "app", state: { waiting: { reason: "PodInitializing" } } }],
+      } }) });
+    const err = await checkPodRunning("p", "ns");
+    expect(err, "an init container alone must not clear the precheck").not.toBeNull();
+    // And it must say what WOULD work, rather than just refusing.
+    expect(err).toContain("wait-for-db");
+    expect(err).toMatch(/init container/i);
+  });
+
+  it("clears it when the named container is the init one", async () => {
+    // Naming it is exactly what makes exec land there, so an explicit request is honoured.
+    mockExecFile
+      .mockResolvedValueOnce({ stdout: "Pending" })
+      .mockResolvedValueOnce({ stdout: JSON.stringify({ status: {
+        initContainerStatuses: [{ name: "wait-for-db", state: { running: {} } }],
+        containerStatuses: [{ name: "app", state: { waiting: {} } }],
+      } }) });
+    expect(await checkPodRunning("p", "ns", undefined, undefined, "wait-for-db")).toBeNull();
+  });
+
+  it("still clears a Pending pod when a REGULAR container is running", async () => {
+    mockExecFile
+      .mockResolvedValueOnce({ stdout: "Pending" })
+      .mockResolvedValueOnce({ stdout: JSON.stringify({ status: {
+        containerStatuses: [{ name: "app", state: { running: {} } }],
+      } }) });
+    expect(await checkPodRunning("p", "ns")).toBeNull();
+  });
+
   it("returns pod-not-found message on 'not found'", async () => {
     const err = Object.assign(new Error("x"), { stderr: 'pods "p" not found' });
     mockExecFile.mockRejectedValueOnce(err);

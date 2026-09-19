@@ -481,6 +481,31 @@ describe("validateCommandRestrictions", () => {
       expect(validateCommandRestrictions("curl -sDout.txt http://example.com")).not.toBeNull();
     });
 
+    it("blocks -X hidden inside a short-option cluster", () => {
+      // curl reads `-Xsi` as `-X si`: X takes a value and swallows the REST OF THE CLUSTER.
+      // A per-letter screen sees three permitted letters and the method check only ran when X
+      // happened to be LAST, so any method could be smuggled past GET/HEAD/OPTIONS this way.
+      // Predates -i (`-Xs` alone does it) but the same hole.
+      for (const command of ["curl -Xsi http://example.com", "curl -Xs http://example.com",
+                             "curl -vXpost http://example.com"]) {
+        const err = validateCommandRestrictions(command);
+        expect(err, command).not.toBeNull();
+      }
+    });
+
+    it("still allows a safe method given inline or as the next token", () => {
+      expect(validateCommandRestrictions("curl -XGET http://example.com")).toBeNull();
+      expect(validateCommandRestrictions("curl -sX GET http://example.com")).toBeNull();
+      expect(validateCommandRestrictions("curl -X HEAD http://example.com")).toBeNull();
+    });
+
+    it("blocks an unsafe method however it is spelled", () => {
+      for (const command of ["curl -XPOST http://x", "curl -sX DELETE http://x",
+                             "curl -X PUT http://x", "curl --request=PATCH http://x"]) {
+        expect(validateCommandRestrictions(command), command).not.toBeNull();
+      }
+    });
+
     it("blocks -D with no value at all", () => {
       const err = validateCommandRestrictions("curl -D");
       expect(err).not.toBeNull();
