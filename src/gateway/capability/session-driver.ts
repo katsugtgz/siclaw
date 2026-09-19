@@ -59,6 +59,7 @@ interface BoxEvent {
   artifacts?: Array<{ path: string; content?: string; deleted?: boolean }>;
   /** Explicit full-compile commit. Replayed file presence alone is not a commit. */
   commit_input?: boolean;
+  completed_checkpoint_id?: string;
   /** KBC durability barrier identity; ACK only after consumer commit succeeds. */
   sync_id?: string;
   code?: string;
@@ -375,11 +376,12 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
             console.error(`[capability] run=${runId} commit_input downgraded to content-only persistence: missing input revision`);
             emit("summary", { text: warning });
           }
-          if (artifacts.length === 0 && !commitInput) break;
+          if (artifacts.length === 0 && !commitInput && !evt.completed_checkpoint_id) break;
           const request: CapabilityPersistArtifactsRequest = {
             run_id: runId,
             ...(inputRevision ? { input_revision: inputRevision } : {}),
             ...(commitInput ? { commit_input: true } : {}),
+            ...(evt.completed_checkpoint_id ? { completed_checkpoint_id: evt.completed_checkpoint_id } : {}),
             artifacts,
           };
           let delayMs = 250;

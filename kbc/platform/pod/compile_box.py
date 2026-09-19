@@ -1089,6 +1089,7 @@ async def _sync_workspace(
     durable_barrier: bool = False,
     force: bool = False,
     retain_until_ack: bool = False,
+    completed_checkpoint: bool = False,
 ) -> int:
     """Emit a syncArtifacts event for workspace files changed since `sent`
     (path → content sha), plus TOMBSTONES ({path, deleted: true}) for
@@ -1131,8 +1132,10 @@ async def _sync_workspace(
             if force or sent.get(path) != _SYNC_TOMBSTONE:
                 next_sent[path] = _SYNC_TOMBSTONE
                 changed.append({"path": path, "deleted": True})
-        if changed or commit_input:
+        if changed or commit_input or completed_checkpoint:
             event = {"type": "syncArtifacts", "artifacts": changed}
+            if completed_checkpoint and run._artifact_ack_required:
+                event["completed_checkpoint_id"] = str(uuid.uuid4())
             if commit_input:
                 event["commit_input"] = True
             ack = None
@@ -5056,7 +5059,7 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
         # exact plan and input identity are durable.
         sent = getattr(run, "_sync_sent", None)
         if sent is not None:
-            await _sync_workspace(run, sent, durable_barrier=True)
+            await _sync_workspace(run, sent, durable_barrier=True, completed_checkpoint=not resuming)
         slice_failures = _materialize_batch_slices(run, plan)
         if slice_failures:
             n_all = len(plan["batches"])
@@ -5264,7 +5267,7 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
             # would re-run an already-done batch on resume.
             sent = getattr(run, "_sync_sent", None)
             if sent is not None:
-                await _sync_workspace(run, sent, durable_barrier=True)
+                await _sync_workspace(run, sent, durable_barrier=True, completed_checkpoint=True)
             _print_compile_lifecycle("batch.done", run, extra=_lifecycle_batch_ref(batch, k, n))
             await run.emit({"type": "summary", "text": _loc(run,
                 f"Batch {k}/{n} done — landed in the store.", f"批 {k}/{n} 完成,已落库。")})
@@ -5321,7 +5324,7 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
                 _write_compilation_state(run, plan)
                 sent = getattr(run, "_sync_sent", None)
                 if sent is not None:
-                    await _sync_workspace(run, sent, durable_barrier=True)
+                    await _sync_workspace(run, sent, durable_barrier=True, completed_checkpoint=True)
         plan["phase"] = "final"
         _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
         _write_compilation_state(run, plan)
