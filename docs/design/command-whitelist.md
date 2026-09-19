@@ -199,6 +199,7 @@ Blocked actions (via whitelist — anything not listed above is blocked):
 -u  --user  --cacert  --cert  -x  --proxy
 --retry  --retry-delay  --retry-max-time
 -f  --fail  -4  -6  -N  --no-buffer
+-i  --include
 ```
 
 #### curl — allowed HTTP methods (with `-X`/`--request`)
@@ -213,6 +214,10 @@ Blocked: `POST`, `PUT`, `DELETE`, `PATCH`, and any other method.
 
 - `-d`/`--data`/`--data-raw`/`--data-urlencode` are not in the whitelist (removed with POST)
 - `-o`/`--output` (write to file) is not in the whitelist
+- `-D`/`--dump-header` is admitted by VALUE, not by flag: only `-D -` (dump to stdout) passes,
+  because every other argument names a file to write. In a short-option cluster it must be
+  written last — curl reads `-Dv` as `-D v`, so a value-taking letter with anything after it
+  writes a file whose name is the rest of the cluster.
 
 ---
 
@@ -404,7 +409,7 @@ Allowed subcommands: `topo`, `nvlink`
 -S  -U  -e  --pager-end  -a  --all
 -q  --quiet  --no-hostname  --no-full
 -m  --merge  -D  --directory  --file
---list-boots
+--list-boots  --utc
 ```
 
 Also allows `KEY=VALUE` field matching (e.g. `_SYSTEMD_UNIT=foo.service`).

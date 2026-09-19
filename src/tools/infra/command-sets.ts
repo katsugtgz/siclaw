@@ -494,6 +494,11 @@ const CURL_SAFE_FLAGS = new Set([
   "-s", "--silent", "-S", "--show-error", "-k", "--insecure", "-v", "--verbose",
   "-H", "--header", "-m", "--max-time", "--connect-timeout",
   "-L", "--location", "-I", "--head", "-w", "--write-out", "--compressed",
+  // -i prints the response headers ahead of the body, on stdout. It is strictly
+  // weaker than -I (already permitted), which suppresses the body entirely, and
+  // it writes nothing: refusing it only cost a round trip on every "is this
+  // ingress answering, and with which headers" check.
+  "-i", "--include",
   "-A", "--user-agent", "-b", "--cookie", "-e", "--referer",
   "-u", "--user", "--cacert", "--cert", "-x", "--proxy",
   "--retry", "--retry-delay", "--retry-max-time",
@@ -508,10 +513,27 @@ const CURL_SAFE_PREFIXES = [
 ];
 const CURL_REQUEST_FLAGS = new Set(["-X", "--request"]);
 const CURL_SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
+/**
+ * `-D`/`--dump-header` writes the response headers to its argument, and the ONE
+ * argument that is not a file is `-` (stdout). So it is admitted by VALUE rather
+ * than by flag: `-D -` is a read, `-D /any/path` is a write and stays refused.
+ */
+const CURL_DUMP_FLAGS = new Set(["-D", "--dump-header"]);
 const CURL_SAFE_SHORT_CHARS = new Set([
   "s", "S", "k", "v", "H", "X", "m", "L", "I", "w", "A", "b", "e", "u", "x", "f", "N",
-  "4", "6",
+  "4", "6", "i",
 ]);
+
+function checkCurlDumpTarget(target: string | undefined): string | null {
+  if (target === "-") return null;
+  if (target === undefined) {
+    return JSON.stringify({ error: `curl "-D" requires a value` }, null, 2);
+  }
+  return JSON.stringify({
+    error: `curl -D ${target} is not allowed — that argument is a FILE to write the headers into.`,
+    hint: "Only `-D -` (dump to stdout) is permitted. `-i` prints the headers with the body, and `-I` prints them alone.",
+  }, null, 2);
+}
 
 function checkCurlMethod(method: string | undefined): string | null {
   if (method && !CURL_SAFE_METHODS.has(method.toUpperCase())) {
@@ -583,6 +605,16 @@ function validateCurl(args: string[]): string | null {
         continue;
       }
 
+      if (CURL_DUMP_FLAGS.has(flag)) {
+        if (!hasValue && i + 1 >= args.length) {
+          return JSON.stringify({ error: `curl "${flag}" requires a value` }, null, 2);
+        }
+        const err = checkCurlDumpTarget(hasValue ? inlineValue : args[i + 1]);
+        if (err) return err;
+        if (!hasValue) i++;
+        continue;
+      }
+
       if (!CURL_SAFE_FLAGS.has(flag) && !startsWithAny(arg, CURL_SAFE_PREFIXES)) {
         return JSON.stringify({
           error: `curl "${arg}" is not allowed. Only read-only curl flags are permitted.`,
@@ -611,6 +643,13 @@ function validateCurl(args: string[]): string | null {
         continue;
       }
 
+      // curl has no `-D=value` form: it would take the whole "=value" as the
+      // FILENAME. Refused rather than screened, so the only short spelling that
+      // reaches the dump check is the one curl actually honours.
+      if (CURL_DUMP_FLAGS.has(flag)) {
+        return checkCurlDumpTarget(`=${inlineValue}`);
+      }
+
       if (!CURL_SAFE_FLAGS.has(flag) && !startsWithAny(arg, CURL_SAFE_PREFIXES)) {
         return JSON.stringify({
           error: `curl "${arg}" is not allowed. Only read-only curl flags are permitted.`,
@@ -621,7 +660,20 @@ function validateCurl(args: string[]): string | null {
 
     // ── Combined short flags (e.g. -sS, -sSX, -vk) ─────────
     const chars = arg.slice(1);
-    for (const ch of chars) {
+    for (let c = 0; c < chars.length; c++) {
+      const ch = chars[c];
+      // A value-taking letter consumes THE REST OF THE CLUSTER as its value, so
+      // `-Dv` means `-D v` — it writes a file called "v" while every letter in it
+      // reads as permitted, and a per-letter screen never looks at it. The value
+      // is therefore read where curl reads it: inline when anything follows in the
+      // cluster (`-D-` is curl's own spelling of `-D -`), else the next token.
+      if (ch === "D") {
+        const inline = chars.slice(c + 1);
+        const err = checkCurlDumpTarget(inline || args[i + 1]);
+        if (err) return err;
+        if (inline) break;   // the cluster ended at the value
+        continue;
+      }
       if (!CURL_SAFE_SHORT_CHARS.has(ch)) {
         return JSON.stringify({
           error: `curl "-${ch}" (in "${arg}") is not allowed. Only read-only curl flags are permitted.`,
@@ -630,7 +682,7 @@ function validateCurl(args: string[]): string | null {
     }
 
     const lastChar = chars[chars.length - 1];
-    if (lastChar && "HXmwAbeux".includes(lastChar)) {
+    if (lastChar && "HXmwAbeuxD".includes(lastChar)) {
       if (lastChar === "X") {
         const err = checkCurlMethod(args[i + 1]);
         if (err) return err;
@@ -1978,6 +2030,11 @@ export const COMMANDS: Record<string, CommandDef> = {
     "-S", "-U", "-e", "--pager-end", "-a", "--all",
     "-q", "--quiet", "--no-hostname", "--no-full",
     "-m", "--merge", "-D", "--directory", "--file", "--list-boots",
+    // --utc only changes how timestamps are RENDERED. It was refused while every
+    // alert and every log line the agent correlates against is written in UTC, so
+    // the first attempt was rejected and the retry re-read the same journal in
+    // local time. Display-only, no file and no journal mutation.
+    "--utc",
   ] },
   systemctl:   { category: "services", allowedSubcommands: { position: 0, allowed: [
     "status", "show", "list-units", "list-unit-files",

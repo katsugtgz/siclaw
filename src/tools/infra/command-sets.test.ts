@@ -447,6 +447,44 @@ describe("validateCommandRestrictions", () => {
       expect(validateCommandRestrictions("curl -w '%{http_code}' http://example.com")).toBeNull();
     });
 
+    it("allows -i / --include (headers on stdout, weaker than the permitted -I)", () => {
+      expect(validateCommandRestrictions("curl -sS -i http://example.com")).toBeNull();
+      expect(validateCommandRestrictions("curl --include http://example.com")).toBeNull();
+      expect(validateCommandRestrictions("curl -si http://example.com")).toBeNull();
+    });
+
+    it("allows -D - (dump headers to stdout)", () => {
+      expect(validateCommandRestrictions("curl -sS -D - http://example.com")).toBeNull();
+      expect(validateCommandRestrictions("curl --dump-header - http://example.com")).toBeNull();
+      expect(validateCommandRestrictions("curl --dump-header=- http://example.com")).toBeNull();
+      expect(validateCommandRestrictions("curl -sD - http://example.com")).toBeNull();
+      // curl's own inline spelling of the same thing.
+      expect(validateCommandRestrictions("curl -D- http://example.com")).toBeNull();
+      expect(validateCommandRestrictions("curl -sD- http://example.com")).toBeNull();
+    });
+
+    it("blocks -D <file> — the argument is what makes it a write", () => {
+      const err = validateCommandRestrictions("curl -D /tmp/headers http://example.com");
+      expect(err).not.toBeNull();
+      expect(err).toContain("FILE");
+      expect(validateCommandRestrictions("curl --dump-header /tmp/h http://example.com")).not.toBeNull();
+      expect(validateCommandRestrictions("curl --dump-header=/tmp/h http://example.com")).not.toBeNull();
+    });
+
+    it("blocks -D inside a cluster, where the rest of the cluster is the filename", () => {
+      // curl reads `-Dv` as `-D v` — it writes a file called "v" while every
+      // letter in the cluster is individually permitted.
+      const err = validateCommandRestrictions("curl -Dv http://example.com");
+      expect(err).not.toBeNull();
+      expect(err).toContain("-D");
+      expect(validateCommandRestrictions("curl -sDout.txt http://example.com")).not.toBeNull();
+    });
+
+    it("blocks -D with no value at all", () => {
+      const err = validateCommandRestrictions("curl -D");
+      expect(err).not.toBeNull();
+    });
+
     it("blocks curl -d (data flag removed with POST)", () => {
       const err = validateCommandRestrictions('curl -d \'{"key":"val"}\' http://api.example.com');
       expect(err).not.toBeNull();
@@ -911,6 +949,11 @@ describe("validateCommandRestrictions", () => {
       expect(validateCommandRestrictions("journalctl --list-boots")).toBeNull();
       expect(validateCommandRestrictions("journalctl -k -r")).toBeNull();
       expect(validateCommandRestrictions("journalctl _SYSTEMD_UNIT=sshd.service")).toBeNull();
+    });
+
+    it("allows --utc (display-only timestamp rendering)", () => {
+      expect(validateCommandRestrictions("journalctl -k --utc --since '2026-09-09 00:00:00'")).toBeNull();
+      expect(validateCommandRestrictions("journalctl --utc -u kubelet -n 200")).toBeNull();
     });
 
     it("blocks journalctl -f (follow)", () => {
