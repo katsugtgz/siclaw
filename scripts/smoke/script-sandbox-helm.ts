@@ -18,6 +18,22 @@ for (const portal of [true, false]) {
   assert.equal(namespace.metadata.labels["pod-security.kubernetes.io/enforce"], "restricted");
   assert(docs.some(d => d.kind === "ResourceQuota"));
 }
+// The runner image follows the RELEASE: nobody sets scriptSandbox.image, and the
+// chart still names a runner — same registry and tag as the gateway, the agentbox
+// rule. An override is still honoured (private mirror, hot-fixed runner).
+function sandboxImage(docs: any[]): string | undefined {
+  for (const doc of docs) {
+    for (const container of doc?.spec?.template?.spec?.containers ?? []) {
+      const found = (container.env ?? []).find((e: any) => e.name === "SICLAW_SCRIPT_SANDBOX_IMAGE");
+      if (found) return found.value;
+    }
+  }
+}
+assert.equal(sandboxImage(render(["portal.enabled=true", "scriptSandbox.provision=true", "scriptSandbox.traffic=null",
+  "image.registry=reg.example", "image.tag=v9"])), "reg.example/siclaw-script-sandbox:v9");
+assert.equal(sandboxImage(render(["portal.enabled=true", "scriptSandbox.provision=true", "scriptSandbox.traffic=null",
+  "image.registry=reg.example", "image.tag=v9", "scriptSandbox.image=mirror.example/runner@sha256:abc"])), "mirror.example/runner@sha256:abc");
+
 const external = render(["portal.enabled=true", "scriptSandbox.provision=true", "scriptSandbox.provider=e2b", "scriptSandbox.publicUrl=https://portal.example", "scriptSandbox.e2b.template=fixture", "scriptSandbox.e2b.apiKeySecret=fixture-key"]);
 assert(!external.some(d => d.kind === "Namespace"));
 assert(JSON.stringify(external).includes("SICLAW_SANDBOX_PUBLIC_URL"));
@@ -25,4 +41,4 @@ render(["portal.enabled=true", "scriptSandbox.provision=true", "scriptSandbox.pr
 render(["scriptSandbox.provision=true", "scriptSandbox.namespace=control"], false);
 const noRuntime = render(["runtime.enabled=false", "scriptSandbox.provision=true"]);
 assert(!noRuntime.some(d => d.kind === "Namespace"));
-console.log("sandbox chart matrix: 7 cases passed");
+console.log("sandbox chart matrix: 9 cases passed");
