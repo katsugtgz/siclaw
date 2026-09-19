@@ -62,6 +62,28 @@ describe("constant-sized handoff tool definitions", () => {
   });
 });
 
+describe("交接说明必须划出「对话跟过去、台账不跟」这条线", () => {
+  // 四条 review、四个不同 agent,做的是同一个推论:说明里写着目标「有完整对话历史」,
+  // 于是模型认为计划也一起过去了 —— 而 ledger 不在对话里。接手方看到空计划,重建一份
+  // 几乎一样的,原来标成 done 的又被重做一遍。
+  //
+  // review 建议「在返回值里提示台账不会移交」,但那时已经晚了:执行权交出去了,brief
+  // 也发出去了。唯一起作用的位置是说明本身 —— 模型是在调用之前读它的。
+  it("紧挨着「有完整对话历史」那句就说清台账不跟", () => {
+    const description = createTransferToAgentTool(refs()).description;
+    expect(description).toContain("full conversation history");
+    expect(description).toMatch(/does not transfer|EMPTY plan/);
+    // 光说「不会移交」不够,得给出能执行的下一步。
+    expect(description).toContain("task_list");
+  });
+
+  it("说明白代价,否则「计划没跟过去」听起来只是件小事", () => {
+    const description = createTransferToAgentTool(refs()).description;
+    // 真实代价是重复劳动加上已完成的工作被重做 —— 这才是让模型愿意多写几行 brief 的理由。
+    expect(description).toMatch(/rebuilds a near-identical plan|silently redone/);
+  });
+});
+
 describe("transfer_to_agent 的执行", () => {
   it("发一条 handoff_requested control 帧,带目标 id 与 brief", async () => {
     const emit = vi.fn();
