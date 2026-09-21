@@ -9,6 +9,7 @@ import type {
   ClusterMeta,
   HostMeta,
   CredentialPayload,
+  DevopsCredentialPayload,
   HostListResult,
 } from "./credential-transport.js";
 
@@ -44,6 +45,16 @@ class FakeTransport implements CredentialTransport {
   queryHosts(query: string, opts?: { limit?: number; cursor?: string }): Promise<HostListResult> {
     this.queryHostsCalls.push({ query, opts });
     return Promise.resolve(this.queryResult);
+  }
+
+  devopsPayload: DevopsCredentialPayload | null = null;
+  devopsError: Error | null = null;
+  getDevopsCalls: string[] = [];
+  getDevopsCredential(purpose: string): Promise<DevopsCredentialPayload> {
+    this.getDevopsCalls.push(purpose);
+    if (this.devopsError) return Promise.reject(this.devopsError);
+    if (!this.devopsPayload) return Promise.reject(new Error("no devops payload"));
+    return Promise.resolve(this.devopsPayload);
   }
 }
 
@@ -767,5 +778,106 @@ describe("withProbeTimeout — aborts timed-out work before it reaches kubectl",
     expect(result.probe_status).toBe("probe_failed");
     if (result.probe_status === "probe_failed") expect(result.reason).toBe("timeout");
     await new Promise((r) => setTimeout(r, 60)); // let the late ensureCluster settle
+  });
+});
+
+// ── delivery-platform credential ────────────────────────────────────────────
+
+const DEVOPS_PAYLOAD: DevopsCredentialPayload = {
+  credential: {
+    name: "scitix-devops",
+    type: "devops_agent",
+    description: "project agent",
+    metadata: { endpoint: "https://devops.example.internal", project: "p42" },
+    token: "sfm_opaque_token",
+  },
+};
+
+/** The type directory the entrypoint creates and fatally asserts before node starts. */
+function makeDevopsTypeDir(): void {
+  fs.mkdirSync(path.join(dir, "devops"), { recursive: true });
+}
+
+describe("CredentialBroker — ensureDevopsCredential", () => {
+  it("writes the credential file and records it in the manifest, without the token in the manifest", async () => {
+    makeDevopsTypeDir();
+    transport.devopsPayload = DEVOPS_PAYLOAD;
+
+    await broker.ensureDevopsCredential("restricted_bash");
+
+    const file = path.join(dir, "devops", "scitix-devops.json");
+    expect(fs.existsSync(file)).toBe(true);
+    expect(JSON.parse(fs.readFileSync(file, "utf-8"))).toEqual({
+      endpoint: "https://devops.example.internal",
+      project: "p42",
+      token: "sfm_opaque_token",
+    });
+
+    // The manifest is how an operator sees a credential exists without being able
+    // to read it. A token in there would defeat exactly that.
+    const manifest = fs.readFileSync(path.join(dir, "manifest.json"), "utf-8");
+    expect(manifest).not.toContain("sfm_opaque_token");
+    expect(JSON.parse(manifest)).toContainEqual(
+      expect.objectContaining({ name: "scitix-devops", type: "devops_agent" }),
+    );
+  });
+
+  it("fetches once per box and not again", async () => {
+    makeDevopsTypeDir();
+    transport.devopsPayload = DEVOPS_PAYLOAD;
+
+    await broker.ensureDevopsCredential();
+    await broker.ensureDevopsCredential();
+    await broker.ensureDevopsCredential();
+
+    // The token is long-lived and revocation happens at the delivery platform, so
+    // a second round trip would rewrite an identical file for nothing.
+    expect(transport.getDevopsCalls).toHaveLength(1);
+    expect(broker.isDevopsCredentialReady()).toBe(true);
+  });
+
+  it("does NOT cache a failure — provisioning may land after the box started", async () => {
+    makeDevopsTypeDir();
+    transport.devopsError = new Error("this agent has no delivery-platform credential");
+
+    await expect(broker.ensureDevopsCredential()).rejects.toThrow(/no delivery-platform credential/);
+    expect(broker.isDevopsCredentialReady()).toBe(false);
+
+    transport.devopsError = null;
+    transport.devopsPayload = DEVOPS_PAYLOAD;
+    await broker.ensureDevopsCredential();
+    expect(broker.isDevopsCredentialReady()).toBe(true);
+    expect(transport.getDevopsCalls).toHaveLength(2);
+  });
+
+  it("refuses when the setgid type directory is absent instead of creating one", async () => {
+    // No makeDevopsTypeDir(). The entrypoint creates it as agentbox:devopscred 2750
+    // and asserts it fatally; creating it here would produce a 0700 agentbox-owned
+    // directory that siforgectl cannot enter, and the only symptom would be a
+    // permission error a process boundary away from anything explaining it.
+    transport.devopsPayload = DEVOPS_PAYLOAD;
+
+    await expect(broker.ensureDevopsCredential()).rejects.toThrow(/does not exist/);
+    expect(broker.isDevopsCredentialReady()).toBe(false);
+  });
+
+  it("concurrent callers share one round trip", async () => {
+    makeDevopsTypeDir();
+    transport.devopsPayload = DEVOPS_PAYLOAD;
+
+    await Promise.all([
+      broker.ensureDevopsCredential(),
+      broker.ensureDevopsCredential(),
+      broker.ensureDevopsCredential(),
+    ]);
+    expect(transport.getDevopsCalls).toHaveLength(1);
+  });
+
+  it("rejects a malformed response rather than writing an empty credential", async () => {
+    makeDevopsTypeDir();
+    transport.devopsPayload = {} as DevopsCredentialPayload;
+
+    await expect(broker.ensureDevopsCredential()).rejects.toThrow(/malformed/);
+    expect(fs.existsSync(path.join(dir, "devops", "scitix-devops.json"))).toBe(false);
   });
 });

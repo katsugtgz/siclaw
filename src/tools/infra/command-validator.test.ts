@@ -14,6 +14,8 @@ import {
   validateCommand,
 } from "./command-validator.js";
 import { CONTAINER_SENSITIVE_PATHS } from "./command-sets.js";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 // ── extractCommands ───────────────────────────────────────────────────
 
@@ -189,6 +191,65 @@ describe("getContextCommands", () => {
       expect(cmds.has("bash")).toBe(false);
       expect(cmds.has("bc")).toBe(false);
     }
+  });
+});
+
+// ── siforgectl: the project-agent delivery CLI ─────────────────────────
+//
+// See scitix-devops/docs/design/project-agent-cli.md. This layer is depth, not the boundary — what the
+// agent may actually do is decided by aslan from the credential the binary reads. What IS asserted
+// here is that the binary reaches the agent through the ordinary command table, with a definition
+// attached, and only inside the AgentBox.
+
+describe("siforgectl registration", () => {
+  it("is enabled in the AgentBox context and nowhere else", () => {
+    // The enablement switch is this intersection and nothing else: the binary and the credential it
+    // reads exist only in the AgentBox image. Admitting the name on a cluster node, inside a target
+    // container or on a remote host would advertise a capability that can only answer 127.
+    expect(getContextCommands("local").has("siforgectl")).toBe(true);
+    for (const ctx of ["node", "pod", "host"] as const) {
+      expect(getContextCommands(ctx).has("siforgectl")).toBe(false);
+    }
+  });
+
+  it("is admitted by the command table, not by extraAllowed", () => {
+    // A hit in extraAllowed short-circuits the whitelist pass before any definition is consulted, and
+    // a binary with no definition carries no constraints at all — kubectl is in that position and
+    // needs a hand-written grammar because of it. So: admitted with NO extraAllowed set at all.
+    expect(validateCommand("siforgectl workflow list", { context: "local" })).toBeNull();
+  });
+
+  it("is not in the extraAllowed set restricted_bash passes", () => {
+    const bash = readFileSync(
+      fileURLToPath(new URL("../cmd-exec/restricted-bash.ts", import.meta.url)), "utf8",
+    );
+    const extra = bash.match(/extraAllowed:\s*new Set\(\[([^\]]*)\]\)/);
+    expect(extra, "restricted_bash must declare an extraAllowed set").not.toBeNull();
+    expect(extra![1]).not.toContain("siforgectl");
+  });
+
+  it("admits every domain the client surface is built from", () => {
+    for (const domain of [
+      "approval", "build", "cluster", "code", "deploy", "describe",
+      "env", "project", "registry", "service", "user", "workflow",
+    ]) {
+      expect(validateCommand(`siforgectl ${domain} list`, { context: "local" }), domain).toBeNull();
+    }
+  });
+
+  it("refuses a domain that is not on the list", () => {
+    // Not a security claim — aslan decides. It is the coarse outer bound, so a domain added to the
+    // client without being reviewed here does not reach the agent by default.
+    for (const domain of ["secret", "system", "admin", "policy"]) {
+      expect(validateCommand(`siforgectl ${domain} list`, { context: "local" }), domain).not.toBeNull();
+    }
+  });
+
+  it("still screens the credential tree when it appears in another command's arguments", () => {
+    // The credential the binary reads is a file in the tree the text tools are screened against; the
+    // new type directory must be covered by the same patterns as the existing ones.
+    expect(validateCommand("printf x | column .siclaw/credentials/devops/*", { context: "local" }))
+      .not.toBeNull();
   });
 });
 

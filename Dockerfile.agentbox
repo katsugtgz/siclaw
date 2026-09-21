@@ -9,6 +9,10 @@
 #              the cluster credentials through its setgid bit; a group membership here would hand
 #              every other binary in the image the same access and make that setgid bit decorative.
 #   kubectl  — setgid kubecred group, reads kubeconfig via group permission
+#   siforgectl — setgid devopscred group, reads the project-agent delivery credential the same way.
+#              A second setgid reader is why /app/.siclaw/credentials is `0751` rather than owned by
+#              one credential group: the parent is a traversal point, each TYPE directory below is
+#              the boundary. See docker/agentbox-entrypoint.sh for the full argument.
 #   host credentials — no sandbox-side reader exists: `ssh` is not in the command whitelist, and
 #              host_exec dials from the node process (running as agentbox, the owner) via ssh2. The
 #              setgid `ssh` once planned here was never built and is not needed.
@@ -88,7 +92,8 @@ RUN curl -fsSL -o /usr/local/lib/yq-real "https://github.com/mikefarah/yq/releas
 RUN userdel -r node 2>/dev/null || true \
     && groupadd --gid 1002 kubecred \
     && groupadd --gid 1003 hostcred \
-    && useradd --uid 1000 -m -s /bin/bash -G kubecred,hostcred agentbox \
+    && groupadd --gid 1004 devopscred \
+    && useradd --uid 1000 -m -s /bin/bash -G kubecred,hostcred,devopscred agentbox \
     && useradd --uid 1001 -M -s /bin/false sandbox \
     && echo 'agentbox ALL=(sandbox) NOPASSWD:SETENV: ALL' > /etc/sudoers.d/sandbox-exec \
     && chmod 440 /etc/sudoers.d/sandbox-exec \
@@ -144,15 +149,29 @@ RUN set -eu \
     && rm -rf /opt/mcp-staging
 
 # Directory structure, permissions, SUID/SGID cleanup — single layer
+#
+# The credential tree is `0751` on the parent and one setgid directory per credential TYPE below it.
+# 0751 grants `o+x` WITHOUT `o+r`: any setgid reader can resolve a path through the parent, and
+# `sandbox` can neither list it nor enter a type directory (2750, other=0) nor open a credential file
+# (0640, other=0), because it holds no credential group. Naming ONE group on the parent — what this
+# did while kubectl was the only sandbox-side reader — admits that reader and locks out every other,
+# which is exactly what a second reader (setgid siforgectl, group devopscred) runs into.
+# docker/agentbox-entrypoint.sh restates all of it at startup, over the emptyDir that shadows this.
+#
+# The SGID retention list at the end is what keeps both setgid bits: the strip below removes every
+# SUID/SGID bit in the image except the names it enumerates, so a new setgid reader that is not
+# listed there is stripped and fails at runtime with a permission error nothing explains.
 RUN chmod +x /usr/local/bin/agentbox-entrypoint.sh \
-    && mkdir -p ./.siclaw/skills ./.siclaw/credentials/clusters ./.siclaw/credentials/hosts ./.siclaw/config ./.siclaw/user-data \
+    && mkdir -p ./.siclaw/skills ./.siclaw/credentials/clusters ./.siclaw/credentials/hosts ./.siclaw/credentials/devops ./.siclaw/config ./.siclaw/user-data \
     && chown -R agentbox:agentbox . \
     && chown agentbox:agentbox ./.siclaw/credentials \
-    && chmod 0750 ./.siclaw/credentials \
+    && chmod 0751 ./.siclaw/credentials \
     && chown agentbox:kubecred ./.siclaw/credentials/clusters \
     && chmod 2750 ./.siclaw/credentials/clusters \
     && chown agentbox:hostcred ./.siclaw/credentials/hosts \
     && chmod 2750 ./.siclaw/credentials/hosts \
+    && chown agentbox:devopscred ./.siclaw/credentials/devops \
+    && chmod 2750 ./.siclaw/credentials/devops \
     && chmod 0700 ./.siclaw/config \
     && chmod 0755 ./.siclaw/skills \
     && chmod 0777 ./.siclaw/user-data \
@@ -160,7 +179,7 @@ RUN chmod +x /usr/local/bin/agentbox-entrypoint.sh \
     && find / -perm /4000 -type f ! -path '/proc/*' 2>/dev/null | while read -r f; do \
          case "$f" in /usr/bin/sudo) ;; *) chmod u-s "$f" ;; esac; done \
     && find / -perm /2000 -type f ! -path '/proc/*' 2>/dev/null | while read -r f; do \
-         case "$f" in /usr/local/bin/kubectl) ;; *) chmod g-s "$f" ;; esac; done
+         case "$f" in /usr/local/bin/kubectl|/usr/local/bin/siforgectl) ;; *) chmod g-s "$f" ;; esac; done
 
 ENV NODE_ENV=production
 

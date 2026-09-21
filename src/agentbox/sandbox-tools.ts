@@ -105,6 +105,13 @@ export async function executeSandboxBuiltin(request: SandboxBuiltinRequest, appr
         listClusters: async () => isHost ? [] : [cluster],
         listHosts: async () => isHost ? [host] : [], queryHosts: deny,
         getClusterCredential: isHost ? deny : get, getHostCredential: isHost ? get : deny,
+        // Always denied, with no isHost branch to switch it on. This broker exists
+        // to serve ONE already-approved credential payload for ONE diagnostic
+        // invocation; the delivery credential is neither of those, and it has no
+        // reader on this path (siforgectl is not a sandbox tool). Wiring it through
+        // would give a sandbox approval for a cluster or host a second, unrelated
+        // credential it never asked for.
+        getDevopsCredential: deny,
       }, dir);
       const ref = { credentialsDir: dir, credentialBroker: broker };
       // A unique cache owner prevents cross-run reuse, and lets us remove ONLY this

@@ -2595,6 +2595,17 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
   });
 
   handlers.set("credential.get", async (params, connectionAgentId) => {
+    // `devops` is answered by the sicore control plane, which owns the encrypted
+    // per-agent delivery credential; this standalone portal has no such store and
+    // never will (there is nothing here to provision it from). Refused by NAME
+    // rather than by falling into the source_id check below, which would report
+    // "source and source_id are required" and send whoever hit it looking for a
+    // field they were right not to send.
+    if (params.source === "devops") {
+      throw new Error(
+        "source=devops is served only by the sicore control plane; this portal stores no delivery credential",
+      );
+    }
     if (!params.source || !params.source_id) {
       throw new Error("source and source_id are required");
     }

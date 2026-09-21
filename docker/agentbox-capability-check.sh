@@ -46,7 +46,7 @@ if ! sandbox_groups=$(id -nG sandbox 2>/dev/null); then
   echo "       The isolation this checks cannot be verified, so refusing rather than assuming." >&2
   exit 1
 fi
-for grp in kubecred hostcred; do
+for grp in kubecred hostcred devopscred; do
   if printf '%s\n' "$sandbox_groups" | tr " " "\n" | grep -qx "$grp"; then
     echo "capability-check FAILED — sandbox is a member of $grp." >&2
     echo "Child processes could then read the materialized credentials directly, and kubectl's setgid" >&2
@@ -54,11 +54,16 @@ for grp in kubecred hostcred; do
     exit 1
   fi
 done
-# And the reader that DOES need the group must still have it.
-if ! id -nG agentbox 2>/dev/null | tr " " "\n" | grep -qx kubecred; then
-  echo "capability-check FAILED — agentbox is not in kubecred; it owns the credential tree." >&2
-  exit 1
-fi
+# And the owner that DOES need the groups must still have them. Owning the tree is not enough: the node
+# process writes each credential file with its type's group, and a process can only chgrp to a group it
+# is a member of. Missing membership degrades to a file the setgid reader cannot open — a permission
+# error at the far end of a credential fetch, with nothing at this end to explain it.
+for grp in kubecred hostcred devopscred; do
+  if ! id -nG agentbox 2>/dev/null | tr " " "\n" | grep -qx "$grp"; then
+    echo "capability-check FAILED — agentbox is not in $grp; it owns and writes that credential type." >&2
+    exit 1
+  fi
+done
 echo "capability-check: sandbox holds no credential group; agentbox owns the tree"
 
 # `yq` on PATH must be the WRAPPER, not the real binary. Presence is not the property that matters

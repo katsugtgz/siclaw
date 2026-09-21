@@ -6,7 +6,9 @@
  * external credential provider. Identity is extracted from the mTLS client
  * certificate and cannot be spoofed.
  *
- *   POST /api/internal/credential-request  → one cluster's kubeconfig
+ *   POST /api/internal/credential-request  → one cluster's kubeconfig, one host's
+ *                                            SSH material, or this agent's
+ *                                            delivery-platform credential
  *   POST /api/internal/credential-list     → metadata for all bound clusters
  */
 
@@ -97,20 +99,31 @@ export async function handleCredentialRequest(
     return;
   }
 
-  if (body.source !== "cluster" && body.source !== "host") {
+  if (body.source !== "cluster" && body.source !== "host" && body.source !== "devops") {
     sendError(res, 400, `Unsupported source: ${body.source ?? "(missing)"}`);
     return;
   }
-  if (!body.source_id) {
+  // source_id identifies WHICH cluster or host. `devops` has no which: an agent
+  // carries exactly one delivery credential, keyed by the agentId in the mTLS
+  // cert this handler already verified. Requiring an id here would force the
+  // caller to invent one, and accepting one would create a selection the
+  // management server has no second row to satisfy.
+  if (body.source !== "devops" && !body.source_id) {
     sendError(res, 400, "source_id is required");
     return;
   }
 
   try {
     const id = toIdentity(identity, body.session_id);
-    const payload = body.source === "cluster"
-      ? await service.getClusterCredential(id, body.source_id, body.purpose ?? "")
-      : await service.getHostCredential(id, body.source_id, body.purpose ?? "");
+    const purpose = body.purpose ?? "";
+    let payload: unknown;
+    if (body.source === "devops") {
+      payload = await service.getDevopsCredential(id, purpose);
+    } else if (body.source === "cluster") {
+      payload = await service.getClusterCredential(id, body.source_id as string, purpose);
+    } else {
+      payload = await service.getHostCredential(id, body.source_id as string, purpose);
+    }
     sendJson(res, 200, payload);
   } catch (err) {
     if (err instanceof SessionOwnershipError) {

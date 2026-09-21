@@ -73,6 +73,7 @@ const goodIdentity: CertificateIdentity = {
 class FakeService {
   getClusterCredential = vi.fn();
   getHostCredential = vi.fn();
+  getDevopsCredential = vi.fn();
   listClusters = vi.fn();
   listHosts = vi.fn();
   queryHosts = vi.fn();
@@ -277,5 +278,73 @@ describe("handleCredentialList", () => {
     await handleCredentialList(asHttpReq(req), asHttpRes(res), goodIdentity, service as unknown as CredentialService);
     expect(res.statusCode).toBe(502);
     errSpy.mockRestore();
+  });
+});
+
+// ── source: devops ─────────────────────────────────────────
+
+describe("handleCredentialRequest — source=devops", () => {
+  it("200 without a source_id, and passes only the cert identity down", async () => {
+    const payload = {
+      credential: {
+        name: "scitix-devops",
+        type: "devops_agent",
+        metadata: { endpoint: "https://devops.example.internal", project: "p42" },
+        token: "sfm_opaque_token",
+      },
+    };
+    service.getDevopsCredential.mockResolvedValue(payload);
+
+    const req = new FakeReq(JSON.stringify({ source: "devops", purpose: "restricted_bash" }));
+    const res = new FakeRes();
+    await handleCredentialRequest(
+      asHttpReq(req), asHttpRes(res), goodIdentity,
+      service as unknown as CredentialService,
+    );
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual(payload);
+    // The agent is the cert's, never the body's — there is no source_id to argue with.
+    const [identity, purpose] = service.getDevopsCredential.mock.calls[0];
+    expect(identity.agentId).toBe("a1");
+    expect(purpose).toBe("restricted_bash");
+    expect(service.getClusterCredential).not.toHaveBeenCalled();
+    expect(service.getHostCredential).not.toHaveBeenCalled();
+  });
+
+  it("a source_id in the body changes nothing — it is not a selector here", async () => {
+    service.getDevopsCredential.mockResolvedValue({ credential: {} });
+    const req = new FakeReq(JSON.stringify({ source: "devops", source_id: "somebody-elses" }));
+    const res = new FakeRes();
+    await handleCredentialRequest(
+      asHttpReq(req), asHttpRes(res), goodIdentity,
+      service as unknown as CredentialService,
+    );
+    expect(res.statusCode).toBe(200);
+    expect(service.getDevopsCredential.mock.calls[0][0].agentId).toBe("a1");
+  });
+
+  it("cluster and host still require a source_id", async () => {
+    for (const source of ["cluster", "host"]) {
+      const req = new FakeReq(JSON.stringify({ source }));
+      const res = new FakeRes();
+      await handleCredentialRequest(
+        asHttpReq(req), asHttpRes(res), goodIdentity,
+        service as unknown as CredentialService,
+      );
+      expect(res.statusCode).toBe(400);
+      expect(res.body).toContain("source_id is required");
+    }
+  });
+
+  it("an unknown source is still refused", async () => {
+    const req = new FakeReq(JSON.stringify({ source: "devops-ish", source_id: "x" }));
+    const res = new FakeRes();
+    await handleCredentialRequest(
+      asHttpReq(req), asHttpRes(res), goodIdentity,
+      service as unknown as CredentialService,
+    );
+    expect(res.statusCode).toBe(400);
+    expect(res.body).toContain("Unsupported source");
   });
 });

@@ -3,6 +3,8 @@ import {
   ensureClusterForTool,
   ensureHostForTool,
   classifyClusterFailure,
+  ensureDevopsCredentialForTool,
+  DEVOPS_CLI_BINARY,
 } from "./ensure-kubeconfigs.js";
 
 describe("ensureClusterForTool", () => {
@@ -155,5 +157,47 @@ describe("every tool that ensures a cluster also classifies the failure", () => 
       expect(src, `${f} ensures a cluster but never calls classifyClusterFailure — an unbound cluster `
         + `would be reported as unavailable`).toMatch(/\bclassifyClusterFailure\s*\(/);
     }
+  });
+});
+
+describe("ensureDevopsCredentialForTool", () => {
+  function fakeBroker() {
+    const calls: string[] = [];
+    return {
+      calls,
+      broker: { ensureDevopsCredential: async (p: string) => { calls.push(p); } } as any,
+    };
+  }
+
+  it("no-op when broker undefined", async () => {
+    await expect(ensureDevopsCredentialForTool(undefined, [DEVOPS_CLI_BINARY], "p")).resolves.toBeUndefined();
+  });
+
+  it("fetches when the command set contains the CLI", async () => {
+    const { calls, broker } = fakeBroker();
+    await ensureDevopsCredentialForTool(broker, ["jq", DEVOPS_CLI_BINARY], "restricted_bash");
+    expect(calls).toEqual(["restricted_bash"]);
+  });
+
+  it("does nothing for a command set that does not contain it", async () => {
+    const { calls, broker } = fakeBroker();
+    await ensureDevopsCredentialForTool(broker, ["kubectl", "grep", "jq"], "restricted_bash");
+    expect(calls).toEqual([]);
+  });
+
+  // Exact name only. A prefix or substring match would fetch a delivery credential
+  // for any binary whose name happens to start the same way.
+  it("does not match on a name that merely looks like it", async () => {
+    const { calls, broker } = fakeBroker();
+    await ensureDevopsCredentialForTool(broker, ["siforgectl-shim", "notsiforgectl"], "p");
+    expect(calls).toEqual([]);
+  });
+
+  it("propagates the failure rather than letting the CLI run without a credential", async () => {
+    const broker = {
+      ensureDevopsCredential: async () => { throw new Error("no delivery-platform credential"); },
+    } as any;
+    await expect(ensureDevopsCredentialForTool(broker, [DEVOPS_CLI_BINARY], "p"))
+      .rejects.toThrow(/no delivery-platform credential/);
   });
 });

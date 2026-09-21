@@ -697,6 +697,16 @@ describe("credential.get", () => {
   // Query order for cluster: (1) cluster lookup by name, (2) agent_clusters binding check
   // Query order for host:    (1) host lookup by name,    (2) agent_hosts binding check
 
+  // The standalone portal has no delivery-credential store, so it refuses by NAME
+  // rather than falling into the source_id check — which would report "source and
+  // source_id are required" and send the reader looking for a field they were
+  // right not to send (there is no source_id for this source anywhere).
+  it("refuses source=devops with a reason, not with a missing-field error", async () => {
+    await expect(
+      getHandler("credential.get")({ source: "devops" }, "agent-1"),
+    ).rejects.toThrow(/served only by the sicore control plane/);
+  });
+
   it("returns kubeconfig for cluster credential", async () => {
     mockQuery(
       [{ id: "cluster-uuid-1", name: "prod-cluster", kubeconfig: "apiVersion: v1\nkind: Config" }],

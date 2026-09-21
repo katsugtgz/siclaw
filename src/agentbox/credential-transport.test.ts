@@ -156,3 +156,29 @@ describe("HttpTransport — getHostCredential", () => {
     await expect(t.getHostCredential("h", "p")).rejects.toThrow(/network error/);
   });
 });
+
+describe("HttpTransport — getDevopsCredential", () => {
+  it("POSTs with source=devops and NO source_id", async () => {
+    const payload = {
+      credential: {
+        name: "scitix-devops",
+        type: "devops_agent" as const,
+        metadata: { endpoint: "https://devops.example.internal", project: "p42" },
+        token: "sfm_opaque_token",
+      },
+    };
+    const client = makeClient(async (path, method, body) => {
+      expect(path).toBe("/api/internal/credential-request");
+      expect(method).toBe("POST");
+      // No source_id: an agent has exactly one delivery credential, keyed by the
+      // agentId in the mTLS cert. Sending a name would invent a selection and
+      // hand this side a lever over which credential it receives.
+      expect(body).toEqual({ source: "devops", purpose: "restricted_bash" });
+      return payload;
+    });
+
+    const t = new HttpTransport(client);
+    const result = await t.getDevopsCredential("restricted_bash");
+    expect(result).toBe(payload);
+  });
+});

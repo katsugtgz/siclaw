@@ -38,6 +38,7 @@ import type {
   HostListResult,
 } from "./credential-transport.js";
 import type { ChainHop, ChainHopMeta, ClusterMetaEntry } from "../shared/credential-types.js";
+import { registerDevopsCredential } from "../tools/infra/credential-manager.js";
 
 export type { ClusterMeta, HostMeta, CredentialPayload, HostListResult };
 
@@ -364,12 +365,39 @@ export class CredentialBroker {
   private clusterRefreshInflight: Promise<ClusterMeta[]> | null = null;
   private hostRefreshInflight: Promise<HostMeta[]> | null = null;
 
+  /**
+   * Where the credential tree lives. Held because the delivery credential is
+   * written by `registerDevopsCredential` rather than by a ResourceRegistry —
+   * see ensureDevopsCredential.
+   */
+  private readonly credentialsDir: string;
+
+  /**
+   * Set once the delivery credential has been fetched AND written, for the life
+   * of this box.
+   *
+   * ⚠️ NO TTL, deliberately, and it is the one credential here without one. D6
+   * says this token is issued once and long-lived; revocation happens at the
+   * delivery platform, where a disabled credential stops verifying whatever any
+   * box still holds on disk. Re-fetching on a timer would rewrite an identical
+   * file forever and buy nothing. A box restart re-serves it, which is the only
+   * convergence this needs.
+   *
+   * ⚠️ FAILURES ARE NOT CACHED. "No credential provisioned yet" is the ordinary
+   * answer for almost every agent, and provisioning may well land after a box is
+   * already running — so the next attempt must ask again rather than remember a
+   * "no" forever.
+   */
+  private devopsCredentialWritten = false;
+  private devopsInflight: Promise<void> | null = null;
+
   constructor(
     private readonly transport: CredentialTransport,
     credentialsDir?: string,
   ) {
     const dir = credentialsDir || path.resolve(process.cwd(), ".siclaw/credentials");
     fs.mkdirSync(dir, { recursive: true });
+    this.credentialsDir = dir;
     this.clusters = new ResourceRegistry<ClusterMeta>("clusters", dir, {
       fileMode: 0o640,
       sharedGroup: "kubecred",
@@ -691,6 +719,66 @@ export class CredentialBroker {
   // ──────────────────────────────────────────────────────────
   // Lifecycle
   // ──────────────────────────────────────────────────────────
+
+  // ──────────────────────────────────────────────────────────
+  // Delivery-platform credential
+  // ──────────────────────────────────────────────────────────
+
+  /**
+   * Fetch this agent's delivery-platform credential over the authenticated
+   * gateway channel and land it in the credential tree, once per box.
+   *
+   * ⚠️ IT DOES NOT GO THROUGH ResourceRegistry, unlike every other credential
+   * here, and that is forced by the reader. `siforgectl` runs as `sandbox` and
+   * owns nothing in this tree; it reaches its file through a setgid `devopscred`
+   * group, so the file must be 0640 inside a 2750 `agentbox:devopscred` type
+   * directory. registerDevopsCredential is the writer that knows that layout and
+   * the manifest entry that goes with it; duplicating it here would be a second
+   * author on the same format.
+   *
+   * ⚠️ registerDevopsCredential THROWS if the type directory is missing, and that
+   * throw is kept rather than softened. The directory is created and fatally
+   * asserted by docker/agentbox-entrypoint.sh before this process starts, so its
+   * absence means this is not an AgentBox credential tree — creating it here
+   * would produce a 0700 agentbox-owned directory the reader cannot enter, and
+   * the only symptom would be a permission error one process boundary away from
+   * anything that could explain it.
+   *
+   * Nothing about the token is logged. The line below names the credential and
+   * its project, which is exactly what the manifest already records.
+   */
+  async ensureDevopsCredential(purpose = "ensure"): Promise<void> {
+    if (this.devopsCredentialWritten) return;
+    if (this.devopsInflight) return this.devopsInflight;
+    this.devopsInflight = (async () => {
+      try {
+        const response = await this.transport.getDevopsCredential(purpose);
+        const credential = response?.credential;
+        if (!credential) {
+          throw new Error("Gateway returned malformed credential-request (devops) response");
+        }
+        registerDevopsCredential(this.credentialsDir, {
+          name: credential.name,
+          endpoint: credential.metadata.endpoint,
+          project: credential.metadata.project,
+          token: credential.token,
+          description: credential.description,
+        });
+        this.devopsCredentialWritten = true;
+        console.log(
+          `[credential-broker] acquired delivery credential "${credential.name}" (project=${credential.metadata.project})`,
+        );
+      } finally {
+        this.devopsInflight = null;
+      }
+    })();
+    return this.devopsInflight;
+  }
+
+  /** true once the delivery credential has been written in this box. */
+  isDevopsCredentialReady(): boolean {
+    return this.devopsCredentialWritten;
+  }
 
   dispose(): void {
     clearInterval(this.cleanupTimer);

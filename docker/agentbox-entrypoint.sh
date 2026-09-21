@@ -30,7 +30,7 @@ if ! sandbox_groups=$(id -nG sandbox 2>/dev/null); then
   echo "       The isolation this checks cannot be verified, so refusing rather than assuming." >&2
   exit 1
 fi
-for grp in kubecred hostcred; do
+for grp in kubecred hostcred devopscred; do
   if printf '%s\n' "$sandbox_groups" | tr " " "\n" | grep -qx "$grp"; then
     echo "FATAL: sandbox is a member of $grp — credential isolation is not in effect." >&2
     echo "       Remove -G from the sandbox useradd; see docs/design/security.md §3 and ADR-010." >&2
@@ -45,26 +45,49 @@ done
 
 # Credentials.
 #
-# The parent MUST stay group-traversable by `kubecred`, because that is the group setgid `kubectl` runs
-# with, and without traversal it cannot reach the kubeconfig at all — `permission denied` on every
-# kubectl the agent issues. Measured the hard way: setting the parent to `agentbox:agentbox` locks the
-# setgid reader out along with everyone else.
+# The parent is a TRAVERSAL POINT, not a boundary. `0751` grants `o+x` and no `o+r`, so EVERY setgid
+# reader can walk through it without the parent having to name any of them, and the boundary is one
+# directory further down: each credential TYPE directory is 2750 with its own group, and each
+# credential file is 0640 with that group.
 #
-# What makes that safe is not this directory's mode, it is that `sandbox` belongs to NO credential group
-# (Dockerfile.agentbox; asserted at build time and again at startup above). kubecred traversal then means
-# "kubectl and the owner", not "every child process". Between 2026-04 and 2026-08 sandbox WAS in kubecred,
-# and this same line is what let it walk in — the line was not the defect, the group grant was.
+# This used to be `agentbox:kubecred 0750`, and the comment here recorded a measurement: tightening it
+# to `agentbox:agentbox` locks the setgid `kubectl` out and every kubectl the agent issues fails with
+# `permission denied`. That measurement stands, and it was about the MODE, not the owner — with the
+# parent readable by exactly ONE credential group, a second setgid reader could not even traverse. The
+# project-agent CLI (setgid `devopscred`) is that second reader, so the parent stops naming a group
+# and starts granting traversal to all of them.
 #
-# The `-R` is gone, though: it flattened `hosts/` into kubecred as well, discarding the per-type split
-# the image sets up. Each type is chowned separately below.
-chown agentbox:kubecred /app/.siclaw/credentials 2>/dev/null || true
-chmod 0750 /app/.siclaw/credentials 2>/dev/null || true
+# What `o+x` gives `sandbox` is path resolution, and nothing else: it cannot list this directory (no
+# `o+r`), cannot enter a type directory (2750, other=0), and cannot open a credential file (0640,
+# other=0). Every one of those fails for the same reason as before — `sandbox` belongs to NO credential
+# group (Dockerfile.agentbox; asserted at build time and again at startup above). Between 2026-04 and
+# 2026-08 it WAS in kubecred, and that grant, not any directory mode, is what made the isolation absent.
+#
+# mkdir FIRST, and this is a fix, not tidiness: /app/.siclaw/credentials is an emptyDir mount, so the
+# image's own type directories are SHADOWED at runtime and every chown below used to run against a
+# missing path and swallow the failure in `|| true`. The verification loop after it then skipped every
+# entry it was written to check, and the directories were created later by the node process at whatever
+# the umask gave (0755, agentbox:agentbox). Creating them here restores both the setgid group
+# inheritance and the assertions.
+#
+# The `-R` on the parent is gone, and stays gone: it flattened `hosts/` into kubecred as well,
+# discarding the per-type split. Each type is chowned separately below.
+if ! mkdir -p /app/.siclaw/credentials/clusters /app/.siclaw/credentials/hosts /app/.siclaw/credentials/devops; then
+  echo "FATAL: cannot create the credential type directories under /app/.siclaw/credentials." >&2
+  echo "       There is no per-type isolation to apply without them, so refusing to start." >&2
+  exit 1
+fi
+chown agentbox:agentbox /app/.siclaw/credentials 2>/dev/null || true
+chmod 0751 /app/.siclaw/credentials 2>/dev/null || true
 # setgid on each type directory, so whatever is materialized into it inherits that type's group.
 chown -R agentbox:kubecred /app/.siclaw/credentials/clusters 2>/dev/null || true
 chmod 2750 /app/.siclaw/credentials/clusters 2>/dev/null || true
 chown -R agentbox:hostcred /app/.siclaw/credentials/hosts 2>/dev/null || true
 chmod 2750 /app/.siclaw/credentials/hosts 2>/dev/null || true
-# Group-readable files, for the setgid reader (kubectl) — not for sandbox, which is in no such group.
+chown -R agentbox:devopscred /app/.siclaw/credentials/devops 2>/dev/null || true
+chmod 2750 /app/.siclaw/credentials/devops 2>/dev/null || true
+# Group-readable files, for the setgid readers (kubectl, siforgectl) — not for sandbox, which is in no
+# such group.
 find /app/.siclaw/credentials -type f -exec chmod 0640 {} \; 2>/dev/null || true
 
 # Verify the chowns above actually took effect, rather than trusting that they did.
@@ -80,9 +103,16 @@ find /app/.siclaw/credentials -type f -exec chmod 0640 {} \; 2>/dev/null || true
 # looking healthy.
 # Each type directory as well as the parent: the chowns are independent, so a partial failure can leave
 # one of them root-owned and readable while the parent looks correct.
-for spec in "clusters:agentbox:kubecred:2750" "hosts:agentbox:hostcred:2750"; do
+for spec in "clusters:agentbox:kubecred:2750" "hosts:agentbox:hostcred:2750" "devops:agentbox:devopscred:2750"; do
   d="${spec%%:*}"; rest="${spec#*:}"; want_own="${rest%:*}"; want_mode="${rest##*:}"
-  [ -d "/app/.siclaw/credentials/$d" ] || continue
+  # No `|| continue` on a missing directory any more. The mkdir -p above creates all three, so absence
+  # is now a real failure rather than the normal case it used to be under the emptyDir mount — and
+  # "normal case" is precisely how this loop came to assert nothing in production.
+  if [ ! -d "/app/.siclaw/credentials/$d" ]; then
+    echo "FATAL: /app/.siclaw/credentials/$d does not exist after mkdir -p." >&2
+    echo "       The credential tree cannot be isolated per type, so refusing to start." >&2
+    exit 1
+  fi
   got_own="$(stat -c '%U:%G' "/app/.siclaw/credentials/$d" 2>/dev/null || echo '?:?')"
   got_mode="$(stat -c '%a' "/app/.siclaw/credentials/$d" 2>/dev/null || echo '?')"
   if [ "$got_own" != "$want_own" ] || [ "$got_mode" != "$want_mode" ]; then
@@ -94,8 +124,8 @@ done
 
 cred_owner="$(stat -c '%U:%G' /app/.siclaw/credentials 2>/dev/null || echo '?:?')"
 cred_mode="$(stat -c '%a' /app/.siclaw/credentials 2>/dev/null || echo '?')"
-if [ "$cred_owner" != "agentbox:kubecred" ] || [ "$cred_mode" != "750" ]; then
-  echo "FATAL: /app/.siclaw/credentials is $cred_owner mode $cred_mode, expected agentbox:kubecred mode 750." >&2
+if [ "$cred_owner" != "agentbox:agentbox" ] || [ "$cred_mode" != "751" ]; then
+  echo "FATAL: /app/.siclaw/credentials is $cred_owner mode $cred_mode, expected agentbox:agentbox mode 751." >&2
   echo "       The permission fix did not take effect, so the credential tree is not isolated from" >&2
   echo "       child processes. The container must start as root with CAP_CHOWN/CAP_FOWNER — check for" >&2
   echo "       runAsNonRoot, a restricted PodSecurity policy, or a dropped capability." >&2
