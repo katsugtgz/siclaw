@@ -197,6 +197,28 @@ describe("driveCapabilitySession — box event → capability wire mapping", () 
     });
   });
 
+  it("completed checkpoint identity travels in the same artifact transaction", async () => {
+    const fe = fakeFrontend();
+    const mgr = fakeManager();
+    mgr.get.mockReturnValue({ inputRevision: "manifest-1", status: "running" });
+    await driveCapabilitySession({
+      client: fakeClient([
+        { type: "syncArtifacts", completed_checkpoint_id: "seal-1", artifacts: [{ path: "candidate/a.md", content: "# A" }] },
+        { type: "end" },
+      ]),
+      runId: "r1", frontendClient: fe, manager: mgr,
+    });
+    expect(fe.request).toHaveBeenCalledWith(CAPABILITY_PERSIST_ARTIFACTS, {
+      run_id: "r1",
+      input_revision: "manifest-1",
+      completed_checkpoint_id: "seal-1",
+      artifacts: [{
+        path: "candidate/a.md",
+        content: { inline_base64: Buffer.from("# A", "utf8").toString("base64") },
+      }],
+    });
+  });
+
   it("ACKs a sealed checkpoint only after the consumer transaction commits", async () => {
     const order: string[] = [];
     const fe = fakeFrontend();
@@ -740,4 +762,18 @@ describe("driveCapabilitySession — reconnect against the real run manager", ()
     expect(paths).toEqual([`/events/${id}?ack=1`]);
     expect(manager.get(id)).toBeUndefined();
   });
+});
+
+
+it("does not retire a box whose checkpoint is blocked before a durable save", async () => {
+  const fe = fakeFrontend();
+  const manager = new CapabilityRunManager(fe);
+  const { runId } = await manager.startRun({ profile: "kb-compile", orgId: "org", correlationId: "attempt" });
+  await manager.setStatus(runId, "running");
+  await driveCapabilitySession({ client: fakeClient([
+    { type: "error", recoverable: true, code: "workspace_checkpoint_blocked", stage: "persist", message: "Unsaved files retained; repair required." },
+  ]), runId, frontendClient: fe, manager });
+  expect(manager.get(runId)?.status).toBe("running");
+  expect(emits(fe).some((event: any) => event.type === "lifecycle")).toBe(false);
+  expect(fe.request.mock.calls.some(([, p]: any[]) => p?.status === "failed" || p?.status === "done")).toBe(false);
 });

@@ -51,7 +51,7 @@ export const CAPABILITY_GROUPS: Record<string, string[]> = {
   // the harness compiler, across all Agent types. No roster means no tool.
   transfer_conversation: ["transfer_to_agent", "search_handoff_targets"],
   scheduling:      ["manage_schedule"],
-  session_output:  ["task_report", "save_feedback", "channel_update", "request_input", "propose_execution"],   // Channel updates and clarification / write-approval requests
+  session_output:  ["task_report", "save_feedback", "channel_update", "request_input", "propose_execution", "report_analysis_recommendation"],   // Channel updates, clarification / write-approval requests, and optional quality-review metadata
 };
 
 /** Strictly decode the stored/wire selection where null means intentional unrestricted. */

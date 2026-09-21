@@ -93,3 +93,101 @@ async def test_responses_read_with_every_advertised_parameter_can_write_result(t
         assert (tmp_path / "page.md").read_text() == source
         assert events[-1].data["outcome"] == "completed"
         assert events[-1].data["model_calls"] == 3
+
+
+async def test_read_context_diagnostics_match_actual_responses_payload(tmp_path):
+    from pi_engine import observe_sessions
+    evidence = "PRIVATE-CORPUS-MARKER\n" * 300
+    (tmp_path / "index.md").write_text(evidence)
+    observed = []
+
+    async def observe(event):
+        observed.append(event)
+
+    def respond(body, number):
+        if number == 1:
+            return response(tool=("Read", {"file_path": "index.md", "limit": 500}))
+        results = [x for x in body["input"] if x.get("type") == "function_call_output"]
+        assert len(results) == 1 and "PRIVATE-CORPUS-MARKER" in results[0]["output"]
+        return response(text="Hello")
+
+    async with provider(respond, api="openai-responses") as (config, requests):
+        with observe_sessions(observe):
+            async with client(tmp_path, config, FileTools(str(tmp_path), ["Read"], allow).tools()) as instance:
+                await instance.query("Hello")
+                events = await collect(instance)
+    wire = [x["data"] for x in observed if x["kind"] == "model_payload"]
+    assert len(wire) == 2, "Every serialized request needs metadata-only tool-result evidence"
+    assert wire[1]["summary"]["toolResults"] == 1
+    assert wire[1]["summary"]["matchedToolResults"] == 1
+    assert wire[1]["summary"]["toolResultChars"] >= len(evidence)
+    context = [x["data"] for x in observed if x["kind"] == "model_request"]
+    assert context[1]["context"]["toolResults"] == 1
+    assert events[-1].data["outcome"] == "completed"
+    result = next(x["data"] for x in observed if x["kind"] == "tool_result")
+    assert result["text_chars"] >= len(evidence) and result["duration_ms"] >= 0
+    assert next(x["data"] for x in observed if x["kind"] == "worker_ready")["duration_ms"] >= 0
+    serialized = json.dumps(observed)
+    assert "PRIVATE-CORPUS-MARKER" not in serialized
+    assert "private-fixture-key" not in serialized
+
+
+async def test_repeated_read_is_counted_without_logging_arguments(tmp_path):
+    from pi_engine import observe_sessions
+    (tmp_path / "private-index.md").write_text("private tool evidence")
+    observed = []
+    async def observe(event):
+        observed.append(event)
+    async with provider(lambda _, n: response(tool=("Read", {"file_path": "private-index.md"}))
+                        if n < 3 else response(text="done"), api="openai-responses") as (config, _):
+        with observe_sessions(observe):
+            async with client(tmp_path, config, FileTools(str(tmp_path), ["Read"], allow).tools()) as instance:
+                await instance.query("Hello")
+                await collect(instance)
+                await instance.query("Hello again")
+                await collect(instance)
+    dispatches = [x["data"] for x in observed if x["kind"] == "tool_dispatch"]
+    assert [x["consecutive_same_call"] for x in dispatches] == [1, 2]
+    assert "private-index.md" not in json.dumps(observed)
+    assert "private tool evidence" not in json.dumps(observed)
+
+
+async def test_diagnostic_sink_failure_does_not_drop_tool_reply(tmp_path):
+    from pi_engine import observe_sessions
+    (tmp_path / "index.md").write_text("evidence")
+    async def broken_sink(event):
+        if event["kind"] in {"worker_start", "worker_ready", "tool_dispatch", "tool_result", "model_payload"}:
+            raise RuntimeError("private failure text")
+    async with provider(lambda _, n: response(tool=("Read", {"file_path": "index.md"}))
+                        if n == 1 else response(text="done"), api="openai-responses") as (config, requests):
+        with observe_sessions(broken_sink):
+            async with client(tmp_path, config, FileTools(str(tmp_path), ["Read"], allow).tools()) as instance:
+                await instance.query("Hello")
+                assert (await collect(instance))[-1].data["outcome"] == "completed"
+    assert "evidence" in next(x["output"] for x in requests[1]["input"] if x.get("type") == "function_call_output")
+
+
+async def test_chat_completions_image_attachment_remains_visible_in_wire_summary(tmp_path):
+    from agent_protocol import EngineTool
+    from pi_engine import observe_sessions
+    from test_pi_engine import completion
+    observed = []
+    async def observe(event):
+        observed.append(event)
+    async def image_tool(_):
+        return {"content": [{"type": "image", "mimeType": "image/png", "data": "cHJpdmF0ZS1pbWFnZQ=="}]}
+    tool = EngineTool("ReadImage", "Read a fixture image", {"type":"object","properties":{}}, image_tool)
+    async with provider(lambda _, n: completion(tool=("ReadImage", {})) if n == 1 else completion("done")) as (config, requests):
+        with observe_sessions(observe):
+            async with client(tmp_path, config, [tool]) as instance:
+                await instance.query("Read image")
+                await collect(instance)
+    actual = sum(1 for m in requests[1]["messages"] for c in (m.get("content") or [])
+                 if isinstance(c, dict) and c.get("type") == "image_url")
+    assert actual == 1
+    context = [e["data"]["context"] for e in observed if e["kind"] == "model_request"][1]
+    wire = [e["data"]["summary"] for e in observed if e["kind"] == "model_payload"][1]
+    assert context["inlineToolResultImages"] == 1
+    assert wire["inlineToolResultImages"] == 0
+    assert wire["otherMessageImages"] == actual
+    assert "cHJpdmF0ZS1pbWFnZQ==" not in json.dumps(observed)

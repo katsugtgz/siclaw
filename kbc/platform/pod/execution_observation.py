@@ -63,11 +63,16 @@ class ExecutionObserver:
         if self._observer is None:
             return
         fields = {
+            "worker_start": (),
+            "worker_ready": ("duration_ms",),
             "ready": ("sdk_version",),
-            "model_request": ("call", "model", "provider"),
+            "model_request": ("call", "model", "provider", "context"),
+            "model_payload": ("call", "summary"),
             "model_envelope": ("manifest",),
             "model_usage": ("observation",),
             "assistant": ("llm_call", "stop_reason"),
+            "tool_dispatch": ("call_id", "name", "consecutive_same_call"),
+            "tool_result": ("call_id", "name", "is_error", "duration_ms", "text_chars", "images"),
             "tool_start": ("call_id", "name"),
             "tool_end": ("call_id", "name", "is_error"),
             "result": ("outcome", "api_error_status", "model_calls", "tool_calls", "usage"),

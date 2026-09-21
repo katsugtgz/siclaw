@@ -51,6 +51,8 @@ from pathlib import Path, PurePosixPath
 from aiohttp import web
 
 import batching
+import loop_diagnostics
+import finalization
 import candidate_context
 import candidate_feedback
 import destream
@@ -64,6 +66,7 @@ from mtls_auth import (
 )
 import redblue
 import selfcheck
+import review_notes
 from engine import selected_readonly_engine, engine_kind, create_agent_client
 from agent_protocol import AgentClient, AgentEvent, AgentTransportError, EngineTool, is_result as message_is_result, message_field
 from execution_observation import observe_sessions
@@ -521,6 +524,10 @@ class ModelResultError(Exception):
     """
 
 
+class ModelCallBudgetExceeded(ModelResultError):
+    """The bounded agent session exhausted its own calls, not provider capacity."""
+
+
 class BatchOutputError(Exception):
     """A successful internal session did not account for its assigned sources."""
 
@@ -573,10 +580,14 @@ def _batch_error_code(exc: BaseException) -> str:
     operator-visible, and the owner's KB content is theirs alone (it flows to the
     OWNER-facing SSE events instead). The class name + this code route the fault
     without leaking any of that."""
+    if isinstance(exc, finalization.FinalizationError):
+        return "finalization_not_converged"
     if isinstance(exc, WorkerTeardownError):
         return "worker_teardown_failed"
     if isinstance(exc, ModelStallError):
         return "model_stall"
+    if isinstance(exc, ModelCallBudgetExceeded):
+        return "model_call_budget_exceeded"
     if isinstance(exc, ModelResultError):
         return "model_result_error"
     if isinstance(exc, BatchOutputError):
@@ -1004,12 +1015,22 @@ RECOVERY_PROVENANCE_PATH = "authoring/RECOVERY_PROVENANCE.json"
 _SYNC_TOMBSTONE = "__deleted__"
 
 
-def _collect_workspace_artifacts(workdir: str) -> list[dict]:
+class WorkspaceArtifactError(RuntimeError):
+    """A complete checkpoint cannot silently omit writable text artifacts."""
+    def __init__(self, message: str, *, retryable: bool = False):
+        super().__init__(message)
+        self.retryable = retryable
+
+
+def _collect_workspace_artifacts(workdir: str, *, strict: bool = False,
+                                 skipped: list | None = None) -> list[dict]:
     """Collect text files under the writable workspace dirs as {path, content}.
     Paths are relative to workdir (e.g. "candidate/01.md"). raw/ is never
-    included; binary, unreadable, or oversized files are skipped."""
+    included. A completed checkpoint rejects uncollectable writable files;
+    periodic sync can retain prior copies while reporting the skipped paths."""
     wd = Path(workdir)
     out: list[dict] = []
+    issues = skipped if skipped is not None else []
     for top in WORKSPACE_SYNC_DIRS:
         base = wd / top
         if not base.is_dir():
@@ -1019,17 +1040,30 @@ def _collect_workspace_artifacts(workdir: str) -> list[dict]:
                 continue
             try:
                 if f.stat().st_size > MAX_SYNC_FILE_BYTES:
+                    issues.append({"path": f.relative_to(wd).as_posix(), "reason": "too_large"})
                     continue
                 content = f.read_text(encoding="utf-8")
-            except (OSError, UnicodeDecodeError):
+            except UnicodeDecodeError:
+                issues.append({"path": f.relative_to(wd).as_posix(), "reason": "invalid_encoding"})
+                continue
+            except PermissionError:
+                issues.append({"path": f.relative_to(wd).as_posix(), "reason": "permission_denied"})
+                continue
+            except OSError:
+                issues.append({"path": f.relative_to(wd).as_posix(), "reason": "unreadable"})
                 continue
             out.append({"path": f.relative_to(wd).as_posix(), "content": content})
+    if strict and issues:
+        details = "; ".join(f"{item['path']} ({item['reason']})" for item in issues[:10])
+        raise WorkspaceArtifactError(f"Incomplete workspace checkpoint: {details}. Split oversized files to at most {MAX_SYNC_FILE_BYTES} bytes; existing files have been retained.",
+                                     retryable=all(item["reason"] == "unreadable" for item in issues))
     return out
 
 
-def _collect_workspace_artifacts_for_sync(run: CompileRun) -> list[dict]:
+def _collect_workspace_artifacts_for_sync(run: CompileRun, *, strict: bool = False) -> list[dict]:
     """Collect a durability-safe snapshot without mutating in-flight files."""
-    artifacts = _collect_workspace_artifacts(run.workdir)
+    run._workspace_sync_issues = []
+    artifacts = _collect_workspace_artifacts(run.workdir, strict=strict, skipped=run._workspace_sync_issues)
     before = getattr(run, "_turn_page_hashes", None)
     stamp_time = getattr(run, "_turn_provenance_at", None)
     changes: dict[str, str] = {}
@@ -1070,7 +1104,18 @@ def _collect_workspace_artifacts_for_sync(run: CompileRun) -> list[dict]:
         if rewritten is not None:
             artifact["content"] = rewritten
         safe_artifacts.append(artifact)
-    return safe_artifacts
+    # Provenance can expand an otherwise collectable file. Apply the budget to
+    # the emitted bytes too; periodic sync must preserve the previous copy.
+    bounded = []
+    for artifact in safe_artifacts:
+        if len(artifact["content"].encode("utf-8")) > MAX_SYNC_FILE_BYTES:
+            run._workspace_sync_issues.append({"path": artifact["path"], "reason": "metadata_too_large"})
+        else:
+            bounded.append(artifact)
+    if strict and run._workspace_sync_issues:
+        paths = ", ".join(item["path"] for item in run._workspace_sync_issues[:10])
+        raise WorkspaceArtifactError(f"Incomplete workspace checkpoint: {paths} exceed the artifact budget after metadata. Split these pages before saving.")
+    return bounded
 
 
 def _workspace_sync_cursor(workdir: str) -> dict[str, str]:
@@ -1089,6 +1134,7 @@ async def _sync_workspace(
     durable_barrier: bool = False,
     force: bool = False,
     retain_until_ack: bool = False,
+    completed_checkpoint: bool = False,
 ) -> int:
     """Emit a syncArtifacts event for workspace files changed since `sent`
     (path → content sha), plus TOMBSTONES ({path, deleted: true}) for
@@ -1096,6 +1142,14 @@ async def _sync_workspace(
     enqueue and retains tombstone markers for reconnect replay;
     returns the number of changed entries."""
     async with run._sync_lock:
+        # Old boxes stored all transcripts in one potentially oversized file.
+        # Convert that known format before enforcing complete checkpoints; the
+        # same consumer transaction saves every shard and deletes the aggregate.
+        legacy_transcripts = Path(run.workdir) / mediaverify.TRANSCRIPTS_PATH
+        if legacy_transcripts.is_file() and not _step_teardown_failed(run):
+            mediaverify.save_transcripts(run.workdir, mediaverify.load_transcripts(run.workdir))
+            legacy_transcripts.unlink()
+            sent.setdefault(mediaverify.TRANSCRIPTS_PATH, "migrated_legacy_cache")
         if _step_teardown_failed(run):
             raise RuntimeError("compile worker teardown was not confirmed; recreate the session")
         if commit_input and not (Path(run.workdir) / "candidate" / "index.md").is_file():
@@ -1109,7 +1163,16 @@ async def _sync_workspace(
         # Blocked pages still exist. Treat them as collected so durability sync
         # preserves the last good consumer copy instead of emitting a tombstone.
         collected = set(blocked_paths)
-        for art in _collect_workspace_artifacts_for_sync(run):
+        artifacts = _collect_workspace_artifacts_for_sync(
+            run, strict=durable_barrier or commit_input or completed_checkpoint)
+        issues = getattr(run, "_workspace_sync_issues", [])
+        issue_key = json.dumps(issues, sort_keys=True)
+        if issues and issue_key != getattr(run, "_workspace_sync_issue_key", ""):
+            await run.emit({"type": "summary", "text": _loc(run,
+                f"Workspace save is incomplete: {len(issues)} file(s) exceed the byte budget or cannot be read. Split oversized pages before completion. Files are retained locally.",
+                f"工作区尚未完整保存：{len(issues)} 个文件超限或无法读取。请拆分超限页面后再完成；本地文件仍保留。")})
+        run._workspace_sync_issue_key = issue_key
+        for art in artifacts:
             collected.add(art["path"])
             sha = hashlib.sha256(art["content"].encode("utf-8")).hexdigest()
             if not force and sent.get(art["path"]) == sha:
@@ -1131,8 +1194,10 @@ async def _sync_workspace(
             if force or sent.get(path) != _SYNC_TOMBSTONE:
                 next_sent[path] = _SYNC_TOMBSTONE
                 changed.append({"path": path, "deleted": True})
-        if changed or commit_input:
+        if changed or commit_input or completed_checkpoint:
             event = {"type": "syncArtifacts", "artifacts": changed}
+            if completed_checkpoint and run._artifact_ack_required:
+                event["completed_checkpoint_id"] = str(uuid.uuid4())
             if commit_input:
                 event["commit_input"] = True
             ack = None
@@ -1856,8 +1921,16 @@ def _render_command(run: "CompileRun", command: dict) -> str:
     return rendered
 
 
+def _reject_checkpoint_blocked(run: "CompileRun") -> None:
+    if getattr(run, "_checkpoint_blocked", None):
+        raise CommandRejected(_loc(run,
+            "Workspace checkpoint is blocked; unsaved files are retained. This message was not queued. Repair the save failure and wait for its checkpoint before starting another turn.",
+            "工作区保存受阻，未保存文件仍保留。本条消息未排队；请修复保存问题并等待完整保存后再发起新回合。"), 409)
+
+
 def _prepare_command(run: "CompileRun", command: dict) -> None:
     """Validate workspace-bound references and materialize structured intent."""
+    _reject_checkpoint_blocked(run)
     action = command["action"]
     params = command["parameters"]
     if action == "compile.approve_plan":
@@ -1946,8 +2019,17 @@ def _compile_engine_tools(
         )
 
     async def candidate_lookup(args):
-        return json.dumps(await asyncio.to_thread(candidate_context.lookup, run.workdir, **args),
-                          ensure_ascii=False)
+        result = await asyncio.to_thread(candidate_context.lookup, run.workdir, **args)
+        reads = getattr(run, "_finalization_reads", None)
+        if reads is not None:
+            if isinstance(reads, finalization.DependencyReads):
+                reads.membership_sensitive = True  # Lookup includes negative results and catalogue membership.
+            if args.get("query") or args.get("sources"):
+                reads.update(p.relative_to(Path(run.workdir) / "candidate").as_posix()
+                             for p in (Path(run.workdir) / "candidate").rglob("*.md") if p.is_file())
+            else:
+                reads.update(page["path"] for page in result.get("pages", []) if isinstance(page.get("path"), str))
+        return json.dumps(result, ensure_ascii=False)
 
     async def source_read(args):
         return await asyncio.to_thread(
@@ -2192,10 +2274,23 @@ def _compile_engine_tools(
             "filed_operation_id": (run._command_context or ("", 0))[0],
             "filed_generation": (run._command_context or ("", 0))[1],
         }
+        try:
+            note, escalate = review_notes.record(run.workdir, ticket, args,
+                defer_owner=bool(getattr(run, "_batch_active", False)) and
+                getattr(run, "_batch_stage", "") not in {"batch_final", "batch_notes"})
+        except (ValueError, OSError) as error:
+            return str(error)
+        if not escalate:
+            return f"Investigation {note['id']} saved ({note['state']}); no owner ticket created. Continue checking related sources and later batches. Reuse review_id when updating this issue."
+        ticket["escalation"] = {key: note[key] for key in ("investigation", "answer_impact", "owner_decision")}
         status, err = selfcheck.file_ticket_record(run.workdir, ticket)
         if err:
             return ft["failed"].format(e=err)
-        return ft[status].format(tid=tid, kind=kind)
+        try:
+            review_notes.finish(run.workdir, note["id"], ticket["id"])
+        except (ValueError, OSError) as error:
+            return f"Ticket {ticket['id']} saved, but investigation receipt failed: {error}. Retry with the same review_id."
+        return ft[status].format(tid=ticket["id"], kind=kind)
 
     async def resolve_ticket(args):
         rt = ts["resolve_ticket"]
@@ -2304,6 +2399,12 @@ def _compile_engine_tools(
             {
                 "type": "object",
                 "properties": {
+                    "review_action": {"type": "string", "enum": ["investigate", "resolved", "needs_owner"], "description": "Default investigate saves an internal issue. needs_owner requires material Q&A impact and exhausted relevant investigation; never use for tool failures or pending batches."},
+                    "existing_ticket_id": {"type": "string", "description": "Exact existing CONTRADICTIONS.json ticket id when investigating a legacy or reworded issue without a review_id. Never creates a ticket with an arbitrary id."},
+                    "review_id": {"type": "string", "description": "Existing REVIEW_NOTES.json id for the same business issue, including reworded questions."},
+                    "investigation": {"type": "string", "description": "Sources and context checked, new evidence tried and conclusion; max 2000 characters."},
+                    "answer_impact": {"type": "string", "description": "Concrete user question and how its answer would be wrong or unavailable."},
+                    "owner_decision": {"type": "string", "description": "Missing fact or decision only the owner can supply."},
                     "ticket_kind": {"type": "string", "enum": list(selfcheck.TICKET_KINDS)},
                     "title": {"type": "string"},
                     "question": {"type": "string"},
@@ -2475,7 +2576,7 @@ def _l1_repair_round_limit(report: dict) -> int:
 
 
 def _media_verify_enabled() -> bool:
-    return os.environ.get("KBC_MEDIA_VERIFY", "on") != "off"
+    return os.environ.get("KBC_MEDIA_VERIFY", "off") == "on"
 
 
 def _media_verify_max_images() -> int:
@@ -2551,6 +2652,18 @@ async def _emit_media_exhausted(run, exhausted: list[str]) -> None:
         f"自检(图像):{len(exhausted)} 页在 {_media_verify_attempts()} 次尝试后仍无法完成复核——已放行并在 SELFCHECK.json 显式标记。")})
 
 
+def _pending_media_for_run(run) -> dict[str, list[str]]:
+    pending = selfcheck.pending_media_verification(run.workdir)
+    report = selfcheck.read_selfcheck(run.workdir) or {}
+    scope = (report.get("incremental") or {}).get("media_review_pages")
+    if isinstance(scope, list):
+        # Keep inherited debt pending and visible; never claim it passed simply
+        # because this source update did not own it. The scope rides the checkpoint.
+        allowed = set(scope)
+        return {page: images for page, images in pending.items() if page in allowed}
+    return pending
+
+
 def _media_verify_due(run) -> dict[str, list[str]] | None:
     """A ≤max-images chunk of image-citing pages owed a blind verify on the
     settled draft, else None. Idempotent via media_verify.verified_pages —
@@ -2569,7 +2682,7 @@ def _media_verify_due(run) -> dict[str, list[str]] | None:
         return None  # ledger repairs first; verify once settled
     inflight = getattr(run, "_media_inflight", set())  # test doubles may lack it
     deferred = getattr(run, "_media_deferred", set())  # failed-this-drain pages (see _maybe_start_media_verify)
-    pending = {p: imgs for p, imgs in selfcheck.pending_media_verification(workdir).items()
+    pending = {p: imgs for p, imgs in _pending_media_for_run(run).items()
                if p not in inflight and p not in deferred}
     if not pending:
         return None
@@ -2675,6 +2788,18 @@ def _observe_pi_sessions(fn):
     @wraps(fn)
     async def observed(run, *args, **kwargs):
         async def emit_observation(observation):
+            stage = getattr(run, "_batch_stage", "")
+            if run._batch_active and stage in {
+                "batch_compile", "batch_map", "batch_reduce", "batch_final",
+                "batch_ledger", "batch_media_verify", "batch_notes", "batch_commit",
+            }:
+                data = {**observation.get("data", {}), "compile_stage": stage}
+                ledger = (getattr(run, "_finalization_plan", None) or {}).get("finalization", {})
+                uid = ledger.get("current_unit", "")
+                kind = ledger.get("current_kind", "")
+                if re.fullmatch(r"f_[a-z]+_[a-f0-9]{16}", uid) and kind in finalization.KINDS:
+                    data.update(finalization_unit=uid, finalization_kind=kind)
+                observation = {**observation, "data": data}
             await run.emit({"type": "execution_observation", "observation": observation})
 
         with observe_sessions(emit_observation):
@@ -2685,7 +2810,7 @@ def _observe_pi_sessions(fn):
 @_observe_pi_sessions
 async def _run_media_verify_flow(run, chunk: dict[str, list[str]]) -> None:
     """Blind transcription + text-only comparison over one chunk, then ONE
-    repair turn for confirmed findings. De-anchored by construction: the
+    investigation turn for advisory findings. De-anchored by construction: the
     transcriber never sees the page, the comparer never sees the image —
     the 07-06/07 live failures (MEM 条→GPU-Util, 跨图 H20) were both
     confirmation-bias artifacts of claim-in-context re-reading. Fail-open."""
@@ -2728,15 +2853,15 @@ async def _run_media_verify_flow(run, chunk: dict[str, list[str]]) -> None:
                     f";{len(errors)} 项转写/比对失败") if errors else ""
         if findings:
             await run.emit({"type": "summary", "text": _loc(run,
-                f"Self-check (images): {result['images']} image(s) checked, {len(findings)} claim(s) contradict the image / exceed the source — repair injected{tail}",
-                f"自检(图像):{result['images']} 张图已核,{len(findings)} 条断言与图不符/超源,注入回修{tail}")})
+                f"Self-check (images): {result['images']} image(s) checked, {len(findings)} review suggestion(s) need contextual investigation{tail}",
+                f"自检(图像):{result['images']} 张图已核,{len(findings)} 条模型疑点待结合原文查证{tail}")})
             await _set_converge_phase(run, "revising")
             await run.inject_user_message(mediaverify.build_repair_prompt(findings, locale=getattr(run, "locale", None)))
             injected_repair = True  # only after a SUCCESSFUL inject — a failed one must fall through to the chain below (review)
         else:
             await run.emit({"type": "summary", "text": _loc(run,
-                f"Self-check (images): {result['images']} image(s) checked, claims match the images ✓{tail}",
-                f"自检(图像):{result['images']} 张图已核,断言与图一致 ✓{tail}")})
+                f"Self-check (images): {result['images']} image(s) checked, no discrepancies reported by the optional reviewer{tail}",
+                f"自检(图像):{result['images']} 张图已核,可选审核未提出疑点{tail}")})
     except Exception as e:
         if getattr(run, "_verification_stopping", False):
             return
@@ -2855,12 +2980,14 @@ def _pk_due(run) -> str | None:
     if not (Path(workdir) / "candidate" / "index.md").is_file():
         return None
     sc = selfcheck.read_selfcheck(workdir) or {}
+    if sc.get("incremental"):
+        return None  # Full-library Q&A evaluation is an explicit independent action after a scoped update.
     if sc.get("state") != "passed":
         return None
     media_task = getattr(run, "_media_task", None)
     if media_task is not None and not media_task.done():
         return None  # blind image verify owns the seam first
-    if _media_verify_enabled() and selfcheck.pending_media_verification(workdir):
+    if _media_verify_enabled() and _pending_media_for_run(run):
         return None
     pk = sc.get("pk") or {}
     if pk.get("state") == "repairing":
@@ -3089,7 +3216,8 @@ async def _post_turn_selfcheck(run, *, allow_repair: bool = True) -> str | None:
     incr = getattr(run, "_incr_pending", None)
     run._incr_pending = None
     key = selfcheck.state_key(workdir)
-    last_state = (selfcheck.read_selfcheck(workdir) or {}).get("state")
+    prior_report = selfcheck.read_selfcheck(workdir) or {}
+    last_state = prior_report.get("state")
     unchanged_this_turn = key is not None and turn_start_key is not None and key == turn_start_key
     if (unchanged_this_turn and incr is None and not l1_repair_turn
             and not getattr(run, "_full_compile_pending", False)
@@ -3268,12 +3396,27 @@ async def _post_turn_selfcheck(run, *, allow_repair: bool = True) -> str | None:
         # full set can be recomputed from the unchanged baseline; cap the report
         # payload so a legacy corpus cannot exceed the workspace sync budget.
         report["incremental"] = {
+            "media_review_pages": sorted(editable | set(incremental.changed_pages(incr["before"], incremental.page_hashes(workdir)))),
             "out_of_scope_pages": incr_violations,
             "restored_pages": restored_pages,
             "grandfathered_format_violation_count": len(grandfathered_format),
             "grandfathered_format_violations": grandfathered_format[:40],
         }
+    elif (isinstance((prior_report.get("incremental") or {}).get("media_review_pages"), list)
+          and not getattr(run, "_full_compile_pending", False)
+          and not getattr(run, "_batch_active", False)):
+        # A media/ledger follow-up must not drop the source update's persisted
+        # scope and start paying off unrelated historical verification debt.
+        scope = set(prior_report["incremental"]["media_review_pages"])
+        if isinstance(turn_pages_before, dict):
+            scope.update(incremental.changed_pages(turn_pages_before, incremental.page_hashes(workdir)))
+        report["incremental"] = {"media_review_pages": sorted(scope)}
     ledger_clean = report["coverage"]["closed"] and report["lint"]["ok"]
+    no_progress = (l1_repair_turn and unchanged and
+                   all(prior_report.get(key) == report.get(key) for key in ("coverage", "lint")))
+    if no_progress and not ledger_clean:
+        report["repair_stop_reason"] = "no_progress"
+
     # High-water, not per-turn recomputation: the workload SHRINKS as repairs
     # succeed, so re-deriving the limit each turn strands the episode at
     # ~half-repaired (review). max() also lets the budget grow if a repair
@@ -3284,7 +3427,7 @@ async def _post_turn_selfcheck(run, *, allow_repair: bool = True) -> str | None:
         run._l1_repairs_used = 0
         run._l1_round_limit = 0
         report["state"] = "passed"
-    elif allow_repair and run._l1_repairs_used < run._l1_round_limit:
+    elif allow_repair and not no_progress and run._l1_repairs_used < run._l1_round_limit:
         report["state"] = "repairing"
         # The report carries the PREVIOUS converge_phase (possibly "settled");
         # the pre-turn_done sync would ship repairing+settled for one window
@@ -3308,17 +3451,11 @@ async def _post_turn_selfcheck(run, *, allow_repair: bool = True) -> str | None:
             f"Self-check normalized {len(mechanical_fixes)} unambiguous source citation(s) without using a repair round.",
             f"自检已机械规范化 {len(mechanical_fixes)} 处可唯一判定的来源标注,未消耗回修轮次。")})
     await run.emit({"type": "summary", "text": selfcheck.narration(report, locale)})
+    # Technical residuals remain in SELFCHECK.json, not the owner's decision queue.
     if report["state"] == "unconverged":
-        # Budget spent with residuals → land a ticket in the owner's question
-        # queue by CODE (same schema the model uses). The publish page only
-        # DISPLAYS residuals; it must never be where the owner discovers work.
-        try:
-            if selfcheck.file_residual_ticket(workdir, report, locale):
-                await run.emit({"type": "summary", "text": _loc(run,
-                    "Self-check residuals filed as a ticket in the question queue.",
-                    "自检残留已落为疑问工单,待负责人裁决。")})
-        except Exception:
-            pass  # ticket filing must never break the turn seam (fail-open, §4.5)
+        await run.emit({"type": "summary", "text": _loc(run,
+            "Automatic repair stopped with technical findings. See the saved self-check; no owner decision ticket was created.",
+            "自动修订结束，技术残留已保存在检查记录中，未转成负责人决策工单。")})
     if report["state"] == "repairing":
         run._l1_repairs_used += 1
         run._l1_repair_pending = True
@@ -3594,6 +3731,35 @@ def _reference_assist_model() -> str:
 
 
 
+def _validate_compile_write(run: "CompileRun", target: Path, content: str) -> None:
+    """Reject metadata expansion while the authoring worker can still repair it."""
+    root = Path(run.workdir).resolve()
+    rel = target.resolve().relative_to(root).as_posix()
+    if rel in {selfcheck.CONTRADICTIONS_PATH, review_notes.PATH}:
+        raise ValueError("Use file_ticket to record investigations or request owner decisions; use resolve_ticket for existing rulings. Do not edit these ledgers directly.")
+    if not rel.startswith("candidate/") or not rel.endswith(".md"):
+        return
+    page = rel[len("candidate/"):]
+
+    if selfcheck._is_reserved_page(page):
+        return
+    before = getattr(run, "_turn_page_hashes", None)
+    created = page not in before if isinstance(before, dict) else not target.exists()
+    projected = selfcheck.siclaw_generated_metadata_text(
+        page, content, created=created, now=getattr(run, "_turn_provenance_at", None))
+    if projected is None:
+        return  # Invalid frontmatter remains available to the existing lint repair.
+    manifest_ids = selfcheck.load_manifest_source_ids(run.workdir)
+    if manifest_ids:
+        projected, _ = selfcheck.attribute_evidence_text(
+            run.workdir, projected, manifest_ids, set(selfcheck.source_inventory(run.workdir)))
+    size = len(projected.encode("utf-8"))
+    if size > MAX_SYNC_FILE_BYTES:
+        raise ValueError(
+            f"Page requires {size} UTF-8 bytes including system metadata, exceeding the "
+            f"{MAX_SYNC_FILE_BYTES}-byte artifact budget; split the page into linked parts before saving")
+
+
 def _compile_session_client(run: "CompileRun", wd: str, system_prompt: str, session_id: str,
                             pdf_page_ranges: dict | None = None,
                             raw_scope: dict | None = None):
@@ -3604,8 +3770,34 @@ def _compile_session_client(run: "CompileRun", wd: str, system_prompt: str, sess
     """
     allowed = DEFAULT_COMPILE_ALLOWED_TOOLS if run.allowed_tools is None else run.allowed_tools
     guard = _make_compile_path_guard(Path(wd), run.locale, pdf_page_ranges=pdf_page_ranges, raw_scope=raw_scope)
+    original_guard = guard
+    async def guard(input_data, tool_use_id, context):
+        decision = await original_guard(input_data, tool_use_id, context)
+        if decision.get("hookSpecificOutput", {}).get("permissionDecision") == "deny":
+            return decision
+        if getattr(run, "_finalization_plan", None) is not None:
+            args = input_data.get("tool_input") or {}
+            tool = input_data.get("tool_name")
+            value = args.get("file_path") or args.get("path") or ""
+            path = Path(value) if Path(value).is_absolute() else Path(wd) / value
+            try:
+                rel = path.resolve().relative_to(Path(wd).resolve()).as_posix()
+            except ValueError:
+                return decision
+            if tool in _RAW_WRITE_TOOLS and rel in finalization.CONTROL_PATHS:
+                return {"hookSpecificOutput": {"permissionDecision": "deny",
+                        "permissionDecisionReason": "The finalization task ledger and frozen manifest are machine-owned."}}
+            reads = getattr(run, "_finalization_reads", None)
+            if reads is not None and tool in {"Read", "Grep", "Glob"}:
+                if isinstance(reads, finalization.DependencyReads) and tool in {"Grep", "Glob"} and path.is_dir() and (rel in {".", "candidate"} or rel.startswith("candidate/")):
+                    reads.membership_sensitive = True
+                if rel.startswith("candidate/") and path.is_file() and (path.suffix == ".md" or path.name == ".library-introduction.json"):
+                    reads.add(rel[len("candidate/"):])
+        return decision
     tools = FileTools(wd, allowed, guard,
-                      feedback=lambda target: candidate_feedback.check_page(wd, target)).tools()
+                      feedback=lambda target: candidate_feedback.check_page(wd, target),
+                      max_write_bytes=MAX_SYNC_FILE_BYTES,
+                      validate_write=lambda target, content: _validate_compile_write(run, target, content)).tools()
     # Keep the published tool names and allowlist while using the single
     # KBC-owned handler/schema registry for every compiler phase.
     tools.extend(EngineTool(f"mcp__compile__{tool.name}", tool.description, tool.input_schema, tool.handler)
@@ -3626,7 +3818,25 @@ def _compile_system_prompt(run: "CompileRun") -> str:
     if instruction:
         header = _INSTRUCTION_HEADER.get((run.locale or DEFAULT_LOCALE).lower(), _INSTRUCTION_HEADER[DEFAULT_LOCALE])
         role_parts.append(header + "\n\n" + instruction)
+    role_parts.append(_loc(run,
+        f"Writable artifact limit: {MAX_SYNC_FILE_BYTES} UTF-8 bytes per file, including metadata. Split larger pages into linked parts. A successful tool write means local bytes exist; only the consumer ACK proves a durable save.",
+        f"本会话可写文件上限：每文件 {MAX_SYNC_FILE_BYTES} 个 UTF-8 字节，包含元数据。大页须拆分并相互链接。工具写入成功只表示本地字节存在，持久保存以平台 ACK 为准。"))
     return "\n\n---\n\n".join(role_parts)
+
+
+def _internal_execution_contract(run: "CompileRun") -> str:
+    """Machine-selected responsibility appended to each bounded worker's role."""
+    phase = getattr(run, "_batch_stage", "") or "internal"
+    phases = {
+        "batch_map": ("Compile the assigned source group; reuse related Candidate pages.", "编写本批负责的原料，复用相关候选页面。"),
+        "batch_reduce": ("Reconcile the assigned section; preserve facts and combined provenance.", "归并指定分区，保留事实及完整来源。"),
+        "batch_final": ("Review only this finalization unit and its explicit dependencies.", "完成当前终审单元及其明确依赖的核对。"),
+        "batch_ledger": ("Repair the listed structural/accounting findings; do not invent evidence to close the ledger.", "修复列出的结构和记账问题，不得为关账编造证据。"),
+        "batch_media_verify": ("Repair the listed image claims; code schedules fresh verification.", "修复列出的图像断言，由代码安排重新核验。"),
+    }
+    task = phases.get(phase, ("Complete the specific task in the directive.", "完成指令明确分配的任务。"))
+    return _prompt("internal_execution", run.locale).format(
+        responsibility=task[0 if selfcheck._is_en(run.locale) else 1])
 
 
 # ── batch mode (DESIGN-kb-batch-compile-2026-07-05) ──────────────────────────
@@ -3904,6 +4114,11 @@ def _load_batch_plan(run: "CompileRun") -> dict | None:
         raise PlanIntegrityError("the durable batch checkpoint has an invalid shape; reset or restore it")
     if not batching.checkpoint_is_valid(plan):
         raise PlanIntegrityError("the durable batch checkpoint digest does not match; reset or restore it")
+    if "finalization" in plan:
+        try:
+            finalization.validate(plan["finalization"])
+        except finalization.FinalizationError as error:
+            raise PlanIntegrityError("invalid durable finalization ledger") from error
     state_errors = batching.checkpoint_state_errors(plan)
     if state_errors:
         raise PlanIntegrityError("the durable batch checkpoint state is inconsistent; reset or restore it")
@@ -4207,7 +4422,7 @@ async def _drive_batch_session(run: "CompileRun", directive: str, label: str,
             directive_full = directive
             try:
                 client = _compile_session_client(
-                    run, wd, _compile_system_prompt(run), session_id,
+                    run, wd, _compile_system_prompt(run) + "\n\n" + _internal_execution_contract(run), session_id,
                     pdf_page_ranges=pdf_page_ranges,
                     raw_scope=raw_scope,
                 )
@@ -4843,7 +5058,9 @@ async def _plan_batches(run: "CompileRun", inventory: list) -> dict:
             cwd=wd, system_prompt=planner_prompt, session_id=planner_session_id,
             model_config=pi_config.for_role("compile", session_kind="authoring"), max_model_calls=8,
             tools=FileTools(wd, ["Read", "Write", "Glob"],
-                            _make_compile_path_guard(Path(wd), run.locale)).tools())
+                            _make_compile_path_guard(Path(wd), run.locale),
+                            max_write_bytes=MAX_SYNC_FILE_BYTES,
+                            validate_write=lambda target, content: _validate_compile_write(run, target, content)).tools())
         directive = _loc(
             run,
             f"Budget: each batch's total effective must not exceed {budget} (pack by the effective field only, ignore bytes). "
@@ -4892,16 +5109,26 @@ async def _run_ledger_repairs(run: "CompileRun", replies: list[str]) -> None:
     # persistent budget would file a residual ticket with ZERO repair attempts
     # for this phase's own findings. Each _run_ledger_repairs call is bounded
     # by its own budget; the batch tail calls it a bounded number of times.
-    run._l1_repairs_used = 0
-    run._l1_round_limit = 0
+    final_plan = getattr(run, "_finalization_plan", None)
+    work = final_plan["finalization"].setdefault("ledger_work", {}) if final_plan else {}
+    run._l1_repairs_used = int(work.get("used", 0))
+    run._l1_round_limit = int(work.get("limit", 0))
     run._ledger_forced = True  # batch-final: the mid-Execute index exemption is off
     try:
         repair = await _post_turn_selfcheck(run)
         while repair:
+            if final_plan:
+                work.update(used=run._l1_repairs_used, limit=run._l1_round_limit)
+                await _checkpoint_finalization(run, final_plan)
             fix_reply = await _drive_batch_session(run, repair, _loc(run, "ledger repair", "账本回修"))
             if fix_reply:
                 replies.append(_loc(run, f"[Repair] {fix_reply}", f"【回修】{fix_reply}"))
             repair = await _post_turn_selfcheck(run)
+            if final_plan:
+                work.update(used=run._l1_repairs_used, limit=run._l1_round_limit)
+                await _checkpoint_finalization(run, final_plan, completed=True)
+        if final_plan:
+            final_plan["finalization"].pop("ledger_work", None)
     finally:
         run._ledger_forced = False
 
@@ -4948,6 +5175,12 @@ def _write_compilation_state(run: "CompileRun", plan: dict) -> None:
         "candidate_index": "candidate/index.md",
         "visibility": "complete_frozen_raw_and_candidate_tree",
     }
+    ledger = plan.get("finalization")
+    if isinstance(ledger, dict):
+        state["finalization"] = finalization.projection(
+            ledger, finalization.snapshot(run.workdir), _finalization_context(run, ledger),
+            investigations=finalization.investigation_identity(run.workdir))
+        state["finalization"]["run_id"] = run.run_id
     _write_batch_file(run, "authoring/COMPILATION_STATE.json", state)
 
 
@@ -4998,6 +5231,253 @@ async def _commit_batch_compile(run: "CompileRun", plan: dict, replies: list[str
                     or _loc(run, "Batch compile complete.", "分批编译完成。")})
 
 
+def _finalization_context(run, ledger):
+    return finalization.digest([finalization.context_identity(run.workdir),
+                                [u["id"] for u in ledger["units"] if u["kind"] == "notes"]])
+
+
+def _write_finalization_checkpoint(run, plan, *, completed=False):
+    ledger = plan["finalization"]
+    ledger["updated_at"] = finalization.now()
+    if completed:
+        ledger["last_completed_at"] = ledger["updated_at"]
+    plan["finalization_progress"] = finalization.projection(
+        ledger, finalization.snapshot(run.workdir), _finalization_context(run, ledger),
+            investigations=finalization.investigation_identity(run.workdir))
+    plan["finalization_progress"]["run_id"] = run.run_id
+    # Never let the ordinary collector silently skip an oversized control file.
+    if len(batching.dump_json(plan).encode()) > MAX_SYNC_FILE_BYTES - 1024:
+        raise PlanIntegrityError("finalization checkpoint exceeds the artifact byte bound")
+    _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
+    _write_compilation_state(run, plan)
+
+
+async def _checkpoint_finalization(run, plan, *, completed=False):
+    _write_finalization_checkpoint(run, plan, completed=completed)
+    sent = getattr(run, "_sync_sent", None)
+    if sent is None:
+        return  # Unhosted driver invocation; production installs the sync cursor.
+    await _sync_workspace(run, sent, durable_barrier=True, retain_until_ack=True,
+                          completed_checkpoint=completed)
+
+
+def _finalization_signature(run, ledger):
+    return finalization.digest([finalization.snapshot(run.workdir), _finalization_context(run, ledger)])
+
+
+async def _run_final_review_units(run, plan, replies):
+    ledger = plan["finalization"]
+    pages = selfcheck.candidate_pages(run.workdir)
+    duplicates = selfcheck.dup_candidates(pages)
+    _, errors = selfcheck.load_exclusions(run.workdir)
+    orphans = [v["page"] for v in selfcheck.lint_candidate(pages, errors)["violations"] if v["kind"] == "orphan"]
+    finalization.reconcile(ledger, pages, duplicates, orphans)
+    queue = finalization.pending(ledger, finalization.snapshot(run.workdir), _finalization_context(run, ledger),
+            investigations=finalization.investigation_identity(run.workdir))
+    # Queue one pass at a time. Later edits invalidate earlier read receipts for
+    # the next pass, rather than repeatedly restarting the first page mid-pass.
+    while queue:
+        unit = queue.pop(0)
+        fingerprints = finalization.snapshot(run.workdir)
+        if finalization.valid(unit, fingerprints, _finalization_context(run, ledger),
+                              investigations=finalization.investigation_identity(run.workdir)):
+            continue
+        ledger.update(stage="review", current_unit=unit["id"], current_kind=unit["kind"])
+        unit["status"] = "running"
+        unit["attempts"] = int(unit.get("attempts", 0)) + 1
+        await _checkpoint_finalization(run, plan)
+        run._batch_stage = "batch_final"
+        run._finalization_reads = finalization.DependencyReads(unit["targets"])
+        try:
+            current = selfcheck.candidate_pages(run.workdir)
+            targets = [p for p in unit["targets"] if p in current]
+            resolved = bool(unit["targets"]) and not targets
+            if unit["kind"] == "duplicates":
+                resolved = not any(set(pair["pages"]) == set(unit["targets"]) for pair in selfcheck.dup_candidates(current))
+            elif unit["kind"] == "orphans":
+                _, errs = selfcheck.load_exclusions(run.workdir)
+                live_orphans = {v["page"] for v in selfcheck.lint_candidate(current, errs)["violations"] if v["kind"] == "orphan"}
+                resolved = not (set(targets) & live_orphans)
+            if resolved:
+                reply = "The assigned structural finding is no longer present."
+            else:
+                prompt = finalization.directive({**unit, "targets": targets}, run.locale,
+                    [u for u in ledger["units"] if u["status"] == "done"])
+                if unit["kind"] == "introduction":
+                    prompt += "\n" + selfcheck.library_introduction_directive(run.locale)
+                reply = await _drive_batch_session(run, prompt,
+                    _loc(run, f"final review {unit['kind']} {unit['id']}", f"终审 {unit['kind']} {unit['id']}"),
+                    raw_scope=semantic_review_raw_scope(plan))
+            finalization.complete(unit, finalization.snapshot(run.workdir),
+                                  _finalization_context(run, ledger), run._finalization_reads, reply,
+                                  investigations=finalization.investigation_identity(run.workdir))
+            ledger.pop("current_unit", None)
+            ledger.pop("current_kind", None)
+            await _checkpoint_finalization(run, plan, completed=True)
+        except ModelCallBudgetExceeded:
+            children = finalization.split(ledger, unit)
+            if not children:
+                unit.update(status="pending", last_error="model_call_budget_exceeded")
+                # The outer failure path will force-save these bytes before it
+                # reports failure. Never stamp an exhausted worker as complete.
+                _write_finalization_checkpoint(run, plan)
+                raise
+            await _checkpoint_finalization(run, plan)
+            await run.emit({"type": "summary", "text": _loc(run,
+                "Final review call budget reached; saved its edits and split the remaining page group.",
+                "终审任务达到调用预算，已保存修改并拆小剩余页面组。")})
+            queue[0:0] = children
+        except Exception:
+            unit["status"] = "pending"
+            _write_finalization_checkpoint(run, plan)
+            raise
+        finally:
+            run._finalization_reads = None
+    replies.append(_loc(run, "[Final review] Bounded units checked.", "【终审】分项核对已完成。"))
+
+
+async def _run_finalization(run, plan, replies):
+    try:
+        ledger = finalization.ensure(plan, run.workdir)
+    except finalization.FinalizationError as error:
+        raise PlanIntegrityError("finalization checkpoint or frozen input is inconsistent") from error
+    run._finalization_plan = plan
+    plan["phase"] = "final"
+    for _ in range(finalization.MAX_PASSES):
+        ledger["passes"] = int(ledger.get("passes", 0)) + 1
+        notes = _drain_batch_notes(run)
+        if notes:
+            ledger["note_sequence"] = int(ledger.get("note_sequence", 0)) + 1
+            finalization.add(ledger, "notes", [], notes=notes, sequence=ledger["note_sequence"])
+        await _run_final_review_units(run, plan, replies)
+        # The quality passes retain their full-corpus policies and honest
+        # residual/exhausted outcomes. Their current content-bound receipts are
+        # reusable; a later edit invalidates them before stable commit.
+        if ledger.get("ledger_signature") != _finalization_signature(run, ledger):
+            ledger["stage"] = "ledger"
+            run._batch_stage = "batch_ledger"
+            await _checkpoint_finalization(run, plan)
+            await _run_ledger_repairs(run, replies)
+            ledger["ledger_signature"] = _finalization_signature(run, ledger)
+            ledger.pop("ledger_work", None)
+            await _checkpoint_finalization(run, plan, completed=True)
+        if ledger.get("media_signature") != _finalization_signature(run, ledger):
+            ledger["stage"] = "media"
+            run._batch_stage = "batch_media_verify"
+            await _checkpoint_finalization(run, plan)
+            await _run_finalization_media(run, plan, replies)
+            ledger["media_signature"] = _finalization_signature(run, ledger)
+            ledger.pop("media_work", None)
+            await _checkpoint_finalization(run, plan, completed=True)
+        notes = _drain_batch_notes(run)
+        if notes:
+            ledger["note_sequence"] = int(ledger.get("note_sequence", 0)) + 1
+            finalization.add(ledger, "notes", [], notes=notes, sequence=ledger["note_sequence"])
+            await _checkpoint_finalization(run, plan)
+        current = selfcheck.candidate_pages(run.workdir)
+        _, errors = selfcheck.load_exclusions(run.workdir)
+        finalization.reconcile(ledger, current, selfcheck.dup_candidates(current),
+            [v["page"] for v in selfcheck.lint_candidate(current, errors)["violations"] if v["kind"] == "orphan"])
+        if (not finalization.pending(ledger, finalization.snapshot(run.workdir), _finalization_context(run, ledger),
+            investigations=finalization.investigation_identity(run.workdir))
+                and ledger.get("ledger_signature") == _finalization_signature(run, ledger)
+                and ledger.get("media_signature") == _finalization_signature(run, ledger)):
+            ledger["stage"] = "complete"
+            run._batch_notes_closed = True
+            ledger.pop("current_unit", None)
+            ledger.pop("current_kind", None)
+            await _checkpoint_finalization(run, plan, completed=True)
+            return
+        await _checkpoint_finalization(run, plan)
+    ledger["stage"] = "paused"
+    await _checkpoint_finalization(run, plan)
+    raise finalization.FinalizationError("final review dependencies kept changing; saved remaining units for explicit continuation")
+
+
+async def _run_finalization_media(run, plan, replies):
+    if _media_verify_enabled():
+        run._batch_stage = "batch_media_verify"
+        work = plan["finalization"].setdefault("media_work", {})
+        rounds = int(work.get("used", 0))
+        initial_pending = selfcheck.pending_media_verification(run.workdir)
+        round_limit = int(work.setdefault("limit", _batch_media_verify_round_limit(plan, initial_pending)))
+        while True:
+            run._batch_stage = "batch_media_verify"
+            pending = selfcheck.pending_media_verification(run.workdir)
+            if not pending:
+                break
+            rounds += 1
+            work["used"] = rounds
+            if rounds > round_limit:
+                # Repair turns can add new image citations that re-enter
+                # pending. Reaching the cap is recorded honestly — pages
+                # with unverified images are named in the reply — but it
+                # must NOT fail the train (2026-07-24 mandate: a quality
+                # tail may degrade with a visible record, never wedge the
+                # whole compile into a deterministic interrupt loop).
+                # Mark every still-pending page EXHAUSTED through the existing
+                # per-page mechanism: it records the page's current fingerprint
+                # as verified (so pending_media_verification stops reporting it)
+                # AND flags it in media_verify.exhausted (fail-open must never
+                # read as a clean pass). Without this, converge would settle
+                # while these pages still report pending and _pk_due would
+                # refuse to start — a contradictory settled-but-pending state.
+                selfcheck.mark_media_verified(run.workdir, sorted(pending), exhausted=True)
+                await run.emit({"type": "summary", "text": _loc(run,
+                    f"Self-check (images): verify/repair round cap ({round_limit}) reached — "
+                    f"{len(pending)} page(s) keep image assertions that could not be verified; recorded, not blocking.",
+                    f"自检(图像):验修轮达到上限({round_limit} 轮)——{len(pending)} 页的图像断言未能核验,"
+                    f"已记录,不阻塞完成。")})
+                replies.append(_loc(run,
+                    f"[Image verify] {len(pending)} page(s) completed with UNVERIFIED image assertions "
+                    f"after {round_limit} round(s): " + ", ".join(sorted(pending)[:10]) + ("…" if len(pending) > 10 else ""),
+                    f"【图像核验】{len(pending)} 页在 {round_limit} 轮后仍带未核验的图像断言:"
+                    + ", ".join(sorted(pending)[:10]) + ("…" if len(pending) > 10 else "")))
+                break
+            # Blind transcribe+compare per ≤max-images chunk (v2): engine
+            # sessions read one image each — no in-session image pileup.
+            chunk = selfcheck.cap_media_pending(pending, _media_verify_max_images())
+            try:
+                result = await mediaverify.run_blind_verify(
+                    selected_readonly_engine(), run.workdir, chunk,
+                    progress=lambda s: asyncio.get_running_loop().create_task(
+                        run.emit({"type": "summary", "text": s})),
+                    locale=getattr(run, "locale", None), run_id=run.run_id,
+                    on_progress=lambda: _sync_media_progress(run))
+            except Exception as e:
+                await run.emit({"type": "summary", "text": _loc(run,
+                    f"Self-check (images) failed, skipping this chunk: {e!r}",
+                    f"自检(图像)执行失败,跳过本组: {e!r}")})
+                await _emit_media_exhausted(run, _settle_media_outcome(run, chunk, None))
+                await _checkpoint_finalization(run, plan, completed=True)
+                continue
+            await _emit_media_exhausted(run, _settle_media_outcome(run, chunk, result))
+            if result["errors"]:
+                await run.emit({"type": "summary",
+                                "text": _loc(run,
+                             f"Self-check (images): {len(result['errors'])} transcription/comparison failure(s) (see logs); the rest proceed as usual.",
+                             f"自检(图像):{len(result['errors'])} 项转写/比对失败(见日志),其余照常。")})
+            if result["findings"]:
+                verify_reply = await _drive_batch_session(
+                    run, mediaverify.build_repair_prompt(result["findings"], locale=getattr(run, "locale", None)),
+                    _loc(run, "image verification", "图像复核"))
+                if verify_reply:
+                    replies.append(_loc(run, f"[Image verification] {verify_reply}", f"【图像复核】{verify_reply}"))
+                # A media repair can introduce a malformed or dangling
+                # source annotation. Repair the ledger BEFORE the next
+                # blind comparison so the verified fingerprint belongs to
+                # the final lint-clean bytes, not the pre-ledger revision.
+                # The while loop then naturally re-verifies any page that
+                # this bounded ledger pass changed.
+                run._batch_stage = "batch_ledger"
+                await _run_ledger_repairs(run, replies)
+            else:
+                await run.emit({"type": "summary",
+                                "text": _loc(run, f"Self-check (images): {result['images']} image(s) checked; optional review found no issues.",
+                                             f"自检(图像):{result['images']} 张图已核,可选审核未提出疑点")})
+            await _checkpoint_finalization(run, plan, completed=True)
+
+
 @_observe_pi_sessions
 async def _run_batch_compile(run: "CompileRun", trigger_text: str):
     """The batch orchestrator: ONE logical turn to the consumer (single turn_done at
@@ -5005,7 +5485,9 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
     section-reduce, and final phases: BATCH_PLAN.json carries phase plus per-unit
     done stamps, and a later compile trigger resumes the unfinished phase."""
     run._batch_active = True
+    run._batch_notes_closed = False
     previous_model_idle_timeout = run._model_idle_timeout_s
+    failure_stage = run._batch_stage = "batch_compile"
     replies: list[str] = []
     _print_compile_lifecycle("batch.start", run)
     try:
@@ -5056,7 +5538,7 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
         # exact plan and input identity are durable.
         sent = getattr(run, "_sync_sent", None)
         if sent is not None:
-            await _sync_workspace(run, sent, durable_barrier=True)
+            await _sync_workspace(run, sent, durable_barrier=True, completed_checkpoint=not resuming)
         slice_failures = _materialize_batch_slices(run, plan)
         if slice_failures:
             n_all = len(plan["batches"])
@@ -5123,10 +5605,20 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
                    f"checkpoint={str(plan.get('checkpoint_digest') or '')[:12]} "
                    f"revision={plan.get('checkpoint_revision', 0)}"))
         if entry_phase == "commit":
+            run._batch_notes_closed = True
+            if plan.get("finalization") is not None:
+                ledger = finalization.ensure(plan, run.workdir)
+                signature = _finalization_signature(run, ledger)
+                if (ledger.get("stage") != "complete" or finalization.pending(ledger, finalization.snapshot(run.workdir), _finalization_context(run, ledger),
+            investigations=finalization.investigation_identity(run.workdir))
+                        or ledger.get("ledger_signature") != signature or ledger.get("media_signature") != signature):
+                    raise PlanIntegrityError("commit checkpoint has unfinished or changed finalization work")
+            failure_stage = run._batch_stage = "batch_commit"
             await _commit_batch_compile(run, plan, replies)
             return
         bounded = plan_bounded_sources(plan)
         for batch in list(pending):
+            failure_stage = run._batch_stage = "batch_map"
             k = next(i + 1 for i, b in enumerate(plan["batches"]) if b["id"] == batch["id"])
             try:
                 unaccounted_before = (
@@ -5264,11 +5756,12 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
             # would re-run an already-done batch on resume.
             sent = getattr(run, "_sync_sent", None)
             if sent is not None:
-                await _sync_workspace(run, sent, durable_barrier=True)
+                await _sync_workspace(run, sent, durable_barrier=True, completed_checkpoint=True)
             _print_compile_lifecycle("batch.done", run, extra=_lifecycle_batch_ref(batch, k, n))
             await run.emit({"type": "summary", "text": _loc(run,
                 f"Batch {k}/{n} done — landed in the store.", f"批 {k}/{n} 完成,已落库。")})
         if plan.get("mode") == "hierarchical" and entry_phase in {"map", "reduce"}:
+            failure_stage = run._batch_stage = "batch_reduce"
             if "reductions" not in plan:
                 plan["reductions"] = batching.pack_section_reductions(
                     selfcheck.candidate_pages(run.workdir))
@@ -5321,116 +5814,10 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
                 _write_compilation_state(run, plan)
                 sent = getattr(run, "_sync_sent", None)
                 if sent is not None:
-                    await _sync_workspace(run, sent, durable_barrier=True)
-        plan["phase"] = "final"
-        _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
-        _write_compilation_state(run, plan)
-        final_reply = await _drive_batch_session(
-            run, _compose_final_directive(run.workdir, n, _drain_batch_notes(run), locale=getattr(run, "locale", None)),
-            _loc(run, "final review", "终审"),
-            raw_scope=semantic_review_raw_scope(plan),
-        )
-        if final_reply:
-            replies.append(_loc(run, f"[Final review] {final_reply}", f"【终审】{final_reply}"))
-        # Full-corpus selfcheck + bounded repair rounds, each a fresh bounded
-        # session (the batch analogue of the ordinary post-turn repair loop).
-        await _run_ledger_repairs(run, replies)
-        # Image numeric re-verification AFTER the ledger settles (repairs may
-        # add image-digesting pages), then one more ledger refresh so
-        # SELFCHECK.json reflects the verified final state.
-        if _media_verify_enabled():
-            rounds = 0
-            initial_pending = selfcheck.pending_media_verification(run.workdir)
-            round_limit = _batch_media_verify_round_limit(plan, initial_pending)
-            while True:
-                pending = selfcheck.pending_media_verification(run.workdir)
-                if not pending:
-                    break
-                rounds += 1
-                if rounds > round_limit:
-                    # Repair turns can add new image citations that re-enter
-                    # pending. Reaching the cap is recorded honestly — pages
-                    # with unverified images are named in the reply — but it
-                    # must NOT fail the train (2026-07-24 mandate: a quality
-                    # tail may degrade with a visible record, never wedge the
-                    # whole compile into a deterministic interrupt loop).
-                    # Mark every still-pending page EXHAUSTED through the existing
-                    # per-page mechanism: it records the page's current fingerprint
-                    # as verified (so pending_media_verification stops reporting it)
-                    # AND flags it in media_verify.exhausted (fail-open must never
-                    # read as a clean pass). Without this, converge would settle
-                    # while these pages still report pending and _pk_due would
-                    # refuse to start — a contradictory settled-but-pending state.
-                    selfcheck.mark_media_verified(run.workdir, sorted(pending), exhausted=True)
-                    await run.emit({"type": "summary", "text": _loc(run,
-                        f"Self-check (images): verify/repair round cap ({round_limit}) reached — "
-                        f"{len(pending)} page(s) keep image assertions that could not be verified; recorded, not blocking.",
-                        f"自检(图像):验修轮达到上限({round_limit} 轮)——{len(pending)} 页的图像断言未能核验,"
-                        f"已记录,不阻塞完成。")})
-                    replies.append(_loc(run,
-                        f"[Image verify] {len(pending)} page(s) completed with UNVERIFIED image assertions "
-                        f"after {round_limit} round(s): " + ", ".join(sorted(pending)[:10]) + ("…" if len(pending) > 10 else ""),
-                        f"【图像核验】{len(pending)} 页在 {round_limit} 轮后仍带未核验的图像断言:"
-                        + ", ".join(sorted(pending)[:10]) + ("…" if len(pending) > 10 else "")))
-                    break
-                # Blind transcribe+compare per ≤max-images chunk (v2): engine
-                # sessions read one image each — no in-session image pileup.
-                chunk = selfcheck.cap_media_pending(pending, _media_verify_max_images())
-                try:
-                    result = await mediaverify.run_blind_verify(
-                        selected_readonly_engine(), run.workdir, chunk,
-                        progress=lambda s: asyncio.get_running_loop().create_task(
-                            run.emit({"type": "summary", "text": s})),
-                        locale=getattr(run, "locale", None), run_id=run.run_id,
-                        on_progress=lambda: _sync_media_progress(run))
-                except Exception as e:
-                    await run.emit({"type": "summary", "text": _loc(run,
-                        f"Self-check (images) failed, skipping this chunk: {e!r}",
-                        f"自检(图像)执行失败,跳过本组: {e!r}")})
-                    await _emit_media_exhausted(run, _settle_media_outcome(run, chunk, None))
-                    continue
-                await _emit_media_exhausted(run, _settle_media_outcome(run, chunk, result))
-                if result["errors"]:
-                    await run.emit({"type": "summary",
-                                    "text": _loc(run,
-                                 f"Self-check (images): {len(result['errors'])} transcription/comparison failure(s) (see logs); the rest proceed as usual.",
-                                 f"自检(图像):{len(result['errors'])} 项转写/比对失败(见日志),其余照常。")})
-                if result["findings"]:
-                    verify_reply = await _drive_batch_session(
-                        run, mediaverify.build_repair_prompt(result["findings"], locale=getattr(run, "locale", None)),
-                        _loc(run, "image verification", "图像复核"))
-                    if verify_reply:
-                        replies.append(_loc(run, f"[Image verification] {verify_reply}", f"【图像复核】{verify_reply}"))
-                    # A media repair can introduce a malformed or dangling
-                    # source annotation. Repair the ledger BEFORE the next
-                    # blind comparison so the verified fingerprint belongs to
-                    # the final lint-clean bytes, not the pre-ledger revision.
-                    # The while loop then naturally re-verifies any page that
-                    # this bounded ledger pass changed.
-                    await _run_ledger_repairs(run, replies)
-                else:
-                    await run.emit({"type": "summary",
-                                    "text": f"自检(图像):{result['images']} 张图已核,断言与图一致 ✓"})
-        # Owner notes that arrived during the tail phases (ledger repair / image
-        # verify) were acked as "will be considered" but have no later batch to
-        # ride — honor the contract with a bounded digest session before the
-        # turn closes. Two passes: a note can land while the first one runs.
-        for _ in range(2):
-            tail_notes = _drain_batch_notes(run)
-            if not tail_notes:
-                break
-            notes_reply = await _drive_batch_session(
-                run,
-                _loc(run,
-                     "The owner left the following notes during the compile's tail phase. Assess whether the "
-                     "draft needs adjusting (make the edits and summarize briefly if so; otherwise explain why "
-                     "not):\n",
-                     "负责人在编译收尾期间的补充留言如下,请评估是否需要据此调整草稿"
-                     "(需要就改并简述,不需要就说明理由):\n") + tail_notes,
-                _loc(run, "note digest", "留言消化"))
-            if notes_reply:
-                replies.append(_loc(run, f"[Note digest] {notes_reply}", f"【留言消化】{notes_reply}"))
-            await _run_ledger_repairs(run, replies)  # the digest may have touched pages
+                    await _sync_workspace(run, sent, durable_barrier=True, completed_checkpoint=True)
+        failure_stage = run._batch_stage = "batch_final"
+        await _run_finalization(run, plan, replies)
+        failure_stage = run._batch_stage = "batch_commit"
         await _commit_batch_compile(run, plan, replies)
     except Exception as e:
         # stdout stays whitelisted: exception class + a machine-routable code.
@@ -5459,10 +5846,21 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
         # deterministic failures (plan_integrity, quota_exhausted) from
         # transient ones (model_stall, provider_fault). Never hardcode batch_failed.
         batch_code = _batch_error_code(e)
+        # Runtime retires a box on its first fatal error. A failed bounded
+        # session can have edited Candidate since the last completed unit, and
+        # the periodic sync deliberately skips batch execution. Preserve those
+        # edits for recovery before releasing the writer. This is not a seal of
+        # a completed unit and must never move the stable head.
+        if not _step_teardown_failed(run):
+            await _cancel_verification_tasks(run)
+            await run.emit({"type": "summary", "text": _loc(run,
+                "Compilation stopped; saving its work before recovery.",
+                "编译已停止，正在保存成果以便恢复。")})
+            await _checkpoint_failed_workspace(run, getattr(run, "_sync_sent", None) or {})
         await run.emit(_error_event(
             f"batch compile failed: {e!r}",
             code=batch_code,
-            stage="batch_compile",
+            stage=getattr(run, "_batch_stage", "") or failure_stage,
             last_sdk_message=getattr(run, "_last_sdk_message_type", None),
             exception_class=type(e).__name__,
             message=f"{batch_code}:{type(e).__name__}",
@@ -5495,6 +5893,11 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
                 f"The model provider refused this request on billing (HTTP 402): "
                 f"the API key's spend limit for the period is used up.{at}",
                 f"模型服务按计费拒绝了本次请求(HTTP 402):该 API key 本周期的额度已用尽。{at}")
+        elif isinstance(e, ModelCallBudgetExceeded):
+            done_note = _loc(run,
+                "The current compile step exhausted its model-call budget. Its work is saved; "
+                "automatic replay is paused. Review the remaining scope before continuing.",
+                "当前编译步骤已耗尽模型调用次数预算。成果已保存，自动重试已暂停；请检查剩余任务范围后再继续。")
         else:
             done_note = _loc(
                 run,
@@ -5504,8 +5907,14 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
             await run.emit({"type": "turn_done", "text": done_note})
         except Exception:
             pass
+        # No PK or successful convergence stamp may follow a failed train.
+        return
     finally:
         run._model_idle_timeout_s = previous_model_idle_timeout
+        run._batch_stage = ""
+        run._batch_notes_closed = False
+        run._finalization_plan = None
+        run._finalization_reads = None
         if not _step_teardown_failed(run):
             shutil.rmtree(Path(run.workdir) / ".kbc-batch-slices", ignore_errors=True)
             run._batch_active = False
@@ -5662,7 +6071,12 @@ async def _consume_turn_stream(
                 run._turn_active = False
                 text.clear()
                 subtype = str(message_field(msg, "subtype", "unknown") or "unknown")[:80]
+                # Only the exact engine sentinel is authoritative. Provider
+                # errors may echo arbitrary request text containing the token.
+                budget_exhausted = msg.data.get("error") == "KBC_MODEL_CALL_BUDGET_EXCEEDED"
                 if fail_on_error_result:
+                    if budget_exhausted:
+                        raise ModelCallBudgetExceeded("bounded session model-call budget exhausted")
                     raise ModelResultError(f"model result failed (subtype={subtype}, api_status={status})")
                 # Session reusability is not operation liveness. Capture the
                 # actual turn, not the run's retained command-generation pin:
@@ -5679,6 +6093,8 @@ async def _consume_turn_stream(
                     # background writers, then reconciles and saves the turn.
                     if status == _MODEL_QUOTA_STATUS:
                         raise ModelQuotaExhausted("model provider refused on billing")
+                    if budget_exhausted:
+                        raise ModelCallBudgetExceeded("bounded session model-call budget exhausted")
                     raise ModelResultError(
                         f"model result failed (subtype={subtype}, api_status={status})")
                 await _reconcile_failed_turn(run)
@@ -5985,26 +6401,90 @@ async def _cancel_verification_tasks(run: CompileRun) -> None:
                                      extra=f"exception_class={type(error).__name__}")
 
 
-async def _checkpoint_failed_workspace(run: CompileRun, sent: dict) -> None:
-    """Keep the failed workspace live until its complete checkpoint is saved.
+def _checkpoint_file_state(workdir: str) -> tuple:
+    """Cheap change token for retained invalid artifacts; never read their bodies."""
+    root = Path(workdir)
+    state = []
+    for top in WORKSPACE_SYNC_DIRS:
+        base = root / top
+        try:
+            for path in [base, *sorted(base.rglob("*"))]:
+                try:
+                    st = path.stat()
+                    state.append((str(path.relative_to(root)), st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_mode))
+                except OSError as error:
+                    state.append((str(path.relative_to(root)), error.errno))
+        except OSError as error:
+            state.append((top, error.errno))
+    return tuple(state)
 
-    Force includes files a previous periodic enqueue already put in `sent`.
-    ACK-capable runtimes confirm the consumer transaction before we retire;
-    older runtimes serialize artifact persistence ahead of terminal events.
-    No source-baseline commit or successful-verification claim is made here.
+
+_CHECKPOINT_FAST_ATTEMPTS = 3
+_CHECKPOINT_POLL_SECONDS = 5
+_CHECKPOINT_PROBE_SECONDS = 60
+
+
+async def _checkpoint_failed_workspace(run: CompileRun, sent: dict) -> None:
+    """Retain failed bytes until a complete checkpoint is acknowledged.
+
+    Invalid artifacts wait for repair. Transient failures get a bounded fast
+    retry burst, then a visible blocked state with periodic recovery probes.
+    Never mistake a blocked save for a completed or safely retired workspace.
     """
     warned = False
+    failures = 0
+    announced = None
     while True:
         try:
-            # A copied or freshly checked report can still carry `settled`.
-            # Saving a failed turn must not promote it as a successful mutation.
             report = selfcheck.read_selfcheck(run.workdir)
             if report is not None and "converge_phase" in report:
                 report.pop("converge_phase")
                 selfcheck.write_selfcheck(run.workdir, report)
             await _sync_workspace(run, sent, force=True, durable_barrier=True, retain_until_ack=True)
+            run._checkpoint_blocked = None
             return
         except Exception as error:
+            failures += 1
+            deterministic = isinstance(error, (ValueError, PermissionError)) or (
+                isinstance(error, WorkspaceArtifactError) and not error.retryable)
+            if deterministic or failures >= _CHECKPOINT_FAST_ATTEMPTS:
+                run._turn_active = False
+                mode = "file_change" if deterministic else "periodic_probe"
+                run._checkpoint_blocked = {"code": "workspace_checkpoint_blocked",
+                    "exception_class": type(error).__name__, "retry_mode": mode, "attempts": failures}
+                notice = (type(error).__name__, mode)
+                if notice != announced:
+                    announced = notice
+                    _print_compile_lifecycle("checkpoint.blocked", run,
+                                             extra=f"exception_class={type(error).__name__}")
+                    message = _loc(run,
+                        "Compilation stopped: workspace save is blocked. Unsaved files remain in this box; new messages are not accepted until the save completes.",
+                        "编译已停止：工作区保存受阻，未保存文件仍保留在当前 Box；保存完成前不接收新消息。")
+                    message += _loc(run,
+                        " Repair invalid files; saving resumes when they change.",
+                        " 请修复损坏或超限文件，文件变化后重新保存。") if deterministic else _loc(run,
+                        " Fast retries are exhausted; storage will be probed every 60 seconds, even if file metadata does not change.",
+                        " 快速重试已用尽；即使文件元数据不变，也会每 60 秒探测存储是否恢复。")
+                    if isinstance(error, WorkspaceArtifactError):
+                        message += " " + str(error)
+                    await run.emit({**_error_event(message, code="workspace_checkpoint_blocked",
+                        stage="persist", exception_class=type(error).__name__), "recoverable": True})
+                unchanged = _checkpoint_file_state(run.workdir)
+                waited = 0
+                while unchanged == _checkpoint_file_state(run.workdir):
+                    await asyncio.sleep(_CHECKPOINT_POLL_SECONDS)
+                    waited += _CHECKPOINT_POLL_SECONDS
+                    if not deterministic and waited >= _CHECKPOINT_PROBE_SECONDS:
+                        break
+                if unchanged != _checkpoint_file_state(run.workdir):
+                    failures = 0
+                    warned = False
+                    await run.emit({"type": "summary", "text": _loc(run,
+                        "Workspace files changed; retrying the complete save before recovery.",
+                        "工作区文件已变化，正在重新尝试完整保存。")})
+                # Keep admission fenced until the successful ACK above, including
+                # during a timed probe or a fast retry after a file change.
+                continue
             _print_compile_lifecycle("checkpoint.retry", run,
                                      extra=f"exception_class={type(error).__name__}")
             if not warned:
@@ -6012,7 +6492,7 @@ async def _checkpoint_failed_workspace(run: CompileRun, sent: dict) -> None:
                     "Compilation stopped; saving its work failed. Retaining the workspace and retrying the save.",
                     "编译已停止，但成果保存失败。正在保留工作区并重试保存。")})
                 warned = True
-            await asyncio.sleep(5)
+            await asyncio.sleep(_CHECKPOINT_POLL_SECONDS)
 
 
 @_observe_pi_sessions
@@ -7503,6 +7983,7 @@ async def _dispatch_authoring_turn(
     rolling-upgrade message adapter and must never be consulted for a typed
     command.
     """
+    _reject_checkpoint_blocked(run)
     # v3 brief: if the wizard's 「开始生成知识库」message carries a 定调标签 block,
     # persist it deterministically to authoring/BRIEF.json BEFORE the turn so the
     # agent reads it this turn. Fail-open — a parse hiccup never blocks the turn.
@@ -7551,6 +8032,8 @@ async def _dispatch_authoring_turn(
         asyncio.create_task(_run_batch_compile(run, text))
         return {"ok": True, "batch": True}
     if run._batch_active:
+        if getattr(run, "_batch_notes_closed", False):
+            raise CommandRejected("the final draft is committing; send new guidance after this update completes", 409)
         if compile_control:
             # A second trigger mid-batch changes nothing the plan doesn't know.
             await run.emit({"type": "summary", "text": _loc(run,
@@ -7751,6 +8234,8 @@ async def handle_events(request: web.Request):
 
 async def handle_health(request: web.Request):
     return web.json_response({"status": "ok", "runs": len(RUNS), "test_sessions": len(TEST_SESSIONS),
+                              "checkpoint_blocked": [{"run_id": r.run_id, **r._checkpoint_blocked}
+                                                     for r in RUNS.values() if getattr(r, "_checkpoint_blocked", None)],
                               "engine": _engine_kind(),
                               "upgrade_ready_run": next((run.run_id for run in RUNS.values() if run._upgrade_ready), None)})
 
@@ -7960,6 +8445,8 @@ async def handle_open_test(request: web.Request):
     consumer_max_turns = _test_max_turns()
     tid = str(uuid.uuid4())
     dest = Path(_test_snapshot_root()) / tid
+    snapshot_started = time.monotonic()
+    print(json.dumps({"event": "kbc.test_snapshot.start", "run_id": parent.run_id, "test_session_id": tid}), flush=True)
     try:
         encoded = body.get("bundle_base64")
         if encoded:
@@ -7970,6 +8457,8 @@ async def handle_open_test(request: web.Request):
     except (FileNotFoundError, ValueError, TypeError) as e:
         shutil.rmtree(dest, ignore_errors=True)
         return web.json_response({"error": str(e)}, status=400)
+    print(json.dumps({"event": "kbc.test_snapshot.complete", "run_id": parent.run_id, "test_session_id": tid,
+                      "duration_ms": round((time.monotonic() - snapshot_started) * 1000), "pages": pages}), flush=True)
     run = TestRun(tid, str(dest), parent_run_id=parent.run_id, snapshot_hash=snapshot_hash, locale=parent.locale)
     # Tool whitelist from the runtime BoxProfile (kb-test); None/absent → read-only default.
     run.allowed_tools = consumer_tools
@@ -8276,6 +8765,7 @@ def build_app() -> web.Application:
         client_max_size=_http_max_request_bytes(),
         middlewares=[_client_certificate_middleware, _upgrade_admission],
     )
+    app.cleanup_ctx.append(loop_diagnostics.lifecycle)
     app.on_startup.append(destream.start)
     app.on_startup.append(model_access.start)
     app.on_startup.append(_start_test_session_reaper)

@@ -268,14 +268,18 @@ async def _agent_json(engine: ReadonlyAgentEngine, *, stage: str, system: str, u
 # ── inputs derivation ──
 
 def raw_fingerprint(raw_dir: str) -> str:
-    """Cache key for the survey: sorted (relpath, size). Sizes not mtimes —
-    workspace rehydration rewrites mtimes; the frozen bundle keeps sizes."""
+    """Hash exact evidence bytes; same-sized replacements must invalidate review."""
     root = Path(raw_dir)
     h = hashlib.sha256()
-    for f in sorted(root.rglob("*")):
-        if f.is_file():
-            h.update(f.relative_to(root).as_posix().encode())
-            h.update(b"\0"); h.update(str(f.stat().st_size).encode()); h.update(b"\0")
+    for path in sorted(root.rglob("*")):
+        if path.is_file():
+            h.update(path.relative_to(root).as_posix().encode())
+            h.update(b"\0")
+            content = hashlib.sha256()
+            with path.open("rb") as stream:
+                while part := stream.read(1024 * 1024):
+                    content.update(part)
+            h.update(content.digest())
     return h.hexdigest()
 
 
@@ -604,13 +608,16 @@ async def run_pk(engine: ReadonlyAgentEngine, *, wiki_dir: str, raw_dir: str,
             say(_t(locale, f"Self-check (PK): targeted re-test, {len(questions)} question(s)",
                    f"自检(PK):定向复测 {len(questions)} 题"))
         else:
-            fp = raw_fingerprint(raw_dir)
+            areas = derive_area_seeds(raw_dir, wiki_dir)
+            fp = hashlib.sha256(json.dumps([
+                2, raw_fingerprint(raw_dir), raw_fingerprint(wiki_dir), judge_m,
+                judge_system, _t(locale, SURVEY_USER_EN, SURVEY_USER_ZH), areas,
+            ], ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
             topics = _load_survey_cache(authoring_dir, fp)
             survey_cache_hit = topics is not None
             if topics is None:
                 say(_t(locale, "Self-check (PK): judge surveying the question surface…",
                        "自检(PK):裁判调研出题面…"))
-                areas = derive_area_seeds(raw_dir, wiki_dir)
                 data = await _agent_json(
                     engine, stage="survey", system=judge_system,
                     user=_t(locale, SURVEY_USER_EN, SURVEY_USER_ZH).format(

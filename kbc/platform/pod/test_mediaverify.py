@@ -141,12 +141,12 @@ def test_repair_prompt():
                  "fix": "降级⚠️存疑+落工单"}]
     # default locale (None) = English; the stored kind token renders as its label
     prompt = mediaverify.build_repair_prompt(findings)
-    assert prompt.startswith("[System self-check · image verification]"), prompt[:80]
+    assert prompt.startswith("[Optional image review]"), prompt[:80]
     assert "beyond what the transcript supports" in prompt and "H20" in prompt
-    assert "file a ticket" in prompt and "Claim:" in prompt
+    assert "review_action=investigate" in prompt and "Claim:" in prompt
     # zh branch keeps the original wording
     zh = mediaverify.build_repair_prompt(findings, locale="zh")
-    assert "【系统自检 · 图像复核】" in zh and "落一条工单" in zh
+    assert "investigate" in zh
     print("OK  repair prompt (en default + zh branch, kinds + claims + fix lines)")
 
 

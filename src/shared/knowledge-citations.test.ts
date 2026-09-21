@@ -78,3 +78,42 @@ describe("knowledge citation attribution", () => {
     ]);
   });
 });
+
+describe("verified source positions", () => {
+  const location = { page: "a.md", page_sha256: "a".repeat(64), raw_sha256: "b".repeat(64), evidence_id: "install", start_line: 3, end_line: 3, section: "Setup → Driver", excerpt: "Use version 1." };
+  it("retains two positions in one document and persists snapshot evidence", () => {
+    const result = normalizeKnowledgeSourceCitations([
+      { title: "A", url: "https://example.com/a", locations: [location] },
+      { title: "A", url: "https://example.com/a", locations: [{ ...location, start_line: 5, end_line: 5 }] },
+    ]);
+    expect(result).toHaveLength(1);
+    expect(result[0].locations).toHaveLength(2);
+    expect(knowledgeCitationsMetadata(result).pages[0].locations).toHaveLength(2);
+    const rendered = appendKnowledgeSourceCitations("结论", result);
+    expect(rendered).toContain("Setup → Driver");
+    expect(rendered).toContain("编译时原文快照 L3–3");
+    expect(rendered).toContain("Use version 1.");
+    expect(appendKnowledgeSourceCitations(rendered, result)).toBe(rendered);
+  });
+  it("bounds rendering, signals omitted positions and escapes excerpt markup", () => {
+    const positions = Array.from({ length: 10 }, (_, i) => ({ ...location, start_line: i + 1, end_line: i + 1, excerpt: "[link](https://untrusted.example) <script>" }));
+    const text = appendKnowledgeSourceCitations("Answer", [{ title: "A", url: "https://example.com/a", locations: positions }]);
+    expect(text).toContain("2 additional evidence positions are not expanded");
+    expect(text).toContain("\\[link\\]");
+    expect(text).not.toContain("<script>");
+  });
+  it("keeps the original link when a location is malformed", () => {
+    const result = normalizeKnowledgeSourceCitations([{ title: "A", url: "https://example.com/a", locations: [{ ...location, start_line: -1 }] }]);
+    expect(result).toHaveLength(1);
+    expect(result[0].locations ?? []).toHaveLength(0);
+  });
+});
+
+
+it("renders an unsectioned snapshot label once", () => {
+  const location = { page: "a.md", page_sha256: "a".repeat(64), raw_sha256: "b".repeat(64), evidence_id: "fact", start_line: 3, end_line: 3, excerpt: "Fact." };
+  for (const [answer, label] of [["结论", "编译时原文快照"], ["Answer", "Compiled source snapshot"]]) {
+    const text = appendKnowledgeSourceCitations(answer, [{ title: "Source", url: "https://example.com/a", locations: [location] }]);
+    expect(text.split(label)).toHaveLength(2);
+  }
+});
