@@ -20,9 +20,11 @@ _CLOSED = object()
 def worker_command() -> list[str]:
     pod = Path(__file__).resolve().parent
     packaged = pod / "pi-worker" / "dist" / "kbc" / "pi-worker.js"
-    worker = packaged if packaged.is_file() else (
+    # Node compares argv[1] with import.meta.url at the worker entry point.
+    # Resolve packaged symlinks too, or the process exits without running it.
+    worker = (packaged if packaged.is_file() else (
         pod / ".." / ".." / ".." / "dist" / "kbc" / "pi-worker.js"
-    ).resolve()
+    )).resolve()
     node = shutil.which("node")
     if not node or not worker.is_file():
         raise AgentTransportError("Pi worker is not built or Node.js is unavailable")

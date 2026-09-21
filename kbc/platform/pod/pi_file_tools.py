@@ -87,11 +87,17 @@ def _integer(args: dict, key: str, default: int, *, minimum: int = 0, maximum: i
 
 
 class FileTools:
-    def __init__(self, cwd: str, allowed: list[str], guard: PermissionGuard, *, feedback=None):
+    def __init__(self, cwd: str, allowed: list[str], guard: PermissionGuard, *,
+                 feedback=None, max_write_bytes=MAX_FILE_BYTES,
+                 validate_write: Callable[[Path, str], None] | None = None):
         self.root = Path(cwd).resolve()
         self.allowed = set(allowed)
         self.guard = guard
         self.feedback = feedback
+        self.validate_write = validate_write
+        if type(max_write_bytes) is not int or max_write_bytes <= 0:
+            raise ValueError("invalid writable artifact byte budget")
+        self.max_write_bytes = min(max_write_bytes, MAX_FILE_BYTES)
 
     def write_result(self, target: Path, message: str) -> dict:
         result = text_result(message)
@@ -230,8 +236,10 @@ class FileTools:
         await self.check("Write", args)
         target = self.target(args.get("file_path"))
         content = args.get("content")
-        if not isinstance(content, str) or len(content.encode("utf-8")) > MAX_FILE_BYTES:
-            raise ValueError("content must be text within the write budget")
+        if not isinstance(content, str) or len(content.encode("utf-8")) > self.max_write_bytes:
+            raise ValueError(f"content must fit the {self.max_write_bytes}-byte artifact budget; split the page and link its parts from the index")
+        if self.validate_write is not None:
+            self.validate_write(target, content)
         self._replace(target, content)
         return self.write_result(target, f"Wrote {len(content.encode('utf-8'))} bytes to {target}")
 
@@ -248,8 +256,10 @@ class FileTools:
         if not count or (count != 1 and args.get("replace_all") is not True):
             raise ValueError(f"old_string matches {count} locations; provide a unique match or replace_all")
         result = content.replace(old, new, -1 if args.get("replace_all") is True else 1)
-        if len(result.encode("utf-8")) > MAX_FILE_BYTES:
-            raise ValueError("Edited file exceeds the write budget")
+        if len(result.encode("utf-8")) > self.max_write_bytes:
+            raise ValueError(f"Edited file exceeds the {self.max_write_bytes}-byte artifact budget; split it before saving")
+        if self.validate_write is not None:
+            self.validate_write(target, result)
         self._replace(target, result)
         return self.write_result(target, f"Edited {target}")
 

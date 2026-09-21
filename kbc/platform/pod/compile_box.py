@@ -1013,12 +1013,19 @@ RECOVERY_PROVENANCE_PATH = "authoring/RECOVERY_PROVENANCE.json"
 _SYNC_TOMBSTONE = "__deleted__"
 
 
-def _collect_workspace_artifacts(workdir: str) -> list[dict]:
+class WorkspaceArtifactError(RuntimeError):
+    """A complete checkpoint cannot silently omit writable text artifacts."""
+
+
+def _collect_workspace_artifacts(workdir: str, *, strict: bool = False,
+                                 skipped: list | None = None) -> list[dict]:
     """Collect text files under the writable workspace dirs as {path, content}.
     Paths are relative to workdir (e.g. "candidate/01.md"). raw/ is never
-    included; binary, unreadable, or oversized files are skipped."""
+    included. A completed checkpoint rejects uncollectable writable files;
+    periodic sync can retain prior copies while reporting the skipped paths."""
     wd = Path(workdir)
     out: list[dict] = []
+    issues = skipped if skipped is not None else []
     for top in WORKSPACE_SYNC_DIRS:
         base = wd / top
         if not base.is_dir():
@@ -1028,17 +1035,23 @@ def _collect_workspace_artifacts(workdir: str) -> list[dict]:
                 continue
             try:
                 if f.stat().st_size > MAX_SYNC_FILE_BYTES:
+                    issues.append({"path": f.relative_to(wd).as_posix(), "reason": "too_large"})
                     continue
                 content = f.read_text(encoding="utf-8")
             except (OSError, UnicodeDecodeError):
+                issues.append({"path": f.relative_to(wd).as_posix(), "reason": "unreadable"})
                 continue
             out.append({"path": f.relative_to(wd).as_posix(), "content": content})
+    if strict and issues:
+        details = "; ".join(f"{item['path']} ({item['reason']})" for item in issues[:10])
+        raise WorkspaceArtifactError(f"Incomplete workspace checkpoint: {details}. Split oversized files to at most {MAX_SYNC_FILE_BYTES} bytes; existing files have been retained.")
     return out
 
 
-def _collect_workspace_artifacts_for_sync(run: CompileRun) -> list[dict]:
+def _collect_workspace_artifacts_for_sync(run: CompileRun, *, strict: bool = False) -> list[dict]:
     """Collect a durability-safe snapshot without mutating in-flight files."""
-    artifacts = _collect_workspace_artifacts(run.workdir)
+    run._workspace_sync_issues = []
+    artifacts = _collect_workspace_artifacts(run.workdir, strict=strict, skipped=run._workspace_sync_issues)
     before = getattr(run, "_turn_page_hashes", None)
     stamp_time = getattr(run, "_turn_provenance_at", None)
     changes: dict[str, str] = {}
@@ -1079,7 +1092,18 @@ def _collect_workspace_artifacts_for_sync(run: CompileRun) -> list[dict]:
         if rewritten is not None:
             artifact["content"] = rewritten
         safe_artifacts.append(artifact)
-    return safe_artifacts
+    # Provenance can expand an otherwise collectable file. Apply the budget to
+    # the emitted bytes too; periodic sync must preserve the previous copy.
+    bounded = []
+    for artifact in safe_artifacts:
+        if len(artifact["content"].encode("utf-8")) > MAX_SYNC_FILE_BYTES:
+            run._workspace_sync_issues.append({"path": artifact["path"], "reason": "metadata_too_large"})
+        else:
+            bounded.append(artifact)
+    if strict and run._workspace_sync_issues:
+        paths = ", ".join(item["path"] for item in run._workspace_sync_issues[:10])
+        raise WorkspaceArtifactError(f"Incomplete workspace checkpoint: {paths} exceed the artifact budget after metadata. Split these pages before saving.")
+    return bounded
 
 
 def _workspace_sync_cursor(workdir: str) -> dict[str, str]:
@@ -1106,6 +1130,14 @@ async def _sync_workspace(
     enqueue and retains tombstone markers for reconnect replay;
     returns the number of changed entries."""
     async with run._sync_lock:
+        # Old boxes stored all transcripts in one potentially oversized file.
+        # Convert that known format before enforcing complete checkpoints; the
+        # same consumer transaction saves every shard and deletes the aggregate.
+        legacy_transcripts = Path(run.workdir) / mediaverify.TRANSCRIPTS_PATH
+        if legacy_transcripts.is_file() and not _step_teardown_failed(run):
+            mediaverify.save_transcripts(run.workdir, mediaverify.load_transcripts(run.workdir))
+            legacy_transcripts.unlink()
+            sent.setdefault(mediaverify.TRANSCRIPTS_PATH, "migrated_legacy_cache")
         if _step_teardown_failed(run):
             raise RuntimeError("compile worker teardown was not confirmed; recreate the session")
         if commit_input and not (Path(run.workdir) / "candidate" / "index.md").is_file():
@@ -1119,7 +1151,16 @@ async def _sync_workspace(
         # Blocked pages still exist. Treat them as collected so durability sync
         # preserves the last good consumer copy instead of emitting a tombstone.
         collected = set(blocked_paths)
-        for art in _collect_workspace_artifacts_for_sync(run):
+        artifacts = _collect_workspace_artifacts_for_sync(
+            run, strict=durable_barrier or commit_input or completed_checkpoint)
+        issues = getattr(run, "_workspace_sync_issues", [])
+        issue_key = json.dumps(issues, sort_keys=True)
+        if issues and issue_key != getattr(run, "_workspace_sync_issue_key", ""):
+            await run.emit({"type": "summary", "text": _loc(run,
+                f"Workspace save is incomplete: {len(issues)} file(s) exceed the byte budget or cannot be read. Split oversized pages before completion. Files are retained locally.",
+                f"工作区尚未完整保存：{len(issues)} 个文件超限或无法读取。请拆分超限页面后再完成；本地文件仍保留。")})
+        run._workspace_sync_issue_key = issue_key
+        for art in artifacts:
             collected.add(art["path"])
             sha = hashlib.sha256(art["content"].encode("utf-8")).hexdigest()
             if not force and sent.get(art["path"]) == sha:
@@ -3625,6 +3666,32 @@ def _reference_assist_model() -> str:
 
 
 
+def _validate_compile_write(run: "CompileRun", target: Path, content: str) -> None:
+    """Reject metadata expansion while the authoring worker can still repair it."""
+    root = Path(run.workdir).resolve()
+    rel = target.resolve().relative_to(root).as_posix()
+    if not rel.startswith("candidate/") or not rel.endswith(".md"):
+        return
+    page = rel[len("candidate/"):]
+    if selfcheck._is_reserved_page(page):
+        return
+    before = getattr(run, "_turn_page_hashes", None)
+    created = page not in before if isinstance(before, dict) else not target.exists()
+    projected = selfcheck.siclaw_generated_metadata_text(
+        page, content, created=created, now=getattr(run, "_turn_provenance_at", None))
+    if projected is None:
+        return  # Invalid frontmatter remains available to the existing lint repair.
+    manifest_ids = selfcheck.load_manifest_source_ids(run.workdir)
+    if manifest_ids:
+        projected, _ = selfcheck.attribute_evidence_text(
+            run.workdir, projected, manifest_ids, set(selfcheck.source_inventory(run.workdir)))
+    size = len(projected.encode("utf-8"))
+    if size > MAX_SYNC_FILE_BYTES:
+        raise ValueError(
+            f"Page requires {size} UTF-8 bytes including system metadata, exceeding the "
+            f"{MAX_SYNC_FILE_BYTES}-byte artifact budget; split the page into linked parts before saving")
+
+
 def _compile_session_client(run: "CompileRun", wd: str, system_prompt: str, session_id: str,
                             pdf_page_ranges: dict | None = None,
                             raw_scope: dict | None = None):
@@ -3658,7 +3725,9 @@ def _compile_session_client(run: "CompileRun", wd: str, system_prompt: str, sess
                     reads.add(rel[len("candidate/"):])
         return decision
     tools = FileTools(wd, allowed, guard,
-                      feedback=lambda target: candidate_feedback.check_page(wd, target)).tools()
+                      feedback=lambda target: candidate_feedback.check_page(wd, target),
+                      max_write_bytes=MAX_SYNC_FILE_BYTES,
+                      validate_write=lambda target, content: _validate_compile_write(run, target, content)).tools()
     # Keep the published tool names and allowlist while using the single
     # KBC-owned handler/schema registry for every compiler phase.
     tools.extend(EngineTool(f"mcp__compile__{tool.name}", tool.description, tool.input_schema, tool.handler)
@@ -3679,7 +3748,25 @@ def _compile_system_prompt(run: "CompileRun") -> str:
     if instruction:
         header = _INSTRUCTION_HEADER.get((run.locale or DEFAULT_LOCALE).lower(), _INSTRUCTION_HEADER[DEFAULT_LOCALE])
         role_parts.append(header + "\n\n" + instruction)
+    role_parts.append(_loc(run,
+        f"Writable artifact limit: {MAX_SYNC_FILE_BYTES} UTF-8 bytes per file, including metadata. Split larger pages into linked parts. A successful tool write means local bytes exist; only the consumer ACK proves a durable save.",
+        f"本会话可写文件上限：每文件 {MAX_SYNC_FILE_BYTES} 个 UTF-8 字节，包含元数据。大页须拆分并相互链接。工具写入成功只表示本地字节存在，持久保存以平台 ACK 为准。"))
     return "\n\n---\n\n".join(role_parts)
+
+
+def _internal_execution_contract(run: "CompileRun") -> str:
+    """Machine-selected responsibility appended to each bounded worker's role."""
+    phase = getattr(run, "_batch_stage", "") or "internal"
+    phases = {
+        "batch_map": ("Compile the assigned source group; reuse related Candidate pages.", "编写本批负责的原料，复用相关候选页面。"),
+        "batch_reduce": ("Reconcile the assigned section; preserve facts and combined provenance.", "归并指定分区，保留事实及完整来源。"),
+        "batch_final": ("Review only this finalization unit and its explicit dependencies.", "完成当前终审单元及其明确依赖的核对。"),
+        "batch_ledger": ("Repair the listed structural/accounting findings; do not invent evidence to close the ledger.", "修复列出的结构和记账问题，不得为关账编造证据。"),
+        "batch_media_verify": ("Repair the listed image claims; code schedules fresh verification.", "修复列出的图像断言，由代码安排重新核验。"),
+    }
+    task = phases.get(phase, ("Complete the specific task in the directive.", "完成指令明确分配的任务。"))
+    return _prompt("internal_execution", run.locale).format(
+        responsibility=task[0 if selfcheck._is_en(run.locale) else 1])
 
 
 # ── batch mode (DESIGN-kb-batch-compile-2026-07-05) ──────────────────────────
@@ -4265,7 +4352,7 @@ async def _drive_batch_session(run: "CompileRun", directive: str, label: str,
             directive_full = directive
             try:
                 client = _compile_session_client(
-                    run, wd, _compile_system_prompt(run), session_id,
+                    run, wd, _compile_system_prompt(run) + "\n\n" + _internal_execution_contract(run), session_id,
                     pdf_page_ranges=pdf_page_ranges,
                     raw_scope=raw_scope,
                 )
@@ -4901,7 +4988,9 @@ async def _plan_batches(run: "CompileRun", inventory: list) -> dict:
             cwd=wd, system_prompt=planner_prompt, session_id=planner_session_id,
             model_config=pi_config.for_role("compile", session_kind="authoring"), max_model_calls=8,
             tools=FileTools(wd, ["Read", "Write", "Glob"],
-                            _make_compile_path_guard(Path(wd), run.locale)).tools())
+                            _make_compile_path_guard(Path(wd), run.locale),
+                            max_write_bytes=MAX_SYNC_FILE_BYTES,
+                            validate_write=lambda target, content: _validate_compile_write(run, target, content)).tools())
         directive = _loc(
             run,
             f"Budget: each batch's total effective must not exceed {budget} (pack by the effective field only, ignore bytes). "
@@ -6259,7 +6348,8 @@ async def _checkpoint_failed_workspace(run: CompileRun, sent: dict) -> None:
             if not warned:
                 await run.emit({"type": "summary", "text": _loc(run,
                     "Compilation stopped; saving its work failed. Retaining the workspace and retrying the save.",
-                    "编译已停止，但成果保存失败。正在保留工作区并重试保存。")})
+                    "编译已停止，但成果保存失败。正在保留工作区并重试保存。")
+                    + (" " + str(error) if isinstance(error, WorkspaceArtifactError) else "")})
                 warned = True
             await asyncio.sleep(5)
 

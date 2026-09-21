@@ -119,8 +119,7 @@ or `redaction=none`): catalog IDs, lookup tables, and internal codes are
 the page. Do not stretch "avoid copying large tables" into hiding the shelf the
 user needs to filter.
 
-A page may hold 5MB (~20,000 typical ticket records); a bundle 100MB and 1000
-pages. If a source truly will not fit, split it along a dimension it already has
+Each page must fit the current session's UTF-8 byte budget (1 MiB by default, including metadata). Do not estimate this from row count. A successful local write is not a persistence acknowledgement. If a source truly will not fit, split it along a dimension it already has
 (month, tenant, cluster), one page per slice, indexed from the understanding
 page.
 

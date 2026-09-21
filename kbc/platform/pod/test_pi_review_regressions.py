@@ -28,21 +28,40 @@ async def test_failed_proposal_does_not_revert_next_owner_edit(tmp_path, monkeyp
     async with provider(respond) as (config, _):
         configure(monkeypatch, config)
         run = compile_box.CompileRun("review-scope", str(tmp_path), 1)
-        run.client = compile_box._compile_session_client(run, str(tmp_path), "Help the owner.", "review-scope-session")
-        await run.client.connect()
-        consume = asyncio.create_task(compile_box._consume_turn_stream(run, run.client, stop_on_result=False))
+
+        async def failing_driver(run):
+            run.client = compile_box._compile_session_client(run, str(tmp_path), "Help the owner.", "review-scope-session")
+            await run.client.connect()
+            try:
+                await compile_box._dispatch_authoring_turn(run, "Apply the approved change to A.", "compile.apply_proposal", ["a.md"])
+                await compile_box._consume_turn_stream(run, run.client, stop_on_result=False)
+            finally:
+                await run.client.disconnect()
+                run.client = None
+
+        monkeypatch.setattr(compile_box, "_COMPILE_IMPL", failing_driver)
+        async with asyncio.timeout(15):
+            await compile_box._run_wrapper(run)
+        events = []
+        while not run.events.empty():
+            events.append(run.events.get_nowait())
+        assert any(e.get("code") == "model_result_error" for e in events)
+        assert run._incr_pending is None and run._verification_stopping
+
+        # Authoring failure is terminal. A later owner edit runs in a fresh
+        # session over the preserved workspace, without the failed scope guard.
+        owner = compile_box.CompileRun("owner-after-failure", str(tmp_path), 2)
+        owner.client = compile_box._compile_session_client(owner, str(tmp_path), "Help the owner.", "owner-session")
+        await owner.client.connect()
         try:
-            for action, text, pages in (("compile.apply_proposal", "Apply the approved change to A.", ["a.md"]),
-                                        (None, "Update B.", None)):
-                await compile_box._dispatch_authoring_turn(run, text, action, pages)
-                async with asyncio.timeout(15):
-                    while (await run.events.get())["type"] != "turn_done":
-                        pass
+            await compile_box._dispatch_authoring_turn(owner, "Update B.")
+            async with asyncio.timeout(15):
+                await compile_box._consume_turn_stream(owner, owner.client, stop_on_result=True)
             assert "Owner changed B." in (candidate / "b.md").read_text()
-            assert run._incr_pending is None
+            assert owner._incr_pending is None
         finally:
-            await run.client.disconnect()
-            await consume
+            await owner.client.disconnect()
+
 
 
 async def test_supported_pdf_page_images_reach_the_next_model_request(tmp_path):
