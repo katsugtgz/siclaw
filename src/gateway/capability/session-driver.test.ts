@@ -197,6 +197,28 @@ describe("driveCapabilitySession — box event → capability wire mapping", () 
     });
   });
 
+  it("completed checkpoint identity travels in the same artifact transaction", async () => {
+    const fe = fakeFrontend();
+    const mgr = fakeManager();
+    mgr.get.mockReturnValue({ inputRevision: "manifest-1", status: "running" });
+    await driveCapabilitySession({
+      client: fakeClient([
+        { type: "syncArtifacts", completed_checkpoint_id: "seal-1", artifacts: [{ path: "candidate/a.md", content: "# A" }] },
+        { type: "end" },
+      ]),
+      runId: "r1", frontendClient: fe, manager: mgr,
+    });
+    expect(fe.request).toHaveBeenCalledWith(CAPABILITY_PERSIST_ARTIFACTS, {
+      run_id: "r1",
+      input_revision: "manifest-1",
+      completed_checkpoint_id: "seal-1",
+      artifacts: [{
+        path: "candidate/a.md",
+        content: { inline_base64: Buffer.from("# A", "utf8").toString("base64") },
+      }],
+    });
+  });
+
   it("ACKs a sealed checkpoint only after the consumer transaction commits", async () => {
     const order: string[] = [];
     const fe = fakeFrontend();

@@ -4,6 +4,7 @@
 
 跑:platform/pod/.venv/bin/python platform/pod/test_compile_box.py
 """
+import uuid
 import asyncio
 import base64
 import contextlib
@@ -6179,10 +6180,11 @@ async def test_durable_workspace_sync_waits_for_consumer_ack():
         sent = {}
 
         pending = asyncio.create_task(
-            compile_box._sync_workspace(run, sent, durable_barrier=True))
+            compile_box._sync_workspace(run, sent, durable_barrier=True, completed_checkpoint=True))
         event = await asyncio.wait_for(run.events.get(), timeout=1)
         run.events.task_done()
         assert event["type"] == "syncArtifacts", event
+        assert uuid.UUID(event["completed_checkpoint_id"])
         sync_id = event.get("sync_id")
         assert sync_id and not pending.done(), "batch advanced before durable ACK"
         assert run._pending_sync_events[sync_id] == event

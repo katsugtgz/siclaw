@@ -468,6 +468,8 @@ export interface CapabilityPersistArtifactRequest {
 /** Atomic content batch. One box sync event is committed all-or-nothing. */
 export interface CapabilityPersistArtifactsRequest {
   run_id: string;
+  /** Completed unit identity, persisted atomically with the exact workspace. */
+  completed_checkpoint_id?: string;
   input_revision?: string;
   /** Explicit full-compile commit; replay/content presence alone never advances provenance. */
   commit_input?: boolean;
