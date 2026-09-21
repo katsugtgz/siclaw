@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import shutil
 import tempfile
+import time
 import uuid
 from pathlib import Path
 from typing import AsyncIterator
@@ -57,6 +59,9 @@ class PiAgentClient:
         self.tools = {tool.name: tool for tool in tools}
         if len(self.tools) != len(tools):
             raise ValueError("Duplicate compiler tool name")
+        self._last_tool_signature = None
+        self._tool_repeat_count = 0
+        self._diagnostic_warning_emitted = False
         self.max_model_calls = max_model_calls
         self.command = command
         self.process: asyncio.subprocess.Process | None = None
@@ -79,7 +84,15 @@ class PiAgentClient:
         self._observations = ExecutionObserver(session_id, model_config)
 
     async def _observe(self, kind: str, data: dict) -> None:
-        await self._observations.emit(kind, data, self._turn_id)
+        try:
+            await self._observations.emit(kind, data, self._turn_id)
+        except Exception:
+            if kind not in {"worker_start", "worker_ready", "tool_dispatch", "tool_result", "model_payload"}:
+                raise
+            # Additive diagnostic delivery must not prevent a tool reply or model request.
+            if not self._diagnostic_warning_emitted:
+                self._diagnostic_warning_emitted = True
+                print("[kbc] diagnostic_observer_failed", flush=True)
 
     @property
     def returncode(self) -> int | None:
@@ -116,6 +129,8 @@ class PiAgentClient:
             environment = {key: value for key, value in os.environ.items() if not (
                 key.endswith(("_API_KEY", "_AUTH_TOKEN")) or key.startswith(("ANTHROPIC_", "OPENAI_", "CLAUDE_"))
             )}
+            connect_started = time.monotonic()
+            await self._observe("worker_start", {})
             self.process = await asyncio.create_subprocess_exec(
                 *(self.command or worker_command()), cwd=self.cwd, env=environment,
                 stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
@@ -139,6 +154,7 @@ class PiAgentClient:
             await asyncio.wait_for(self._ready.wait(), 30)
             if self._failure:
                 raise self._failure
+            await self._observe("worker_ready", {"duration_ms": round((time.monotonic() - connect_started) * 1000)})
         except BaseException:
             await self.disconnect()
             raise
@@ -149,7 +165,7 @@ class PiAgentClient:
         while await self.process.stderr.read(8192):
             pass
 
-    async def _reply_tool(self, frame: dict, task: asyncio.Task) -> None:
+    async def _reply_tool(self, frame: dict, task: asyncio.Task, started: float) -> None:
         call_id = frame["call_id"]
         try:
             try:
@@ -163,6 +179,14 @@ class PiAgentClient:
                 content, is_error = [{"type": "text", "text": "Tool execution cancelled"}], True
             except Exception as error:
                 content, is_error = [{"type": "text", "text": self._safe_error(error)}], True
+            elapsed_ms = round((time.monotonic() - started) * 1000)
+            await self._observe("tool_result", {
+                "call_id": call_id, "name": frame["name"], "is_error": is_error,
+                "duration_ms": elapsed_ms,
+                "text_chars": sum(len(part.get("text", "")) for part in content
+                                  if isinstance(part, dict) and isinstance(part.get("text"), str)),
+                "images": sum(1 for part in content if isinstance(part, dict) and part.get("type") == "image"),
+            })
             await self._send({"type": "tool_result", "turn_id": frame["turn_id"],
                               "call_id": call_id, "content": content, "is_error": is_error})
         except AgentTransportError as error:
@@ -205,16 +229,22 @@ class PiAgentClient:
                         raise AgentTransportError("Pi worker returned an invalid tool request")
                     if len(self._executions) >= 64:
                         raise AgentTransportError("Pi concurrent tool budget exceeded")
+                    signature = hashlib.sha256(json.dumps([name, args], sort_keys=True).encode()).digest()
+                    self._tool_repeat_count = self._tool_repeat_count + 1 if signature == self._last_tool_signature else 1
+                    self._last_tool_signature = signature
+                    await self._observe("tool_dispatch", {"call_id": call_id, "name": name,
+                                                          "consecutive_same_call": self._tool_repeat_count})
+                    started = time.monotonic()
                     task = asyncio.create_task(self.tools[name].handler(args))
                     self._executions[call_id] = task
-                    self._replies[call_id] = asyncio.create_task(self._reply_tool(frame, task))
+                    self._replies[call_id] = asyncio.create_task(self._reply_tool(frame, task, started))
                     continue
                 if kind == "tool_cancel":
                     task = self._executions.get(frame.get("call_id"))
                     if task:
                         task.cancel()
                     continue
-                if kind not in {"activity", "assistant", "tool_start", "tool_end", "model_request", "model_envelope", "model_usage", "result"}:
+                if kind not in {"activity", "assistant", "tool_start", "tool_end", "model_request", "model_payload", "model_envelope", "model_usage", "result"}:
                     raise AgentTransportError("Pi worker returned an unknown event")
                 if kind == "result":
                     if frame.get("outcome") not in {"completed", "failed", "aborted"} or self._executions:
@@ -242,6 +272,8 @@ class PiAgentClient:
             raise self._failure
         if self._closing or not self._ready.is_set() or not self._settled.is_set():
             raise AgentTransportError("Previous Pi turn has not settled or session is unavailable")
+        self._last_tool_signature = None
+        self._tool_repeat_count = 0
         self._turn_id = str(uuid.uuid4())
         self._settled.clear()
         await self._send({"type": "prompt", "turn_id": self._turn_id, "text": message,

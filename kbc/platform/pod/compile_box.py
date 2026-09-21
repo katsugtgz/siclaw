@@ -51,6 +51,7 @@ from pathlib import Path, PurePosixPath
 from aiohttp import web
 
 import batching
+import loop_diagnostics
 import finalization
 import candidate_context
 import candidate_feedback
@@ -8352,6 +8353,8 @@ async def handle_open_test(request: web.Request):
     consumer_max_turns = _test_max_turns()
     tid = str(uuid.uuid4())
     dest = Path(_test_snapshot_root()) / tid
+    snapshot_started = time.monotonic()
+    print(json.dumps({"event": "kbc.test_snapshot.start", "run_id": parent.run_id, "test_session_id": tid}), flush=True)
     try:
         encoded = body.get("bundle_base64")
         if encoded:
@@ -8362,6 +8365,8 @@ async def handle_open_test(request: web.Request):
     except (FileNotFoundError, ValueError, TypeError) as e:
         shutil.rmtree(dest, ignore_errors=True)
         return web.json_response({"error": str(e)}, status=400)
+    print(json.dumps({"event": "kbc.test_snapshot.complete", "run_id": parent.run_id, "test_session_id": tid,
+                      "duration_ms": round((time.monotonic() - snapshot_started) * 1000), "pages": pages}), flush=True)
     run = TestRun(tid, str(dest), parent_run_id=parent.run_id, snapshot_hash=snapshot_hash, locale=parent.locale)
     # Tool whitelist from the runtime BoxProfile (kb-test); None/absent → read-only default.
     run.allowed_tools = consumer_tools
@@ -8668,6 +8673,7 @@ def build_app() -> web.Application:
         client_max_size=_http_max_request_bytes(),
         middlewares=[_client_certificate_middleware, _upgrade_admission],
     )
+    app.cleanup_ctx.append(loop_diagnostics.lifecycle)
     app.on_startup.append(destream.start)
     app.on_startup.append(model_access.start)
     app.on_startup.append(_start_test_session_reaper)
