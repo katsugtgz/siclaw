@@ -420,8 +420,23 @@ def test_investigation_context_ignores_timestamp_but_tracks_decision(tmp_path):
     notes = authoring / 'REVIEW_NOTES.json'
     row = {'id': 'review', 'state': 'pending', 'investigation': 'checked source', 'updated_at': 'old'}
     notes.write_text(json.dumps([row]))
-    before = finalization.context_identity(str(tmp_path))
+    before = finalization.investigation_identity(str(tmp_path))
     notes.write_text(json.dumps([{**row, 'updated_at': 'new'}]))
-    assert finalization.context_identity(str(tmp_path)) == before
+    assert finalization.investigation_identity(str(tmp_path)) == before
     notes.write_text(json.dumps([{**row, 'owner_decision': 'choose version'}]))
-    assert finalization.context_identity(str(tmp_path)) != before
+    assert finalization.investigation_identity(str(tmp_path)) != before
+
+
+def test_investigation_changes_invalidate_catalog_only():
+    pages = {'p.md': 'page-hash', 'index.md': 'index-hash'}
+    ledger = {'units': []}
+    units = {kind: finalization.add(ledger, kind, ['p.md'] if kind == 'semantic' else [])
+             for kind in ['semantic', 'catalog', 'introduction']}
+    for unit in units.values():
+        finalization.complete(unit, pages, 'context', set(), 'reviewed', investigations='a' * 64)
+    assert [u['kind'] for u in finalization.pending(ledger, pages, 'context', investigations='b' * 64)] == ['catalog']
+    finalization.complete(units['catalog'], pages, 'context', set(), 'reviewed', investigations='b' * 64)
+    assert not finalization.pending(ledger, pages, 'context', investigations='b' * 64)
+    # A legacy catalog receipt without the dependency must be revisited once.
+    units['catalog'].pop('investigations')
+    assert [u['kind'] for u in finalization.pending(ledger, pages, 'context', investigations='b' * 64)] == ['catalog']

@@ -1056,7 +1056,7 @@ def _collect_workspace_artifacts(workdir: str, *, strict: bool = False,
     if strict and issues:
         details = "; ".join(f"{item['path']} ({item['reason']})" for item in issues[:10])
         raise WorkspaceArtifactError(f"Incomplete workspace checkpoint: {details}. Split oversized files to at most {MAX_SYNC_FILE_BYTES} bytes; existing files have been retained.",
-                                     retryable=any(item["reason"] == "unreadable" for item in issues))
+                                     retryable=all(item["reason"] == "unreadable" for item in issues))
     return out
 
 
@@ -1921,8 +1921,16 @@ def _render_command(run: "CompileRun", command: dict) -> str:
     return rendered
 
 
+def _reject_checkpoint_blocked(run: "CompileRun") -> None:
+    if getattr(run, "_checkpoint_blocked", None):
+        raise CommandRejected(_loc(run,
+            "Workspace checkpoint is blocked; unsaved files are retained. This message was not queued. Repair the save failure and wait for its checkpoint before starting another turn.",
+            "工作区保存受阻，未保存文件仍保留。本条消息未排队；请修复保存问题并等待完整保存后再发起新回合。"), 409)
+
+
 def _prepare_command(run: "CompileRun", command: dict) -> None:
     """Validate workspace-bound references and materialize structured intent."""
+    _reject_checkpoint_blocked(run)
     action = command["action"]
     params = command["parameters"]
     if action == "compile.approve_plan":
@@ -5170,7 +5178,8 @@ def _write_compilation_state(run: "CompileRun", plan: dict) -> None:
     ledger = plan.get("finalization")
     if isinstance(ledger, dict):
         state["finalization"] = finalization.projection(
-            ledger, finalization.snapshot(run.workdir), _finalization_context(run, ledger))
+            ledger, finalization.snapshot(run.workdir), _finalization_context(run, ledger),
+            investigations=finalization.investigation_identity(run.workdir))
         state["finalization"]["run_id"] = run.run_id
     _write_batch_file(run, "authoring/COMPILATION_STATE.json", state)
 
@@ -5233,7 +5242,8 @@ def _write_finalization_checkpoint(run, plan, *, completed=False):
     if completed:
         ledger["last_completed_at"] = ledger["updated_at"]
     plan["finalization_progress"] = finalization.projection(
-        ledger, finalization.snapshot(run.workdir), _finalization_context(run, ledger))
+        ledger, finalization.snapshot(run.workdir), _finalization_context(run, ledger),
+            investigations=finalization.investigation_identity(run.workdir))
     plan["finalization_progress"]["run_id"] = run.run_id
     # Never let the ordinary collector silently skip an oversized control file.
     if len(batching.dump_json(plan).encode()) > MAX_SYNC_FILE_BYTES - 1024:
@@ -5262,13 +5272,15 @@ async def _run_final_review_units(run, plan, replies):
     _, errors = selfcheck.load_exclusions(run.workdir)
     orphans = [v["page"] for v in selfcheck.lint_candidate(pages, errors)["violations"] if v["kind"] == "orphan"]
     finalization.reconcile(ledger, pages, duplicates, orphans)
-    queue = finalization.pending(ledger, finalization.snapshot(run.workdir), _finalization_context(run, ledger))
+    queue = finalization.pending(ledger, finalization.snapshot(run.workdir), _finalization_context(run, ledger),
+            investigations=finalization.investigation_identity(run.workdir))
     # Queue one pass at a time. Later edits invalidate earlier read receipts for
     # the next pass, rather than repeatedly restarting the first page mid-pass.
     while queue:
         unit = queue.pop(0)
         fingerprints = finalization.snapshot(run.workdir)
-        if finalization.valid(unit, fingerprints, _finalization_context(run, ledger)):
+        if finalization.valid(unit, fingerprints, _finalization_context(run, ledger),
+                              investigations=finalization.investigation_identity(run.workdir)):
             continue
         ledger.update(stage="review", current_unit=unit["id"], current_kind=unit["kind"])
         unit["status"] = "running"
@@ -5297,7 +5309,8 @@ async def _run_final_review_units(run, plan, replies):
                     _loc(run, f"final review {unit['kind']} {unit['id']}", f"终审 {unit['kind']} {unit['id']}"),
                     raw_scope=semantic_review_raw_scope(plan))
             finalization.complete(unit, finalization.snapshot(run.workdir),
-                                  _finalization_context(run, ledger), run._finalization_reads, reply)
+                                  _finalization_context(run, ledger), run._finalization_reads, reply,
+                                  investigations=finalization.investigation_identity(run.workdir))
             ledger.pop("current_unit", None)
             ledger.pop("current_kind", None)
             await _checkpoint_finalization(run, plan, completed=True)
@@ -5365,7 +5378,8 @@ async def _run_finalization(run, plan, replies):
         _, errors = selfcheck.load_exclusions(run.workdir)
         finalization.reconcile(ledger, current, selfcheck.dup_candidates(current),
             [v["page"] for v in selfcheck.lint_candidate(current, errors)["violations"] if v["kind"] == "orphan"])
-        if (not finalization.pending(ledger, finalization.snapshot(run.workdir), _finalization_context(run, ledger))
+        if (not finalization.pending(ledger, finalization.snapshot(run.workdir), _finalization_context(run, ledger),
+            investigations=finalization.investigation_identity(run.workdir))
                 and ledger.get("ledger_signature") == _finalization_signature(run, ledger)
                 and ledger.get("media_signature") == _finalization_signature(run, ledger)):
             ledger["stage"] = "complete"
@@ -5595,7 +5609,8 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
             if plan.get("finalization") is not None:
                 ledger = finalization.ensure(plan, run.workdir)
                 signature = _finalization_signature(run, ledger)
-                if (ledger.get("stage") != "complete" or finalization.pending(ledger, finalization.snapshot(run.workdir), _finalization_context(run, ledger))
+                if (ledger.get("stage") != "complete" or finalization.pending(ledger, finalization.snapshot(run.workdir), _finalization_context(run, ledger),
+            investigations=finalization.investigation_identity(run.workdir))
                         or ledger.get("ledger_signature") != signature or ledger.get("media_signature") != signature):
                     raise PlanIntegrityError("commit checkpoint has unfinished or changed finalization work")
             failure_stage = run._batch_stage = "batch_commit"
@@ -6404,61 +6419,80 @@ def _checkpoint_file_state(workdir: str) -> tuple:
     return tuple(state)
 
 
-async def _checkpoint_failed_workspace(run: CompileRun, sent: dict) -> None:
-    """Keep the failed workspace live until its complete checkpoint is saved.
+_CHECKPOINT_FAST_ATTEMPTS = 3
+_CHECKPOINT_POLL_SECONDS = 5
+_CHECKPOINT_PROBE_SECONDS = 60
 
-    Force includes files a previous periodic enqueue already put in `sent`.
-    ACK-capable runtimes confirm the consumer transaction before we retire;
-    older runtimes serialize artifact persistence ahead of terminal events.
-    No source-baseline commit or successful-verification claim is made here.
+
+async def _checkpoint_failed_workspace(run: CompileRun, sent: dict) -> None:
+    """Retain failed bytes until a complete checkpoint is acknowledged.
+
+    Invalid artifacts wait for repair. Transient failures get a bounded fast
+    retry burst, then a visible blocked state with periodic recovery probes.
+    Never mistake a blocked save for a completed or safely retired workspace.
     """
     warned = False
+    failures = 0
+    announced = None
     while True:
         try:
-            # A copied or freshly checked report can still carry `settled`.
-            # Saving a failed turn must not promote it as a successful mutation.
             report = selfcheck.read_selfcheck(run.workdir)
             if report is not None and "converge_phase" in report:
                 report.pop("converge_phase")
                 selfcheck.write_selfcheck(run.workdir, report)
             await _sync_workspace(run, sent, force=True, durable_barrier=True, retain_until_ack=True)
+            run._checkpoint_blocked = None
             return
         except Exception as error:
+            failures += 1
             deterministic = isinstance(error, (ValueError, PermissionError)) or (
                 isinstance(error, WorkspaceArtifactError) and not error.retryable)
-            if deterministic:
-                # Retiring this box would discard the only copy of unsaved bytes.
-                # Report a nonterminal failure and wait for repair, not an endless
-                # resubmission of the same deterministic error to the consumer.
-                run._turn_active = False  # There is no model turn for the watchdog to reap.
+            if deterministic or failures >= _CHECKPOINT_FAST_ATTEMPTS:
+                run._turn_active = False
+                mode = "file_change" if deterministic else "periodic_probe"
                 run._checkpoint_blocked = {"code": "workspace_checkpoint_blocked",
-                                           "exception_class": type(error).__name__}
-                _print_compile_lifecycle("checkpoint.blocked", run,
-                                         extra=f"exception_class={type(error).__name__}")
-                await run.emit({**_error_event(_loc(run,
-                    "Compilation stopped: workspace artifacts cannot be saved. The box retains unsaved files. Repair the invalid or oversized artifacts before saving can resume; automatic retries are paused until the files change.",
-                    "编译已停止：工作区含无法保存的文件。未保存成果仍保留在当前 Box；请修复损坏或超限文件。文件变化前暂停自动重试。")
-                    + (" " + str(error) if isinstance(error, WorkspaceArtifactError) else ""),
-                    code="workspace_checkpoint_blocked", stage="persist", exception_class=type(error).__name__),
-                    "recoverable": True})
+                    "exception_class": type(error).__name__, "retry_mode": mode, "attempts": failures}
+                notice = (type(error).__name__, mode)
+                if notice != announced:
+                    announced = notice
+                    _print_compile_lifecycle("checkpoint.blocked", run,
+                                             extra=f"exception_class={type(error).__name__}")
+                    message = _loc(run,
+                        "Compilation stopped: workspace save is blocked. Unsaved files remain in this box; new messages are not accepted until the save completes.",
+                        "编译已停止：工作区保存受阻，未保存文件仍保留在当前 Box；保存完成前不接收新消息。")
+                    message += _loc(run,
+                        " Repair invalid files; saving resumes when they change.",
+                        " 请修复损坏或超限文件，文件变化后重新保存。") if deterministic else _loc(run,
+                        " Fast retries are exhausted; storage will be probed every 60 seconds, even if file metadata does not change.",
+                        " 快速重试已用尽；即使文件元数据不变，也会每 60 秒探测存储是否恢复。")
+                    if isinstance(error, WorkspaceArtifactError):
+                        message += " " + str(error)
+                    await run.emit({**_error_event(message, code="workspace_checkpoint_blocked",
+                        stage="persist", exception_class=type(error).__name__), "recoverable": True})
                 unchanged = _checkpoint_file_state(run.workdir)
+                waited = 0
                 while unchanged == _checkpoint_file_state(run.workdir):
-                    await asyncio.sleep(5)
-                run._checkpoint_blocked = None
-                warned = False
-                await run.emit({"type": "summary", "text": _loc(run,
-                    "Workspace files changed; retrying the complete save before recovery.",
-                    "工作区文件已变化，正在重新尝试完整保存。")})
+                    await asyncio.sleep(_CHECKPOINT_POLL_SECONDS)
+                    waited += _CHECKPOINT_POLL_SECONDS
+                    if not deterministic and waited >= _CHECKPOINT_PROBE_SECONDS:
+                        break
+                if unchanged != _checkpoint_file_state(run.workdir):
+                    failures = 0
+                    warned = False
+                    await run.emit({"type": "summary", "text": _loc(run,
+                        "Workspace files changed; retrying the complete save before recovery.",
+                        "工作区文件已变化，正在重新尝试完整保存。")})
+                # Keep admission fenced until the successful ACK above, including
+                # during a timed probe or a fast retry after a file change.
                 continue
             _print_compile_lifecycle("checkpoint.retry", run,
                                      extra=f"exception_class={type(error).__name__}")
             if not warned:
                 await run.emit({"type": "summary", "text": _loc(run,
                     "Compilation stopped; saving its work failed. Retaining the workspace and retrying the save.",
-                    "编译已停止，但成果保存失败。正在保留工作区并重试保存。")
-                    + (" " + str(error) if isinstance(error, WorkspaceArtifactError) else "")})
+                    "编译已停止，但成果保存失败。正在保留工作区并重试保存。")})
                 warned = True
-            await asyncio.sleep(5)
+            await asyncio.sleep(_CHECKPOINT_POLL_SECONDS)
 
 
 @_observe_pi_sessions
@@ -7949,6 +7983,7 @@ async def _dispatch_authoring_turn(
     rolling-upgrade message adapter and must never be consulted for a typed
     command.
     """
+    _reject_checkpoint_blocked(run)
     # v3 brief: if the wizard's 「开始生成知识库」message carries a 定调标签 block,
     # persist it deterministically to authoring/BRIEF.json BEFORE the turn so the
     # agent reads it this turn. Fail-open — a parse hiccup never blocks the turn.
