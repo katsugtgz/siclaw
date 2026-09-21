@@ -34,6 +34,7 @@ import json
 import os
 import shutil
 import tempfile
+import time
 from pathlib import Path
 
 import re
@@ -45,6 +46,9 @@ from media_progress import MediaProgress
 TRANSCRIPTS_PATH = "authoring/MEDIA_TRANSCRIPTS.json"
 TRANSCRIPTS_DIR = "authoring/media-transcripts"
 _TRANSCRIPT_CHAR_CAP = 6000  # per image, persisted
+_COMPARE_PAGE_CHARS = 24000
+_COMPARE_OVERLAP_CHARS = 1000
+TRANSCRIPT_CONTRACT_VERSION = 2
 
 
 def _env(name: str, default: str) -> str:
@@ -176,7 +180,7 @@ def load_transcripts(workdir: str) -> dict:
         item = json.loads(shard.read_text("utf-8"))
         if not isinstance(item, dict) or not isinstance(item.get("image"), str) or not isinstance(item.get("transcript"), dict):
             raise ValueError("invalid media transcript cache shard")
-        cache[item["image"]] = {"sha8": item.get("sha8"), "transcript": item["transcript"]}
+        cache[item["image"]] = {k: item[k] for k in ("sha8", "sha256", "contract", "transcript") if k in item}
     return cache
 
 
@@ -206,50 +210,88 @@ async def transcribe_image(engine, workdir: str, img_rel: str, cache: dict,
     img_path = Path(workdir) / "raw" / img_rel
     if not img_path.is_file():
         return None
-    sha = _sha8(img_path)
+    sha = hashlib.sha256(img_path.read_bytes()).hexdigest()
+    system, user = _transcribe_prompts(locale)
+    contract = hashlib.sha256(json.dumps(
+        [TRANSCRIPT_CONTRACT_VERSION, _transcribe_model(), system, user],
+        ensure_ascii=False).encode("utf-8")).hexdigest()
     hit = cache.get(img_rel)
-    if hit and hit.get("sha8") == sha and isinstance(hit.get("transcript"), dict):
+    if (isinstance(hit, dict) and hit.get("sha256") == sha
+            and hit.get("contract") == contract and isinstance(hit.get("transcript"), dict)):
         return hit["transcript"]
     raw_dir = str(Path(workdir) / "raw")
-    system, user = _transcribe_prompts(locale)
     data = await _agent_json(
         engine, stage="transcribe", system=system,
         user=user.format(img=str(img_path.resolve())),
         model=_transcribe_model(), role="transcribe", cwd=raw_dir, roots=[raw_dir],
         timeout=float(_env("KBC_MV_TRANSCRIBE_TIMEOUT", "240")))
-    if not isinstance(data, dict):
-        return None
+    if not isinstance(data, dict) or not isinstance(data.get("facts"), list):
+        raise ValueError("Image transcription did not return a facts list")
     if len(json.dumps(data, ensure_ascii=False)) > _TRANSCRIPT_CHAR_CAP:
-        data = {"chart_type": data.get("chart_type"), "legend": data.get("legend"),
-                "axes": data.get("axes"),
-                "facts": (data.get("facts") or [])[:80],
-                "notes": ("(transcript truncated — over the length cap)" if _is_en(locale)
-                          else "(转写超长已截断)")}
-    cache[img_rel] = {"sha8": sha, "transcript": data}
+        raise ValueError("Image transcript exceeds the bounded evidence budget; incomplete transcripts cannot verify a page")
+    cache[img_rel] = {"sha8": sha[:8], "sha256": sha, "contract": contract, "transcript": data}
     save_transcript(workdir, img_rel, cache[img_rel])
     return data
 
 
+def comparison_segments(text: str):
+    """Cover every character, retaining overlap for claims at segment edges."""
+    start = 0
+    while start < len(text):
+        end = min(len(text), start + _COMPARE_PAGE_CHARS)
+        if end < len(text):
+            # Prefer a paragraph/line boundary without creating tiny chunks.
+            boundary = text.rfind("\n", start + _COMPARE_PAGE_CHARS // 2, end)
+            if boundary >= 0:
+                end = boundary + 1
+        yield start, end, text[start:end]
+        if end == len(text):
+            break
+        start = max(start + 1, end - _COMPARE_OVERLAP_CHARS)
+
+
 async def compare_page(engine, tmp_dir: str, page_rel: str, page_text: str,
                        transcripts: dict[str, dict], locale: str | None = None) -> list[dict]:
-    """Text-only comparison — cwd/roots point at an EMPTY dir so the comparer
-    cannot open the image (or anything else); everything it may see is inline."""
+    """Compare the entire page in bounded, overlapping text-only sessions.
+
+    A single deadline covers the whole page. A failed/malformed segment raises:
+    the caller may retry or record exhaustion, but cannot mark the page passed.
+    """
+    if not page_text.strip():
+        raise ValueError("Cannot verify an empty page")
     system, user = _compare_prompts(locale)
-    data = await _agent_json(
-        engine, stage="compare", system=system,
-        user=user.format(page=page_rel, page_text=page_text[:24000],
-                         transcripts_json=json.dumps(transcripts, ensure_ascii=False)),
-        model=_compare_model(), role="compare", cwd=tmp_dir, roots=[tmp_dir],
-        timeout=float(_env("KBC_MV_COMPARE_TIMEOUT", "300")))
-    findings = data.get("findings") if isinstance(data, dict) else None
-    out = []
-    for f in findings or []:
-        if isinstance(f, dict) and f.get("claim"):
-            out.append({"page": page_rel, "image": str(f.get("image", "")),
-                        "kind": str(f.get("kind", "不一致")),
-                        "claim": str(f.get("claim"))[:200],
-                        "expected": str(f.get("expected", ""))[:200],
-                        "fix": str(f.get("fix", ""))[:200]})
+    out, seen = [], set()
+    budget = float(_env("KBC_MV_COMPARE_TIMEOUT", "300"))
+    deadline = time.monotonic() + budget
+    async with asyncio.timeout(budget):
+        for start, end, segment in comparison_segments(page_text):
+            scope = (f"\nThis is character range [{start},{end}) of a {len(page_text)}-character page. "
+                     "Ranges overlap. Judge claims visible in this excerpt; do not assume omitted surrounding text is absent from the page."
+                     if _is_en(locale) else
+                     f"\n本段覆盖全页 {len(page_text)} 字符中的 [{start},{end})，分段间有重叠。"
+                     "只判断本段可见断言，不要把本段未展示的上下文当成整页缺失。")
+            data = await _agent_json(
+                engine, stage="compare", system=system,
+                user=user.format(page=page_rel, page_text=segment,
+                                 transcripts_json=json.dumps(transcripts, ensure_ascii=False)) + scope,
+                model=_compare_model(), role="compare", cwd=tmp_dir, roots=[tmp_dir],
+                timeout=max(0.001, deadline - time.monotonic()))
+            if not isinstance(data, dict) or not isinstance(data.get("findings"), list):
+                raise ValueError("Image comparison did not return a findings list")
+            for finding in data["findings"]:
+                if not isinstance(finding, dict) or not isinstance(finding.get("claim"), str) or not finding["claim"].strip():
+                    raise ValueError("Image comparison returned a malformed finding")
+                if finding.get("image") not in transcripts or finding.get("kind") not in {"不一致", "超出转写范围"}:
+                    raise ValueError("Image comparison referenced unknown evidence or finding kind")
+                value = {"page": page_rel, "image": str(finding.get("image", "")),
+                         "kind": str(finding.get("kind", "不一致")),
+                         "claim": finding["claim"][:200],
+                         "expected": str(finding.get("expected", ""))[:200],
+                         "fix": str(finding.get("fix", ""))[:200]}
+                identity = (value["image"], finding["claim"].strip(), value["kind"])
+                if identity not in seen:
+                    seen.add(identity)
+                    out.append(value)
     return out
 
 

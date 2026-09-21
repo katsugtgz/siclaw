@@ -203,7 +203,9 @@ async def test_workspace_sync():
         # must NOT be tombstoned — deletion is judged by is_file(), not by
         # absence from the collection.
         (wd / "eval" / "TESTS.md").write_text("x" * (compile_box.MAX_SYNC_FILE_BYTES + 1))
-        assert await compile_box._sync_workspace(run, sent) == 0 and run.events.empty()
+        assert await compile_box._sync_workspace(run, sent) == 0
+        assert run.events.get_nowait()["type"] == "summary", "skipped artifacts must be visible"
+        assert run.events.empty()
         assert "eval/TESTS.md" in sent, "row kept: file exists, just oversized"
     print("✓ workspace sync (B5) + deletion tombstones")
 

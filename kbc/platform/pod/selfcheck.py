@@ -3897,6 +3897,10 @@ def pending_media_verification(workdir: str) -> dict[str, list[str]]:
             if fingerprints.get(p) != current.get(p)}
 
 
+# v2 verifies every page segment; old prefix-only receipts cannot prove it ran.
+MEDIA_VERIFICATION_CONTRACT_VERSION = 2
+
+
 def media_page_fingerprints(
     workdir: str, citing: dict[str, list[str]] | None = None,
 ) -> dict[str, str]:
@@ -3918,6 +3922,7 @@ def media_page_fingerprints(
         except OSError:
             continue
         digest = hashlib.sha256()
+        digest.update(f"media-verification:{MEDIA_VERIFICATION_CONTRACT_VERSION}\0".encode())
         digest.update(page_bytes)
         for image in sorted(images):
             digest.update(b"\0")
