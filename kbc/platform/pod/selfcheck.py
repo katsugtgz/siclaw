@@ -2233,6 +2233,24 @@ def _remap_evidence_source_ids(text: str, original: str, manifest_ids: dict[str,
             edits.append((match.start(1), match.end(1), json.dumps(marker, separators=(",", ":"))))
     for start, end, value in reversed(edits):
         text = text[:start] + value + text[end:]
+    def rebind_locations(match):
+        try:
+            rows = json.loads(match[1])
+        except json.JSONDecodeError:
+            return match[0]
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            return match[0]
+        changed = False
+        for row in rows:
+            old = row.get("source_id")
+            if isinstance(old, str) and old in remap and remap[old] != old:
+                row["source_id"] = remap[old]
+                changed = True
+        return "source_locations: " + json.dumps(rows, ensure_ascii=False, separators=(",", ":")) if changed else match[0]
+    # Canonical generated metadata only; never rewrite a lookalike in page prose.
+    boundary = text.find("\n---", 4)
+    if boundary > 0:
+        text = re.sub(r"(?m)^source_locations: (.+)$", rebind_locations, text[:boundary]) + text[boundary:]
     return text
 
 
@@ -2317,6 +2335,7 @@ _SETEXT_UNDERLINE_RE = re.compile(r"^[ ]{0,3}(=+|-+)[ \t]*$")
 
 def _attribute_page_text(
     text: str, ids_by_resource: dict[str, str],
+    location_sections: list | None = None,
 ) -> tuple[str, dict[str, int], list[str]]:
     """Regenerate machine evidence markers for one page.
 
@@ -2405,6 +2424,14 @@ def _attribute_page_text(
         if any(_EVIDENCE_MARKER_START_RE.search(masked) for masked in section_prose):
             stats["sections"] += 1
             stats["authored"] += 1
+            if location_sections is not None:
+                for match in _EVIDENCE_MARKER_RE.finditer("".join(section_prose)):
+                    try:
+                        marker = json.loads(match.group(1))
+                    except json.JSONDecodeError:
+                        continue  # Existing evidence lint reports malformed markers.
+                    if isinstance(marker, dict) and isinstance(marker.get("id"), str) and isinstance(marker.get("sources"), list):
+                        location_sections.append((marker, "".join(section_prose)))
             continue
         if not any(_substantive_line(raw) for raw in content):
             continue
@@ -2437,6 +2464,8 @@ def _attribute_page_text(
         digest = hashlib.sha1((heading or "").encode("utf-8")).hexdigest()[:8]
         marker = {"id": f"{MACHINE_EVIDENCE_PREFIX}{ordinal}-{digest}", "sources": chosen}
         markers[heading_idx] = f"<!-- okf:evidence {json.dumps(marker, separators=(',', ':'))} -->"
+        if location_sections is not None:
+            location_sections.append((marker, "".join(section_prose)))
 
     newline = "\r\n" if "\r\n" in text else "\n"
     out = list(lines[:fm_end + 1])
@@ -2448,6 +2477,137 @@ def _attribute_page_text(
         out.append(raw)
     return "".join(out), stats, unattributed
 
+
+
+# Position declarations are optional producer input. Sicore rechecks them against
+# the frozen Raw archive and derives the excerpt; consumers trust only that result.
+_SOURCE_LINE_RANGE = re.compile(r"^(.+?)\s+lines?\s+(\d+)(?:\s*[-–]\s*(\d+))?$", re.IGNORECASE)
+MAX_SOURCE_LOCATION_LINES = 20
+MAX_SOURCE_LOCATIONS_PER_PAGE = 64
+
+
+def _stamp_source_locations(text: str, sections: list, ids: dict[str, str], workdir: str) -> str:
+    lines = _lf_lines(text)
+    end = next(i for i, line in enumerate(lines[1:], 1) if _is_frontmatter_end(line))
+    front = "".join(lines[1:end])
+    root = yaml.compose(front, Loader=yaml.SafeLoader)
+    if not isinstance(root, yaml.MappingNode) or root.flow_style or any(key.start_mark.column for key, _ in root.value):
+        return text
+    rows = []
+    hashes: dict[str, str] = {}
+    raw_root = (Path(workdir) / "raw").resolve()
+    for marker, section in sections:
+        for payload in _body_source_payloads(section):
+            match = _SOURCE_LINE_RANGE.fullmatch(payload.strip())
+            if not match:
+                continue  # Legacy page/section locators retain document citations.
+            resource = _norm_source_entry(match[1].strip(" `"))
+            source_id = ids.get(resource)
+            if not isinstance(source_id, str) or source_id not in marker.get("sources", []):
+                continue
+            if Path(resource).suffix.lower() not in {".md", ".txt", ".markdown"}:
+                continue
+            target = raw_root / resource
+            # Do not follow a symlink (including in parent directories).
+            if ".." in Path(resource).parts or Path(resource).is_absolute():
+                continue
+            if any(part.is_symlink() for part in [target, *target.parents] if part != raw_root):
+                continue
+            if not target.is_file():
+                continue  # Existing coverage lint owns missing sources.
+            if resource not in hashes:
+                hashes[resource] = hashlib.sha256(target.read_bytes()).hexdigest() if target.stat().st_size <= 16 * 1024 * 1024 else ""
+            digest = hashes[resource]
+            row = {"evidence_id": marker["id"], "source_id": source_id,
+                   "raw_sha256": digest, "start_line": int(match[2]),
+                   "end_line": int(match[3] or match[2])}
+            if row not in rows:
+                rows.append(row)
+    pairs = [(k, v) for k, v in root.value if k.value == "source_locations"]
+    if len(pairs) > 1:
+        return text  # Duplicate fields remain a lint error, not silently repaired.
+    if pairs:
+        key, value = pairs[0]
+        # Only rewrite our canonical single-line JSON field. Preserve hand-edited
+        # YAML for validation rather than deleting aliases or adjacent comments.
+        if key.start_mark.column != 0 or value.start_mark.line != value.end_mark.line:
+            return text
+        try:
+            json.loads(front[value.start_mark.index:value.end_mark.index])
+        except json.JSONDecodeError:
+            return text
+        start = key.start_mark.index
+        finish = front.find("\n", value.end_mark.index)
+        finish = len(front) if finish < 0 else finish + 1
+        front = front[:start] + front[finish:]
+    if rows:
+        front += "source_locations: " + json.dumps(rows, ensure_ascii=False, separators=(",", ":")) + "\n"
+    return lines[0] + front + "".join(lines[end:])
+
+
+def source_location_violations(workdir: str, pages: dict) -> list[dict]:
+    findings = []
+    for rel, page in pages.items():
+        if "error" in page:
+            continue
+        text = page.get("text", "")
+        try:
+            lines = _lf_lines(text)
+            if not lines or not _is_frontmatter_start(lines[0]):
+                continue
+            end = next(i for i, line in enumerate(lines[1:], 1) if _is_frontmatter_end(line))
+            fm = yaml.safe_load("".join(lines[1:end]))
+            rows = fm.get("source_locations", []) if isinstance(fm, dict) else []
+            if not isinstance(rows, list) or len(rows) > MAX_SOURCE_LOCATIONS_PER_PAGE:
+                raise ValueError("source_locations must contain at most 64 positions")
+            if not rows:
+                continue
+            declared = fm.get("sources")
+            if not isinstance(declared, list):
+                raise ValueError("source locations require declared sources")
+            sources = {row.get("id"): _norm_source_entry(row.get("resource", ""))
+                       for row in declared if isinstance(row, dict) and isinstance(row.get("resource"), str) and isinstance(row.get("id"), str)}
+            evidence = {}
+            body = "".join(lines[end+1:])
+            for match in _EVIDENCE_MARKER_RE.finditer(_markdown_prose(body)):
+                try:
+                    marker = json.loads(match[1])
+                except json.JSONDecodeError:
+                    continue  # The existing evidence lint owns malformed markers.
+                if isinstance(marker, dict) and isinstance(marker.get("id"), str) and isinstance(marker.get("sources"), list):
+                    evidence[marker["id"]] = marker["sources"]
+            for row in rows:
+                if (not isinstance(row, dict) or set(row) != {"source_id", "evidence_id", "raw_sha256", "start_line", "end_line"}
+                        or not isinstance(row.get("source_id"), str) or not isinstance(row.get("evidence_id"), str)):
+                    raise ValueError("invalid source location")
+                if row["source_id"] not in evidence.get(row["evidence_id"], []):
+                    raise ValueError("source location does not match its evidence marker")
+                start, finish = row.get("start_line"), row.get("end_line")
+                if type(start) is not int or type(finish) is not int or start < 1 or finish < start or finish - start >= MAX_SOURCE_LOCATION_LINES:
+                    raise ValueError("source location must select 1-20 original Raw lines")
+                resource = sources.get(row.get("source_id"))
+                if not resource or Path(resource).is_absolute() or ".." in Path(resource).parts:
+                    raise ValueError("source location must reference a declared source")
+                target = Path(workdir) / "raw" / resource
+                raw_root = (Path(workdir) / "raw").resolve()
+                if any(part.is_symlink() for part in [target, *target.parents] if part != raw_root):
+                    raise ValueError("source location cannot follow a symlink")
+                if target.stat().st_size > 16 * 1024 * 1024:
+                    raise ValueError("source location Raw file exceeds the 16 MiB verification limit")
+                raw = target.read_bytes()
+                if hashlib.sha256(raw).hexdigest() != row.get("raw_sha256"):
+                    raise ValueError("source location Raw hash changed; re-read and update the page")
+                raw_lines = raw.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n").removesuffix("\n").split("\n")
+                if finish > len(raw_lines):
+                    raise ValueError("source location exceeds original Raw line count")
+                excerpt = "\n".join(raw_lines[start-1:finish])
+                if not excerpt.strip() or len(excerpt) > 1200:
+                    raise ValueError("source location must select a nonempty excerpt of at most 1200 characters")
+                if credential_exposure_violations(rel, excerpt):
+                    raise ValueError("source location excerpt contains a credential; choose a safe supporting passage")
+        except (ValueError, OSError, UnicodeError, yaml.YAMLError, StopIteration) as exc:
+            findings.append({"page": rel, "kind": "source_location_invalid", "detail": str(exc)})
+    return findings
 
 
 def normalize_evidence_source_ids(workdir: str) -> list[dict[str, object]]:
@@ -2512,7 +2672,9 @@ def attribute_evidence_sections(
         if stamped is None or not stamped[1]:
             continue
         rebound = _remap_evidence_source_ids(stamped[0], text, manifest_ids)
-        updated, stats, _ = _attribute_page_text(rebound, stamped[1])
+        location_sections: list = []
+        updated, stats, _ = _attribute_page_text(rebound, stamped[1], location_sections)
+        updated = _stamp_source_locations(updated, location_sections, stamped[1], workdir)
         if updated == text:
             continue
         _write_text_atomic(path, updated)
@@ -3058,6 +3220,7 @@ def run_layer1(workdir: str) -> dict:
         except (OSError, ValueError) as exc:
             lint["violations"].append({"page": LIBRARY_INTRODUCTION_PATH, "kind": "library_introduction", "detail": str(exc)})
     lint["violations"].extend(trusted_evidence_violations(workdir, pages))
+    lint["violations"].extend(source_location_violations(workdir, pages))
     lint["ok"] = not lint["violations"]
     over_broad = detect_over_broad_exclusions(workdir, exclusions)
     previous = read_selfcheck(workdir) or {}
