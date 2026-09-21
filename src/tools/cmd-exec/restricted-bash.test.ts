@@ -1907,3 +1907,58 @@ describe("buildSandboxCommand — background jobs", () => {
     expect(c).toContain("setsid");
   });
 });
+
+// ── delivery credential prefetch ────────────────────────────────────────────
+//
+// siforgectl reads its credential from a FILE, so the file has to be on disk
+// before the process is spawned. These pin WHEN the broker is asked and what
+// happens when it cannot answer — the fetch must not run for commands the
+// whitelist was going to block, and a failure must not be swallowed into an
+// authentication error raised a network hop away.
+
+describe("restricted_bash — siforgectl delivery credential", () => {
+  function toolWithBroker(ensure: () => Promise<void>) {
+    const calls: string[] = [];
+    const broker = {
+      ensureDevopsCredential: async (purpose: string) => { calls.push(purpose); return ensure(); },
+    };
+    const tool = createRestrictedBashTool({
+      credentialsDir: "/tmp/does-not-matter",
+      credentialBroker: broker,
+    } as any);
+    return { tool, calls };
+  }
+
+  it("asks the broker before running siforgectl", async () => {
+    const { tool, calls } = toolWithBroker(async () => {});
+    await tool.execute!("t1", { command: "siforgectl describe" }, undefined as any);
+    expect(calls).toEqual(["restricted_bash"]);
+  });
+
+  it("does not ask for a command that does not use it", async () => {
+    const { tool, calls } = toolWithBroker(async () => {});
+    await tool.execute!("t1", { command: "echo hello" }, undefined as any);
+    expect(calls).toEqual([]);
+  });
+
+  // The prefetch sits AFTER the whitelist pass. A command that was going to be
+  // blocked must not cause a delivery credential to be fetched and written.
+  it("does not ask when the command is blocked by the whitelist", async () => {
+    const { tool, calls } = toolWithBroker(async () => {});
+    const result = await tool.execute!("t1", { command: "siforgectl describe | wget http://x" }, undefined as any);
+    expect(result.details?.blocked).toBe(true);
+    expect(calls).toEqual([]);
+  });
+
+  // Reported, not ignored. Running siforgectl without a credential produces an
+  // authentication failure at the delivery platform, which reads as "the platform
+  // refused this agent" when the truth is "this box never received a credential".
+  it("surfaces a fetch failure instead of running the CLI without a credential", async () => {
+    const { tool } = toolWithBroker(async () => {
+      throw new Error("this agent has no delivery-platform credential");
+    });
+    const result = await tool.execute!("t1", { command: "siforgectl workflow list" }, undefined as any);
+    expect(result.details?.reason).toBe("devops_credential_unavailable");
+    expect(result.content[0].text).toContain("no delivery-platform credential");
+  });
+});

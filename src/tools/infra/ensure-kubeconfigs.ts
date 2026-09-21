@@ -8,6 +8,7 @@
  */
 
 import type { CredentialBroker, HostLocalInfo } from "../../agentbox/credential-broker.js";
+import { getCommandBinary } from "./command-sets.js";
 
 /**
  * Prefetch for tools that take a single `cluster` parameter (pod-exec,
@@ -34,6 +35,44 @@ export async function ensureClusterForTool(
   if (clusters.length === 1) {
     await broker.ensureCluster(clusters[0].name, purpose);
   }
+}
+
+/**
+ * The binary whose credential this seam materializes. Matching by exact name,
+ * because that is what the command whitelist admitted — an argv token that is
+ * not exactly this is not this binary.
+ */
+export const DEVOPS_CLI_BINARY = "siforgectl";
+
+/**
+ * Prefetch for the project-agent CLI: put its delivery credential on disk before
+ * `siforgectl` is spawned.
+ *
+ * ⚠️ IT KEYS OFF THE COMMAND NAME, which is the one place in this file that does.
+ * The cluster/host seams key off a tool PARAMETER because the model chooses the
+ * target; here there is nothing to choose — an agent has exactly one delivery
+ * credential, and the only question is whether the binary about to run needs it.
+ * (This is not the "command sniffing" restricted-bash refuses to do for kubectl:
+ * that one would have to GUESS which of several clusters was meant. This one
+ * infers no argument at all.)
+ *
+ * ⚠️ A FAILURE IS NOT SWALLOWED. The caller surfaces it instead of running
+ * `siforgectl` without a credential — the CLI would otherwise fail against the
+ * delivery platform with an authentication error, which reads to the model as
+ * "the platform refused me" rather than "this box never received a credential".
+ */
+export async function ensureDevopsCredentialForTool(
+  broker: CredentialBroker | undefined,
+  commands: string[],
+  purpose: string,
+): Promise<void> {
+  if (!broker) return;
+  // `commands` are the pipeline's command STRINGS, not binaries — the same shape
+  // extractCommands produces. Reduced through the shared getCommandBinary rather
+  // than by matching a prefix of the raw string, so `siforgectl-shim …` and
+  // `/opt/x/siforgectl …` are classified the way the whitelist classified them.
+  if (!commands.some((cmd) => getCommandBinary(cmd) === DEVOPS_CLI_BINARY)) return;
+  await broker.ensureDevopsCredential(purpose);
 }
 
 /** Structured result of a failed `ensureClusterForTool`, rendered to the model. */

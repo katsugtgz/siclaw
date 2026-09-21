@@ -130,14 +130,14 @@ Two users exist inside the AgentBox container:
 
 | User | UID | Groups | Purpose |
 |------|-----|--------|---------|
-| `agentbox` | 1000 | `agentbox`, `kubecred`, `hostcred` | Main Node.js process. Owns the credential tree. |
+| `agentbox` | 1000 | `agentbox`, `kubecred`, `hostcred`, `devopscred` | Main Node.js process. Owns the credential tree. |
 | `sandbox` | 1001 | `sandbox` | All child processes (shell commands). No credential access. |
 
 `sandbox` holds **no** credential group, and that is the property everything else in this document
 rests on: a command that gets past the whitelist meets `Permission denied` rather than a kubeconfig.
-The one sandbox-side reader is `kubectl`, which reaches the cluster credentials through its setgid bit
-(§3.2) — a group membership on `sandbox` would give every other binary in the image the same access and
-leave that bit decorative.
+The sandbox-side readers are `kubectl` and `siforgectl`, each of which reaches one credential type
+through its own setgid bit (§3.2) — a group membership on `sandbox` would give every other binary in
+the image the same access and leave those bits decorative.
 
 Host credentials need no sandbox-side reader at all: `ssh` is not in the command registry, so no child
 can dial one, and `host_exec` connects from the node process (running as `agentbox`, the owner) through
@@ -158,20 +158,28 @@ place — `restricted-bash.ts` — so `node_exec`, `pod_exec`, `host_exec` and t
 node process, as `agentbox`; their safety comes from argument validation and credential brokering
 (§4, §7), not from this layer.
 
-### 3.2 setgid kubectl
+### 3.2 setgid readers
 
-The `kubectl` binary has the setgid bit set for the `kubecred` group:
+Two binaries carry a setgid bit, one per credential type they are allowed to read:
 
 ```
--rwxr-sr-x 1 root kubecred  kubectl
+-rwxr-sr-x 1 root kubecred    kubectl
+-rwxr-sr-x 1 root devopscred  siforgectl
 ```
 
-This allows `kubectl` to read kubeconfig files owned by `agentbox:kubecred` with mode
-`0640`, while other commands (grep, cut, cat) running as `sandbox` cannot.
+This allows each to read the files of its own type — owned `agentbox:<its group>`, mode `0640` —
+while other commands (grep, cut, cat) running as `sandbox` cannot, and while neither can read the
+other's. `siforgectl` is the project-agent delivery CLI; see
+`scitix-devops/docs/design/project-agent-cli.md`, which explains why the credential being unreadable
+to the model is depth rather than the boundary.
 
 **Why setgid and not SUID**: setgid only changes the effective group ID, not the user ID.
-The process remains `sandbox` (UID 1001) but temporarily gains `kubecred` group membership.
-This is the minimum privilege needed for kubectl to read the kubeconfig.
+The process remains `sandbox` (UID 1001) but temporarily gains one group membership.
+This is the minimum privilege needed to read one credential type.
+
+The strip at the end of the image build removes every SUID/SGID bit except the names it enumerates,
+so a new setgid reader that is not added to that list loses its bit at the last build layer — and
+fails at runtime with a permission error nothing in the image explains.
 
 ### 3.3 File Permission Matrix
 
@@ -183,12 +191,28 @@ the correct access boundaries.
 
 #### Credentials & secrets (sandbox: no access)
 
-The parent directory is group `kubecred`, mode 0750 — it must be traversable by the group setgid
-`kubectl` runs with, or the one legitimate sandbox-side reader cannot reach a kubeconfig at all. What
-makes that safe is not the mode but the membership: `sandbox` is in no credential group, so kubecred
-traversal means "kubectl and the owner" rather than "every child process". Each credential type below it
-then keeps its own group, setgid, so material written into it inherits the right one — `hosts/` stays
-`hostcred` instead of being flattened into `kubecred` by a recursive chown.
+The parent directory is `agentbox:agentbox`, mode **0751** — a traversal point, not a boundary. `o+x`
+without `o+r` lets every setgid reader resolve a path through it without the parent having to name any
+of them, and lets `sandbox` do nothing more than resolve a path: it cannot list the directory, cannot
+enter a type directory (2750, other=0) and cannot open a credential file (0640, other=0). Each
+credential type below it keeps its own group, setgid, so material written into it inherits the right
+one — `hosts/` stays `hostcred` instead of being flattened into `kubecred` by a recursive chown, and
+`devops/` stays `devopscred`.
+
+> The parent was `agentbox:kubecred 0750` while `kubectl` was the only sandbox-side reader, and the
+> comment there recorded a measurement: tightening it to `agentbox:agentbox` locked the setgid reader
+> out and every kubectl the agent issued failed with `permission denied`. That measurement was about
+> the MODE. At 0750 the parent's GROUP was the traversal decision, so it admitted exactly one setgid
+> reader; a second one (`siforgectl`, group `devopscred`) could not even traverse. At 0751 the parent
+> decides nothing and the type directory decides everything, which is where the decision belonged.
+>
+> What makes any of it safe is unchanged and is not a directory mode: `sandbox` is in no credential
+> group.
+
+The type directories are created by the entrypoint, before the chowns. `/app/.siclaw/credentials` is an
+emptyDir mount, so the image's own type directories are shadowed at runtime; without that mkdir every
+chown ran against a missing path, swallowed the failure in `|| true`, and the verification loop below
+skipped every entry it was written to check.
 
 **The permission fix is verified, not assumed.** Every chown in the entrypoint ends in `|| true`, so a
 standalone Docker run without `CAP_CHOWN` is not bricked — but that also means the isolation can fail to
@@ -197,8 +221,9 @@ land leaves the tree readable by every child process. The group guard does not c
 `sandbox`'s group membership, a property of the image, not the directory's owner — so the tree could be
 world-readable with that guard passing.
 
-The entrypoint therefore re-reads owner and mode afterwards and refuses to start unless they are
-`agentbox:kubecred` mode `0750`. The realistic way to reach that refusal is a spec change rather than a
+The entrypoint therefore re-reads owner and mode afterwards and refuses to start unless the parent is
+`agentbox:agentbox` mode `0751` and each type directory is `agentbox:<its group>` mode `2750`. The
+realistic way to reach that refusal is a spec change rather than a
 bug — `runAsNonRoot: true`, a restricted Pod Security Standard on the namespace, or `CHOWN` dropped from
 the capability list — and without the check the pod would come up looking healthy.
 
@@ -207,7 +232,10 @@ no `runAsUser`, so it starts as root, and explicitly adds `CHOWN`, `FOWNER`, `SE
 halves are asserted by `credential-isolation-invariants.test.ts`, because neither file states the pairing
 on its own.
 
-| `.siclaw/credentials/*.kubeconfig` | agentbox:kubecred | 0640 | rw | -- | r- (via group) |
+| `.siclaw/credentials/` | agentbox:agentbox | 0751 | rwx | --x (traverse only) | Traversal point; names no group. |
+| `.siclaw/credentials/clusters/*.kubeconfig` | agentbox:kubecred | 0640 | rw | -- | r- via setgid `kubectl` |
+| `.siclaw/credentials/hosts/*` | agentbox:hostcred | 0640 | rw | -- | no sandbox-side reader exists |
+| `.siclaw/credentials/devops/*.json` | agentbox:devopscred | 0640 | rw | -- | r- via setgid `siforgectl` |
 | `/etc/siclaw/certs/` | agentbox:agentbox | 0600 | rw | -- | -- |
 | `.siclaw/config/settings.json` | agentbox:agentbox | 0600 | rw | -- | -- |
 | `.siclaw/data.sqlite` | agentbox:agentbox | 0600 | rw | -- | -- |
@@ -254,7 +282,8 @@ The dual-user model preserves natural shell pipeline syntax:
 sudo -E -u sandbox -- bash -c 'kubectl get pods -A | grep Error | wc -l'
 ```
 
-`kubectl` (setgid kubecred) reads the kubeconfig. `grep` and `wc` (plain sandbox) cannot.
+`kubectl` (setgid kubecred) reads the kubeconfig. `grep` and `wc` (plain sandbox) cannot, and neither
+can `siforgectl`, whose setgid group is `devopscred`.
 The pipe passes stdout data, not file access permissions.
 
 ### 3.5 Dockerfile Changes
@@ -285,8 +314,8 @@ RUN chgrp kubecred /usr/local/bin/kubectl && chmod 2755 /usr/local/bin/kubectl
 # Directory structure & permissions
 RUN mkdir -p .siclaw/skills .siclaw/credentials .siclaw/config .siclaw/user-data \
     && chown -R agentbox:agentbox . \
-    && chown agentbox:kubecred .siclaw/credentials \
-    && chmod 0750 .siclaw/credentials \
+    && chown agentbox:agentbox .siclaw/credentials \
+    && chmod 0751 .siclaw/credentials \
     && chmod 0700 .siclaw/config \
     && chmod 0755 .siclaw/skills \
     && chmod 0777 .siclaw/user-data

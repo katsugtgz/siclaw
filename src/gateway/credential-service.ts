@@ -13,6 +13,7 @@ import type {
   ClusterMeta,
   HostMeta,
   CredentialPayload,
+  DevopsCredentialPayload,
   HostListResult,
 } from "../shared/credential-types.js";
 import { sessionRegistry, type SessionRegistry } from "./session-registry.js";
@@ -113,6 +114,27 @@ export class CredentialService {
       "credential.get",
       await this.rpcParams(identity, { source: "host", source_id: hostName, purpose }),
     ) as Promise<CredentialPayload>;
+  }
+
+  /**
+   * The project agent's delivery-platform credential — the `sfm_` token
+   * `siforgectl` presents to the delivery control plane.
+   *
+   * ⚠️ NO source_id, and that is the shape rather than an omission. An agent has
+   * exactly one of these, keyed by the agentId the management server already
+   * authorized; there is no second row a name could select. Sending one would
+   * invent a choice and hand the caller a lever over which credential it gets.
+   *
+   * ⚠️ This is also why the credential is NOT delivered as spawn env. Spawn env
+   * becomes plain container env in the pod spec, readable by anyone who can
+   * `kubectl get pod -o yaml` and stored in etcd. Pulling it over this
+   * already-authenticated channel keeps it out of both.
+   */
+  async getDevopsCredential(identity: Identity, purpose: string): Promise<DevopsCredentialPayload> {
+    return this.frontendClient.request(
+      "credential.get",
+      await this.rpcParams(identity, { source: "devops", purpose }),
+    ) as Promise<DevopsCredentialPayload>;
   }
 }
 

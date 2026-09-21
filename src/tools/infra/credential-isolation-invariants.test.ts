@@ -20,8 +20,17 @@ import { resolve } from "node:path";
  * `agentbox:agentbox` instead — the intuitive move, and one I tried — locks the setgid reader out too,
  * and every kubectl the agent issues fails with `permission denied`. That is measured, not theorised.
  *
+ * That measurement was about the MODE, and the parent has since moved to `agentbox:agentbox 0751`. The
+ * two are not in conflict: at 0750 the parent's GROUP decided who could traverse, so naming one
+ * credential group admitted exactly one setgid reader and locked out every other — which is what a
+ * second reader (setgid `siforgectl`, group `devopscred`) ran into. At 0751 the parent grants `o+x`
+ * with no `o+r`, so it is a traversal point that names nobody, and the boundary is one level down:
+ * each TYPE directory is 2750 with its own group, each credential file is 0640 with that group, and
+ * `sandbox` fails both for the same reason it always did.
+ *
  * The assertions span both files because the invariant lives in their interaction: safe traversal is
- * "kubecred parent" AND "sandbox in no credential group", and neither file states both.
+ * "a parent that grants traversal without granting reads" AND "sandbox in no credential group", and
+ * neither file states both.
  */
 const repoRoot = resolve(import.meta.dirname, "../../..");
 const dockerfile = readFileSync(resolve(repoRoot, "Dockerfile.agentbox"), "utf8");
@@ -41,36 +50,56 @@ describe("credential isolation: the sandbox user holds no credential group", () 
     const line = dockerfile.split("\n").find((l) => l.includes("useradd") && l.includes("1000"));
     expect(line).toContain("kubecred");
     expect(line).toContain("hostcred");
+    // It writes each credential file with that type's group, and a process can only chgrp into a group
+    // it belongs to. Missing membership degrades to a file the setgid reader cannot open.
+    expect(line).toContain("devopscred");
   });
 
-  it("keeps kubectl setgid — it is the one sandbox-side reader", () => {
+  it("keeps kubectl setgid — the first sandbox-side reader", () => {
     expect(dockerfile).toMatch(/chgrp kubecred \/usr\/local\/bin\/kubectl/);
     expect(dockerfile).toMatch(/chmod 2755 \/usr\/local\/bin\/kubectl/);
   });
 
+  it("retains the SGID bit of every sandbox-side reader through the strip", () => {
+    // The build strips every SUID/SGID bit in the image except the names enumerated here. A reader
+    // that is not listed loses its bit at the last layer and fails at runtime with a permission error
+    // that nothing in the image explains — which is why this is asserted rather than reviewed.
+    const strip = dockerfile.match(/find \/ -perm \/2000[\s\S]*?esac; done/);
+    expect(strip, "the SGID strip").not.toBeNull();
+    expect(strip![0]).toContain("/usr/local/bin/kubectl");
+    expect(strip![0]).toContain("/usr/local/bin/siforgectl");
+  });
+
   it("refuses to start if the image was built with sandbox in a credential group", () => {
     // Belt to the Dockerfile's braces: a wrong image fails loudly at startup instead of running with the
-    // isolation silently absent.
-    expect(entrypoint).toMatch(/for grp in kubecred hostcred/);
+    // isolation silently absent. Every credential group, not a subset — an omitted group here is the
+    // 2026-04 defect with a different name on it.
+    expect(entrypoint).toMatch(/for grp in kubecred hostcred devopscred/);
     expect(entrypoint).toMatch(/id -nG sandbox/);
     expect(entrypoint).toMatch(/FATAL: sandbox is a member/);
   });
 });
 
 describe("credential isolation: the entrypoint does not re-open what the image closes", () => {
-  it("keeps the parent traversable by kubecred — the group setgid kubectl runs with", () => {
-    // Not a weakening: `kubecred` traversal means "kubectl and the owner" precisely because `sandbox`
-    // belongs to no credential group. Locking the parent to `agentbox:agentbox` instead locks the setgid
-    // reader out too — measured in a live pod, where every kubectl the agent issues then fails with
-    // `permission denied`. The group grant on sandbox was the defect, not this line.
-    expect(entrypoint).toMatch(/chown agentbox:kubecred \/app\/\.siclaw\/credentials\b/);
-    expect(entrypoint).toMatch(/chmod 0750 \/app\/\.siclaw\/credentials\b/);
+  it("keeps the parent traversable by every setgid reader, and readable by none", () => {
+    // 0751 is `o+x` without `o+r`: a traversal point that names no group, so a second setgid reader
+    // needs no change here. Under the previous `agentbox:kubecred 0750` the parent's group WAS the
+    // traversal decision, which admitted kubectl and locked out everything else — the measured reason
+    // `agentbox:agentbox` could not be used then, and the reason it can be used now.
+    //
+    // What `sandbox` gains from `o+x` is path resolution and nothing else: it cannot list this
+    // directory, cannot enter a type directory (2750, other=0), and cannot open a credential file
+    // (0640, other=0), because it is in no credential group.
+    expect(entrypoint).toMatch(/chown agentbox:agentbox \/app\/\.siclaw\/credentials\b/);
+    expect(entrypoint).toMatch(/chmod 0751 \/app\/\.siclaw\/credentials\b/);
+    // `o+r` here would turn the traversal point into a directory listing of every credential name.
+    expect(entrypoint).not.toMatch(/chmod 07[5-7][5-7] \/app\/\.siclaw\/credentials\b/);
   });
 
   it("never chowns the whole tree to one credential group", () => {
     // The exact line that caused this: `chown -R agentbox:kubecred /app/.siclaw/credentials` (no
     // subdirectory). It re-grouped the parent AND flattened hosts/ into kubecred.
-    const flattening = /chown\s+-R\s+agentbox:(kubecred|hostcred)\s+\/app\/\.siclaw\/credentials\s*(?![/\w])/;
+    const flattening = /chown\s+-R\s+agentbox:(kubecred|hostcred|devopscred)\s+\/app\/\.siclaw\/credentials\s*(?![/\w])/;
     expect(entrypoint).not.toMatch(flattening);
   });
 
@@ -79,6 +108,26 @@ describe("credential isolation: the entrypoint does not re-open what the image c
     expect(entrypoint).toMatch(/chmod 2750 \/app\/\.siclaw\/credentials\/clusters/);
     expect(entrypoint).toMatch(/chown -R agentbox:hostcred \/app\/\.siclaw\/credentials\/hosts/);
     expect(entrypoint).toMatch(/chmod 2750 \/app\/\.siclaw\/credentials\/hosts/);
+    expect(entrypoint).toMatch(/chown -R agentbox:devopscred \/app\/\.siclaw\/credentials\/devops/);
+    expect(entrypoint).toMatch(/chmod 2750 \/app\/\.siclaw\/credentials\/devops/);
+  });
+
+  it("creates the type directories before asserting on them", () => {
+    // /app/.siclaw/credentials is an emptyDir mount, so the image's own type directories are shadowed
+    // at runtime. Without this mkdir every chown below ran against a missing path and swallowed the
+    // failure in `|| true`, the verification loop skipped every entry it was written to check, and the
+    // directories were created later by the node process at whatever the umask gave. The assertions
+    // were not weak — they were unreachable.
+    const mkdir = entrypoint.match(/^if ! mkdir -p \/app\/\.siclaw\/credentials.*$/m);
+    expect(mkdir, "the credential type directories must be created before the chowns").not.toBeNull();
+    for (const d of ["clusters", "hosts", "devops"]) {
+      expect(mkdir![0]).toContain(`/app/.siclaw/credentials/${d}`);
+    }
+    expect(entrypoint.indexOf("mkdir -p /app/.siclaw/credentials"))
+      .toBeLessThan(entrypoint.indexOf("for spec in \"clusters:"));
+    // A missing directory is now a genuine failure, not the normal case it silently was.
+    expect(entrypoint).not.toMatch(/\[ -d "\/app\/\.siclaw\/credentials\/\$d" \] \|\| continue/);
+    expect(entrypoint).toMatch(/FATAL: \/app\/\.siclaw\/credentials\/\$d does not exist/);
   });
 
   it("refuses to start when the permission fix did not take effect", () => {
@@ -93,7 +142,7 @@ describe("credential isolation: the entrypoint does not re-open what the image c
     // Verified against the spawner: the pod has no runAsUser and explicitly adds CHOWN/FOWNER, so root
     // + the capability is the contract this depends on.
     expect(entrypoint).toMatch(/stat -c '%U:%G' \/app\/\.siclaw\/credentials/);
-    expect(entrypoint).toMatch(/agentbox:kubecred.*expected|expected agentbox:kubecred/);
+    expect(entrypoint).toMatch(/expected agentbox:agentbox mode 751/);
     expect(entrypoint).toMatch(/FATAL: \/app\/\.siclaw\/credentials is/);
     // and it must EXIT, not warn — a warning in a container log is not a control
     const block = entrypoint.slice(entrypoint.indexOf("cred_owner="));
@@ -121,6 +170,7 @@ describe("credential isolation: the entrypoint does not re-open what the image c
     // and the parent's 0750 is all that is left.
     expect(dockerfile).toMatch(/credentials\/clusters/);
     expect(dockerfile).toMatch(/credentials\/hosts/);
+    expect(dockerfile).toMatch(/credentials\/devops/);
   });
 });
 

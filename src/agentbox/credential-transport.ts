@@ -12,10 +12,11 @@ import type {
   ClusterMeta,
   HostMeta,
   CredentialPayload,
+  DevopsCredentialPayload,
   HostListResult,
 } from "../shared/credential-types.js";
 
-export type { ClusterMeta, HostMeta, CredentialPayload, HostListResult };
+export type { ClusterMeta, HostMeta, CredentialPayload, DevopsCredentialPayload, HostListResult };
 
 export interface CredentialTransport {
   listClusters(): Promise<ClusterMeta[]>;
@@ -29,6 +30,12 @@ export interface CredentialTransport {
   queryHosts(query: string, opts?: { limit?: number; cursor?: string }): Promise<HostListResult>;
   getClusterCredential(name: string, purpose: string): Promise<CredentialPayload>;
   getHostCredential(name: string, purpose: string): Promise<CredentialPayload>;
+  /**
+   * This agent's delivery-platform credential. Takes no name: there is exactly
+   * one, and the gateway keys it off the agentId in the mTLS certificate rather
+   * than off anything this side can state.
+   */
+  getDevopsCredential(purpose: string): Promise<DevopsCredentialPayload>;
 }
 
 interface GatewayClientLike {
@@ -101,5 +108,13 @@ export class HttpTransport implements CredentialTransport {
       "POST",
       { source: "host", source_id: name, purpose },
     ) as Promise<CredentialPayload>;
+  }
+
+  async getDevopsCredential(purpose: string): Promise<DevopsCredentialPayload> {
+    return this.client.request(
+      "/api/internal/credential-request",
+      "POST",
+      { source: "devops", purpose },
+    ) as Promise<DevopsCredentialPayload>;
   }
 }

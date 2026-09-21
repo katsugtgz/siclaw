@@ -16,7 +16,12 @@ import {
   validateCommandRestrictions,
 } from "../infra/command-sets.js";
 import { resolveRequiredKubeconfig } from "../infra/kubeconfig-resolver.js";
-import { ensureClusterForTool, classifyClusterFailure } from "../infra/ensure-kubeconfigs.js";
+import {
+  ensureClusterForTool,
+  classifyClusterFailure,
+  ensureDevopsCredentialForTool,
+  DEVOPS_CLI_BINARY,
+} from "../infra/ensure-kubeconfigs.js";
 import { sanitizeEnv } from "../infra/sanitize-env.js";
 import {
   extractCommands as _extractCommands,
@@ -291,6 +296,32 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
       const commands = _extractCommands(command);
       const isSkill = commands.some((c) => isSkillScript(c));
       const defaultTimeout = isSkill ? 180 : 60;
+
+      // The project-agent CLI reads its credential from a FILE, so the file has to
+      // exist before the process is spawned. Deliberately placed AFTER the
+      // whitelist pass above: a command that was going to be blocked must not
+      // cause a credential fetch, and `commands` is only trustworthy once the
+      // validator has agreed on what it parsed.
+      //
+      // Reported rather than ignored. Running siforgectl without its credential
+      // produces an authentication failure at the delivery platform, which reads
+      // as "the platform refused this agent" when the truth is "this box never
+      // received a credential" — a diagnosis one process and one network hop away
+      // from the evidence.
+      if (!trustedOptions?.kubeconfigPath) {
+        try {
+          await ensureDevopsCredentialForTool(kubeconfigRef?.credentialBroker, commands, "restricted_bash");
+        } catch (err) {
+          return {
+            content: [{
+              type: "text",
+              text: `Error: ${DEVOPS_CLI_BINARY} has no delivery credential in this box — ` +
+                `${err instanceof Error ? err.message : String(err)}`,
+            }],
+            details: { error: true, reason: "devops_credential_unavailable" },
+          };
+        }
+      }
 
       // Sanitized env + KUBECONFIG injection — identical for foreground and background.
       const isProd = process.env.NODE_ENV === "production";

@@ -112,6 +112,47 @@ export interface HostListResult {
   next_cursor: string | null;
 }
 
+/**
+ * The answer to `credential-request` with `source: "devops"` — a project agent's
+ * delivery-platform credential.
+ *
+ * ⚠️ A SEPARATE TYPE FROM CredentialPayload, not a `type` variant of it, and the
+ * difference is load-bearing. Every other source ships `files`: bytes the broker
+ * writes out verbatim through ResourceRegistry. This one does not, because the
+ * file it becomes is composed at this end by `registerDevopsCredential`, which
+ * owns its layout, its 0640 mode and the setgid `devops/` directory it lands in.
+ * Squeezing it into `files` would put a second author on that format, and the two
+ * copies would drift the first time either side added a field.
+ *
+ * ⚠️ NO ttl_seconds either. The token is issued once and long-lived (a box restart
+ * is re-served, not re-issued), and revocation happens at the delivery platform,
+ * where a disabled credential stops verifying no matter what any box still holds
+ * on disk. A TTL here would only make boxes rewrite an identical file forever.
+ */
+export interface DevopsCredentialPayload {
+  credential: {
+    /** Becomes `devops/<name>.json` and the manifest entry name. */
+    name: string;
+    type: "devops_agent";
+    description?: string;
+    /**
+     * Locating facts, not permissions — the token resolves to its own (project,
+     * user id) server-side regardless of what is said here. These DO reach
+     * manifest.json, which is how an operator sees a credential exists without
+     * being able to read it.
+     */
+    metadata: { endpoint: string; project: string };
+    /**
+     * The opaque bearer token.
+     *
+     * ⚠️ It exists in memory for the length of one write and goes nowhere else:
+     * not into a log line, not into an error message, not into the manifest.
+     * `registerDevopsCredential` is the only consumer.
+     */
+    token: string;
+  };
+}
+
 export interface CredentialPayload {
   credential: {
     name: string;
