@@ -1241,6 +1241,14 @@ async def test_test_session_stall_reaps_turn_keeps_session_live():
                 while time.monotonic() < deadline and fake.interrupts == 0:
                     await asyncio.sleep(0.02)
                 assert fake.interrupts == 1, fake.interrupts
+                # The interrupt request precedes the delivered turn boundary.
+                # Wait for the event that actually enables the UI's next turn.
+                first_turn_events = []
+                while True:
+                    event = await asyncio.wait_for(run.events.get(), timeout=3)
+                    first_turn_events.append(event)
+                    if event["type"] == "turn_done":
+                        break
                 # turn 2 → the SAME live session answers a fresh question
                 compile_box._arm_test_turn(run)
                 await fake.query("again")
@@ -1252,7 +1260,7 @@ async def test_test_session_stall_reaps_turn_keeps_session_live():
                     await wdog
                 except asyncio.CancelledError:
                     pass
-        evs = _drain(run)
+        evs = first_turn_events + _drain(run)
         types = [e["type"] for e in evs]
         assert "turn_stalled" in types and "error" in types and "turn_done" in types, types
         td = next(e for e in evs if e["type"] == "turn_done")
@@ -3759,7 +3767,7 @@ async def test_batch_orchestrator_routing_and_resume():
         assert all(b["status"] == "done" for b in plan["batches"]), plan
         assert (wd / batching.SOURCES_INVENTORY_PATH).is_file()
         # two batches + 终审 were driven, in order
-        assert len(driven) == 3 and driven[-1].startswith("final review"), driven
+        assert len(driven) == 4 and all(d.startswith("final review") for d in driven[2:]), driven
 
         # resume: mark one batch pending again → next trigger routes to batch even
         # under a huge threshold, and only the pending batch (+终审) re-runs
@@ -3776,7 +3784,7 @@ async def test_batch_orchestrator_routing_and_resume():
         finally:
             compile_box._drive_batch_session = real_drive
             compile_box._unaccounted_batch_sources = real_accounted
-        assert len(driven) == 2 and driven[0].startswith("batch 2/2"), driven
+        assert len(driven) == 1 and driven[0].startswith("batch 2/2"), driven
 
         # mid-batch owner chat queues and is relayed into the next directive
         run._batch_active = True
@@ -3804,7 +3812,7 @@ async def test_batch_orchestrator_routing_and_resume():
         finally:
             compile_box._drive_batch_session = real_drive
             compile_box._unaccounted_batch_sources = real_accounted
-        assert len(driven) == 3, driven
+        assert len(driven) == 4, driven
         assert not reset_marker.exists(), "reset marker survived replacement-plan seal"
         assert (wd / batching.BATCH_PLAN_PATH).is_file()
         del os.environ["KBC_BATCH_THRESHOLD_BYTES"]
@@ -5106,7 +5114,7 @@ async def test_hierarchical_batch_plan_and_section_reduce():
                             if label.startswith("final review")]
             saved = json.loads((wd / batching.BATCH_PLAN_PATH).read_text())
             assert reduce_scopes == [compile_box.NO_RAW_SCOPE], observed_raw_scopes
-            assert final_scopes == [compile_box.semantic_review_raw_scope(saved)], observed_raw_scopes
+            assert final_scopes and all(scope == compile_box.semantic_review_raw_scope(saved) for scope in final_scopes), observed_raw_scopes
             assert set(observed_idle_timeouts) == {
                 max(compile_box._MODEL_IDLE_TIMEOUT_S, 123)
             }, observed_idle_timeouts
@@ -5123,7 +5131,7 @@ async def test_hierarchical_batch_plan_and_section_reduce():
             assert compile_box._should_route_to_batch(run, "直接开始编译")
             driven.clear()
             await compile_box._run_batch_compile(run, "直接开始编译")
-            assert len(driven) == 1 and driven[0].startswith("final review"), driven
+            assert driven == [], "durable final units must not be replayed"
 
             # A crash after semantic finalization but before the durable commit
             # retries delivery only. No model session is replayed.
@@ -5370,13 +5378,14 @@ async def test_batch_orchestrator_review_fixes():
             async def drive_and_note(run_, directive, label, pdf_page_ranges=None,
                                      raw_scope=None):
                 driven.append(f"{label}|{directive}")
-                if label == "final review":  # owner speaks while the tail is running
+                if label.startswith("final review") and not getattr(run_, "_fixture_note_sent", False):  # one owner note
+                    run_._fixture_note_sent = True
                     run_._batch_notes.append("附录不要发布")
                 return f"done {label}"
 
             compile_box._drive_batch_session = drive_and_note
             await compile_box._run_batch_compile(run, "直接开始编译")
-            digest = [d for d in driven if d.startswith("note digest|")]
+            digest = [d for d in driven if d.startswith("final review notes ")]
             assert len(digest) == 1 and "附录不要发布" in digest[0], driven
             assert [e for e in _events(run) if e["type"] == "turn_done"], "turn still closes"
 

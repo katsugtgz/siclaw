@@ -2,6 +2,13 @@ import { describe, expect, it } from "vitest";
 import { asFailureToken, asSafeFailureMessage, normalizeFailure, structuredBoxFailure } from "./failure.js";
 
 describe("failure token normalization", () => {
+  it("preserves model-call budget and final-stage identity without provider text", () => {
+    expect(structuredBoxFailure({code: "model_call_budget_exceeded", stage: "batch_final",
+      exception_class: "ModelCallBudgetExceeded", error: "private provider body"})).toEqual({
+      code: "model_call_budget_exceeded", stage: "batch_final", exception_class: "ModelCallBudgetExceeded",
+      message: "model_call_budget_exceeded:ModelCallBudgetExceeded",
+    });
+  });
   it("rejects tokens with whitespace or newlines (log-injection)", () => {
     expect(asFailureToken("box_error\nFORGED Authorization: Bearer X")).toBeUndefined();
     expect(asFailureToken("model turn stalled")).toBeUndefined();
