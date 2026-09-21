@@ -2486,6 +2486,18 @@ MAX_SOURCE_LOCATION_LINES = 20
 MAX_SOURCE_LOCATIONS_PER_PAGE = 64
 
 
+def _raw_location_target(raw_root: Path, resource: str) -> Path | None:
+    relative = Path(resource)
+    if relative.is_absolute() or ".." in relative.parts:
+        return None
+    target = raw_root
+    for part in relative.parts:
+        target = target / part
+        if target.is_symlink():
+            return None
+    return target
+
+
 def _stamp_source_locations(text: str, sections: list, ids: dict[str, str], workdir: str) -> str:
     lines = _lf_lines(text)
     end = next(i for i, line in enumerate(lines[1:], 1) if _is_frontmatter_end(line))
@@ -2507,16 +2519,13 @@ def _stamp_source_locations(text: str, sections: list, ids: dict[str, str], work
                 continue
             if Path(resource).suffix.lower() not in {".md", ".txt", ".markdown"}:
                 continue
-            target = raw_root / resource
-            # Do not follow a symlink (including in parent directories).
-            if ".." in Path(resource).parts or Path(resource).is_absolute():
-                continue
-            if any(part.is_symlink() for part in [target, *target.parents] if part != raw_root):
-                continue
-            if not target.is_file():
+            target = _raw_location_target(raw_root, resource)
+            if target is None or not target.is_file():
                 continue  # Existing coverage lint owns missing sources.
             if resource not in hashes:
-                hashes[resource] = hashlib.sha256(target.read_bytes()).hexdigest() if target.stat().st_size <= 16 * 1024 * 1024 else ""
+                if target.stat().st_size > 16 * 1024 * 1024:
+                    continue  # Optional positions cannot verify this Raw; retain document attribution.
+                hashes[resource] = hashlib.sha256(target.read_bytes()).hexdigest()
             digest = hashes[resource]
             row = {"evidence_id": marker["id"], "source_id": source_id,
                    "raw_sha256": digest, "start_line": int(match[2]),
@@ -2588,9 +2597,9 @@ def source_location_violations(workdir: str, pages: dict) -> list[dict]:
                 resource = sources.get(row.get("source_id"))
                 if not resource or Path(resource).is_absolute() or ".." in Path(resource).parts:
                     raise ValueError("source location must reference a declared source")
-                target = Path(workdir) / "raw" / resource
                 raw_root = (Path(workdir) / "raw").resolve()
-                if any(part.is_symlink() for part in [target, *target.parents] if part != raw_root):
+                target = _raw_location_target(raw_root, resource)
+                if target is None:
                     raise ValueError("source location cannot follow a symlink")
                 if target.stat().st_size > 16 * 1024 * 1024:
                     raise ValueError("source location Raw file exceeds the 16 MiB verification limit")

@@ -77,3 +77,35 @@ def test_code_example_locator_is_not_evidence(tmp_path):
     page.write_text(page.read_text().replace('(source: a.md lines 3-3)', '`(source: a.md lines 3-3)`'))
     selfcheck.attribute_evidence_sections(str(tmp_path))
     assert 'source_locations:' not in page.read_text()
+
+
+def test_workspace_symlink_does_not_invalidate_locations(tmp_path):
+    actual = tmp_path / 'actual'
+    actual.mkdir()
+    page = fixture(actual)
+    alias = tmp_path / 'alias'
+    alias.symlink_to(actual, target_is_directory=True)
+    selfcheck.attribute_evidence_sections(str(alias))
+    assert 'source_locations:' in page.read_text()
+    assert selfcheck.source_location_violations(str(alias), {'guide.md': {'text': page.read_text()}}) == []
+
+
+def test_oversized_raw_does_not_generate_invalid_optional_locations(tmp_path):
+    page = fixture(tmp_path)
+    with (tmp_path / 'raw/a.md').open('ab') as f:
+        f.write(b'x' * (16 * 1024 * 1024))
+    selfcheck.attribute_evidence_sections(str(tmp_path))
+    assert 'source_locations:' not in page.read_text()
+    assert 'source-a' in page.read_text()
+    assert selfcheck.source_location_violations(str(tmp_path), {'guide.md': {'text': page.read_text()}}) == []
+
+
+def test_symlink_inside_raw_remains_rejected(tmp_path):
+    page = fixture(tmp_path)
+    selfcheck.attribute_evidence_sections(str(tmp_path))
+    outside = tmp_path / 'outside.md'
+    outside.write_bytes((tmp_path / 'raw/a.md').read_bytes())
+    (tmp_path / 'raw/a.md').unlink()
+    (tmp_path / 'raw/a.md').symlink_to(outside)
+    findings = selfcheck.source_location_violations(str(tmp_path), {'guide.md': {'text': page.read_text()}})
+    assert 'symlink' in findings[0]['detail']

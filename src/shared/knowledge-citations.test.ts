@@ -108,3 +108,12 @@ describe("verified source positions", () => {
     expect(result[0].locations ?? []).toHaveLength(0);
   });
 });
+
+
+it("renders an unsectioned snapshot label once", () => {
+  const location = { page: "a.md", page_sha256: "a".repeat(64), raw_sha256: "b".repeat(64), evidence_id: "fact", start_line: 3, end_line: 3, excerpt: "Fact." };
+  for (const [answer, label] of [["结论", "编译时原文快照"], ["Answer", "Compiled source snapshot"]]) {
+    const text = appendKnowledgeSourceCitations(answer, [{ title: "Source", url: "https://example.com/a", locations: [location] }]);
+    expect(text.split(label)).toHaveLength(2);
+  }
+});

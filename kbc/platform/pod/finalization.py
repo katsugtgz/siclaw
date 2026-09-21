@@ -141,9 +141,25 @@ def context_identity(workdir: str) -> str:
                 try:
                     text = json.loads(text)
                 except ValueError:
-                    pass  # Hash the malformed bytes; the ledger checker reports them.
+                    pass  # Hash malformed bytes; the ledger checker reports them.
             files[name] = text
     return digest(files)
+
+
+def investigation_identity(workdir: str) -> str:
+    """Investigation judgment belongs to catalog review, not unrelated units."""
+    path = Path(workdir) / "authoring" / "REVIEW_NOTES.json"
+    value = None
+    if path.is_file():
+        value = path.read_text(encoding="utf-8")
+        try:
+            value = json.loads(value)
+        except ValueError:
+            pass
+        if isinstance(value, list):
+            value = [{k: v for k, v in row.items() if k != "updated_at"}
+                     if isinstance(row, dict) else row for row in value]
+    return digest(value)
 
 
 def _path(value) -> bool:
@@ -192,6 +208,8 @@ def validate(ledger: dict) -> None:
             raise FinalizationError("invalid finalization attempt count")
         if unit["status"] == "done" and not all(re.fullmatch(r"[a-f0-9]{64}", str(unit.get(key, ""))) for key in ("dependency_digest", "context", "membership")):
             raise FinalizationError("completed finalization unit has no receipt")
+        if "investigations" in unit and not re.fullmatch(r"[a-f0-9]{64}", str(unit["investigations"])):
+            raise FinalizationError("invalid investigation review receipt")
         ids.add(unit["id"])
         by_id[unit["id"]] = unit
     for unit in units:
@@ -289,23 +307,25 @@ def dependency_digest(reads, fingerprints: dict) -> str:
     return digest({p: fingerprints.get(p) for p in reads})
 
 
-def valid(unit: dict, fingerprints: dict, context: str) -> bool:
+def valid(unit: dict, fingerprints: dict, context: str, *, investigations: str = "") -> bool:
     # Owner notes are applied actions, not a claim to replay whenever a later
     # quality pass edits a page. Their identity remains in review context.
     if unit["kind"] == "notes":
         return unit["status"] == "done"
+    if unit["kind"] == "catalog" and investigations and unit.get("investigations") != investigations:
+        return False
     return (unit["status"] == "done" and unit.get("context") == context
             and (unit.get("membership_sensitive", True) is False or unit.get("membership") == digest(sorted(fingerprints)))
             and unit.get("dependency_digest") == dependency_digest(unit.get("reads", []), fingerprints))
 
 
-def pending(ledger: dict, fingerprints: dict, context: str) -> list[dict]:
+def pending(ledger: dict, fingerprints: dict, context: str, *, investigations: str = "") -> list[dict]:
     order = {kind: i for i, kind in enumerate(("duplicates", "orphans", "semantic", "catalog", "introduction", "notes"))}
-    return sorted((u for u in ledger["units"] if u["status"] != "split" and not valid(u, fingerprints, context)),
+    return sorted((u for u in ledger["units"] if u["status"] != "split" and not valid(u, fingerprints, context, investigations=investigations)),
                   key=lambda u: (order[u["kind"]], u["id"]))
 
 
-def complete(unit: dict, fingerprints: dict, context: str, reads: set[str], summary: str) -> None:
+def complete(unit: dict, fingerprints: dict, context: str, reads: set[str], summary: str, *, investigations: str = "") -> None:
     selected = sorted(reads | set(unit["targets"]))
     if unit["kind"] in {"introduction", "notes"} or set(selected) >= set(fingerprints):
         scope = "all"
@@ -318,6 +338,8 @@ def complete(unit: dict, fingerprints: dict, context: str, reads: set[str], summ
                 dependency_digest=dependency_digest(scope, fingerprints),
                 membership=digest(sorted(fingerprints)), context=context,
                 completed_at=now(), summary=str(summary)[:1500])
+    if unit["kind"] == "catalog" and investigations:
+        unit["investigations"] = investigations
     unit.pop("last_error", None)
 
 
@@ -332,10 +354,10 @@ def split(ledger: dict, unit: dict) -> list[dict]:
     return children
 
 
-def projection(ledger: dict, fingerprints: dict, context: str) -> dict:
+def projection(ledger: dict, fingerprints: dict, context: str, *, investigations: str = "") -> dict:
     units = [u for u in ledger["units"] if u["status"] != "split"]
     signature = digest([fingerprints, context])
-    done = sum(valid(u, fingerprints, context) for u in units)
+    done = sum(valid(u, fingerprints, context, investigations=investigations) for u in units)
     done += int(ledger.get("ledger_signature") == signature) + int(ledger.get("media_signature") == signature)
     return {"version": VERSION, "stage": ledger.get("stage", "review"),
             "total": len(units) + 2, "done": done, "pending": len(units) + 2 - done,

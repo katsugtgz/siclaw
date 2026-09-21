@@ -18,7 +18,17 @@ pages. Ordinary periodic synchronization reports uncollectable files and retains
 previous copies. An ACK-backed or completed checkpoint rejects an incomplete
 workspace rather than silently sealing it. A legacy oversized/unreadable artifact
 therefore requires repair; failed-save retention must not be reported as a fully
-saved draft. There is no new deployment setting.
+saved draft. A deterministic artifact/cache failure emits the recoverable
+`workspace_checkpoint_blocked` event and appears in `/health.checkpoint_blocked`.
+Any deterministic artifact error takes precedence over transient read failures
+in the same checkpoint. The box retains unsaved bytes and checks metadata for
+repair instead of repeatedly attempting the same invalid save. Uncertain I/O or
+transport failures get three fast attempts, then an explicit blocked state with
+60-second recovery probes: storage can recover without changing file metadata.
+A changed file triggers an earlier retry. The admission fence stays active until
+a complete checkpoint ACK; new chat and command requests are rejected before
+intent mutation or message queueing, with an actionable save-blocked message. This is a blocked save, not a
+completed or durable recovery; do not retire the box before preserving its files. There is no new deployment setting.
 
 ## Whole-page media evidence
 
@@ -103,3 +113,14 @@ record consistency, not the truth of supplied measurements. Repeat paired runs
 before estimating completion rate, latency distribution or semantic parity.
 Unit and synthetic SDK tests establish protocol behavior only; they are not a
 real-corpus quality or cost result.
+
+## Deferred investigations during finalization
+
+The catalog-review receipt tracks the semantic contents of `REVIEW_NOTES.json`.
+A tail ledger/media investigation reopens that responsibility before commit,
+without invalidating unrelated semantic/introduction units or quality receipts.
+Timestamp-only rewrites do not invalidate receipts. Candidate changes still
+invalidate their actual read dependencies, and the bounded final-pass limit is
+unchanged. Legacy catalog receipts without the investigation hash are revisited. Investigation still precedes escalation: pending notes are not promoted
+to owner tickets mechanically. The final reviewer must make that decision through
+`file_ticket` with its existing evidence requirements.

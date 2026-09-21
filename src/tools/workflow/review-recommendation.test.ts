@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { createReviewRecommendationTool } from "./review-recommendation.js";
+import { describe, expect, it, vi } from "vitest";
+import { createReviewRecommendationTool, registration } from "./review-recommendation.js";
 import { persistableToolDetails } from "../../shared/tool-result-metadata.js";
 
 describe("review recommendation", () => {
@@ -18,4 +18,16 @@ describe("review recommendation", () => {
   const ctrl=new AbortController();ctrl.abort();
   await expect(tool.execute("cancel", {analysis_recommendation:"low",reason_codes:[],confidence:"low"},ctrl.signal)).rejects.toThrow();
  });
+});
+
+
+it("keeps recommendation registration opt-in and unavailable to subagents", () => {
+  const refs = { turnRef: { current: 1 } } as Parameters<NonNullable<typeof registration.available>>[0];
+  try {
+    vi.stubEnv("SICLAW_REVIEW_RECOMMENDATION", "");
+    expect(registration.available!(refs)).toBe(false);
+    vi.stubEnv("SICLAW_REVIEW_RECOMMENDATION", "1");
+    expect(registration.available!(refs)).toBe(true);
+    expect(registration.available!({ ...refs, isSubagent: true })).toBe(false);
+  } finally { vi.unstubAllEnvs(); }
 });
