@@ -959,7 +959,20 @@ export class K8sSpawner implements BoxSpawner {
                 ? { drop: ["ALL"] }
                 : {
                     drop: ["ALL"],
-                    add: ["SETUID", "SETGID", "CHOWN", "FOWNER", "AUDIT_WRITE"],
+                    // FSETID is what lets the entrypoint set the setgid BIT on the
+                    // credential type directories, and it is not optional: the
+                    // credentials volume is an emptyDir, so it SHADOWS the 2750
+                    // directories baked into the image and the entrypoint has to
+                    // recreate them at runtime.
+                    //
+                    // chmod(2): without CAP_FSETID, when the file's group does not
+                    // match the process's effective GID, "the S_ISGID bit will be
+                    // turned off, but this will not cause an error to be returned."
+                    // The entrypoint runs as root (gid 0) and the directory is group
+                    // kubecred, so `chmod 2750` silently produced 750 — and the
+                    // entrypoint's own assertion then refused to start the box. Every
+                    // AgentBox, not just the ones holding a delivery credential.
+                    add: ["SETUID", "SETGID", "CHOWN", "FOWNER", "FSETID", "AUDIT_WRITE"],
                   },
               readOnlyRootFilesystem: true,
             },
