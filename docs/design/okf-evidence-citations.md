@@ -146,3 +146,51 @@ agentbox image leaves Feishu / SSE rendering on the old 3-link ceiling.
   can still fail package import if Go's start regex or scan range differs.
 
 Live sessions keep the box they already have.
+
+
+## Verified source positions
+
+Markdown/text pages may carry optional machine-owned `source_locations` in
+frontmatter. Each entry has `evidence_id`, `source_id`, `raw_sha256`,
+`start_line`, and `end_line`. The original `okf:evidence` grammar is unchanged.
+The compiler derives entries from one-path `(source: docs/file.md lines 12-15)`
+tags within the corresponding section; unlocated sections retain document-level
+citations. Positions use one-based, inclusive original Raw lines with universal
+newline handling. Bounded-input slice coordinates must first be translated back
+to original Raw coordinates. Binary/PDF/Office page coordinates are not inferred.
+
+Sicore checks the declared source/evidence relation and Raw hash against the
+attempt's frozen manifest, reads the pinned archive, and extracts the selected
+text and original heading trail. The version's `citation_manifest` freezes
+`locations` beside each source. Each location contains the page-relative path,
+SHA-256 of the final published page bytes, evidence id, Raw SHA-256, line range,
+optional original section and exact excerpt. No URL is accepted from a position.
+Package-only imports without verifiable Raw do not acquire verified positions.
+Invalid declared positions block managed publication with a named error; missing
+positions do not block legacy publication. A sidecar origin override cannot
+receive positions verified against a different Raw origin.
+
+Bounds: 64 positions per page, 2048 per package, 1–20 lines and 1200 Unicode
+characters per excerpt, 16 MiB per located text source. Archive reads reuse the
+heavy-operation gate and process one selected source at a time. Each source is
+hashed and scanned once for all its positions. These checks prove location and
+snapshot identity, not semantic support for a claim. Existing compiler content
+checks also apply to selected excerpts.
+
+`knowledge_cite` selects locations only from the pinned server manifest and
+matches the page hash and evidence id to the bytes read this turn. Same-document
+citations merge distinct positions, including across calls; source-link caps
+remain unchanged. Web/SSE/Lark use the shared renderer: it shows the original
+section, explicit snapshot line coordinates and an escaped excerpt preview.
+At most eight positions are expanded per answer, with 400-character previews;
+ellipses and a named omitted-position count make display limits explicit.
+Message citation metadata retains the full selected locations for historical
+answers. Live source documents can change; these are snapshot coordinates,
+not fabricated block links into the current document.
+
+Deploy the Runtime/Gateway and AgentBox consumers, then the Sicore validator,
+then the compile-box producer. Old versions remain valid document citations;
+new positions appear after affected pages are recompiled. No database migration,
+Helm setting or deployment environment variable is introduced. Rollback restores
+the version-owned excerpts together with its Wiki and citation origins. A later
+phase may add provider-owned block mappings after actual deep-link verification.

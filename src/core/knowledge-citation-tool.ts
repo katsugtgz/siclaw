@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { createHash } from "node:crypto";
 import path from "node:path";
 import yaml from "js-yaml";
 import { Type } from "@sinclair/typebox";
@@ -8,6 +9,9 @@ import { isKnowledgeNavigationPage } from "../knowledge/page-kind.js";
 import type { SessionEventEmitter } from "./tool-registry.js";
 import { codePointLength } from "./subagent-models.js";
 import {
+  normalizeSourceLocations,
+  mergeKnowledgeCitationLocations,
+  type KnowledgeSourceLocation,
   CLAIM_MAX_LENGTH,
   CLAIM_MIN_LENGTH,
   MAX_EVIDENCE_SOURCES_PER_MARKER,
@@ -17,7 +21,7 @@ import {
 
 export const KNOWLEDGE_CITATION_MANIFEST = ".citation-manifest.json";
 
-interface CitationManifestSource { sourceId?: string; resource: string; title: string; url: string }
+interface CitationManifestSource { sourceId?: string; resource: string; title: string; url: string; locations?: KnowledgeSourceLocation[] }
 interface CitationManifestRepo { id: string; root: string; sources: CitationManifestSource[] }
 interface CitationManifest { version: 1; repos: CitationManifestRepo[] }
 
@@ -499,7 +503,8 @@ export function createKnowledgeCitationSupport(opts: {
         );
         let refResolved = true;
         const refCitations: KnowledgeSourceCitation[] = [];
-        const refSeen = new Set<string>();
+        const localPage = repo.root ? rel.slice(repo.root.length + 1) : rel;
+        const pageHash = createHash("sha256").update(snapshot).digest("hex");
         for (const sourceId of evidence.sourceIds) {
           const pageSource = pageSourceById.get(sourceId);
           const source = manifestSourceById.get(sourceId);
@@ -507,8 +512,8 @@ export function createKnowledgeCitationSupport(opts: {
             refResolved = false;
             break;
           }
-          if (seenURLs.has(source.url) || refSeen.has(source.url)) continue;
-          refSeen.add(source.url);
+          const locations = normalizeSourceLocations(source.locations).filter((location) =>
+            location.page === localPage && location.page_sha256 === pageHash && location.evidence_id === evidenceId);
           refCitations.push({
             title: source.title,
             url: source.url,
@@ -517,6 +522,7 @@ export function createKnowledgeCitationSupport(opts: {
             page: rel,
             evidence: evidenceId,
             repoId: repo.id,
+            ...(locations.length ? { locations } : {}),
           });
         }
         if (!refResolved) {
@@ -612,12 +618,17 @@ export function createKnowledgeCitationSupport(opts: {
       // whole call — that is a correctness problem, not a breadth problem.
       // The cap applies to the TURN's union: repeated calls cannot raise it.
       const already = new Set(registeredThisTurn.map((citation) => citation.url));
-      const fresh = citations.filter((citation) => !already.has(citation.url));
+      const grouped = mergeKnowledgeCitationLocations(citations);
+      const fresh = grouped.filter((citation) => !already.has(citation.url));
       const duplicates = citations.length - fresh.length;
       const capacity = Math.max(0, MAX_KNOWLEDGE_CITATIONS - registeredThisTurn.length);
       const overflow = fresh.length > capacity ? fresh.splice(capacity) : [];
-      if (fresh.length > 0) {
-        registeredThisTurn.push(...fresh);
+      const merged = mergeKnowledgeCitationLocations([
+        ...registeredThisTurn,
+        ...grouped.filter((citation) => already.has(citation.url)), ...fresh,
+      ]);
+      if (JSON.stringify(merged) !== JSON.stringify(registeredThisTurn)) {
+        registeredThisTurn = merged;
         opts.sessionEventEmitter({ type: "knowledge_sources", sources: [...registeredThisTurn] });
       }
       const overflowNote = overflow.length === 0
@@ -634,13 +645,13 @@ export function createKnowledgeCitationSupport(opts: {
       const zeroFreshMessage = overflow.length > 0
         ? `No new sources were registered — the ${MAX_KNOWLEDGE_CITATIONS}-source per-answer cap is already filled by this turn's earlier citations.${overflowNote}`
         : duplicates > 0
-          ? "All resolved sources were already registered this turn; the references list is unchanged."
+          ? "All resolved sources were already registered this turn; any additional verified positions have been attached to the references."
           : refs.length > 0
             ? "The evidence refs resolved but have no unique original-source links."
             : "The selected pages have no trusted clickable original sources; answer normally without a references section.";
       return result(
         fresh.length > 0
-          ? `Registered ${fresh.length} ${refs.length > 0 ? "exact " : ""}trusted original source${fresh.length === 1 ? "" : "s"}; links will be appended automatically.${overflowNote}`
+          ? `Registered ${fresh.length} ${refs.length > 0 ? "exact " : ""}trusted original source${fresh.length === 1 ? "" : "s"}; links and available snapshot excerpts will be appended automatically.${overflowNote}`
           : zeroFreshMessage,
         fresh.length,
         refs.length > 0 ? [] : undefined,
