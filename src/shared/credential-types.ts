@@ -150,6 +150,18 @@ export interface DevopsCredentialPayload {
      * `registerDevopsCredential` is the only consumer.
      */
     token: string;
+    /**
+     * The RUNTIME's service token, which siforgectl sends as `Authorization:
+     * Bearer`. Not a per-agent secret and not an authorization by itself: the
+     * delivery platform treats it as the switch that turns the whole exchange
+     * path on, and still requires `token` above to decide who the caller is.
+     *
+     * It travels in the credential file rather than in the box's environment
+     * precisely because the environment is readable by the model, and a value
+     * the model can read is a value it can carry off. Same handling as `token`:
+     * memory for the length of one write, never logged, never in the manifest.
+     */
+    service_token: string;
   };
 }
 

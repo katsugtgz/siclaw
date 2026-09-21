@@ -762,6 +762,7 @@ export class CredentialBroker {
           endpoint: credential.metadata.endpoint,
           project: credential.metadata.project,
           token: credential.token,
+          serviceToken: credential.service_token,
           description: credential.description,
         });
         this.devopsCredentialWritten = true;

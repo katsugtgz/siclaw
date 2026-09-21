@@ -790,6 +790,7 @@ const DEVOPS_PAYLOAD: DevopsCredentialPayload = {
     description: "project agent",
     metadata: { endpoint: "https://devops.example.internal", project: "p42" },
     token: "sfm_opaque_token",
+    service_token: "runtime-service-token",
   },
 };
 
@@ -807,10 +808,14 @@ describe("CredentialBroker — ensureDevopsCredential", () => {
 
     const file = path.join(dir, "devops", "scitix-devops.json");
     expect(fs.existsSync(file)).toBe(true);
+    // The exact key set scitix-devops cmd/siforgectl reads. Asserted with toEqual
+    // rather than objectContaining so that dropping or renaming one fails here,
+    // in the repository that writes it, instead of inside a sandbox.
     expect(JSON.parse(fs.readFileSync(file, "utf-8"))).toEqual({
       endpoint: "https://devops.example.internal",
       project: "p42",
       token: "sfm_opaque_token",
+      service_token: "runtime-service-token",
     });
 
     // The manifest is how an operator sees a credential exists without being able
