@@ -1092,7 +1092,18 @@ def _collect_workspace_artifacts_for_sync(run: CompileRun, *, strict: bool = Fal
         if rewritten is not None:
             artifact["content"] = rewritten
         safe_artifacts.append(artifact)
-    return safe_artifacts
+    # Provenance can expand an otherwise collectable file. Apply the budget to
+    # the emitted bytes too; periodic sync must preserve the previous copy.
+    bounded = []
+    for artifact in safe_artifacts:
+        if len(artifact["content"].encode("utf-8")) > MAX_SYNC_FILE_BYTES:
+            run._workspace_sync_issues.append({"path": artifact["path"], "reason": "metadata_too_large"})
+        else:
+            bounded.append(artifact)
+    if strict and run._workspace_sync_issues:
+        paths = ", ".join(item["path"] for item in run._workspace_sync_issues[:10])
+        raise WorkspaceArtifactError(f"Incomplete workspace checkpoint: {paths} exceed the artifact budget after metadata. Split these pages before saving.")
+    return bounded
 
 
 def _workspace_sync_cursor(workdir: str) -> dict[str, str]:
@@ -3655,6 +3666,32 @@ def _reference_assist_model() -> str:
 
 
 
+def _validate_compile_write(run: "CompileRun", target: Path, content: str) -> None:
+    """Reject metadata expansion while the authoring worker can still repair it."""
+    root = Path(run.workdir).resolve()
+    rel = target.resolve().relative_to(root).as_posix()
+    if not rel.startswith("candidate/") or not rel.endswith(".md"):
+        return
+    page = rel[len("candidate/"):]
+    if selfcheck._is_reserved_page(page):
+        return
+    before = getattr(run, "_turn_page_hashes", None)
+    created = page not in before if isinstance(before, dict) else not target.exists()
+    projected = selfcheck.siclaw_generated_metadata_text(
+        page, content, created=created, now=getattr(run, "_turn_provenance_at", None))
+    if projected is None:
+        return  # Invalid frontmatter remains available to the existing lint repair.
+    manifest_ids = selfcheck.load_manifest_source_ids(run.workdir)
+    if manifest_ids:
+        projected, _ = selfcheck.attribute_evidence_text(
+            run.workdir, projected, manifest_ids, set(selfcheck.source_inventory(run.workdir)))
+    size = len(projected.encode("utf-8"))
+    if size > MAX_SYNC_FILE_BYTES:
+        raise ValueError(
+            f"Page requires {size} UTF-8 bytes including system metadata, exceeding the "
+            f"{MAX_SYNC_FILE_BYTES}-byte artifact budget; split the page into linked parts before saving")
+
+
 def _compile_session_client(run: "CompileRun", wd: str, system_prompt: str, session_id: str,
                             pdf_page_ranges: dict | None = None,
                             raw_scope: dict | None = None):
@@ -3689,7 +3726,8 @@ def _compile_session_client(run: "CompileRun", wd: str, system_prompt: str, sess
         return decision
     tools = FileTools(wd, allowed, guard,
                       feedback=lambda target: candidate_feedback.check_page(wd, target),
-                      max_write_bytes=MAX_SYNC_FILE_BYTES).tools()
+                      max_write_bytes=MAX_SYNC_FILE_BYTES,
+                      validate_write=lambda target, content: _validate_compile_write(run, target, content)).tools()
     # Keep the published tool names and allowlist while using the single
     # KBC-owned handler/schema registry for every compiler phase.
     tools.extend(EngineTool(f"mcp__compile__{tool.name}", tool.description, tool.input_schema, tool.handler)
@@ -4951,7 +4989,8 @@ async def _plan_batches(run: "CompileRun", inventory: list) -> dict:
             model_config=pi_config.for_role("compile", session_kind="authoring"), max_model_calls=8,
             tools=FileTools(wd, ["Read", "Write", "Glob"],
                             _make_compile_path_guard(Path(wd), run.locale),
-                            max_write_bytes=MAX_SYNC_FILE_BYTES).tools())
+                            max_write_bytes=MAX_SYNC_FILE_BYTES,
+                            validate_write=lambda target, content: _validate_compile_write(run, target, content)).tools())
         directive = _loc(
             run,
             f"Budget: each batch's total effective must not exceed {budget} (pack by the effective field only, ignore bytes). "

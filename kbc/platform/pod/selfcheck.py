@@ -2640,6 +2640,22 @@ def normalize_evidence_source_ids(workdir: str) -> list[dict[str, object]]:
     return fixes
 
 
+def attribute_evidence_text(
+    workdir: str, text: str, manifest_ids: dict[str, str], managed_sources: set[str],
+) -> tuple[str, dict]:
+    """Project the same evidence metadata used by finalization without writing."""
+    sources, derived, _ = parse_okf_sources(text, managed_sources)
+    if derived or not sources:
+        return text, {}
+    stamped = _stamp_source_ids_text(text, manifest_ids)
+    if stamped is None or not stamped[1]:
+        return text, {}
+    rebound = _remap_evidence_source_ids(stamped[0], text, manifest_ids)
+    location_sections: list = []
+    updated, stats, _ = _attribute_page_text(rebound, stamped[1], location_sections)
+    return _stamp_source_locations(updated, location_sections, stamped[1], workdir), stats
+
+
 def attribute_evidence_sections(
     workdir: str,
     allowed_pages: set[str] | None = None,
@@ -2665,16 +2681,7 @@ def attribute_evidence_sections(
             text = path.read_bytes().decode("utf-8")
         except (OSError, UnicodeDecodeError):
             continue
-        sources, derived, _ = parse_okf_sources(text, managed_sources)
-        if derived or not sources:
-            continue
-        stamped = _stamp_source_ids_text(text, manifest_ids)
-        if stamped is None or not stamped[1]:
-            continue
-        rebound = _remap_evidence_source_ids(stamped[0], text, manifest_ids)
-        location_sections: list = []
-        updated, stats, _ = _attribute_page_text(rebound, stamped[1], location_sections)
-        updated = _stamp_source_locations(updated, location_sections, stamped[1], workdir)
+        updated, stats = attribute_evidence_text(workdir, text, manifest_ids, managed_sources)
         if updated == text:
             continue
         _write_text_atomic(path, updated)

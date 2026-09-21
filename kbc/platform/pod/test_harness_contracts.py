@@ -186,3 +186,64 @@ def test_packaged_worker_symlink_uses_the_actual_node_entrypoint(tmp_path, monke
     monkeypatch.setattr(pi_engine, "__file__", str(pod / "pi_engine.py"))
     monkeypatch.setattr(pi_engine.shutil, "which", lambda _: "/fixture/node")
     assert pi_engine.worker_command() == ["/fixture/node", str(actual.resolve())]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_evidence", [False, True])
+async def test_compiler_write_budget_includes_controller_metadata(tmp_path, monkeypatch, with_evidence):
+    from datetime import datetime, timezone
+    import selfcheck
+    monkeypatch.setattr(compile_box.pi_config, "for_role", lambda *a, **kw: {})
+    monkeypatch.setattr(compile_box, "create_agent_client", lambda **kw: kw)
+    run = compile_box.CompileRun("metadata-budget", str(tmp_path), 1)
+    run._turn_page_hashes = {}
+    run._turn_provenance_at = datetime(2026, 9, 21, tzinfo=timezone.utc)
+    prefix = "---\ntype: concept\ntitle: Page\nsources: []\ngenerated:\n  by: process:siclaw-kbc\nstatus: stable\n---\n"
+    if with_evidence:
+        _mk(tmp_path, "raw/a.md", "# Source\nA fact.\n")
+        _mk(tmp_path, "authoring/manifest.yaml", "sources:\n- path: a.md\n  id: source-a\n")
+        prefix = prefix.replace("sources: []", "sources:\n- resource: a.md") + "## Fact\nA fact. (source: a.md lines 2-2)\n"
+    limit = compile_box.MAX_SYNC_FILE_BYTES
+    content = prefix + "x" * (limit - (128 if with_evidence else 0) - len(prefix.encode()))
+    options = compile_box._compile_session_client(run, str(tmp_path), "role", "session")
+    tools = {tool.name: tool for tool in options["tools"]}
+    page = tmp_path / "candidate/page.md"
+    # Reject while the worker is alive and can split the page, before mutation.
+    with pytest.raises(ValueError, match="artifact budget"):
+        await tools["Write"].handler({"file_path": str(page), "content": content})
+    assert not page.exists()
+    smaller = content[:-4096]
+    await tools["Write"].handler({"file_path": str(page), "content": smaller})
+    with pytest.raises(ValueError, match="artifact budget"):
+        await tools["Edit"].handler({"file_path": str(page), "old_string": smaller, "new_string": content})
+    assert page.read_text() == smaller
+    # Run the actual controller transformations, then complete its checkpoint.
+    selfcheck.stamp_siclaw_generated_metadata(str(tmp_path), {"page.md"}, new_pages={"page.md"}, now=run._turn_provenance_at)
+    selfcheck.attribute_evidence_sections(str(tmp_path))
+    assert page.stat().st_size <= limit
+    if with_evidence:
+        assert "source_locations:" in page.read_text()
+    await compile_box._sync_workspace(run, {}, durable_barrier=True, completed_checkpoint=True)
+    artifacts = run.events.get_nowait()["artifacts"]
+    assert any(a["path"] == "candidate/page.md" for a in artifacts)
+    assert all(len(a.get("content", "").encode()) <= limit for a in artifacts)
+
+
+@pytest.mark.asyncio
+async def test_snapshot_budget_checked_after_provenance_transform(tmp_path):
+    from datetime import datetime, timezone
+    run = compile_box.CompileRun("snapshot-budget", str(tmp_path), 1)
+    run._turn_page_hashes = {}
+    run._turn_provenance_at = datetime(2026, 9, 21, tzinfo=timezone.utc)
+    prefix = "---\ntype: concept\ntitle: Page\n---\n"
+    content = prefix + "x" * (compile_box.MAX_SYNC_FILE_BYTES - len(prefix))
+    _mk(tmp_path, "candidate/page.md", content)
+    with pytest.raises(compile_box.WorkspaceArtifactError, match="candidate/page.md"):
+        await compile_box._sync_workspace(run, {}, durable_barrier=True)
+    assert run.events.empty()
+    sent = {"candidate/page.md": "last-good-copy"}
+    await compile_box._sync_workspace(run, sent)
+    assert sent == {"candidate/page.md": "last-good-copy"}
+    assert run.events.get_nowait()["type"] == "summary"
+    assert run.events.empty()
+    assert (tmp_path / "candidate/page.md").read_text() == content

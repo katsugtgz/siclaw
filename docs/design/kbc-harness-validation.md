@@ -8,8 +8,12 @@ same bounded responsibility; engine selection does not change publication policy
 
 Served compiler and planner Write/Edit tools use the existing
 `KBC_MAX_SYNC_FILE_BYTES` limit (1 MiB by default), measured in UTF-8 bytes including
-metadata. A rejected write leaves the old file intact. An oversized inherited
-file can be edited down to the budget; large tables should be split into linked
+metadata. Before mutation, served Write/Edit tools project producer timestamps,
+source IDs, evidence markers and source positions using the same transformations
+as the controller. A page whose projected bytes exceed the limit is rejected
+while the worker can still split it; the old file stays intact. Synchronization
+also checks the final provenance-stamped payload before enqueueing it. An
+oversized inherited file can be edited down to the budget; large tables should be split into linked
 pages. Ordinary periodic synchronization reports uncollectable files and retains
 previous copies. An ACK-backed or completed checkpoint rejects an incomplete
 workspace rather than silently sealing it. A legacy oversized/unreadable artifact
