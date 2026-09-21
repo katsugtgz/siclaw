@@ -14,6 +14,7 @@ import {
   getCommandBinary,
   parseArgs,
   validateCommandRestrictions,
+  extraCommandDocsFor,
 } from "../infra/command-sets.js";
 import { resolveRequiredKubeconfig } from "../infra/kubeconfig-resolver.js";
 import {
@@ -170,11 +171,20 @@ export function createRestrictedBashTool(
   // run_in_background is exposed to the model only when the master switch is on AND a
   // runtime executor was injected — otherwise the param stays out of the schema.
   const backgroundEnabled = BACKGROUND_BASH_ENABLED && Boolean(bg?.executor);
+  // Commands this DEPLOYMENT added, with the descriptions they declared. The built-in prose below
+  // cannot name them — it ships with the open-source image and they do not — so without this the
+  // capability is enforceable but invisible, and an agent that never hears of a tool never uses it.
+  const extraDocs = extraCommandDocsFor("local");
+  const extraSection = extraDocs.length === 0 ? "" : `
+
+Also available in this AgentBox (installed by this deployment — run them through this tool):
+${extraDocs.map((d) => `- ${d.name}: ${d.description}`).join("\n")}
+Use \`<command> --help\` to discover their subcommands and flags rather than guessing.`;
   return {
     name: "bash",
     label: "Bash",
-    description: `Execute kubectl and shell commands for Kubernetes cluster operations.
-This is the primary tool for all kubectl interactions. It runs through a shell, so pipes (|), &&, and redirections are fully supported.
+    description: `Execute kubectl and other whitelisted shell commands.
+kubectl is the main one, and it runs through a shell, so pipes (|), &&, and redirections are fully supported.${extraSection}
 
 Allowed commands: kubectl, grep, sort, uniq, wc, head, tail, cut, tr, jq, yq, column, and other text processing tools.
 kubectl is restricted to read-only subcommands: get, describe, logs, top, events, api-resources, explain, config, version, cluster-info, auth.
@@ -199,7 +209,7 @@ Examples:
 For long node-side work (e.g. RDMA perftest打流: a server on node A, a client on node B), do NOT hand-roll shell '&' here — use node_exec with run_in_background (it runs the command on the node, streams output to a file, and notifies you on completion).
 
 Prefer kubectl built-in filtering (-l, --field-selector, -o jsonpath, -o custom-columns) over piping to grep when possible.
-Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
+Do NOT use for file editing or package management — those binaries are not whitelisted and there are dedicated read/write/grep/glob tools for files. Anything listed above IS in scope for this tool.`,
     parameters: Type.Object({
       command: Type.String({
         description: "Shell command to execute, e.g. 'kubectl get pods -n default -o wide'",

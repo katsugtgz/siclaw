@@ -496,6 +496,38 @@ describe("K8sSpawner — spawn branches", () => {
     });
   });
 
+  // The credential volume is an emptyDir, so it SHADOWS the 2750 type directories
+  // baked into the image and docker/agentbox-entrypoint.sh has to recreate them at
+  // runtime. Setting the setgid BIT there needs CAP_FSETID: chmod(2) says that
+  // without it, when the file's group does not match the process's effective GID,
+  // "the S_ISGID bit will be turned off, but this will not cause an error to be
+  // returned." The entrypoint runs as root (gid 0) against a kubecred-owned
+  // directory, so dropping FSETID turns `chmod 2750` into 750 — silently — and the
+  // entrypoint's own assertion then refuses to start EVERY AgentBox.
+  //
+  // Pinned as an exact list rather than a `toContain`, because the failure mode is a
+  // capability going missing, which is exactly what a containment assertion cannot
+  // see.
+  it("grants FSETID so the entrypoint can set the setgid bit on the credential type directories", async () => {
+    const cm = new FakeCertManager();
+    const s = new K8sSpawner({ namespace: "siclaw-debug" });
+    s.setCertManager(cm as any);
+
+    let reads = 0;
+    readPodImpl.fn = async () => {
+      reads++;
+      if (reads % 2 === 1) throw Object.assign(new Error("nf"), { code: 404 });
+      return { status: { phase: "Running", podIP: "10.0.0.26", conditions: [{ type: "Ready", status: "True" }] }, metadata: { labels: {} } };
+    };
+
+    await s.spawn({ agentId: "normal-agent" });
+    const pod = calls.createNamespacedPod[0].body;
+    expect(pod.spec.containers[0].securityContext.capabilities).toEqual({
+      drop: ["ALL"],
+      add: ["SETUID", "SETGID", "CHOWN", "FOWNER", "FSETID", "AUDIT_WRITE"],
+    });
+  });
+
   it("uses in-container exec probes for KB boxes so NetworkPolicy need not admit kubelet traffic", async () => {
     const cm = new FakeCertManager();
     const s = new K8sSpawner({ namespace: "siclaw-debug" });

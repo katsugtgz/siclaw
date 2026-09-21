@@ -8,9 +8,11 @@
  *
  * Contract: docs/design/2026-06-10-extra-command-whitelist.md
  */
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { join } from "node:path";
 import {
   ALL_COMMAND_CATEGORIES,
+  ALL_EXEC_CONTEXTS,
   setExtraCommands,
   type CommandCategory,
   type CommandDef,
@@ -18,6 +20,21 @@ import {
 
 /** Conventional path baked into the AgentBox image (Dockerfile.agentbox). */
 export const DEFAULT_EXTRA_COMMANDS_PATH = "/etc/siclaw/extra-commands.json";
+
+/**
+ * Drop-in directory, merged with the single file above.
+ *
+ * The single file is documented as the slot a deployer REPLACES wholesale, which makes it the wrong
+ * place for anything an IMAGE ships: the first site-specific customization silently deletes it, and
+ * an absent extras file is a no-op by design, so nothing reports the loss. That argument was the
+ * stated reason a delivery CLI was once declared as a built-in instead — coupling an open-source
+ * registry to one vendor's binary to dodge a packaging problem.
+ *
+ * A drop-in directory removes the dilemma. An image that ships a binary ships its declaration
+ * beside it (`<name>.json`), a deployer adds their own without touching either, and neither can
+ * silently erase the other — a name claimed twice is a hard failure, not a last-writer-wins merge.
+ */
+export const DEFAULT_EXTRA_COMMANDS_DIR = "/etc/siclaw/extra-commands.d";
 
 const NAME_PATTERN = /^[a-z0-9][a-z0-9._+-]*$/;
 
@@ -55,7 +72,7 @@ const INTERPRETER_VERSION_PATTERN =
   /^(sh|bash|dash|ash|zsh|ksh|csh|tcsh|fish|python|perl|ruby|node|deno|bun|lua|php|tclsh|awk|gawk|sed)[0-9]/;
 
 const ALLOWED_ENTRY_KEYS = new Set([
-  "category", "description",
+  "category", "description", "contexts",
   "allowedFlags", "blockedFlags", "allowedSubcommands", "positionals", "requiredFlags",
 ]);
 
@@ -94,6 +111,34 @@ function parseEntry(source: string, name: string, raw: unknown): CommandDef {
 
   const def: CommandDef = { category: category as CommandCategory };
 
+  // Carried, not stripped. This string is the ONLY thing that tells a model the command exists:
+  // the whitelist decides what may run, and a capability nothing advertises is one an agent never
+  // reaches for. Both shipped entries (sichek, mmlscluster) have carried a careful description
+  // since they were added, and no model has ever seen one.
+  if (entry.description !== undefined) {
+    if (typeof entry.description !== "string" || entry.description.trim() === "") {
+      fail(source, `"${name}".description must be a non-empty string`);
+    }
+    def.description = entry.description.trim();
+  }
+
+  // Which execution contexts may run it. Absent = wherever its category is available.
+  //
+  // This is what a binary that only exists inside the AgentBox image needs, and it is a property of
+  // the command rather than of its category: `node_exec` reaches a cluster node, `pod_exec` a target
+  // container, `host_exec` a remote host, and a binary installed in none of them can only answer 127
+  // there. Expressing that as a dedicated CATEGORY (as `delivery` once did) forces every such tool
+  // into one bucket and puts a vendor-shaped name in an open-source enum.
+  if (entry.contexts !== undefined) {
+    const raw = entry.contexts;
+    const ok = Array.isArray(raw) && raw.length > 0 &&
+      raw.every((c: unknown) => typeof c === "string" && (ALL_EXEC_CONTEXTS as readonly string[]).includes(c));
+    if (!ok) {
+      fail(source, `"${name}".contexts must be a non-empty array drawn from: ${ALL_EXEC_CONTEXTS.join(", ")}`);
+    }
+    def.contexts = raw as string[];
+  }
+
   if (entry.allowedFlags !== undefined) def.allowedFlags = checkFlagArray(source, name, "allowedFlags", entry.allowedFlags);
   if (entry.blockedFlags !== undefined) def.blockedFlags = checkFlagArray(source, name, "blockedFlags", entry.blockedFlags);
   if (entry.requiredFlags !== undefined) def.requiredFlags = checkFlagArray(source, name, "requiredFlags", entry.requiredFlags);
@@ -125,7 +170,6 @@ function parseEntry(source: string, name: string, raw: unknown): CommandDef {
 /**
  * Parse and validate an extra-commands JSON document.
  * Throws a descriptive error on any schema violation (fail-loud contract).
- * The optional per-entry "description" field is documentation-only and stripped.
  */
 export function parseExtraCommandsConfig(text: string, source: string): Record<string, CommandDef> {
   let root: unknown;
@@ -163,6 +207,8 @@ export interface LoadExtraCommandsOptions {
   envPath?: string;
   /** Conventional path; silently skipped when absent. */
   defaultPath?: string;
+  /** Drop-in directory; every *.json inside is merged in. Silently skipped when absent. */
+  dirPath?: string;
 }
 
 /**
@@ -172,19 +218,46 @@ export interface LoadExtraCommandsOptions {
  * Returns the parsed command map, or null when no file is configured/present.
  */
 export function loadExtraCommands(options?: LoadExtraCommandsOptions): Record<string, CommandDef> | null {
+  const merged: Record<string, CommandDef> = {};
+  const claimedBy: Record<string, string> = {};
+
+  const absorb = (parsed: Record<string, CommandDef>, source: string): void => {
+    for (const [name, def] of Object.entries(parsed)) {
+      const already = claimedBy[name];
+      if (already !== undefined) {
+        // Refused rather than merged. Two sources disagreeing about one binary's constraints is a
+        // packaging mistake, and silently keeping either one produces a whitelist nobody declared.
+        fail(source, `"${name}" is already declared by ${already}; remove one of the two declarations`);
+      }
+      claimedBy[name] = source;
+      merged[name] = def;
+    }
+  };
+
   const envPath = options?.envPath;
   if (envPath) {
     if (!existsSync(envPath)) {
       throw new Error(`SICLAW_EXTRA_COMMANDS_FILE points to a missing file: ${envPath}`);
     }
-    return parseExtraCommandsConfig(readFileSync(envPath, "utf8"), envPath);
+    absorb(parseExtraCommandsConfig(readFileSync(envPath, "utf8"), envPath), envPath);
+  } else {
+    const defaultPath = options?.defaultPath;
+    if (defaultPath && existsSync(defaultPath)) {
+      absorb(parseExtraCommandsConfig(readFileSync(defaultPath, "utf8"), defaultPath), defaultPath);
+    }
   }
 
-  const defaultPath = options?.defaultPath;
-  if (defaultPath && existsSync(defaultPath)) {
-    return parseExtraCommandsConfig(readFileSync(defaultPath, "utf8"), defaultPath);
+  // Drop-ins are loaded in ADDITION to whichever single file applied above, and in a stable
+  // (sorted) order so a collision reports the same pair on every boot.
+  const dir = options?.dirPath;
+  if (dir && existsSync(dir) && statSync(dir).isDirectory()) {
+    for (const entry of readdirSync(dir).filter((f) => f.endsWith(".json")).sort()) {
+      const full = join(dir, entry);
+      absorb(parseExtraCommandsConfig(readFileSync(full, "utf8"), full), full);
+    }
   }
-  return null;
+
+  return Object.keys(merged).length > 0 ? merged : null;
 }
 
 let initialized = false;
@@ -201,6 +274,7 @@ export function initExtraCommands(): void {
   const loaded = loadExtraCommands({
     envPath: process.env.SICLAW_EXTRA_COMMANDS_FILE,
     defaultPath: DEFAULT_EXTRA_COMMANDS_PATH,
+    dirPath: process.env.SICLAW_EXTRA_COMMANDS_DIR || DEFAULT_EXTRA_COMMANDS_DIR,
   });
   if (!loaded || Object.keys(loaded).length === 0) return;
 

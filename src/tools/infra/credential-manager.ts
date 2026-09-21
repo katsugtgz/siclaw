@@ -56,6 +56,13 @@ export interface RegisterDevopsCredentialOpts {
   project: string;
   /** Opaque bearer token. Never logged, never echoed, never put in manifest metadata. */
   token: string;
+  /**
+   * The runtime's service token, sent by siforgectl as `Authorization: Bearer`.
+   * Required for the same reason `token` is: the delivery platform refuses the
+   * exchange without it, so a file written without one is a file whose only
+   * possible outcome is an authentication failure inside a sandbox.
+   */
+  serviceToken: string;
   description?: string;
 }
 
@@ -337,6 +344,7 @@ export function registerDevopsCredential(
   const endpoint = requireSingleLine(opts.endpoint, "endpoint");
   const project = requireSingleLine(opts.project, "project");
   const token = requireSingleLine(opts.token, "token");
+  const serviceToken = requireSingleLine(opts.serviceToken, "serviceToken");
 
   let url: URL;
   try {
@@ -364,7 +372,12 @@ export function registerDevopsCredential(
   writeCredentialFile(
     credentialsDir,
     filename,
-    JSON.stringify({ endpoint, project, token }, null, 2) + "\n",
+    // 🔴 These four keys are a CROSS-REPOSITORY contract, not a local choice. The
+    // reader is scitix-devops cmd/siforgectl/internal/identity/identity.go, whose
+    // Identity struct names them `endpoint`, `project`, `token` and
+    // `service_token`. Renaming one here compiles, passes every test in this
+    // repository, and fails only inside a sandbox with a missing-field error.
+    JSON.stringify({ endpoint, project, token, service_token: serviceToken }, null, 2) + "\n",
     DEVOPS_CREDENTIAL_MODE,
   );
 

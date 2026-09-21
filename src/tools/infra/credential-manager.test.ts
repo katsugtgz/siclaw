@@ -149,6 +149,7 @@ const OPTS = {
   endpoint: "https://devops.example.internal",
   project: "demo-project",
   token: "sfm_0123456789abcdef",
+  serviceToken: "runtime-service-token",
 };
 
 describe("registerDevopsCredential", () => {
@@ -164,6 +165,7 @@ describe("registerDevopsCredential", () => {
     expect(JSON.parse(fs.readFileSync(file, "utf8"))).toEqual({
       endpoint: OPTS.endpoint,
       project: OPTS.project,
+      service_token: OPTS.serviceToken,
       token: OPTS.token,
     });
   });
