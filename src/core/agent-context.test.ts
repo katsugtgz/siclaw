@@ -47,7 +47,7 @@ describe("resolveAgentHarness", () => {
       "read", "grep", "find", "ls", "knowledge_search", "knowledge_cite",
       "local_script", "write", "edit", "skill_preview",
       "task_create", "task_update", "task_list", "task_get",
-      "task_report", "save_feedback", "channel_update", "request_input", "propose_execution", "report_analysis_recommendation",
+      "task_report", "save_feedback", "channel_update", "request_input", "propose_execution",
     ]);
     expect(harness.legacyUnrestrictedCustom).toBe(false);
     expect(harness.includeBundledSkills).toBe(true);
