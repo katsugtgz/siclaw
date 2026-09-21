@@ -5,6 +5,8 @@
  * Kept consistent with the original agent-factory.ts registration order.
  */
 
+import { registration as reviewRecommendation } from "./workflow/review-recommendation.js";
+
 import type { ToolEntry } from "../core/tool-registry.js";
 
 // cmd-exec
@@ -57,7 +59,7 @@ export const allToolEntries: ToolEntry[] = [
   clusterList, hostList, k8sInspect,
   memorySearch, memoryGet, knowledgeSearch, knowledgeCite,
   // ── workflow ──
-  saveFeedback, manageSchedule, taskReport, skillPreview,
+  reviewRecommendation, saveFeedback, manageSchedule, taskReport, skillPreview,
   channelUpdate, requestInput,
   taskCreateRegistration, taskUpdateRegistration, taskListRegistration, taskGetRegistration,
   spawnSubagent, waitAgentRegistration, sendParentMessageRegistration, jobStop, taskOutput,
