@@ -1,4 +1,5 @@
-import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { setExtraCommands } from "../infra/command-sets.js";
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach} from "vitest";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import {
@@ -1917,6 +1918,21 @@ describe("buildSandboxCommand — background jobs", () => {
 // authentication error raised a network hop away.
 
 describe("restricted_bash — siforgectl delivery credential", () => {
+  // The delivery CLI is no longer a built-in: it reaches the whitelist as a deployment-supplied
+  // entry (docs/design/2026-06-10-extra-command-whitelist.md). Registering it here is what an
+  // image that installs the binary does through its drop-in file.
+  beforeEach(() => {
+    setExtraCommands({
+      siforgectl: {
+        category: "general",
+        contexts: ["local"],
+        description: "delivery control plane CLI",
+        allowedSubcommands: { position: 0, allowed: ["describe", "project", "build", "workflow"] },
+      },
+    });
+  });
+  afterEach(() => { setExtraCommands({}); });
+
   function toolWithBroker(ensure: () => Promise<void>) {
     const calls: string[] = [];
     const broker = {

@@ -46,7 +46,13 @@ describe("parseExtraCommandsConfig", () => {
     }), "test.json");
 
     expect(Object.keys(parsed).sort()).toEqual(["iperf3", "mytool", "vendorctl"]);
-    expect(parsed.iperf3).toEqual({ category: "network", allowedFlags: ["-c", "-p", "--json"] });
+    // description is CARRIED, not stripped: it is the only thing that tells a model the command
+    // exists, and dropping it is what made two shipped entries invisible for months.
+    expect(parsed.iperf3).toEqual({
+      category: "network",
+      description: "site-specific throughput tool",
+      allowedFlags: ["-c", "-p", "--json"],
+    });
     expect(parsed.mytool.positionals).toBe(2);
     expect(parsed.vendorctl.allowedSubcommands).toEqual({ position: 0, allowed: ["status", "show"] });
   });
@@ -323,5 +329,35 @@ describe("docker/extra-commands.json (internal commands shipped in the image)", 
     // Its writer siblings are separate binaries and none of them is whitelisted.
     expect(validateCommand("mmchcluster -p node1", { context: "host" })).not.toBeNull();
     expect(validateCommand("mmshutdown -a", { context: "host" })).not.toBeNull();
+  });
+});
+
+describe("contexts", () => {
+  const wrap = (commands: unknown) => JSON.stringify({ version: 1, commands });
+
+  it("accepts a valid context list", () => {
+    const parsed = parseExtraCommandsConfig(
+      wrap({ vendorctl: { category: "general", contexts: ["local"] } }), "t");
+    expect(parsed.vendorctl.contexts).toEqual(["local"]);
+  });
+
+  it("rejects an unknown context rather than ignoring it", () => {
+    // Fail-loud: a typo that silently dropped the field would widen the command to every context
+    // its category allows — the opposite of what the author wrote.
+    expect(() => parseExtraCommandsConfig(
+      wrap({ vendorctl: { category: "general", contexts: ["agentbox"] } }), "t"))
+      .toThrow(/contexts/);
+  });
+
+  it("rejects an empty context list", () => {
+    expect(() => parseExtraCommandsConfig(
+      wrap({ vendorctl: { category: "general", contexts: [] } }), "t"))
+      .toThrow(/contexts/);
+  });
+
+  it("rejects an empty description rather than carrying a blank line into the tool prose", () => {
+    expect(() => parseExtraCommandsConfig(
+      wrap({ vendorctl: { category: "general", description: "  " } }), "t"))
+      .toThrow(/description/);
   });
 });

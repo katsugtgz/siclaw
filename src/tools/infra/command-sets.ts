@@ -1820,7 +1820,7 @@ export type CommandCategory =
   | "hardware" | "kernel" | "process" | "file"
   | "diagnostic" | "services" | "container" | "firewall"
   | "inspection" | "compressed" | "activity" | "stream"
-  | "general" | "general-env" | "flow" | "delivery";
+  | "general" | "general-env" | "flow";
 
 /**
  * A single command's complete security definition.
@@ -1853,6 +1853,19 @@ export interface CommandDef {
   validate?: (args: string[]) => string | null;
   /** Flags whose value may begin with "-" (e.g. journalctl -b -1). */
   valueFlags?: readonly string[];
+  /**
+   * One line telling a model what this command is for. Surfaced in the exec tool's description for
+   * DEPLOYMENT-SUPPLIED commands (see extraCommandDocsFor) — built-ins are already described in the
+   * hand-written prose there.
+   */
+  description?: string;
+  /**
+   * Execution contexts this command may run in. Absent = wherever its category is available.
+   *
+   * For a binary that exists only inside the AgentBox image: admitting it on a cluster node, inside
+   * a target container or on a remote host advertises a capability that can only answer 127 there.
+   */
+  contexts?: readonly string[];
 }
 
 /**
@@ -2111,46 +2124,6 @@ export const COMMANDS: Record<string, CommandDef> = {
   env:      { category: "general-env", validate: validateEnv },
   printenv: { category: "general-env" },
 
-  // ── delivery control plane ──
-  //
-  // The project-agent CLI. See docs/design/project-agent-cli.md — "Why the boundary is not the
-  // client": this entry is the sandbox layer, which is depth, not enforcement. What the agent may
-  // actually do is decided by aslan from the credential the binary reads.
-  //
-  // It is a built-in rather than an entry in docker/extra-commands.json even though that file can
-  // express the same constraints. That file is documented as the site-specific slot a deployer
-  // REPLACES wholesale; a capability the image ships would disappear the first time someone
-  // customized it, silently, because an absent extras file is a no-op by design.
-  //
-  // It is NOT admitted through `extraAllowed` either. A hit there short-circuits the whitelist pass
-  // before any definition is consulted, and a binary with no definition carries no constraints at
-  // all — which is why kubectl needs a hand-written grammar. Having a definition here is the whole
-  // point, so the name must resolve through the ordinary table.
-  //
-  // position 0 is the domain. The verb at position 1 is not constrained here: the declarative
-  // schema screens one position, and the second one is the client's own command table plus the
-  // server's authorization — neither of which this layer can restate without becoming a second copy
-  // that drifts. Domains the design withholds from a project agent (organisation-wide code
-  // listings, the trigger families) are absent from the client's table; this list is the coarse
-  // outer bound, not a duplicate of it.
-  siforgectl: {
-    category: "delivery",
-    allowedSubcommands: {
-      position: 0,
-      allowed: [
-        "approval", "build", "cluster", "code", "deploy", "describe",
-        "env", "project", "registry", "service", "user", "workflow",
-      ],
-    },
-  },
-  // No `blockedFlags` beside it, deliberately. validateByRule RETURNS as soon as the positional at
-  // `position` is in the set, so a blockedFlags list on the same definition is never consulted — the
-  // same early return that made `ip -batch` reachable past a permitted verb. A `--project` entry
-  // there would read as a live restatement of "Project confinement" while screening nothing, which
-  // is worse than leaving the invariant where it is enforced: the client does not define the flag,
-  // and aslan resolves the project from the credential regardless of what argv said. A switch that
-  // must hold DESPITE a permitted domain belongs in WRITE_FLAGS_BY_COMMAND, which runs first.
-
   // ── flow control ──
   echo:   { category: "flow" },
   printf: { category: "flow" },
@@ -2214,22 +2187,26 @@ export const ALL_COMMAND_CATEGORIES: readonly CommandCategory[] = [
   "text", "network", "rdma", "perftest", "gpu", "hardware", "kernel",
   "process", "file", "diagnostic", "services", "container", "firewall",
   "inspection", "compressed", "activity", "stream", "general", "general-env",
-  "flow", "delivery",
+  "flow",
 ];
 
 /**
- * Categories whose commands describe the machine the exec tool reaches — every category except the
- * ones that only exist inside the AgentBox image.
+ * Execution contexts a command definition may name in `contexts`.
  *
- * `delivery` is the one exception so far. Its binary and the credential it reads are installed by
- * Dockerfile.agentbox and materialized into that pod's credential tree; on a cluster node
- * (`node_exec`), inside a target container (`pod_exec`) or on a remote host (`host_exec`) neither
- * exists, so admitting the name there would advertise a capability that can only answer 127. The
- * AgentBox is the one context whose binaries we control — see agentboxRequiredCommands() for the
- * same distinction stated from the other side.
+ * Kept next to the categories because both are validated against configuration (extra-commands.ts)
+ * and a typo in either must fail loudly at startup rather than quietly widen or narrow a whitelist.
  */
-const REMOTE_EXEC_CATEGORIES: readonly CommandCategory[] =
-  ALL_COMMAND_CATEGORIES.filter((c) => c !== "delivery");
+export const ALL_EXEC_CONTEXTS: readonly string[] = ["local", "node", "pod", "host"];
+
+/**
+ * Categories whose commands describe the machine the exec tool reaches.
+ *
+ * "Exists only inside the AgentBox image" used to be carved out here as a category (`delivery`),
+ * which put one vendor's tool shape into an open-source enum and gave every future such tool the
+ * same bucket. It is a property of the COMMAND, so it lives on the definition now: `contexts`.
+ * See CommandDef.contexts and getContextAllowedSet.
+ */
+const REMOTE_EXEC_CATEGORIES: readonly CommandCategory[] = ALL_COMMAND_CATEGORIES;
 
 interface ContextPolicy {
   available: readonly CommandCategory[];
@@ -2243,10 +2220,6 @@ const CONTEXT_POLICIES: Record<string, ContextPolicy> = {
       "text", "network", "rdma", "perftest", "gpu", "hardware", "kernel",
       "process", "diagnostic", "services", "container", "firewall",
       "activity", "stream", "general", "flow",
-      // Only here: `local` IS the AgentBox, the one place the delivery binary and its credential
-      // exist. This intersection is the enablement switch — there is no separate allow-list to keep
-      // in step with it, and no path that admits the binary without also applying its definition.
-      "delivery",
     ],
     pipeOnlyCategories: ["text"],
     categoryBlockedFlags: {},
@@ -2292,10 +2265,20 @@ export function getContextAllowedSet(context: string): ReadonlySet<string> {
   const cached = contextAllowedCache.get(context);
   if (cached) return cached;
 
+  // `contexts` is a NARROWING on top of the category policy, never a widening: a command still has
+  // to pass its category, and naming a context it was not already admitted to changes nothing. That
+  // ordering is what keeps a configuration file unable to reach a context its category is barred
+  // from — the additive-only contract of extra-commands applies to reach as well as to names.
+  const admittedHere = (def: CommandDef): boolean =>
+    def.contexts === undefined || def.contexts.includes(context);
+
   const policy = CONTEXT_POLICIES[context];
   if (!policy) {
     // Unknown context → all commands
-    const all = new Set([...Object.keys(COMMANDS), ...Object.keys(extraCommands)]);
+    const all = new Set<string>();
+    for (const [cmd, def] of [...Object.entries(COMMANDS), ...Object.entries(extraCommands)]) {
+      if (admittedHere(def)) all.add(cmd);
+    }
     contextAllowedCache.set(context, all);
     return all;
   }
@@ -2303,11 +2286,31 @@ export function getContextAllowedSet(context: string): ReadonlySet<string> {
   const categorySet = new Set<string>(policy.available);
   const cmds = new Set<string>();
   for (const [cmd, def] of [...Object.entries(COMMANDS), ...Object.entries(extraCommands)]) {
-    if (categorySet.has(def.category)) cmds.add(cmd);
+    if (categorySet.has(def.category) && admittedHere(def)) cmds.add(cmd);
   }
 
   contextAllowedCache.set(context, cmds);
   return cmds;
+}
+
+/**
+ * Deployment-supplied commands available in `context`, with the one-line description each declared.
+ *
+ * This is the read side of the discoverability contract. The whitelist decides what MAY run; it has
+ * never decided what a model KNOWS it can run, and nothing else closes that gap: a binary an image
+ * ships, a credential it can reach and a whitelist entry admitting it still add up to a capability
+ * the agent never reaches for. Built-ins are excluded because the exec tool already describes them
+ * in prose — this covers exactly the entries that prose cannot know about.
+ *
+ * Entries without a description are omitted rather than listed bare: a name with no explanation is
+ * an invitation to guess at its arguments, and every wrong guess costs a blocked round trip.
+ */
+export function extraCommandDocsFor(context: string): Array<{ name: string; description: string }> {
+  const allowed = getContextAllowedSet(context);
+  return Object.entries(extraCommands)
+    .filter(([name, def]) => allowed.has(name) && typeof def.description === "string" && def.description !== "")
+    .map(([name, def]) => ({ name, description: def.description as string }))
+    .sort((a, b) => a.name.localeCompare(b.name));
 }
 
 // ── Container-context sensitive path patterns ────────────────────

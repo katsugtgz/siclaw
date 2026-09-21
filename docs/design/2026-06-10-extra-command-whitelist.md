@@ -59,7 +59,8 @@ loaded at agent startup and merged into the built-in registry.
   "commands": {
     "iperf3": {
       "category": "network",
-      "description": "optional free-text rationale (ignored by the engine)",
+      "description": "one line telling a model what this is for — SHOWN to it, see below",
+      "contexts": ["local"],
       "allowedFlags": ["-c", "-s", "-p", "-t", "--json"]
     }
   }
@@ -87,6 +88,9 @@ memoized — load happens once per process):
 
 1. `SICLAW_EXTRA_COMMANDS_FILE` env var, if set → file is mandatory.
 2. Default path `/etc/siclaw/extra-commands.json` → loaded if present, no-op if absent.
+3. Drop-in directory `/etc/siclaw/extra-commands.d/*.json` (override: `SICLAW_EXTRA_COMMANDS_DIR`)
+   → every file merged in ADDITION to whichever of 1/2 applied, in sorted order. A command
+   name claimed by two sources is a hard failure, not a last-writer-wins merge.
 
 This covers every runtime mode through one chokepoint: TUI and `siclaw local` set the
 env var if they want extras; the AgentBox image bakes a file at the default path.
@@ -100,10 +104,43 @@ env var if they want extras; the AgentBox image bakes a file at the default path
   an absent default path is a no-op, not an error, so the commands simply stop being
   whitelisted. `extra-commands.test.ts` asserts the two agree, loads the real file,
   and checks each declared command reaches the node/host contexts.
-- A deployment that layers this repo (rsync-style overlay, ConfigMap, fork) replaces
-  the file wholesale rather than merging, so the same binary declared in two layers
-  keeps only the outermost declaration. Whichever layer wins must carry the complete
-  set — a command dropped there is not refused loudly, it is just absent.
+- A deployment that layers this repo (rsync-style overlay, ConfigMap, fork) replaces the
+  single FILE wholesale rather than merging. That is why anything an **image** ships must
+  go in the drop-in directory instead: the first site-specific customization of the file
+  would otherwise delete it silently, since an absent file is a no-op by design.
+  This cost us once already — a delivery CLI was declared as a built-in `COMMANDS` entry
+  specifically to dodge this, which coupled the open-source registry to one vendor's binary
+  and to its twelve subcommands. The drop-in directory removes the dilemma: the image that
+  installs a binary ships `<name>.json` beside it, a deployer adds their own file without
+  touching either, and a name claimed twice fails loudly instead of one silently winning.
+
+## Discoverability
+
+`description` is **shown to the model**. The exec tool renders every extra command available
+in the current context, with its description, into its own tool description
+(`extraCommandDocsFor`). This is not documentation for humans.
+
+The whitelist decides what MAY run; it never decided what the model KNOWS it can run. A
+binary the image ships, a credential it can reach and a whitelist entry admitting it still
+add up to a capability the agent never reaches for — observed in production, where an agent
+asked for delivery facts it had a CLI for, exhausted every other source, and correctly
+reported that it could not answer. Both originally shipped entries carried careful
+descriptions that the loader stripped and no model ever saw.
+
+An entry with no `description` is still whitelisted and simply not advertised.
+
+## Contexts
+
+`contexts` narrows a command to named execution contexts (`local`, `node`, `pod`, `host`).
+Absent means "wherever this category is available". It is a NARROWING only: a command must
+still pass its category policy, so a config file naming `local` cannot buy its way into a
+context its category is barred from.
+
+This exists for binaries that live only inside the AgentBox image. Admitting such a name on
+a cluster node, inside a target container or on a remote host advertises a capability that
+can only answer 127 there. It is a property of the COMMAND, not of its category — expressing
+it as a category (as `delivery` briefly did) forces every such tool into one bucket and puts
+a vendor-shaped name into an open-source enum.
 - **Runtime override (future, not in scope)**: mounting a ConfigMap over
   `/etc/siclaw/extra-commands.json` in the AgentBox pod spec would avoid rebuilds; this
   needs k8s-spawner pod-spec changes and is deliberately deferred.
