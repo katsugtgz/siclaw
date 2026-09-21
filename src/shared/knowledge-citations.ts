@@ -158,7 +158,7 @@ export function appendKnowledgeSourceCitations(text: string, value: unknown): st
       const quote = Array.from(location.excerpt);
       const preview = quote.slice(0, 400).join("") + (quote.length > 400 ? "…" : "");
       const label = chinese ? "编译时原文快照" : "Compiled source snapshot";
-      line += `\n  ${plain(location.section || label)} · ${label} L${location.start_line}–${location.end_line}\n  > ${plain(preview)}`;
+      line += `\n  ${location.section ? `${plain(location.section)} · ` : ""}${label} L${location.start_line}–${location.end_line}\n  > ${plain(preview)}`;
     }
     if (positions.length > shown.length) line += chinese
       ? `\n  另有 ${positions.length - shown.length} 处证据位置未展开。`

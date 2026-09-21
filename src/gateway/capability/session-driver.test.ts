@@ -763,3 +763,17 @@ describe("driveCapabilitySession — reconnect against the real run manager", ()
     expect(manager.get(id)).toBeUndefined();
   });
 });
+
+
+it("does not retire a box whose checkpoint is blocked before a durable save", async () => {
+  const fe = fakeFrontend();
+  const manager = new CapabilityRunManager(fe);
+  const { runId } = await manager.startRun({ profile: "kb-compile", orgId: "org", correlationId: "attempt" });
+  await manager.setStatus(runId, "running");
+  await driveCapabilitySession({ client: fakeClient([
+    { type: "error", recoverable: true, code: "workspace_checkpoint_blocked", stage: "persist", message: "Unsaved files retained; repair required." },
+  ]), runId, frontendClient: fe, manager });
+  expect(manager.get(runId)?.status).toBe("running");
+  expect(emits(fe).some((event: any) => event.type === "lifecycle")).toBe(false);
+  expect(fe.request.mock.calls.some(([, p]: any[]) => p?.status === "failed" || p?.status === "done")).toBe(false);
+});

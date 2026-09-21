@@ -412,3 +412,16 @@ def test_semantic_receipt_detects_changed_claim_attribution():
     page_level = header + 'The supported claim.\n'
     generated = header + '<!-- okf:evidence {"id":"generated","sources":["a","b"]} -->\nThe supported claim.\n'
     assert finalization.page_fingerprint(page_level) == finalization.page_fingerprint(generated)
+
+
+def test_investigation_context_ignores_timestamp_but_tracks_decision(tmp_path):
+    authoring = tmp_path / 'authoring'
+    authoring.mkdir()
+    notes = authoring / 'REVIEW_NOTES.json'
+    row = {'id': 'review', 'state': 'pending', 'investigation': 'checked source', 'updated_at': 'old'}
+    notes.write_text(json.dumps([row]))
+    before = finalization.context_identity(str(tmp_path))
+    notes.write_text(json.dumps([{**row, 'updated_at': 'new'}]))
+    assert finalization.context_identity(str(tmp_path)) == before
+    notes.write_text(json.dumps([{**row, 'owner_decision': 'choose version'}]))
+    assert finalization.context_identity(str(tmp_path)) != before

@@ -1017,6 +1017,9 @@ _SYNC_TOMBSTONE = "__deleted__"
 
 class WorkspaceArtifactError(RuntimeError):
     """A complete checkpoint cannot silently omit writable text artifacts."""
+    def __init__(self, message: str, *, retryable: bool = False):
+        super().__init__(message)
+        self.retryable = retryable
 
 
 def _collect_workspace_artifacts(workdir: str, *, strict: bool = False,
@@ -1040,13 +1043,20 @@ def _collect_workspace_artifacts(workdir: str, *, strict: bool = False,
                     issues.append({"path": f.relative_to(wd).as_posix(), "reason": "too_large"})
                     continue
                 content = f.read_text(encoding="utf-8")
-            except (OSError, UnicodeDecodeError):
+            except UnicodeDecodeError:
+                issues.append({"path": f.relative_to(wd).as_posix(), "reason": "invalid_encoding"})
+                continue
+            except PermissionError:
+                issues.append({"path": f.relative_to(wd).as_posix(), "reason": "permission_denied"})
+                continue
+            except OSError:
                 issues.append({"path": f.relative_to(wd).as_posix(), "reason": "unreadable"})
                 continue
             out.append({"path": f.relative_to(wd).as_posix(), "content": content})
     if strict and issues:
         details = "; ".join(f"{item['path']} ({item['reason']})" for item in issues[:10])
-        raise WorkspaceArtifactError(f"Incomplete workspace checkpoint: {details}. Split oversized files to at most {MAX_SYNC_FILE_BYTES} bytes; existing files have been retained.")
+        raise WorkspaceArtifactError(f"Incomplete workspace checkpoint: {details}. Split oversized files to at most {MAX_SYNC_FILE_BYTES} bytes; existing files have been retained.",
+                                     retryable=any(item["reason"] == "unreadable" for item in issues))
     return out
 
 
@@ -5372,13 +5382,13 @@ async def _run_finalization(run, plan, replies):
 
 async def _run_finalization_media(run, plan, replies):
     if _media_verify_enabled():
-        failure_stage = run._batch_stage = "batch_media_verify"
+        run._batch_stage = "batch_media_verify"
         work = plan["finalization"].setdefault("media_work", {})
         rounds = int(work.get("used", 0))
         initial_pending = selfcheck.pending_media_verification(run.workdir)
         round_limit = int(work.setdefault("limit", _batch_media_verify_round_limit(plan, initial_pending)))
         while True:
-            failure_stage = run._batch_stage = "batch_media_verify"
+            run._batch_stage = "batch_media_verify"
             pending = selfcheck.pending_media_verification(run.workdir)
             if not pending:
                 break
@@ -5445,11 +5455,12 @@ async def _run_finalization_media(run, plan, replies):
                 # the final lint-clean bytes, not the pre-ledger revision.
                 # The while loop then naturally re-verifies any page that
                 # this bounded ledger pass changed.
-                failure_stage = run._batch_stage = "batch_ledger"
+                run._batch_stage = "batch_ledger"
                 await _run_ledger_repairs(run, replies)
             else:
                 await run.emit({"type": "summary",
-                                "text": f"自检(图像):{result['images']} 张图已核,可选审核未提出疑点"})
+                                "text": _loc(run, f"Self-check (images): {result['images']} image(s) checked; optional review found no issues.",
+                                             f"自检(图像):{result['images']} 张图已核,可选审核未提出疑点")})
             await _checkpoint_finalization(run, plan, completed=True)
 
 
@@ -6375,6 +6386,24 @@ async def _cancel_verification_tasks(run: CompileRun) -> None:
                                      extra=f"exception_class={type(error).__name__}")
 
 
+def _checkpoint_file_state(workdir: str) -> tuple:
+    """Cheap change token for retained invalid artifacts; never read their bodies."""
+    root = Path(workdir)
+    state = []
+    for top in WORKSPACE_SYNC_DIRS:
+        base = root / top
+        try:
+            for path in [base, *sorted(base.rglob("*"))]:
+                try:
+                    st = path.stat()
+                    state.append((str(path.relative_to(root)), st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_mode))
+                except OSError as error:
+                    state.append((str(path.relative_to(root)), error.errno))
+        except OSError as error:
+            state.append((top, error.errno))
+    return tuple(state)
+
+
 async def _checkpoint_failed_workspace(run: CompileRun, sent: dict) -> None:
     """Keep the failed workspace live until its complete checkpoint is saved.
 
@@ -6395,6 +6424,32 @@ async def _checkpoint_failed_workspace(run: CompileRun, sent: dict) -> None:
             await _sync_workspace(run, sent, force=True, durable_barrier=True, retain_until_ack=True)
             return
         except Exception as error:
+            deterministic = isinstance(error, (ValueError, PermissionError)) or (
+                isinstance(error, WorkspaceArtifactError) and not error.retryable)
+            if deterministic:
+                # Retiring this box would discard the only copy of unsaved bytes.
+                # Report a nonterminal failure and wait for repair, not an endless
+                # resubmission of the same deterministic error to the consumer.
+                run._turn_active = False  # There is no model turn for the watchdog to reap.
+                run._checkpoint_blocked = {"code": "workspace_checkpoint_blocked",
+                                           "exception_class": type(error).__name__}
+                _print_compile_lifecycle("checkpoint.blocked", run,
+                                         extra=f"exception_class={type(error).__name__}")
+                await run.emit({**_error_event(_loc(run,
+                    "Compilation stopped: workspace artifacts cannot be saved. The box retains unsaved files. Repair the invalid or oversized artifacts before saving can resume; automatic retries are paused until the files change.",
+                    "编译已停止：工作区含无法保存的文件。未保存成果仍保留在当前 Box；请修复损坏或超限文件。文件变化前暂停自动重试。")
+                    + (" " + str(error) if isinstance(error, WorkspaceArtifactError) else ""),
+                    code="workspace_checkpoint_blocked", stage="persist", exception_class=type(error).__name__),
+                    "recoverable": True})
+                unchanged = _checkpoint_file_state(run.workdir)
+                while unchanged == _checkpoint_file_state(run.workdir):
+                    await asyncio.sleep(5)
+                run._checkpoint_blocked = None
+                warned = False
+                await run.emit({"type": "summary", "text": _loc(run,
+                    "Workspace files changed; retrying the complete save before recovery.",
+                    "工作区文件已变化，正在重新尝试完整保存。")})
+                continue
             _print_compile_lifecycle("checkpoint.retry", run,
                                      extra=f"exception_class={type(error).__name__}")
             if not warned:
@@ -8144,6 +8199,8 @@ async def handle_events(request: web.Request):
 
 async def handle_health(request: web.Request):
     return web.json_response({"status": "ok", "runs": len(RUNS), "test_sessions": len(TEST_SESSIONS),
+                              "checkpoint_blocked": [{"run_id": r.run_id, **r._checkpoint_blocked}
+                                                     for r in RUNS.values() if getattr(r, "_checkpoint_blocked", None)],
                               "engine": _engine_kind(),
                               "upgrade_ready_run": next((run.run_id for run in RUNS.values() if run._upgrade_ready), None)})
 

@@ -133,13 +133,18 @@ def input_identity(workdir: str) -> str:
 def context_identity(workdir: str) -> str:
     root = Path(workdir) / "authoring"
     files = {}
-    for name in ("BRIEF.json", "INTENT.md", "RESOLUTIONS.json", "EXCLUSIONS.json"):
+    for name in ("BRIEF.json", "INTENT.md", "RESOLUTIONS.json", "EXCLUSIONS.json", "REVIEW_NOTES.json"):
         path = root / name
         if path.is_file():
             text = path.read_text(encoding="utf-8")
             if name.endswith(".json"):
                 try:
                     text = json.loads(text)
+                    if name == "REVIEW_NOTES.json" and isinstance(text, list):
+                        # Investigation changes invalidate final judgment, clock-only
+                        # rewrites do not. Keep malformed rows for deterministic hashing.
+                        text = [{k: v for k, v in row.items() if k != "updated_at"}
+                                if isinstance(row, dict) else row for row in text]
                 except ValueError:
                     pass  # Hash the malformed bytes; the ledger checker reports them.
             files[name] = text

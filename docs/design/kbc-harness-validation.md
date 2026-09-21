@@ -18,7 +18,13 @@ pages. Ordinary periodic synchronization reports uncollectable files and retains
 previous copies. An ACK-backed or completed checkpoint rejects an incomplete
 workspace rather than silently sealing it. A legacy oversized/unreadable artifact
 therefore requires repair; failed-save retention must not be reported as a fully
-saved draft. There is no new deployment setting.
+saved draft. A deterministic artifact/cache failure emits the recoverable
+`workspace_checkpoint_blocked` event and appears in `/health.checkpoint_blocked`.
+The box retains the unsaved bytes and checks file metadata for repair; it does
+not repeatedly attempt the same invalid save. A file change retries the complete
+checkpoint, still requiring the consumer ACK before terminal failure. Network
+and ACK failures retain their retry behavior. This is a blocked save, not a
+completed or durable recovery; do not retire the box before preserving its files. There is no new deployment setting.
 
 ## Whole-page media evidence
 
@@ -103,3 +109,12 @@ record consistency, not the truth of supplied measurements. Repeat paired runs
 before estimating completion rate, latency distribution or semantic parity.
 Unit and synthetic SDK tests establish protocol behavior only; they are not a
 real-corpus quality or cost result.
+
+## Deferred investigations during finalization
+
+Final review receipts include the semantic contents of `REVIEW_NOTES.json`.
+An investigation filed by a tail ledger/media repair must invalidate earlier
+judgment before the compile can commit. Timestamp-only rewrites do not invalidate
+receipts. Investigation still precedes escalation: pending notes are not promoted
+to owner tickets mechanically. The final reviewer must make that decision through
+`file_ticket` with its existing evidence requirements.
