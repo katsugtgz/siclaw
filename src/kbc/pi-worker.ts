@@ -1,3 +1,4 @@
+import { summarizeModelMessages } from "../core/model-request-summary.js";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { once } from "node:events";
@@ -161,6 +162,7 @@ export class PiCompilerWorker {
       services, sessionManager: SessionManager.create(config.cwd, path.join(config.state_dir, "sessions")),
       model: resolved, thinkingLevel: config.thinking_level, customTools: tools,
       guards,
+      onModelPayload: summary => this.emit("model_payload", { call: this.calls, summary }),
       onModelEnvelope: manifest => this.emit("model_envelope", { manifest }),
     });
     const { session, llmCallRecorder } = this.execution;
@@ -173,7 +175,8 @@ export class PiCompilerWorker {
     session.agent.streamFunction = (requestedModel, context, options) => {
       if (this.calls >= config.max_model_calls) throw new Error("KBC_MODEL_CALL_BUDGET_EXCEEDED");
       this.calls++;
-      this.emit("model_request", { call: this.calls, model: requestedModel.id, provider: requestedModel.provider });
+      this.emit("model_request", { call: this.calls, model: requestedModel.id, provider: requestedModel.provider,
+        context: summarizeModelMessages(context.messages) });
       return stream(requestedModel, context, {
         ...options, maxRetries: 0, headers: { ...options?.headers, ...config.headers },
       });
