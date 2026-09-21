@@ -1241,51 +1241,6 @@ def test_file_ticket_record_supersedes_by_claim_and_normalizer_never_guesses():
     print("✓ file_ticket_record supersedes by claim; normalizer marks unclassified without guessing")
 
 
-def test_file_residual_ticket():
-    """L2: budget spent with residuals → CODE files ONE ticket in the owner's
-    queue (model schema, stable content-fingerprint id). Dedupes on repeat,
-    preserves the model's tickets, refuses to clobber an unreadable ledger."""
-    report = {
-        "coverage": {"unaccounted": ["snap/two.md"], "dangling_citations": []},
-        "lint": {"ok": False, "violations": [{"page": "p1.md", "kind": "orphan", "detail": "unreachable"}]},
-        "incremental": {"out_of_scope_pages": ["c.md"]},
-        "state": "unconverged",
-    }
-    with tempfile.TemporaryDirectory() as td:
-        base = Path(td)
-        _mk(base, "authoring/CONTRADICTIONS.json",
-            json.dumps([{"id": "model-1", "title": "既有工单", "status": "open"}]))
-        assert selfcheck.file_residual_ticket(td, report, "zh") is True
-        tickets = json.loads((base / "authoring/CONTRADICTIONS.json").read_text(encoding="utf-8"))
-        assert len(tickets) == 2 and tickets[0]["id"] == "model-1"  # model ticket preserved
-        t = tickets[1]
-        assert t["id"].startswith("selfcheck-residual-") and t["status"] == "open" and t["answer"] is None
-        assert "未入账源: snap/two.md" in t["sources"][0]["quote"]
-        assert sorted(t["affected_pages"]) == ["c.md", "p1.md"]
-        assert t["options"] and t["current_value"]
-        assert t["ticket_kind"] == "model_gap" and t["origin"] == "selfcheck"
-        # same residuals again → dedupe, no second ticket
-        assert selfcheck.file_residual_ticket(td, report, "zh") is False
-        assert len(json.loads((base / "authoring/CONTRADICTIONS.json").read_text(encoding="utf-8"))) == 2
-        # different residuals → a fresh ticket (new fingerprint)
-        report2 = {"coverage": {"unaccounted": [], "dangling_citations": ["snap/ghost.md"]},
-                   "lint": {"ok": True, "violations": []}, "state": "unconverged"}
-        assert selfcheck.file_residual_ticket(td, report2, "en") is True
-        assert len(json.loads((base / "authoring/CONTRADICTIONS.json").read_text(encoding="utf-8"))) == 3
-    with tempfile.TemporaryDirectory() as td:
-        # nothing residual → no ticket
-        clean = {"coverage": {"unaccounted": [], "dangling_citations": []},
-                 "lint": {"ok": True, "violations": []}}
-        assert selfcheck.file_residual_ticket(td, clean) is False
-        assert not (Path(td) / "authoring/CONTRADICTIONS.json").exists()
-    with tempfile.TemporaryDirectory() as td:
-        # unreadable ledger → bail rather than clobber the model's tickets
-        _mk(Path(td), "authoring/CONTRADICTIONS.json", "{oops")
-        assert selfcheck.file_residual_ticket(td, report) is False
-        assert (Path(td) / "authoring/CONTRADICTIONS.json").read_text(encoding="utf-8") == "{oops"
-    print("OK  file_residual_ticket (files/dedupes/preserves/bails, fingerprint id)")
-
-
 def test_ledger_repair_pages():
     """Interlock: the pages a ledger/lint repair legitimately edits — the byte
     guard must authorize exactly these on the repair turn, or the mechanical
@@ -1328,24 +1283,8 @@ def test_citation_path_normalization():
         print("OK  managed citation path normalization (./ and a/../ canonicalize; no double-report wedge)")
 
 
-def test_residual_fingerprint_full_set():
-    """Review fix: the ticket id fingerprints the FULL residual set — two sets
-    sharing a 10-item prefix must not collide (the old [:10] cap silently
-    deduped the second, genuinely different, ticket away)."""
-    base_items = [f"snap/s{i:02d}.md" for i in range(10)]
-    r1 = {"coverage": {"unaccounted": base_items + ["snap/only-in-one.md"], "dangling_citations": []},
-          "lint": {"ok": True, "violations": []}}
-    r2 = {"coverage": {"unaccounted": base_items + ["snap/only-in-two.md"], "dangling_citations": []},
-          "lint": {"ok": True, "violations": []}}
-    with tempfile.TemporaryDirectory() as td:
-        assert selfcheck.file_residual_ticket(td, r1) is True
-        assert selfcheck.file_residual_ticket(td, r2) is True  # distinct id → files, not deduped
-        tickets = json.loads((Path(td) / "authoring/CONTRADICTIONS.json").read_text(encoding="utf-8"))
-        assert len(tickets) == 2 and tickets[0]["id"] != tickets[1]["id"], tickets
-    print("OK  residual fingerprint covers the full set (no prefix collision)")
-
-
-async def test_media_clean_pass_settles_converge():
+async def test_media_clean_pass_settles_converge(monkeypatch):
+    monkeypatch.setenv("KBC_MEDIA_VERIFY", "on")
     """Review HIGH: the clean/failed media-verify paths used to stop dead —
     converge_phase parked at "verifying" forever in the single-session case.
     The flow must hand back to the seam: chain PK, else settle."""
@@ -1531,7 +1470,8 @@ def test_run_layer1_carries_converge_phase():
     print("OK  run_layer1 carries converge_phase forward (no per-turn blank window)")
 
 
-async def test_media_chunks_self_drain_then_settle():
+async def test_media_chunks_self_drain_then_settle(monkeypatch):
+    monkeypatch.setenv("KBC_MEDIA_VERIFY", "on")
     """Review fix: with >cap images, settling after chunk 1 silently skipped
     the remaining chunks AND PK. The finally now mirrors the full seam — each
     chunk's completion starts the next; only a fully-drained set settles."""
@@ -1648,8 +1588,9 @@ async def test_wiring():
         # A repair that changed nothing must spend the bounded retry budget;
         # deduplicating it would strand the persisted state in "repairing".
         retry = await _post_turn_selfcheck(run)
-        assert retry and "s/b.md" in retry, retry
-        assert run._l1_repairs_used == 2
+        assert retry is None
+        assert run._l1_repairs_used == 1
+        assert selfcheck.read_selfcheck(td)["repair_stop_reason"] == "no_progress"
 
         # agent repairs by EXCLUSIONS ONLY (no candidate edit) → re-check fires → passed
         _mk(base, "authoring/EXCLUSIONS.json",
@@ -1675,7 +1616,8 @@ async def test_wiring():
     print("OK  wiring (trigger gating / repair inject / exclusions-only reopen / budget → unconverged)")
 
 
-async def test_media_verify_wiring():
+async def test_media_verify_wiring(monkeypatch):
+    monkeypatch.setenv("KBC_MEDIA_VERIFY", "on")
     """Blind-verify wiring (v2): settled-draft gate, ≤max-images chunking with
     the remainder rolling to the next trigger, findings → repair injection,
     clean chunk → no injection, all-verified → PK unblocked."""
@@ -1718,7 +1660,7 @@ async def test_media_verify_wiring():
             assert _maybe_start_media_verify(run)           # chunk 1 (p.md, cap 1 image)
             await run._media_task
             assert calls[0] == {"p.md": ["s/i1.png"]}, calls
-            assert run.injected and "[System self-check · image verification]" in run.injected[-1] and "94% 是 MEM 条" in run.injected[-1]
+            assert run.injected and "[Optional image review]" in run.injected[-1] and "94% 是 MEM 条" in run.injected[-1]
             assert compile_box._pk_due(run) is None         # finding page + q.md pending → PK waits
 
             # Simulate the injected repair editing the finding page. The path is
@@ -1749,7 +1691,8 @@ async def test_media_verify_wiring():
 
 
 
-async def test_media_inject_failure_does_not_double_settle():
+async def test_media_inject_failure_does_not_double_settle(monkeypatch):
+    monkeypatch.setenv("KBC_MEDIA_VERIFY", "on")
     """Round-3 review (med-high): a findings-path inject throwing AFTER the
     primary settle used to re-settle the chunk with result=None — bumping the
     just-verified pages' attempt counts (toward a spurious `exhausted`) and
@@ -1797,7 +1740,8 @@ async def test_media_inject_failure_does_not_double_settle():
     print("OK  findings-inject failure settles once (no double-settle, no phantom exhausted)")
 
 
-async def test_media_failed_chunk_still_drains_later_chunks():
+async def test_media_failed_chunk_still_drains_later_chunks(monkeypatch):
+    monkeypatch.setenv("KBC_MEDIA_VERIFY", "on")
     """Round-3 review (med): a transient failure on chunk 1 used to skip chunks
     2..N AND PK, then settle green — the unattempted chunks were never verified
     in a single session. The drain now chains past a failed chunk (its pages
@@ -1857,7 +1801,8 @@ async def test_media_failed_chunk_still_drains_later_chunks():
     print("OK  failed chunk defers, later chunks still drain; fresh trigger retries")
 
 
-async def test_media_failed_pages_retry_then_exhaust():
+async def test_media_failed_pages_retry_then_exhaust(monkeypatch):
+    monkeypatch.setenv("KBC_MEDIA_VERIFY", "on")
     """Review fix: verified marks land only AFTER a completed verification.
     A failed page retries on later triggers, bounded by KBC_MEDIA_VERIFY_ATTEMPTS,
     then ships with a VISIBLE exhausted flag — never a silent false-pass."""
@@ -1905,7 +1850,8 @@ async def test_media_failed_pages_retry_then_exhaust():
     print("OK  media failed pages retry then exhaust (visible flag, no silent false-pass)")
 
 
-async def test_media_attempt_count_resets_on_success():
+async def test_media_attempt_count_resets_on_success(monkeypatch):
+    monkeypatch.setenv("KBC_MEDIA_VERIFY", "on")
     """Round-4 review fix: a page that fails once then completes verification
     must have its attempt count cleared — a stale residue would push a later
     re-entry to 'exhausted' after fewer real failures than the budget implies."""
@@ -2873,10 +2819,8 @@ def main():
     test_media_verify_content_identity_and_attempt_reset()
     test_cap_media_pending()
     test_dangling_alone_blocks_closed()
-    test_file_residual_ticket()
     test_ledger_repair_pages()
     test_citation_path_normalization()
-    test_residual_fingerprint_full_set()
     test_page_too_large_lint()
     test_repair_prompt_names_noop_exclusions_and_glob_shape()
     test_run_layer1_carries_converge_phase()

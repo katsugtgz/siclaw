@@ -183,6 +183,8 @@ def validate(ledger: dict) -> None:
         targets = unit.get("targets")
         if not isinstance(targets, list) or len(targets) > MAX_UNITS or not all(_path(p) for p in targets) or len(set(targets)) != len(targets):
             raise FinalizationError("invalid finalization responsibility")
+        if "membership_sensitive" in unit and type(unit["membership_sensitive"]) is not bool:
+            raise FinalizationError("invalid directory dependency receipt")
         reads = unit.get("reads", [])
         if reads not in ("all", "content") and (not isinstance(reads, list) or not all(_path(p) for p in reads)):
             raise FinalizationError("invalid finalization dependencies")
@@ -274,6 +276,11 @@ def reconcile(ledger: dict, pages: dict, duplicates: list[dict], orphans: list[s
     add(ledger, "introduction", [])
 
 
+class DependencyReads(set):
+    """Exact file reads do not depend on unrelated directory membership."""
+    membership_sensitive = False
+
+
 def dependency_digest(reads, fingerprints: dict) -> str:
     if reads == "all":
         return digest(fingerprints)
@@ -288,7 +295,7 @@ def valid(unit: dict, fingerprints: dict, context: str) -> bool:
     if unit["kind"] == "notes":
         return unit["status"] == "done"
     return (unit["status"] == "done" and unit.get("context") == context
-            and unit.get("membership") == digest(sorted(fingerprints))
+            and (unit.get("membership_sensitive", True) is False or unit.get("membership") == digest(sorted(fingerprints)))
             and unit.get("dependency_digest") == dependency_digest(unit.get("reads", []), fingerprints))
 
 
@@ -306,7 +313,9 @@ def complete(unit: dict, fingerprints: dict, context: str, reads: set[str], summ
         scope = "content"
     else:
         scope = selected
-    unit.update(status="done", reads=scope, dependency_digest=dependency_digest(scope, fingerprints),
+    unit.update(status="done", reads=scope,
+                membership_sensitive=(not isinstance(reads, DependencyReads) or reads.membership_sensitive or scope in ("all", "content")),
+                dependency_digest=dependency_digest(scope, fingerprints),
                 membership=digest(sorted(fingerprints)), context=context,
                 completed_at=now(), summary=str(summary)[:1500])
     unit.pop("last_error", None)
@@ -343,12 +352,12 @@ def directive(unit: dict, locale: str | None, completed: list[dict]) -> str:
     goals = {
         "duplicates": ("Judge this explicit duplicate pair: merge with combined provenance and corrected links, or explain why both pages must remain.", "判断这对重复页：合并并保留完整来源、修复链接，或说明两页各自保留的理由。"),
         "orphans": ("Make these orphan pages reachable from the index. Preserve valid knowledge; remove a page only after judging it genuinely redundant.", "将这些孤儿页接入目录。保留有效知识；只有确认内容冗余才可删除页面。"),
-        "semantic": ("Review the assigned pages for cross-batch contradictions, factual/source support, uncertainty and consistent terminology. Consult other pages and frozen Raw as needed. Apply owner rulings; retain unresolved conflicts as explicit tickets. Focus edits on these subjects; do not recompile unrelated pages.", "核对分配页面的跨批矛盾、事实与来源依据、存疑项和术语一致性。按需查阅其他页面与冻结原料，应用负责人裁决，将无法确定的冲突保留为明确问题。围绕分配主题修改，不要重编无关页面。"),
-        "catalog": ("Review the complete index and page titles for coherent global routing and cross-batch structure. Use the prior unit receipts and authoring ledgers; repair index grouping/links. Do not repeat a full-body review of every already-reviewed page unless a concrete new inconsistency requires it.", "完整核对目录与各页标题的全库导航和跨批结构。利用已完成任务回执及编译账本修正目录分组与链接；仅在发现具体新矛盾时回查已核对页面，不要无目标地重审所有正文。"),
+        "semantic": ("Review the assigned pages for cross-batch contradictions, factual/source support, uncertainty and consistent terminology. Consult other pages and frozen Raw as needed. Apply owner rulings; record unresolved questions in REVIEW_NOTES.json for consolidated investigation. Focus edits on these subjects; do not recompile unrelated pages.", "核对分配页面的跨批矛盾、事实与来源依据、存疑项和术语一致性。按需查阅其他页面与冻结原料，应用负责人裁决，将无法确定的冲突保留为明确问题。围绕分配主题修改，不要重编无关页面。"),
+        "catalog": ("Review the complete index and page titles for coherent global routing and cross-batch structure. Use the prior unit receipts and authoring ledgers; repair index grouping/links. Read REVIEW_NOTES.json and resolve deferred investigations using completed batches; escalate only material Q&A issues requiring an owner decision through file_ticket. Do not repeat a full-body review of every already-reviewed page unless a concrete new inconsistency requires it.", "完整核对目录与各页标题的全库导航和跨批结构。利用已完成任务回执及编译账本修正目录分组与链接；仅在发现具体新矛盾时回查已核对页面，不要无目标地重审所有正文。"),
         "introduction": ("Read the finished index and prior review receipts. Call report_domain for the complete library with its accurate domain, overview and reading guide. Do not repeat body editing; report a concrete issue if the final library still has a structural gap.", "阅读最终目录与已完成核对回执，为完整知识库调用 report_domain，给出准确领域、概览和阅读指南。不要重复修改正文；若仍有结构缺口，明确指出具体问题。"),
         "notes": ("Apply these owner notes to the candidate and report exactly what changed: ", "处理以下负责人补充意见，并说明具体修改："),
     }
     lead = f"[Finalization unit {unit['id']} · {unit['kind']}]" if en else f"【终审任务 {unit['id']} · {unit['kind']}】"
     access = ("The full frozen Raw and Candidate remain available through read/search. This is one bounded responsibility, not a read-visibility restriction. The machine owns BATCH_PLAN and COMPILATION_STATE; do not edit them. Finish with a concise judgment and list the touched pages. Report uncertainty honestly; do not fabricate facts or suppress quality findings."
               if en else "仍可通过读取和检索访问完整冻结原料与候选库。此处只划分任务责任，不限制全库可见性。BATCH_PLAN 和 COMPILATION_STATE 由系统维护，请勿修改。结束时简述判断与修改页面；诚实保留不确定性，不编造事实或隐藏质量问题。")
-    return "\n\n".join([lead, goals[unit["kind"]][0 if en else 1] + unit.get("notes", ""), targets, access, handoff])
+    return "\n\n".join([lead, goals[unit["kind"]][0 if en else 1] + unit.get("notes", ""), targets, access, "Read authoring/REVIEW_NOTES.json if present. Reuse review_id; investigate before escalating to the owner.", handoff])

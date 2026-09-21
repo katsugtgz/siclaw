@@ -3207,15 +3207,14 @@ async def test_unconverged_files_residual_ticket():
         assert repair is None, repair  # unconverged does not inject another repair
         sc = _json.loads((wd / "authoring" / "SELFCHECK.json").read_text())
         assert sc["state"] == "unconverged", sc
-        tickets = _json.loads((wd / "authoring" / "CONTRADICTIONS.json").read_text())
-        assert len(tickets) == 1 and tickets[0]["id"].startswith("selfcheck-residual-"), tickets
-        assert "never-compiled.md" in tickets[0]["sources"][0]["quote"]
+        assert not (wd / "authoring" / "CONTRADICTIONS.json").exists()
+        assert "snap/never-compiled.md" in sc["coverage"]["unaccounted"]
         # a second settle with the same residuals does not duplicate the ticket
         run._selfcheck_key = None
         (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: raw/snap/one.md\n---\n正文a 又动了。")
         await compile_box._post_turn_selfcheck(run)
-        tickets2 = _json.loads((wd / "authoring" / "CONTRADICTIONS.json").read_text())
-        assert len(tickets2) == 1, tickets2
+        assert not (wd / "authoring" / "CONTRADICTIONS.json").exists()
+
     print("OK  unconverged files a residual ticket (once, code-written, question queue)")
 
 
@@ -3482,52 +3481,9 @@ async def test_noop_repair_turn_reaches_the_gate():
         assert repair2 is None, repair2
         sc2 = _json.loads((wd / "authoring" / "SELFCHECK.json").read_text())
         assert sc2["state"] == "unconverged", sc2  # budget spent honestly, not stuck 'repairing'
-        tickets = _json.loads((wd / "authoring" / "CONTRADICTIONS.json").read_text())
-        assert any(str(tk.get("id", "")).startswith("selfcheck-residual-") for tk in tickets), tickets
+        assert not (wd / "authoring" / "CONTRADICTIONS.json").exists()
         del os.environ["KBC_L1_REPAIR_ROUNDS"]
     print("OK  no-op repair turn reaches the gate (unconverged + residual ticket, not silent)")
-
-
-def test_media_verify_suppresses_text_backed_beyond_transcript():
-    """A beyond-transcript image doubt whose claim is verbatim-backed by a
-    co-cited TEXT source is corroboration noise, not an owner question (live
-    adoption run 2026-07-22: "FP4 +46%" flagged while the co-cited markdown
-    states the figure verbatim). Inconsistent findings are never suppressed."""
-    import mediaverify
-    with tempfile.TemporaryDirectory() as td:
-        wd = Path(td)
-        (wd / "raw" / "snap").mkdir(parents=True)
-        (wd / "raw" / "snap" / "perf.md").write_text(
-            "B300较B200，FP4有46%提升；整体也只 +39.7%，不太符合预期。")
-        page_text = (
-            "---\ntype: Comparison\ntitle: c\nsources:\n"
-            "  - resource: raw/snap/perf.md\n  - resource: raw/snap/assets/tok1.png\n---\n"
-            "B300 FP4 较 B200 +46%。整体 +39.7%。另一个编造值 +87.5%。")
-        findings = [
-            {"image": "snap/assets/tok1.png", "claim": "B300 FP4 较 B200 +46%",
-             "kind": "超出转写范围", "expected": "not in the transcript", "fix": "…"},
-            {"image": "snap/assets/tok1.png", "claim": "整体 +39.7%",
-             "kind": "超出转写范围", "expected": "not in the transcript", "fix": "…"},
-            {"image": "snap/assets/tok1.png", "claim": "编造值 +87.5%",
-             "kind": "超出转写范围", "expected": "not in the transcript", "fix": "…"},
-            {"image": "snap/assets/tok1.png", "claim": "FP4 较 B200 +46%",
-             "kind": "不一致", "expected": "图中为 40%", "fix": "…"},
-        ]
-        kept, suppressed = mediaverify.suppress_text_backed(
-            str(wd), "c.md", page_text, findings)
-        s_claims = {s["claim"] for s in suppressed}
-        assert s_claims == {"B300 FP4 较 B200 +46%", "整体 +39.7%"}, suppressed
-        k_kinds = [(f["kind"], f["claim"]) for f in kept]
-        assert ("超出转写范围", "编造值 +87.5%") in k_kinds, kept   # not in text → real doubt
-        assert ("不一致", "FP4 较 B200 +46%") in k_kinds, kept      # conflicts never suppressed
-        assert all(s["suppressed_reason"] == "text_source_backed" for s in suppressed)
-        # qualitative claim without distinctive numbers → never suppressed
-        kept2, sup2 = mediaverify.suppress_text_backed(
-            str(wd), "c.md", page_text,
-            [{"image": "snap/assets/tok1.png", "claim": "该型号为 X 系列",
-              "kind": "超出转写范围", "expected": "not in the transcript", "fix": "…"}])
-        assert not sup2 and len(kept2) == 1
-    print("OK  media verify suppresses text-backed beyond-transcript doubts (keeps real ones + conflicts)")
 
 
 def test_l1_repair_budget_scales_with_workload():
@@ -3588,13 +3544,11 @@ async def test_l1_repair_budget_high_water_survives_shrinking_workload():
             assert repair2 is not None, "high-water must keep the gate open (used=1 < 3)"
             run._begin_turn(repair2)
             repair3 = await compile_box._post_turn_selfcheck(run)
-            assert repair3 is not None, "used=2 < 3 still repairing"
-            run._begin_turn(repair3)
-            repair4 = await compile_box._post_turn_selfcheck(run)
-            assert repair4 is None  # used=3 == limit -> unconverged
+            assert repair3 is None, "no new evidence or repair progress must stop retries"
             sc = _json.loads((wd / "authoring" / "SELFCHECK.json").read_text())
             assert sc["state"] == "unconverged", sc["state"]
-            assert sc["repair_rounds_used"] == 3 and sc["repair_rounds_limit"] == 3, sc
+            assert sc["repair_rounds_used"] == 2 and sc["repair_rounds_limit"] == 3, sc
+            assert sc["repair_stop_reason"] == "no_progress"
         finally:
             del os.environ["KBC_L1_REPAIR_ROUNDS"]
     print("OK  L1 repair budget keeps its episode high-water while the workload shrinks")
@@ -7404,6 +7358,7 @@ async def test_file_ticket_is_the_only_door_and_the_evidence_picks_the_kind():
         assert "id" not in ft.input_schema["properties"]  # identity is code-owned
         base = {"title": "K8s 版本", "question": "当前 K8s 是 1.30.2 还是 1.29?",
                 "options": ["1.30.2", "1.29.0"], "current_value": "1.30.2", "affected_pages": ["cluster.md"]}
+        base.update(review_action="needs_owner", investigation="Read original versions and applicability; neither states which is active.", answer_impact="Which Kubernetes version should a new cluster use?", owner_decision="Confirm the currently supported version.")
         two = [{"doc": "raw/a.md", "quote": "1.30.2"}, {"doc": "b.md", "quote": "1.29.0"}]
         one = [{"doc": "raw/a.md", "quote": "1.30.2"}]
         ledger = Path(td) / "authoring" / "CONTRADICTIONS.json"
