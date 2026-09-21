@@ -65,6 +65,7 @@ from mtls_auth import (
 )
 import redblue
 import selfcheck
+import review_notes
 from engine import selected_readonly_engine, engine_kind, create_agent_client
 from agent_protocol import AgentClient, AgentEvent, AgentTransportError, EngineTool, is_result as message_is_result, message_field
 from execution_observation import observe_sessions
@@ -2002,6 +2003,8 @@ def _compile_engine_tools(
         result = await asyncio.to_thread(candidate_context.lookup, run.workdir, **args)
         reads = getattr(run, "_finalization_reads", None)
         if reads is not None:
+            if isinstance(reads, finalization.DependencyReads):
+                reads.membership_sensitive = True  # Lookup includes negative results and catalogue membership.
             if args.get("query") or args.get("sources"):
                 reads.update(p.relative_to(Path(run.workdir) / "candidate").as_posix()
                              for p in (Path(run.workdir) / "candidate").rglob("*.md") if p.is_file())
@@ -2252,10 +2255,23 @@ def _compile_engine_tools(
             "filed_operation_id": (run._command_context or ("", 0))[0],
             "filed_generation": (run._command_context or ("", 0))[1],
         }
+        try:
+            note, escalate = review_notes.record(run.workdir, ticket, args,
+                defer_owner=bool(getattr(run, "_batch_active", False)) and
+                getattr(run, "_batch_stage", "") not in {"batch_final", "batch_notes"})
+        except (ValueError, OSError) as error:
+            return str(error)
+        if not escalate:
+            return f"Investigation {note['id']} saved ({note['state']}); no owner ticket created. Continue checking related sources and later batches. Reuse review_id when updating this issue."
+        ticket["escalation"] = {key: note[key] for key in ("investigation", "answer_impact", "owner_decision")}
         status, err = selfcheck.file_ticket_record(run.workdir, ticket)
         if err:
             return ft["failed"].format(e=err)
-        return ft[status].format(tid=tid, kind=kind)
+        try:
+            review_notes.finish(run.workdir, note["id"], ticket["id"])
+        except (ValueError, OSError) as error:
+            return f"Ticket {ticket['id']} saved, but investigation receipt failed: {error}. Retry with the same review_id."
+        return ft[status].format(tid=ticket["id"], kind=kind)
 
     async def resolve_ticket(args):
         rt = ts["resolve_ticket"]
@@ -2364,6 +2380,12 @@ def _compile_engine_tools(
             {
                 "type": "object",
                 "properties": {
+                    "review_action": {"type": "string", "enum": ["investigate", "resolved", "needs_owner"], "description": "Default investigate saves an internal issue. needs_owner requires material Q&A impact and exhausted relevant investigation; never use for tool failures or pending batches."},
+                    "existing_ticket_id": {"type": "string", "description": "Exact existing CONTRADICTIONS.json ticket id when investigating a legacy or reworded issue without a review_id. Never creates a ticket with an arbitrary id."},
+                    "review_id": {"type": "string", "description": "Existing REVIEW_NOTES.json id for the same business issue, including reworded questions."},
+                    "investigation": {"type": "string", "description": "Sources and context checked, new evidence tried and conclusion; max 2000 characters."},
+                    "answer_impact": {"type": "string", "description": "Concrete user question and how its answer would be wrong or unavailable."},
+                    "owner_decision": {"type": "string", "description": "Missing fact or decision only the owner can supply."},
                     "ticket_kind": {"type": "string", "enum": list(selfcheck.TICKET_KINDS)},
                     "title": {"type": "string"},
                     "question": {"type": "string"},
@@ -2535,7 +2557,7 @@ def _l1_repair_round_limit(report: dict) -> int:
 
 
 def _media_verify_enabled() -> bool:
-    return os.environ.get("KBC_MEDIA_VERIFY", "on") != "off"
+    return os.environ.get("KBC_MEDIA_VERIFY", "off") == "on"
 
 
 def _media_verify_max_images() -> int:
@@ -2611,6 +2633,18 @@ async def _emit_media_exhausted(run, exhausted: list[str]) -> None:
         f"自检(图像):{len(exhausted)} 页在 {_media_verify_attempts()} 次尝试后仍无法完成复核——已放行并在 SELFCHECK.json 显式标记。")})
 
 
+def _pending_media_for_run(run) -> dict[str, list[str]]:
+    pending = selfcheck.pending_media_verification(run.workdir)
+    report = selfcheck.read_selfcheck(run.workdir) or {}
+    scope = (report.get("incremental") or {}).get("media_review_pages")
+    if isinstance(scope, list):
+        # Keep inherited debt pending and visible; never claim it passed simply
+        # because this source update did not own it. The scope rides the checkpoint.
+        allowed = set(scope)
+        return {page: images for page, images in pending.items() if page in allowed}
+    return pending
+
+
 def _media_verify_due(run) -> dict[str, list[str]] | None:
     """A ≤max-images chunk of image-citing pages owed a blind verify on the
     settled draft, else None. Idempotent via media_verify.verified_pages —
@@ -2629,7 +2663,7 @@ def _media_verify_due(run) -> dict[str, list[str]] | None:
         return None  # ledger repairs first; verify once settled
     inflight = getattr(run, "_media_inflight", set())  # test doubles may lack it
     deferred = getattr(run, "_media_deferred", set())  # failed-this-drain pages (see _maybe_start_media_verify)
-    pending = {p: imgs for p, imgs in selfcheck.pending_media_verification(workdir).items()
+    pending = {p: imgs for p, imgs in _pending_media_for_run(run).items()
                if p not in inflight and p not in deferred}
     if not pending:
         return None
@@ -2757,7 +2791,7 @@ def _observe_pi_sessions(fn):
 @_observe_pi_sessions
 async def _run_media_verify_flow(run, chunk: dict[str, list[str]]) -> None:
     """Blind transcription + text-only comparison over one chunk, then ONE
-    repair turn for confirmed findings. De-anchored by construction: the
+    investigation turn for advisory findings. De-anchored by construction: the
     transcriber never sees the page, the comparer never sees the image —
     the 07-06/07 live failures (MEM 条→GPU-Util, 跨图 H20) were both
     confirmation-bias artifacts of claim-in-context re-reading. Fail-open."""
@@ -2800,15 +2834,15 @@ async def _run_media_verify_flow(run, chunk: dict[str, list[str]]) -> None:
                     f";{len(errors)} 项转写/比对失败") if errors else ""
         if findings:
             await run.emit({"type": "summary", "text": _loc(run,
-                f"Self-check (images): {result['images']} image(s) checked, {len(findings)} claim(s) contradict the image / exceed the source — repair injected{tail}",
-                f"自检(图像):{result['images']} 张图已核,{len(findings)} 条断言与图不符/超源,注入回修{tail}")})
+                f"Self-check (images): {result['images']} image(s) checked, {len(findings)} review suggestion(s) need contextual investigation{tail}",
+                f"自检(图像):{result['images']} 张图已核,{len(findings)} 条模型疑点待结合原文查证{tail}")})
             await _set_converge_phase(run, "revising")
             await run.inject_user_message(mediaverify.build_repair_prompt(findings, locale=getattr(run, "locale", None)))
             injected_repair = True  # only after a SUCCESSFUL inject — a failed one must fall through to the chain below (review)
         else:
             await run.emit({"type": "summary", "text": _loc(run,
-                f"Self-check (images): {result['images']} image(s) checked, claims match the images ✓{tail}",
-                f"自检(图像):{result['images']} 张图已核,断言与图一致 ✓{tail}")})
+                f"Self-check (images): {result['images']} image(s) checked, no discrepancies reported by the optional reviewer{tail}",
+                f"自检(图像):{result['images']} 张图已核,可选审核未提出疑点{tail}")})
     except Exception as e:
         if getattr(run, "_verification_stopping", False):
             return
@@ -2927,12 +2961,14 @@ def _pk_due(run) -> str | None:
     if not (Path(workdir) / "candidate" / "index.md").is_file():
         return None
     sc = selfcheck.read_selfcheck(workdir) or {}
+    if sc.get("incremental"):
+        return None  # Full-library Q&A evaluation is an explicit independent action after a scoped update.
     if sc.get("state") != "passed":
         return None
     media_task = getattr(run, "_media_task", None)
     if media_task is not None and not media_task.done():
         return None  # blind image verify owns the seam first
-    if _media_verify_enabled() and selfcheck.pending_media_verification(workdir):
+    if _media_verify_enabled() and _pending_media_for_run(run):
         return None
     pk = sc.get("pk") or {}
     if pk.get("state") == "repairing":
@@ -3161,7 +3197,8 @@ async def _post_turn_selfcheck(run, *, allow_repair: bool = True) -> str | None:
     incr = getattr(run, "_incr_pending", None)
     run._incr_pending = None
     key = selfcheck.state_key(workdir)
-    last_state = (selfcheck.read_selfcheck(workdir) or {}).get("state")
+    prior_report = selfcheck.read_selfcheck(workdir) or {}
+    last_state = prior_report.get("state")
     unchanged_this_turn = key is not None and turn_start_key is not None and key == turn_start_key
     if (unchanged_this_turn and incr is None and not l1_repair_turn
             and not getattr(run, "_full_compile_pending", False)
@@ -3340,12 +3377,27 @@ async def _post_turn_selfcheck(run, *, allow_repair: bool = True) -> str | None:
         # full set can be recomputed from the unchanged baseline; cap the report
         # payload so a legacy corpus cannot exceed the workspace sync budget.
         report["incremental"] = {
+            "media_review_pages": sorted(editable | set(incremental.changed_pages(incr["before"], incremental.page_hashes(workdir)))),
             "out_of_scope_pages": incr_violations,
             "restored_pages": restored_pages,
             "grandfathered_format_violation_count": len(grandfathered_format),
             "grandfathered_format_violations": grandfathered_format[:40],
         }
+    elif (isinstance((prior_report.get("incremental") or {}).get("media_review_pages"), list)
+          and not getattr(run, "_full_compile_pending", False)
+          and not getattr(run, "_batch_active", False)):
+        # A media/ledger follow-up must not drop the source update's persisted
+        # scope and start paying off unrelated historical verification debt.
+        scope = set(prior_report["incremental"]["media_review_pages"])
+        if isinstance(turn_pages_before, dict):
+            scope.update(incremental.changed_pages(turn_pages_before, incremental.page_hashes(workdir)))
+        report["incremental"] = {"media_review_pages": sorted(scope)}
     ledger_clean = report["coverage"]["closed"] and report["lint"]["ok"]
+    no_progress = (l1_repair_turn and unchanged and
+                   all(prior_report.get(key) == report.get(key) for key in ("coverage", "lint")))
+    if no_progress and not ledger_clean:
+        report["repair_stop_reason"] = "no_progress"
+
     # High-water, not per-turn recomputation: the workload SHRINKS as repairs
     # succeed, so re-deriving the limit each turn strands the episode at
     # ~half-repaired (review). max() also lets the budget grow if a repair
@@ -3356,7 +3408,7 @@ async def _post_turn_selfcheck(run, *, allow_repair: bool = True) -> str | None:
         run._l1_repairs_used = 0
         run._l1_round_limit = 0
         report["state"] = "passed"
-    elif allow_repair and run._l1_repairs_used < run._l1_round_limit:
+    elif allow_repair and not no_progress and run._l1_repairs_used < run._l1_round_limit:
         report["state"] = "repairing"
         # The report carries the PREVIOUS converge_phase (possibly "settled");
         # the pre-turn_done sync would ship repairing+settled for one window
@@ -3380,17 +3432,11 @@ async def _post_turn_selfcheck(run, *, allow_repair: bool = True) -> str | None:
             f"Self-check normalized {len(mechanical_fixes)} unambiguous source citation(s) without using a repair round.",
             f"自检已机械规范化 {len(mechanical_fixes)} 处可唯一判定的来源标注,未消耗回修轮次。")})
     await run.emit({"type": "summary", "text": selfcheck.narration(report, locale)})
+    # Technical residuals remain in SELFCHECK.json, not the owner's decision queue.
     if report["state"] == "unconverged":
-        # Budget spent with residuals → land a ticket in the owner's question
-        # queue by CODE (same schema the model uses). The publish page only
-        # DISPLAYS residuals; it must never be where the owner discovers work.
-        try:
-            if selfcheck.file_residual_ticket(workdir, report, locale):
-                await run.emit({"type": "summary", "text": _loc(run,
-                    "Self-check residuals filed as a ticket in the question queue.",
-                    "自检残留已落为疑问工单,待负责人裁决。")})
-        except Exception:
-            pass  # ticket filing must never break the turn seam (fail-open, §4.5)
+        await run.emit({"type": "summary", "text": _loc(run,
+            "Automatic repair stopped with technical findings. See the saved self-check; no owner decision ticket was created.",
+            "自动修订结束，技术残留已保存在检查记录中，未转成负责人决策工单。")})
     if report["state"] == "repairing":
         run._l1_repairs_used += 1
         run._l1_repair_pending = True
@@ -3670,9 +3716,12 @@ def _validate_compile_write(run: "CompileRun", target: Path, content: str) -> No
     """Reject metadata expansion while the authoring worker can still repair it."""
     root = Path(run.workdir).resolve()
     rel = target.resolve().relative_to(root).as_posix()
+    if rel in {selfcheck.CONTRADICTIONS_PATH, review_notes.PATH}:
+        raise ValueError("Use file_ticket to record investigations or request owner decisions; use resolve_ticket for existing rulings. Do not edit these ledgers directly.")
     if not rel.startswith("candidate/") or not rel.endswith(".md"):
         return
     page = rel[len("candidate/"):]
+
     if selfcheck._is_reserved_page(page):
         return
     before = getattr(run, "_turn_page_hashes", None)
@@ -3721,6 +3770,8 @@ def _compile_session_client(run: "CompileRun", wd: str, system_prompt: str, sess
                         "permissionDecisionReason": "The finalization task ledger and frozen manifest are machine-owned."}}
             reads = getattr(run, "_finalization_reads", None)
             if reads is not None and tool in {"Read", "Grep", "Glob"}:
+                if isinstance(reads, finalization.DependencyReads) and tool in {"Grep", "Glob"} and path.is_dir() and (rel in {".", "candidate"} or rel.startswith("candidate/")):
+                    reads.membership_sensitive = True
                 if rel.startswith("candidate/") and path.is_file() and (path.suffix == ".md" or path.name == ".library-introduction.json"):
                     reads.add(rel[len("candidate/"):])
         return decision
@@ -5213,7 +5264,7 @@ async def _run_final_review_units(run, plan, replies):
         unit["attempts"] = int(unit.get("attempts", 0)) + 1
         await _checkpoint_finalization(run, plan)
         run._batch_stage = "batch_final"
-        run._finalization_reads = set(unit["targets"])
+        run._finalization_reads = finalization.DependencyReads(unit["targets"])
         try:
             current = selfcheck.candidate_pages(run.workdir)
             targets = [p for p in unit["targets"] if p in current]
@@ -5397,7 +5448,7 @@ async def _run_finalization_media(run, plan, replies):
                 await _run_ledger_repairs(run, replies)
             else:
                 await run.emit({"type": "summary",
-                                "text": f"自检(图像):{result['images']} 张图已核,断言与图一致 ✓"})
+                                "text": f"自检(图像):{result['images']} 张图已核,可选审核未提出疑点"})
             await _checkpoint_finalization(run, plan, completed=True)
 
 

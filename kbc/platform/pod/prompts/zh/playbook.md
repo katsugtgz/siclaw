@@ -129,3 +129,8 @@ status: stable
 开始前被拒绝。
 
 精确引用 Markdown/纯文本时，每个标注使用一个完整 Raw 相对路径，例如 `(source: docs/runbook.md lines 12-15)`，行号对应原始 Raw（读取切片时也要换算）。选取 1–20 行且最多 1200 字符；不确定时只标文件。`source_locations` 由自检生成，不要手写。
+
+
+先查证再升级：默认用 file_ticket(review_action="investigate") 保存内部疑点，不直接编辑 CONTRADICTIONS.json 或 REVIEW_NOTES.json。同一业务问题先查已有记录，复用 review_id。结合完整原料、附近正文、版本适用范围、已有裁决及原图查证；每次重试必须增加证据，后续批次未到的事项先延后。resolved 需要说明证据与结论。只有已完成查证仍无法解决、影响具体问答且需要负责人补充事实或决策，才用 needs_owner，并填写 investigation、answer_impact、owner_decision。技术故障、结构修订和审核模型分歧不直接提业务工单。图片描述和模型转写仅是线索，不是原图的替代品；使用图像事实时阅读原图及附近原文，读不清则保留未知。终审核对暂存事项，利用已完成批次自行解决，不能为减少工单编造确定结论。已有负责人回答沿用原裁决流程。
+
+本地工作区若没有托管 file_ticket 工具，可在工作副本中维护查证记录，按现有提案流程提交修改；不要声称已向负责人提单。

@@ -3548,77 +3548,6 @@ def _write_text_atomic(path: Path, text: str) -> None:
         raise
 
 
-# ── L2: budget spent with residuals → a ticket, never owner homework ─────────
-# The publish page only DISPLAYS residual state; the owner must never discover
-# work there. When the bounded repair loop gives up (state=unconverged), CODE
-# files one contradiction ticket — same schema, same queue, same rule/dispatch/
-# resolve_ticket loop the model's own tickets ride (box_role.md 「矛盾工单」).
-
-def file_residual_ticket(workdir: str, report: dict, locale: str | None = None) -> bool:
-    """Append ONE residual ticket to authoring/CONTRADICTIONS.json, model-free.
-    Stable id = fingerprint of the residual list: the same residuals repeatedly
-    unconverging never duplicate the ticket; different residuals open a fresh
-    one. An existing same-id ticket (open or already ruled) is left untouched.
-    Returns whether a ticket was filed."""
-    cov = report.get("coverage") or {}
-    lint = report.get("lint") or {}
-    incr = report.get("incremental") or {}
-    # The FULL residual set — both the fingerprint and the quote derive from it.
-    # Fingerprinting a truncated view (the old [:10] caps) made two genuinely
-    # different residual sets sharing a prefix collide to one ticket id, so the
-    # second was silently deduped away (review finding). Only the DISPLAY quote
-    # is truncated, below.
-    residuals: list[str] = []
-    pages: set[str] = set()
-    for p in (cov.get("unaccounted") or []):
-        residuals.append(f"未入账源: {p}")
-    for p in (cov.get("dangling_citations") or []):
-        residuals.append(f"悬空引用: {p}")
-    for v in (lint.get("violations") or []):
-        residuals.append(f"lint {v.get('kind')}: {v.get('page')} — {str(v.get('detail', ''))[:80]}")
-        if v.get("page"):
-            pages.add(str(v["page"]))
-    for p in (incr.get("out_of_scope_pages") or []):
-        residuals.append(f"越界未还原: {p}")
-        pages.add(str(p))
-    if not residuals:
-        return False
-    digest = hashlib.sha256("\n".join(sorted(residuals)).encode("utf-8")).hexdigest()[:8]
-    tid = f"selfcheck-residual-{digest}"
-    path = Path(workdir) / "authoring" / "CONTRADICTIONS.json"
-    tickets: list = []
-    if path.is_file():
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-            # Unreadable ledger: bail rather than clobber the model's tickets.
-            return False
-        if not isinstance(data, list):
-            return False
-        tickets = data
-    if any(isinstance(t, dict) and t.get("id") == tid for t in tickets):
-        return False
-    en = _is_en(locale)
-    tickets.append({
-        "id": tid,
-        "title": "Self-check residuals" if en else "自检残留待处理",
-        "question": ("The automatic self-check repair budget is spent and the items below remain unfixed — how should they be handled?"
-                     if en else "自检自动回修额度已用完,以下残留没有修完,要怎么处理?"),
-        "sources": [{"doc": "authoring/SELFCHECK.json", "quote": "; ".join(residuals)[:600]}],
-        "options": (["Run another repair round", "Accept as-is"] if en else ["再修一轮", "接受现状"]),
-        "current_value": "unresolved residuals" if en else "残留未处理",
-        "affected_pages": sorted(pages)[:20],
-        "status": "open",
-        "answer": None,
-        # A residual ticket asks the owner for an ACTION on the model's own
-        # output; no raw source is in dispute. Code knows that, so code says it.
-        "ticket_kind": TICKET_KIND_MODEL_GAP,
-        "origin": TICKET_ORIGIN_SELFCHECK,
-    })
-    _write_text_atomic(path, json.dumps(tickets, ensure_ascii=False, indent=2))
-    return True
-
-
 # ── ticket kind: filed by evidence, never by self-description ────────────────
 # A contradiction ticket has exactly two kinds, decided when it is FILED and
 # re-decided every compile round from the evidence on the ticket itself:
@@ -3769,7 +3698,7 @@ def file_ticket_record(workdir: str, ticket: dict) -> tuple[str, str | None]:
     else:
         for key in ("ticket_kind", "title", "question", "sources", "options",
                     "current_value", "affected_pages", "origin",
-                    "filed_operation_id", "filed_generation"):
+                    "filed_operation_id", "filed_generation", "escalation"):
             if key in ticket:
                 existing[key] = ticket[key]
         existing["superseded_at"] = ticket["filed_at"]
@@ -3779,6 +3708,14 @@ def file_ticket_record(workdir: str, ticket: dict) -> tuple[str, str | None]:
     except OSError as e:
         return "", f"{CONTRADICTIONS_PATH} write failed: {e}"
     return status, None
+
+
+def _review_note_receipts(workdir: str) -> list:
+    path = Path(workdir) / "authoring/REVIEW_NOTES.json"
+    if not path.exists():
+        return []
+    rows = json.loads(path.read_text("utf-8"))
+    return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
 
 
 def normalize_contradictions_file(workdir: str) -> tuple[int, str | None]:
@@ -3812,7 +3749,8 @@ def normalize_contradictions_file(workdir: str) -> tuple[int, str | None]:
         elif t.get("origin") not in (TICKET_ORIGIN_SELFCHECK, TICKET_ORIGIN_EDGE):
             filed_by_tool = (
                 t.get("ticket_kind") in TICKET_KINDS
-                and tid == ticket_claim_id(str(t.get("question", "")), normalize_ticket_sources(t.get("sources")))
+                and (tid == ticket_claim_id(str(t.get("question", "")), normalize_ticket_sources(t.get("sources")))
+                     or any(n.get("ticket_id") == tid for n in _review_note_receipts(workdir)))
             )
             if not filed_by_tool and t.get("ticket_kind") != TICKET_KIND_UNCLASSIFIED:
                 t["ticket_kind"] = TICKET_KIND_UNCLASSIFIED
