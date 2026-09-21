@@ -31,7 +31,7 @@ export const CAPABILITY_GROUPS: CapabilityGroup[] = [
   { key: "spawn_subagents", name: "Spawn sub-agents", description: "Fan out work to in-box sub-agents (privilege amplification)", tools: ["spawn_subagent", "wait_agent", "send_message", "task_output", "job_stop"] },
   { key: "transfer_conversation", name: "Transfer the conversation", description: "Hand the whole conversation to another agent that can reach the target network (roster-gated) — not a delegation", tools: ["transfer_to_agent", "search_handoff_targets"] },
   { key: "scheduling", name: "Scheduling", description: "Manage scheduled / recurring runs", tools: ["manage_schedule"] },
-  { key: "session_output", name: "Session output", description: "Report findings, post channel updates, submit feedback & propose writes for approval", tools: ["task_report", "save_feedback", "channel_update", "request_input", "propose_execution", "report_analysis_recommendation"] },
+  { key: "session_output", name: "Session output", description: "Report findings, post channel updates, submit feedback & propose writes for approval", tools: ["task_report", "save_feedback", "channel_update", "request_input", "propose_execution"] },
 ]
 
 /** Total distinct tools across the selected group keys (for the UI summary). */
