@@ -980,6 +980,10 @@ class TestRun:
         self._rebuild_requested: asyncio.Event = asyncio.Event()
         self._rebuild_ready: asyncio.Event = asyncio.Event()
         self._rebuild_error: str | None = None
+        # Initial startup is a distinct contract from later turn readiness.
+        # testStart does not return a usable session ID until this settles.
+        self.startup_ready: asyncio.Event = asyncio.Event()
+        self.startup_failure: dict | None = None
         # Snapshot page count (returned by open, replayed on an idempotent open).
         self.pages: int = 0
         # Consumer-minted client_request_id that opened this session (if any), so
@@ -2789,7 +2793,7 @@ def _observe_pi_sessions(fn):
     async def observed(run, *args, **kwargs):
         async def emit_observation(observation):
             stage = getattr(run, "_batch_stage", "")
-            if run._batch_active and stage in {
+            if getattr(run, "_batch_active", False) and stage in {
                 "batch_compile", "batch_map", "batch_reduce", "batch_final",
                 "batch_ledger", "batch_media_verify", "batch_notes", "batch_commit",
             }:
@@ -7249,6 +7253,12 @@ async def test_session_driver(run: "TestRun"):
             await client.connect()  # conversational: wait for the first /test-message
         except Exception as e:
             if not rebuilding:
+                run.startup_failure = {
+                    "code": "test_session_start_failed",
+                    "stage": "worker_connect",
+                    "exception_class": type(e).__name__,
+                }
+                run.startup_ready.set()
                 run.connected.set()  # unblock /test-message waiters → they see 409
                 raise                # first connect failed: hard session failure
             # A rebuild's reconnect failed. Keep the session row alive and report a
@@ -7264,6 +7274,7 @@ async def test_session_driver(run: "TestRun"):
             run._rebuild_ready.clear()
             continue
         run.client = client
+        run.startup_ready.set()
         run.connected.set()
         sid = str(getattr(client, "session_id", run.session_id) or run.session_id)
         run.session_id = sid
@@ -7657,6 +7668,13 @@ async def _test_session_wrapper(run: "TestRun"):
     try:
         await _TEST_SESSION_IMPL(run)
     except Exception as e:  # top-level boundary; CancelledError (teardown) passes through
+        if run.startup_failure is None:
+            run.startup_failure = {
+                "code": "test_session_failed",
+                "stage": "test_session",
+                "exception_class": type(e).__name__,
+            }
+        run.startup_ready.set()
         await run.emit(_error_event(
             repr(e),
             code="test_session_failed",
@@ -8405,6 +8423,9 @@ async def handle_open_test(request: web.Request):
         existing = TEST_SESSIONS.get(TEST_SESSION_IDEMPOTENCY.get(idem_key, ""))
         if existing is not None and not existing.done and existing.parent_run_id == parent.run_id:
             _print_test_lifecycle("test.open.idempotent", existing)
+            failure = await _await_test_startup(existing)
+            if failure is not None:
+                return _test_start_failure_response(failure)
             return web.json_response({
                 "ok": True,
                 "test_session_id": existing.tid,
@@ -8477,6 +8498,10 @@ async def handle_open_test(request: web.Request):
     TEST_SESSIONS[tid] = run
     run.task = asyncio.create_task(_test_session_wrapper(run))
     _print_test_lifecycle("test.open", run, extra=f"pages={pages}")
+    failure = await _await_test_startup(run)
+    if failure is not None:
+        await _teardown_test_session(run)
+        return _test_start_failure_response(failure)
     return web.json_response({
         "ok": True,
         "test_session_id": tid,
@@ -8485,6 +8510,31 @@ async def handle_open_test(request: web.Request):
         "pages": pages,
         "idempotent_replay": False,
     })
+
+
+async def _await_test_startup(run: "TestRun") -> dict | None:
+    try:
+        await asyncio.wait_for(
+            run.startup_ready.wait(),
+            timeout=float(os.environ.get("KBC_CONNECT_TIMEOUT_SECS", "25")),
+        )
+    except asyncio.TimeoutError:
+        return {
+            "code": "test_session_start_timeout",
+            "stage": "worker_connect",
+            "exception_class": "TimeoutError",
+        }
+    return run.startup_failure
+
+
+def _test_start_failure_response(failure: dict) -> web.Response:
+    return web.json_response({"error": {
+        "code": failure.get("code", "test_session_start_failed"),
+        "stage": failure.get("stage", "worker_connect"),
+        "exception_class": failure.get("exception_class", "UnknownError"),
+        "message": "test session failed to initialize",
+        "retriable": True,
+    }}, status=503)
 
 
 async def handle_test_recommendation(request: web.Request):

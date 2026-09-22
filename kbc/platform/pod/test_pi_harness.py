@@ -190,6 +190,40 @@ async def test_test_session_model_failure_emits_error_and_remains_reusable(tmp_p
             await consume
 
 
+async def test_real_test_session_observation_does_not_break_startup(tmp_path, monkeypatch):
+    """The shared observer must accept TestRun, not just CompileRun.
+
+    This is the production seam: wrapper -> TestRun -> real Pi worker.  A
+    diagnostic callback failure must never turn a healthy SDK startup into a
+    dead test session.
+    """
+    async with provider(lambda *_: completion("hello")) as (config, requests):
+        configure(monkeypatch, config)
+        run = compile_box.TestRun(
+            "test-observer", str(tmp_path), "parent-run", "snapshot-fixture")
+        run.task = asyncio.create_task(compile_box._test_session_wrapper(run))
+        try:
+            assert await compile_box._await_session_live(run) is None
+            assert run.client is not None
+            compile_box._arm_test_turn(run)
+            await run.client.query("hello")
+            seen = []
+            async with asyncio.timeout(15):
+                while True:
+                    event = await run.events.get()
+                    seen.append(event)
+                    if event["type"] == "turn_done":
+                        break
+            assert seen[-1]["text"] == "hello"
+            assert not any(event["type"] == "error" for event in seen)
+            assert len(requests) == 1
+        finally:
+            run.done = True
+            if run.task and not run.task.done():
+                run.task.cancel()
+                await asyncio.gather(run.task, return_exceptions=True)
+
+
 async def test_parallel_tools_keep_the_long_tool_watchdog_bound(tmp_path):
     run = compile_box.CompileRun("fixture", str(tmp_path), 1)
     for kind, call_id in (("tool_start", "a"), ("tool_start", "b"), ("tool_end", "a")):
