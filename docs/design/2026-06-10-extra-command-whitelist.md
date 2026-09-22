@@ -72,11 +72,18 @@ Validation rules (violations throw):
 - `version` must be `1`.
 - Command names must match `^[a-z0-9][a-z0-9._+-]*$` (lookup lowercases binary names).
 - `category` must be one of the existing `CommandCategory` values.
-- Only `category`, `description`, and the five declarative constraint fields are
-  accepted; unknown keys (including `validate`) are rejected.
+- Only `category`, `description`, `contexts`, `credentialFreeSubcommands` and the
+  five declarative constraint fields are accepted; unknown keys (including
+  `validate`) are rejected.
 - Flags must be non-empty strings starting with `-`; `positionals` must be
   `"allow" | "block" |` a non-negative integer; `allowedSubcommands` must be
-  `{ position: <non-negative int>, allowed: <non-empty string[]> }`.
+  `{ position: <non-negative int>, allowed: <non-empty string[]> }`;
+  `credentialFreeSubcommands` must be
+  `{ position: <non-negative int>, subcommands: <non-empty string[]> }`.
+- When both subcommand fields name the SAME position, every
+  `credentialFreeSubcommands` entry must also appear in `allowedSubcommands.allowed`.
+  A subcommand declared credential-free but not whitelisted would skip the prefetch
+  and then be refused anyway — a typo that presents as a credential fault.
 
 A bare entry (`{"category": "network"}`) means *no flag restrictions* for that binary —
 that responsibility lies with the config author; the startup audit log makes it visible.
@@ -144,6 +151,43 @@ a vendor-shaped name into an open-source enum.
 - **Runtime override (future, not in scope)**: mounting a ConfigMap over
   `/etc/siclaw/extra-commands.json` in the AgentBox pod spec would avoid rebuilds; this
   needs k8s-spawner pod-spec changes and is deliberately deferred.
+
+## Credential-free subcommands
+
+`credentialFreeSubcommands` names the subcommands of a command that need **no credential
+materialized before the binary is spawned**. Absent means every subcommand needs one, which
+is the fail-closed reading and the behaviour that predates the field.
+
+It exists because a credential prefetch keyed only off the BINARY NAME takes the command's
+own contract down with it. `siforgectl describe` prints a local catalog and resolves no
+identity at all — its CLI says so in as many words:
+
+> The identity is deliberately NOT resolved here. `describe` must work with no credential at
+> all — an agent reading the contract before it has one, or in a session where provisioning
+> failed, should get the catalog and not an auth error about a command it is only reading about.
+
+Prefetching for it meant that in a box whose provisioning had failed, the one command that
+explains what the tool can do was the one command that could not run. The model then reported
+the whole binary unusable rather than "I can read the contract but cannot act yet" — the same
+class of failure as a description the loader silently dropped, arrived at from the other side.
+
+Why it is DECLARED rather than inferred: which of a binary's subcommands talk to a server is
+that binary's fact, and the party that installs the binary is the party that knows. Hardcoding
+`describe` into the credential seam would put one vendor CLI's verbs back into the open-source
+registry — exactly the coupling the drop-in directory removed.
+
+Scope: it changes only whether a credential is FETCHED. It is not an authorization decision,
+it does not widen the whitelist (a subcommand still has to pass `allowedSubcommands`), and a
+pipeline is armed by any invocation that needs the credential — a cheap read standing next to
+a real call does not decide for it.
+
+Known residual: an invocation with NO positional at the declared position is not free, because
+the fail-closed reading of "which subcommand is this" is "none of the declared ones". So
+`<binary> --help` still arms the prefetch and is still refused in a box with no credential.
+That is deliberate — a bare binary is an action for some commands — and it is tolerable here
+only because the documented entry point is `describe`, which both the CLI's own usage text and
+the command description point at. Expressing "the empty subcommand is also free" would need a
+sentinel in the schema, and it has not been worth one.
 
 ## Security analysis
 

@@ -12,6 +12,7 @@ import {
   setExtraCommands,
   getContextAllowedSet,
   validateCommandRestrictions,
+  isCredentialFreeInvocation,
 } from "./command-sets.js";
 import { validateCommand } from "./command-validator.js";
 
@@ -126,6 +127,52 @@ describe("parseExtraCommandsConfig", () => {
     expect(() => parseExtraCommandsConfig(wrap({ x: { category: "network", allowedSubcommands: { position: -1, allowed: ["a"] } } }), "t")).toThrow(/allowedSubcommands/);
     expect(() => parseExtraCommandsConfig(wrap({ x: { category: "network", allowedSubcommands: { position: 0, allowed: [] } } }), "t")).toThrow(/allowedSubcommands/);
     expect(() => parseExtraCommandsConfig(wrap({ x: { category: "network", allowedSubcommands: { allowed: ["a"] } } }), "t")).toThrow(/allowedSubcommands/);
+  });
+
+  it("accepts credentialFreeSubcommands and carries it through", () => {
+    const parsed = parseExtraCommandsConfig(wrap({
+      vendorctl: {
+        category: "general",
+        allowedSubcommands: { position: 0, allowed: ["describe", "deploy"] },
+        credentialFreeSubcommands: { position: 0, subcommands: ["describe"] },
+      },
+    }), "t");
+    expect(parsed.vendorctl.credentialFreeSubcommands).toEqual({ position: 0, subcommands: ["describe"] });
+  });
+
+  it("rejects malformed credentialFreeSubcommands", () => {
+    const bad = (v: unknown) => wrap({ x: { category: "network", credentialFreeSubcommands: v } });
+    expect(() => parseExtraCommandsConfig(bad({ position: -1, subcommands: ["a"] }), "t")).toThrow(/credentialFreeSubcommands/);
+    expect(() => parseExtraCommandsConfig(bad({ position: 0, subcommands: [] }), "t")).toThrow(/credentialFreeSubcommands/);
+    expect(() => parseExtraCommandsConfig(bad({ subcommands: ["a"] }), "t")).toThrow(/credentialFreeSubcommands/);
+    // `allowed` is the neighbouring field's key; naming it here is the likely typo.
+    expect(() => parseExtraCommandsConfig(bad({ position: 0, allowed: ["a"] }), "t")).toThrow(/credentialFreeSubcommands/);
+  });
+
+  // A subcommand declared credential-free but not whitelisted fails at load
+  // rather than at use. Left to run, it skips the prefetch and is then refused
+  // by the whitelist anyway — a typo that presents as a credential fault.
+  it("rejects a credential-free subcommand the whitelist does not permit", () => {
+    expect(() => parseExtraCommandsConfig(wrap({
+      x: {
+        category: "network",
+        allowedSubcommands: { position: 0, allowed: ["describe"] },
+        credentialFreeSubcommands: { position: 0, subcommands: ["describ"] },
+      },
+    }), "t")).toThrow(/does not permit/);
+  });
+
+  // Different positions mean the two fields are talking about different tokens,
+  // so neither constrains the other and the cross-check must not invent a link.
+  it("does not cross-check when the two fields name different positions", () => {
+    const parsed = parseExtraCommandsConfig(wrap({
+      x: {
+        category: "network",
+        allowedSubcommands: { position: 0, allowed: ["describe"] },
+        credentialFreeSubcommands: { position: 1, subcommands: ["anything"] },
+      },
+    }), "t");
+    expect(parsed.x.credentialFreeSubcommands).toEqual({ position: 1, subcommands: ["anything"] });
   });
 
   it("rejects a non-object command entry", () => {
@@ -359,5 +406,55 @@ describe("contexts", () => {
     expect(() => parseExtraCommandsConfig(
       wrap({ vendorctl: { category: "general", description: "  " } }), "t"))
       .toThrow(/description/);
+  });
+});
+
+// End to end: a declaration in a drop-in file reaches the predicate the
+// credential seam consults. Parsing it and honouring it are two steps, and a
+// field that parses but is never read is the failure this pins.
+describe("credentialFreeSubcommands → isCredentialFreeInvocation", () => {
+  const wrap = (commands: unknown) => JSON.stringify({ version: 1, commands });
+
+  afterEach(() => { setExtraCommands({}); });
+
+  const register = () => {
+    setExtraCommands(parseExtraCommandsConfig(wrap({
+      vendorctl: {
+        category: "general",
+        allowedSubcommands: { position: 0, allowed: ["describe", "deploy", "build"] },
+        credentialFreeSubcommands: { position: 0, subcommands: ["describe"] },
+      },
+    }), "t"));
+  };
+
+  it("is true for a declared subcommand", () => {
+    register();
+    expect(isCredentialFreeInvocation("vendorctl describe")).toBe(true);
+  });
+
+  it("locates the subcommand past leading flags, as the whitelist does", () => {
+    register();
+    expect(isCredentialFreeInvocation("vendorctl --pretty describe")).toBe(true);
+    expect(isCredentialFreeInvocation("vendorctl --pretty deploy run")).toBe(false);
+  });
+
+  it("resolves through an absolute path and is case-insensitive on the binary", () => {
+    register();
+    expect(isCredentialFreeInvocation("/usr/local/bin/vendorctl describe")).toBe(true);
+  });
+
+  it("is false for an undeclared subcommand, a missing one, and an unknown binary", () => {
+    register();
+    expect(isCredentialFreeInvocation("vendorctl build list")).toBe(false);
+    expect(isCredentialFreeInvocation("vendorctl")).toBe(false);
+    expect(isCredentialFreeInvocation("someothertool describe")).toBe(false);
+    expect(isCredentialFreeInvocation("")).toBe(false);
+  });
+
+  it("is false for a command that declares nothing — the fail-closed default", () => {
+    setExtraCommands(parseExtraCommandsConfig(wrap({
+      vendorctl: { category: "general", allowedSubcommands: { position: 0, allowed: ["describe"] } },
+    }), "t"));
+    expect(isCredentialFreeInvocation("vendorctl describe")).toBe(false);
   });
 });

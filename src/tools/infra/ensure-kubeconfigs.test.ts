@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import {
   ensureClusterForTool,
   ensureHostForTool,
@@ -6,6 +6,7 @@ import {
   ensureDevopsCredentialForTool,
   DEVOPS_CLI_BINARY,
 } from "./ensure-kubeconfigs.js";
+import { setExtraCommands } from "./command-sets.js";
 
 describe("ensureClusterForTool", () => {
   it("no-op when broker undefined", async () => {
@@ -199,5 +200,101 @@ describe("ensureDevopsCredentialForTool", () => {
     } as any;
     await expect(ensureDevopsCredentialForTool(broker, [DEVOPS_CLI_BINARY], "p"))
       .rejects.toThrow(/no delivery-platform credential/);
+  });
+});
+
+// The declaration-driven half: a subcommand its command declared as needing no
+// credential must not arm the prefetch, and everything else still must.
+//
+// 🔴 The bug these pin is not "describe was blocked". It is that the ONE command
+// which explains what the binary can do was the one command a box with broken
+// provisioning could not run, so the model reported the whole CLI unusable
+// instead of "I can read the contract but cannot act yet".
+describe("ensureDevopsCredentialForTool — credential-free subcommands", () => {
+  function fakeBroker() {
+    const calls: string[] = [];
+    return {
+      calls,
+      broker: { ensureDevopsCredential: async (p: string) => { calls.push(p); } } as any,
+    };
+  }
+
+  beforeEach(() => {
+    setExtraCommands({
+      [DEVOPS_CLI_BINARY]: {
+        category: "general",
+        allowedSubcommands: { position: 0, allowed: ["describe", "deploy", "build"] },
+        credentialFreeSubcommands: { position: 0, subcommands: ["describe"] },
+      },
+    });
+  });
+  afterEach(() => { setExtraCommands({}); });
+
+  it("does not fetch for a declared credential-free subcommand", async () => {
+    const { calls, broker } = fakeBroker();
+    await ensureDevopsCredentialForTool(broker, [`${DEVOPS_CLI_BINARY} describe`], "restricted_bash");
+    expect(calls).toEqual([]);
+  });
+
+  // The subcommand is the Nth POSITIONAL, not argv[1] — the same walk the
+  // whitelist uses. A global flag in front must not turn a free read into a fetch.
+  it("skips leading flags when locating the subcommand", async () => {
+    const { calls, broker } = fakeBroker();
+    await ensureDevopsCredentialForTool(broker, [`${DEVOPS_CLI_BINARY} --pretty describe`], "p");
+    expect(calls).toEqual([]);
+  });
+
+  it("still fetches for a subcommand that reaches the platform", async () => {
+    const { calls, broker } = fakeBroker();
+    await ensureDevopsCredentialForTool(broker, [`${DEVOPS_CLI_BINARY} deploy run --yes`], "restricted_bash");
+    expect(calls).toEqual(["restricted_bash"]);
+  });
+
+  // A pipeline is armed by ANY invocation that needs the credential. The cheap
+  // read must not decide for the expensive write standing next to it.
+  it("fetches when a pipeline mixes a free read with a real call", async () => {
+    const { calls, broker } = fakeBroker();
+    await ensureDevopsCredentialForTool(
+      broker,
+      [`${DEVOPS_CLI_BINARY} describe`, "jq .", `${DEVOPS_CLI_BINARY} build list`],
+      "p",
+    );
+    expect(calls).toEqual(["p"]);
+  });
+
+  // Fail-closed: an undeclared subcommand is not free just because a sibling is.
+  it("fetches for a subcommand the declaration does not name", async () => {
+    const { calls, broker } = fakeBroker();
+    await ensureDevopsCredentialForTool(broker, [`${DEVOPS_CLI_BINARY} build list`], "p");
+    expect(calls).toEqual(["p"]);
+  });
+
+  // …and a bare binary names no subcommand at all, so it cannot be the free one.
+  it("fetches when no subcommand is present", async () => {
+    const { calls, broker } = fakeBroker();
+    await ensureDevopsCredentialForTool(broker, [DEVOPS_CLI_BINARY], "p");
+    expect(calls).toEqual(["p"]);
+  });
+
+  it("resolves the declaration through an absolute path, as the whitelist does", async () => {
+    const { calls, broker } = fakeBroker();
+    await ensureDevopsCredentialForTool(broker, [`/usr/local/bin/${DEVOPS_CLI_BINARY} describe`], "p");
+    expect(calls).toEqual([]);
+  });
+});
+
+// Without a declaration nothing changes — this is the state every other
+// deployment is in, and the one that must keep prefetching.
+describe("ensureDevopsCredentialForTool — no declaration", () => {
+  afterEach(() => { setExtraCommands({}); });
+
+  it("fetches for every subcommand when the command declares none", async () => {
+    setExtraCommands({
+      [DEVOPS_CLI_BINARY]: { category: "general", allowedSubcommands: { position: 0, allowed: ["describe"] } },
+    });
+    const calls: string[] = [];
+    const broker = { ensureDevopsCredential: async (p: string) => { calls.push(p); } } as any;
+    await ensureDevopsCredentialForTool(broker, [`${DEVOPS_CLI_BINARY} describe`], "p");
+    expect(calls).toEqual(["p"]);
   });
 });
