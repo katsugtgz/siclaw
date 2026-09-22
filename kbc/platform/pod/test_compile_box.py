@@ -401,6 +401,19 @@ class _FakeAgentClient:
         pass
 
 
+class _OpenFakeAgentClient(_FakeAgentClient):
+    """Keep an HTTP-opened test session live until explicit teardown."""
+    async def receive_messages(self):
+        while self._pending:
+            yield self._pending.pop(0)
+        await asyncio.Future()
+
+
+class _FailConnectAgentClient(_FakeAgentClient):
+    async def connect(self, prompt=None):
+        raise RuntimeError("private provider detail")
+
+
 async def test_session_driver_conversational():
     """run_session connects WITHOUT a prompt (conversational by construction) and
     relays assistant text + turn_done; the session id is minted and announced."""
@@ -907,7 +920,7 @@ async def test_open_close_test_session_http():
     missing index.md → 400; concurrency cap → 429; close tears down
     (snapshot dir + registry entry gone)."""
     orig = compile_box.create_agent_client
-    compile_box.create_agent_client = _FakeAgentClient
+    compile_box.create_agent_client = _OpenFakeAgentClient
     compile_box.RUNS.clear()
     compile_box.TEST_SESSIONS.clear()
     snap_root = tempfile.mkdtemp()
@@ -984,6 +997,22 @@ async def test_open_close_test_session_http():
         nobidx = make_source_bundle({"only.md": "x"})
         r = await client.post("/test-session/p1", json={"bundle_base64": base64.b64encode(nobidx).decode()})
         assert r.status == 400, await r.text()
+
+        # A failed worker connect is rejected by testStart itself. The response
+        # retains bounded routing facts, not the private exception message, and
+        # no dead session is advertised to a later testMessage call.
+        compile_box.create_agent_client = _FailConnectAgentClient
+        failed = await client.post("/test-session/p1")
+        assert failed.status == 503, await failed.text()
+        error = (await failed.json())["error"]
+        assert error == {
+            "code": "test_session_start_failed",
+            "stage": "worker_connect",
+            "exception_class": "RuntimeError",
+            "message": "test session failed to initialize",
+            "retriable": True,
+        }, error
+        assert "private" not in json.dumps(error)
 
         # sha mismatch → 400
         r = await client.post("/test-session/p1", json={

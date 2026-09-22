@@ -96,6 +96,15 @@ IDs and duplicate inserts are ignored. A dropped record produces an explicit gap
 Readiness observations also include the pinned type/release/harness identity
 when supplied. Managed instructions are excluded from that metadata.
 
+Observation delivery is strictly additive. Compiler and read-only test runs
+share the observer wrapper, which must treat run-type-specific fields as
+optional. A diagnostic callback rejection is reported once through a fixed
+content-free marker and cannot fail worker startup, model/tool processing,
+terminal result handling or teardown. Test-session creation waits for the Pi
+worker connection before returning a session ID. A failed initial connection
+returns only a controlled code, stage and exception class; it never advertises
+a dead session whose first question can only fail with `session is not live`.
+
 ## Rollout and rollback
 
 Oversized text and PDF sources select the slice-aware planner even when the

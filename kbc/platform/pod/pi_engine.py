@@ -87,9 +87,9 @@ class PiAgentClient:
         try:
             await self._observations.emit(kind, data, self._turn_id)
         except Exception:
-            if kind not in {"worker_start", "worker_ready", "tool_dispatch", "tool_result", "model_payload"}:
-                raise
-            # Additive diagnostic delivery must not prevent a tool reply or model request.
+            # Observability is strictly additive. A persistence or callback
+            # failure must never alter startup, tool delivery, model execution,
+            # terminal result handling, or teardown.
             if not self._diagnostic_warning_emitted:
                 self._diagnostic_warning_emitted = True
                 print("[kbc] diagnostic_observer_failed", flush=True)

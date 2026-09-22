@@ -167,6 +167,29 @@ async def test_diagnostic_sink_failure_does_not_drop_tool_reply(tmp_path):
     assert "evidence" in next(x["output"] for x in requests[1]["input"] if x.get("type") == "function_call_output")
 
 
+async def test_every_diagnostic_sink_failure_is_execution_neutral(tmp_path):
+    """Observability is additive, including startup and terminal events."""
+    from pi_engine import observe_sessions
+
+    (tmp_path / "index.md").write_text("evidence")
+    seen = []
+
+    async def broken_sink(event):
+        seen.append(event["kind"])
+        raise RuntimeError("private diagnostic backend failure")
+
+    async with provider(lambda _, n: response(tool=("Read", {"file_path": "index.md"}))
+                        if n == 1 else response(text="done"), api="openai-responses") as (config, requests):
+        with observe_sessions(broken_sink):
+            async with client(tmp_path, config, FileTools(str(tmp_path), ["Read"], allow).tools()) as instance:
+                await instance.query("Hello")
+                events = await collect(instance)
+    assert events[-1].data["outcome"] == "completed"
+    assert "ready" in seen and "result" in seen and "transport_error" not in seen
+    assert "evidence" in next(x["output"] for x in requests[1]["input"]
+                              if x.get("type") == "function_call_output")
+
+
 async def test_chat_completions_image_attachment_remains_visible_in_wire_summary(tmp_path):
     from agent_protocol import EngineTool
     from pi_engine import observe_sessions
