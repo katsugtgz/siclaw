@@ -1,0 +1,167 @@
+# Ticket watch result MCP
+
+A standalone stdio MCP for one turn of **following an L1 ticket**.
+`submit_ticket_watch_result` validates the turn's receipt and returns the same
+JSON object in MCP text and `structuredContent`. It reads and writes nothing:
+no ticket system, no messages, no scheduling. The harness that dispatched the
+run stores the result and acts on it.
+
+This is the in-flight follow only. The other result contracts in this directory
+belong to different moments of a ticket's life: pre-ticket intake keeps
+[product-support-result](../product-support-result/README.md), the pre-handoff
+closure keeps [ticket-closure-result](../ticket-closure-result/README.md), and
+the post-closure retrospective keeps
+[ticket-review-result](../ticket-review-result/README.md).
+
+## Why a result tool at all
+
+The assistant following a ticket is **stateless**; the harness is stateful.
+Every run starts from nothing, is handed one row, and ends. This result is the
+entire handover — the only thing a run leaves behind, and the only material the
+next run (possibly in a fresh session, possibly two days later) will have.
+
+The platform makes the submission mandatory through the Agent's result contract
+(see [Assistant and API setup](#assistant-and-api-setup)), so a run that ends
+without calling this tool fails with `TURN_RESULT_MISSING` rather than silently
+losing its turn. The contract belongs to the Agent, not to one dispatch: sicore
+enforces it on every strict `/run` dispatch and, for a ticket-type Agent, on its
+Web and channel conversations too. An L1 engineer chatting with this assistant
+therefore also gets a turn that ends in a submission; an assistant meant for
+free conversation should be a separate Agent without this contract.
+
+## Output contract
+
+```json
+{
+  "state": "watching",
+  "next_check_after_seconds": 300,
+  "last_seen_message_id": "1047",
+  "open_sre_tasks": ["task-abc"],
+  "understanding": {
+    "timeline": "13:50 起海外 MaaS API 报 404，三次复现",
+    "ruled_out": [{ "claim": "网关不健康", "by_task": "task-abc" }],
+    "open_questions": ["客户用的是哪个模型，尚未说明"],
+    "from_l1": ["这个客户是 VIP，优先级提高"]
+  },
+  "note": "已派排障任务 task-abc，等结果"
+}
+```
+
+| Field | Meaning | Bound |
+| --- | --- | --- |
+| `state` | `watching` · `waiting_sre` · `waiting_l1` · `done` | required |
+| `next_check_after_seconds` | Floor on when to wake this follow again. Required unless `done`, where it must be **absent**. | 60–3600 |
+| `last_seen_message_id` | Group-message cursor. | ≤64 characters |
+| `open_sre_tasks` | Investigation tasks still in flight, as a whole list. | ≤10 ids, ≤64 characters each |
+| `understanding.timeline` | Established facts in order. | ≤1500 characters |
+| `understanding.ruled_out` | `{claim, by_task}` — causes an investigation excluded. | ≤10 entries; claim ≤300 |
+| `understanding.open_questions` | What is still unknown, including unproven suspicions. | ≤10 entries, ≤300 each |
+| `understanding.from_l1` | What the L1 engineer said that should outlive this run. | ≤10 entries, ≤300 each |
+| `note` | One internal line about this run. Required when `state` is `done`. | ≤500 characters |
+
+Strings are returned trimmed; nothing is coerced, defaulted or truncated.
+Oversized input is rejected so the model can shorten its own text — a silent
+clip would drop the end of a timeline and the next run would inherit the damage
+as fact.
+
+## Three rules that are not decoration
+
+### A turn that did nothing is a complete result
+
+```json
+{ "state": "waiting_sre", "next_check_after_seconds": 900 }
+```
+
+That is legal and changes nothing stored. Following a ticket is mostly silence:
+no new messages, an investigation still running. A contract that demanded a
+narrative every turn would get one invented.
+
+### Present replaces, absent leaves alone
+
+Update semantics mirror the ticket system's own `update_for_ai`, which the team
+already knows: a field present in the result replaces that field; a field absent
+leaves it alone; there is no merge inside a field. So the assistant re-curates
+what is worth keeping instead of appending forever, which is what keeps the
+injected context flat as a ticket ages.
+
+Consequences worth stating:
+
+- `[]` on a list is a real retraction — "nothing is ruled out any more",
+  "no investigation is in flight". Omitting the field is what leaves it alone.
+- `understanding: {}` is legal and changes nothing.
+- `null` is **rejected** on every field. The difference between "clear this" and
+  "do not touch this" is exactly what the caller must not have to guess.
+
+### Nothing is ruled out without a task that ruled it out
+
+`by_task` is mandatory on every `ruled_out` entry, and its refusal message
+points at `open_questions`, where a suspicion belongs. A confident wrong
+exclusion is far more damaging than a missing fact: whoever reads the
+`understanding` next — including an investigator receiving it as a brief —
+cannot see where the claim came from and has no reason to doubt it.
+
+What this tool can enforce is that the citation exists. It holds no state, so it
+cannot check that the task exists or that it concluded any such thing. That
+check belongs to the harness, which knows the ticket's own task history; until
+it lands, the guarantee here is structural, not evidential.
+
+## What is deliberately absent
+
+- **No state the agent can reschedule itself with.** The lease, the fencing
+  token and the failure count are the harness's. The agent proposes a next check
+  and nothing more.
+- **No `stalled`.** It exists in the harness as its verdict after repeated
+  failed runs. A run that believes it is stuck is still `watching` and says so
+  in `note`.
+- **No text bound for the ticket or the group.** Whether a run may write a note
+  onto the ticket — and whether that goes through a gated tool or a field here —
+  is an open design question. Adding the field later is additive; shipping it
+  before the conflict-handling is decided would not be.
+- **No customer-visible field of any kind.** The customer never perceives this
+  assistant. `note` is internal to the team.
+
+## Assistant and API setup
+
+The AgentBox image builds every package in [`mcp/MCP_LIST.txt`](../MCP_LIST.txt)
+and exposes the binary on `PATH`:
+
+```json
+{
+  "name": "ticket-watch-result",
+  "transport": "stdio",
+  "command": "mcp-ticket-watch-result",
+  "args": [],
+  "env": {}
+}
+```
+
+Bind it to the ticket-following assistant alongside its read tools, and point
+the Agent's result contract at it (`kind: mcp_tool`, this server's id,
+`submit_ticket_watch_result`, `required: true`). No platform code is involved:
+sicore resolves the contract to `mcp__ticket-watch-result__submit_ticket_watch_result`
+and enforces it for the turn.
+
+### One prompt line is load-bearing
+
+The instance prompt must say to submit **exactly once, as the last thing in the
+turn, and never a second time**. This is not boilerplate. Measured against a real
+model: the turn that first had to read the ticket called the tool once, while the
+turn whose only action was the submission called it **three times** and failed
+with `MULTIPLE_TURN_RESULTS`. A scheduled follower's normal turn is exactly that
+second shape — nothing to do but report — so the line is what keeps the common
+case working. The same rule already appears in
+[support-prompt.md](../../examples/support-review/support-prompt.md).
+
+An omitted result does not simply fail either: the runtime repairs the omission
+by forcing the call, and a prompt that fights the repair can produce several
+submissions instead of none. A caller should treat `TURN_RESULT_MISSING` and
+`MULTIPLE_TURN_RESULTS` the same way — this run produced nothing usable.
+
+## Verification
+
+From the repository root:
+
+```bash
+npx vitest run mcp/ticket-watch-result
+npm run build --prefix mcp/ticket-watch-result
+```
