@@ -8,7 +8,7 @@
  */
 
 import type { CredentialBroker, HostLocalInfo } from "../../agentbox/credential-broker.js";
-import { getCommandBinary } from "./command-sets.js";
+import { getCommandBinary, isCredentialFreeInvocation } from "./command-sets.js";
 
 /**
  * Prefetch for tools that take a single `cluster` parameter (pod-exec,
@@ -60,6 +60,14 @@ export const DEVOPS_CLI_BINARY = "siforgectl";
  * `siforgectl` without a credential — the CLI would otherwise fail against the
  * delivery platform with an authentication error, which reads to the model as
  * "the platform refused me" rather than "this box never received a credential".
+ *
+ * ⚠️ THAT ARGUMENT ONLY HOLDS FOR SUBCOMMANDS THAT REACH THE PLATFORM. A command
+ * that resolves no identity — the CLI's own catalog — has no authentication
+ * failure to be mistaken for anything, and refusing to spawn it costs the model
+ * the one command that would tell it what the binary can do. Which subcommands
+ * those are is the binary's fact and arrives as a DECLARATION
+ * (`credentialFreeSubcommands`), so this file gains no knowledge of any
+ * particular CLI's verbs. Absent declaration = prefetch, exactly as before.
  */
 export async function ensureDevopsCredentialForTool(
   broker: CredentialBroker | undefined,
@@ -71,7 +79,14 @@ export async function ensureDevopsCredentialForTool(
   // extractCommands produces. Reduced through the shared getCommandBinary rather
   // than by matching a prefix of the raw string, so `siforgectl-shim …` and
   // `/opt/x/siforgectl …` are classified the way the whitelist classified them.
-  if (!commands.some((cmd) => getCommandBinary(cmd) === DEVOPS_CLI_BINARY)) return;
+  //
+  // ANY invocation that needs the credential arms the fetch: a pipeline mixing
+  // `siforgectl describe` with a real call still needs it, and the cheap read is
+  // the one that must not decide for the whole pipeline.
+  const needsCredential = commands.some(
+    (cmd) => getCommandBinary(cmd) === DEVOPS_CLI_BINARY && !isCredentialFreeInvocation(cmd),
+  );
+  if (!needsCredential) return;
   await broker.ensureDevopsCredential(purpose);
 }
 

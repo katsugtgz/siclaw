@@ -266,6 +266,28 @@ interface InternalRule {
   requiredFlags?: string[];
 }
 
+/**
+ * The Nth positional of an argv (flags skipped), or undefined when there are fewer.
+ *
+ * Shared rather than inlined because two decisions now read "which subcommand is
+ * this": the whitelist (`allowedSubcommands`) and the credential prefetch
+ * (`credentialFreeSubcommands`). Two walks that could disagree about which token
+ * is the subcommand would let a command be admitted as one thing and have its
+ * credential decided as another — `siforgectl --pretty describe` is exactly the
+ * shape where a naive `args[1]` and this walk diverge.
+ *
+ * argv[0] is the binary, so the scan starts at 1.
+ */
+function positionalAt(args: string[], position: number): string | undefined {
+  let seen = 0;
+  for (const arg of args.slice(1)) {
+    if (arg.startsWith("-")) continue;
+    if (seen === position) return arg;
+    seen++;
+  }
+  return undefined;
+}
+
 function validateByRule(
   args: string[],
   rule: InternalRule,
@@ -292,27 +314,21 @@ function validateByRule(
   // 2. allowedSubcommands: check the Nth positional
   if (rule.allowedSubcommands) {
     const { position, allowed } = rule.allowedSubcommands;
-    let posCount = 0;
-    for (const arg of args.slice(1)) {
-      if (arg.startsWith("-")) continue;
-      if (posCount === position) {
-        if (!allowed.includes(arg)) {
-          return JSON.stringify({
-            error: `${cmd} ${position === 0 ? "subcommand" : "action"} "${arg}" is not allowed.`,
-            // Listing what IS permitted turns a dead end into a next step. A review reports `crictl exec`
-            // being refused clearly and the caller then guessing at kubelet volume paths, because the
-            // refusal named nothing.
-            allowed: [...allowed],
-            ...(SUBCOMMAND_ALTERNATIVES.get(`${cmd} ${arg}`)
-              ? { hint: SUBCOMMAND_ALTERNATIVES.get(`${cmd} ${arg}`) }
-              : {}),
-          }, null, 2);
-        }
-        return null;
-      }
-      posCount++;
+    const arg = positionalAt(args, position);
+    if (arg === undefined) return null; // not enough positionals → safe default
+    if (!allowed.includes(arg)) {
+      return JSON.stringify({
+        error: `${cmd} ${position === 0 ? "subcommand" : "action"} "${arg}" is not allowed.`,
+        // Listing what IS permitted turns a dead end into a next step. A review reports `crictl exec`
+        // being refused clearly and the caller then guessing at kubelet volume paths, because the
+        // refusal named nothing.
+        allowed: [...allowed],
+        ...(SUBCOMMAND_ALTERNATIVES.get(`${cmd} ${arg}`)
+          ? { hint: SUBCOMMAND_ALTERNATIVES.get(`${cmd} ${arg}`) }
+          : {}),
+      }, null, 2);
     }
-    return null; // not enough positionals → safe default
+    return null;
   }
 
   // 3. check flags + positionals
@@ -1866,6 +1882,27 @@ export interface CommandDef {
    * a target container or on a remote host advertises a capability that can only answer 127 there.
    */
   contexts?: readonly string[];
+  /**
+   * Subcommands that need NO credential materialized before the binary runs.
+   *
+   * 🔴 It exists because a credential prefetch that keys only off the binary name
+   * takes the command's own contract down with it. `siforgectl describe` prints a
+   * local catalog and resolves no identity at all — its CLI says so in as many
+   * words ("`describe` must work with no credential at all — an agent reading the
+   * contract before it has one, or in a session where provisioning failed, should
+   * get the catalog and not an auth error"). Prefetching for it meant that in a
+   * box whose provisioning had failed, the ONE command that explains what the
+   * tool can do was the one command that could not run, and the model concluded
+   * the whole binary was unusable rather than "I can read the contract but cannot
+   * act yet".
+   *
+   * DECLARED, not inferred. Which of a binary's subcommands talk to a server is
+   * that binary's fact, and the party that installs it is the party that knows —
+   * the same argument that moved the command declaration itself out of this
+   * registry and into a drop-in file. Absent means every subcommand needs it,
+   * which is the fail-closed reading and today's behaviour unchanged.
+   */
+  credentialFreeSubcommands?: { position: number; subcommands: string[] };
 }
 
 /**
@@ -2176,6 +2213,27 @@ export function setExtraCommands(extra: Record<string, CommandDef>): SetExtraCom
 /** Resolve a command definition: built-in registry first, then extras. */
 function getCommandDef(baseName: string): CommandDef | undefined {
   return COMMANDS[baseName] ?? extraCommands[baseName];
+}
+
+/**
+ * Whether this invocation is one its command declared as needing no credential.
+ *
+ * Answers only the question; the caller decides what a credential is and whether
+ * to fetch one. The registry stays the place that knows what a command DECLARED,
+ * and the credential seam stays the place that knows what a credential IS.
+ *
+ * Fail-closed at every unknown: a command with no definition, no declaration, or
+ * an invocation whose subcommand is absent or unlisted all return false, so the
+ * caller prefetches exactly as it did before this field existed.
+ */
+export function isCredentialFreeInvocation(cmd: string): boolean {
+  const args = parseArgs(cmd);
+  if (args.length === 0) return false;
+  const def = getCommandDef(args[0].split("/").pop()?.toLowerCase() ?? "");
+  const declared = def?.credentialFreeSubcommands;
+  if (!declared) return false;
+  const sub = positionalAt(args, declared.position);
+  return sub !== undefined && declared.subcommands.includes(sub);
 }
 
 // ── Context Policies (internal) ─────────────────────────────────

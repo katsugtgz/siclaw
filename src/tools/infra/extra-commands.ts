@@ -74,6 +74,7 @@ const INTERPRETER_VERSION_PATTERN =
 const ALLOWED_ENTRY_KEYS = new Set([
   "category", "description", "contexts",
   "allowedFlags", "blockedFlags", "allowedSubcommands", "positionals", "requiredFlags",
+  "credentialFreeSubcommands",
 ]);
 
 function fail(source: string, message: string): never {
@@ -162,6 +163,35 @@ function parseEntry(source: string, name: string, raw: unknown): CommandDef {
       fail(source, `"${name}".allowedSubcommands must be { position: <non-negative int>, allowed: <non-empty string[]> }`);
     }
     def.allowedSubcommands = { position: s.position as number, allowed: s.allowed as string[] };
+  }
+
+  // Which subcommands need no credential materialized before the binary runs.
+  // See CommandDef.credentialFreeSubcommands for why this is declared here and
+  // not inferred by the credential seam.
+  if (entry.credentialFreeSubcommands !== undefined) {
+    const s = entry.credentialFreeSubcommands as { position?: unknown; subcommands?: unknown };
+    const positionOk = typeof s === "object" && s !== null &&
+      typeof s.position === "number" && Number.isInteger(s.position) && s.position >= 0;
+    const subsOk = positionOk && Array.isArray(s.subcommands) && s.subcommands.length > 0 &&
+      s.subcommands.every((a: unknown) => typeof a === "string" && a.length > 0);
+    if (!subsOk) {
+      fail(source, `"${name}".credentialFreeSubcommands must be { position: <non-negative int>, subcommands: <non-empty string[]> }`);
+    }
+    const declared = { position: s.position as number, subcommands: s.subcommands as string[] };
+
+    // 🔴 A credential-free subcommand that the whitelist does not admit is a
+    // contradiction, and the silent reading of it is the dangerous one: the
+    // prefetch is skipped, then the command is refused anyway, and the box looks
+    // like it has a credential problem when it has a typo. Only checkable when
+    // both fields name the same position — at a different position the two are
+    // talking about different tokens and neither constrains the other.
+    if (def.allowedSubcommands && def.allowedSubcommands.position === declared.position) {
+      const unknown = declared.subcommands.filter((s) => !def.allowedSubcommands!.allowed.includes(s));
+      if (unknown.length > 0) {
+        fail(source, `"${name}".credentialFreeSubcommands names ${JSON.stringify(unknown)}, which allowedSubcommands does not permit at position ${declared.position}`);
+      }
+    }
+    def.credentialFreeSubcommands = declared;
   }
 
   return def;
