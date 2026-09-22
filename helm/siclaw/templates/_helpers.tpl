@@ -74,9 +74,31 @@ keeps older Runtime releases enabled.
 
 {{/*
 Build agentbox image string — same registry/tag as gateway, different component name.
+
+agentbox.image overrides the whole string, the way scriptSandbox.image and
+agentbox.compileBoxImage already do for the other spawned images. The reason is
+specific to the box: it is where a DEPLOYMENT's own tooling lives. A deployment
+that installs a binary of its own — a delivery CLI built from another repository,
+say — runs boxes built FROM the release's image under a name this chart cannot
+derive, and without an override its only options are to fork the chart or to patch
+SICLAW_AGENTBOX_IMAGE on the Deployment after every upgrade. The patch is the worse
+one: it is exactly the drift the next `helm upgrade` silently reverts, and the
+symptom is a capability that disappears from the agent with no deployment event
+anywhere near it.
+
+🔴 An override PINS the box. `helm upgrade` then moves the gateway and leaves the
+boxes where they are, so the overriding image is rebuilt against the new release
+and set in the SAME upgrade. Nothing here can check that — the chart cannot know
+what went into someone else's image — which is why it is stated rather than
+enforced.
 */}}
 {{- define "siclaw.agentboxImage" -}}
+{{- $ab := .Values.agentbox | default dict -}}
+{{- if $ab.image -}}
+{{- $ab.image -}}
+{{- else -}}
 {{- include "siclaw.image" (dict "component" "agentbox" "ctx" .) -}}
+{{- end -}}
 {{- end }}
 
 {{/*

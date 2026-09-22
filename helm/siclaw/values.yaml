@@ -218,6 +218,13 @@ ocr:
 
 # -- AgentBox (spawned at runtime by K8s spawner)
 agentbox:
+  # Full-image override for every AgentBox this Runtime spawns. Empty ⇒ the
+  # release-coupled default {image.registry}/siclaw-agentbox:{image.tag}, which is
+  # what nearly every deployment wants. Set it when your boxes are built FROM that
+  # image with extra tooling installed (e.g. a delivery CLI from another repo) —
+  # and then rebuild and re-set it on every upgrade, because an override pins the
+  # box while the gateway moves. See siclaw.agentboxImage in _helpers.tpl.
+  image: ""
   debugImage: ""
   # Resources for every AgentBox pod the Runtime spawns — one per agent, NOT the
   # Runtime's own pod (that is runtime.resources above). A BoxProfile that declares
