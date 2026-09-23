@@ -366,3 +366,73 @@ async def test_real_pi_worker_runs_codex_subscription_through_live_transport(tmp
     assert all(headers.get("chatgpt-account-id") == "acct-fixture" for headers in posts)
     assert posts[1]["Authorization"] == "Bearer " + new_key
     assert old_key not in str(refreshes) and new_key not in str(refreshes)
+
+
+async def test_refused_session_configuration_is_structured_and_not_registered(tmp_path, monkeypatch):
+    monkeypatch.setattr(compile_box, "RUNS", {})
+    app = web.Application()
+    app.router.add_post("/session/{run_id}", compile_box.handle_session)
+    broken = execution()
+    broken["roles"]["compile"]["model"]["api"] = "openai-mystery"
+    async with TestClient(TestServer(app)) as client:
+        response = await client.post("/session/refused-run", json={
+            "workdir": str(tmp_path), "llm": {"engine": "pi_agent", "execution": broken}})
+        assert response.status == 422
+        body = await response.json()
+    assert body["error"]["code"] == "session_config_invalid"
+    assert body["error"]["retriable"] is False
+    assert "refused-run" not in compile_box.RUNS
+
+
+async def test_unexpected_handler_failure_returns_a_structured_summary():
+    async def explode(_request):
+        raise RuntimeError("seed directory missing\nsecond line stays out")
+    app = web.Application(middlewares=[compile_box._unhandled_error_middleware])
+    app.router.add_post("/boom", explode)
+    async with TestClient(TestServer(app)) as client:
+        response = await client.post("/boom")
+        assert response.status == 500
+        body = await response.json()
+    assert body["error"] == {"code": "box_internal_error", "retriable": True,
+                             "message": "RuntimeError: seed directory missing"}
+
+
+async def test_handler_failure_after_a_started_stream_leaves_the_stream_to_aiohttp():
+    async def stream_then_explode(request):
+        response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        await response.write(b"data: one\n\n")
+        raise RuntimeError("relay broke mid-stream")
+    app = web.Application(middlewares=[compile_box._unhandled_error_middleware])
+    app.router.add_get("/events", stream_then_explode)
+    server = TestServer(app)
+    await server.start_server()
+    try:
+        reader, writer = await asyncio.open_connection(server.host, server.port)
+        writer.write(b"GET /events HTTP/1.1\r\nHost: box\r\n\r\n")
+        await writer.drain()
+        raw, closed = b"", False
+        try:
+            while chunk := await asyncio.wait_for(reader.read(4096), 2):
+                raw += chunk
+            closed = True
+        except asyncio.TimeoutError:
+            pass
+        writer.close()
+    finally:
+        await server.close()
+    # A second status line inside the chunked body desynchronises the relay; the
+    # broken stream must end with the connection closed instead.
+    assert b"data: one" in raw
+    assert raw.count(b"HTTP/1.1 ") == 1, raw
+    assert closed
+
+
+async def test_handler_timeout_keeps_aiohttps_gateway_timeout():
+    async def time_out(_request):
+        raise asyncio.TimeoutError()
+    app = web.Application(middlewares=[compile_box._unhandled_error_middleware])
+    app.router.add_post("/slow", time_out)
+    async with TestClient(TestServer(app)) as client:
+        response = await client.post("/slow")
+        assert response.status == 504

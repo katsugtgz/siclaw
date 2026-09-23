@@ -40,7 +40,7 @@ import { CapabilityImageUpgrade, type ImageUpgradeAdmission } from "./capability
 import { acquireCapabilityBox } from "./capability/box-acquire.js";
 import { CAPABILITY_OBSERVE_CONTAINER } from "./capability/contract.js";
 import { driveCapabilitySession } from "./capability/session-driver.js";
-import { asFailureToken } from "./capability/failure.js";
+import { asFailureToken, capabilityStartFailure } from "./capability/failure.js";
 import { driveTestSession, shouldRelayTestSession } from "./capability/test-relay.js";
 import { CAPABILITY_GET_RUN, CAPABILITY_FETCH_INPUT, INPUT_REF_UPGRADE_ADMISSION, isTerminalCapabilityStatus } from "./capability/contract.js";
 import type {
@@ -1582,12 +1582,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       capabilityStartsTotal.inc({ outcome: "failure" });
       capabilityStartDurationMs.observe({ outcome: "failure" }, Date.now() - startedAt);
       if (startedRunId) {
-        await capabilityRunManager.endRun(startedRunId, "failed", {
-          code: "start_failed",
-          stage: "capability_start",
-          message: `start_failed:${err instanceof Error ? err.name : "Error"}`,
-          exception_class: err instanceof Error ? err.name : undefined,
-        });
+        await capabilityRunManager.endRun(startedRunId, "failed", capabilityStartFailure(err));
       }
       throw err;
     }

@@ -38,6 +38,7 @@ import posixpath
 import re
 import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
 import time
@@ -7809,7 +7810,17 @@ async def handle_session(request: web.Request):
     # Consumer-managed LLM endpoint + KBC_* knobs (DESIGN-kb-llm-binding-v2):
     # applied to os.environ BEFORE any SDK/engine session exists, so the
     # persistent session, batch sessions, PK and media-verify all inherit them.
-    _apply_session_config(body)
+    try:
+        _apply_session_config(body)
+    except ValueError as error:
+        # A configuration this box can never accept (missing roles, unsupported
+        # protocol, invalid settings). Report it as non-retriable so the runtime
+        # ends the run as spawn_config_refused instead of an opaque 500 that the
+        # consumer retries with the same frozen snapshot.
+        print(f"[session] configuration refused: {type(error).__name__}", file=sys.stderr, flush=True)
+        return web.json_response({"error": {
+            "code": "session_config_invalid", "message": str(error), "retriable": False,
+        }}, status=422)
     run = CompileRun(run_id, body.get("workdir", "/work"), int(body.get("round", 1)), body.get("instruction", ""))
     run._artifact_ack_required = body.get("artifact_ack") is True
     # Tool whitelist from the runtime BoxProfile (None/absent → driver default).
@@ -8810,10 +8821,38 @@ async def _client_certificate_middleware(request: web.Request, handler):
     return await handler(request)
 
 
+@web.middleware
+async def _unhandled_error_middleware(request: web.Request, handler):
+    """Return a structured summary for unexpected handler failures.
+
+    A failed setup deletes the box, and its stderr with it. The Runtime logs the
+    error body it receives, so the exception class and first line travel with
+    the response; the full traceback still goes to stderr for live boxes.
+
+    Only a response that has not started can carry the summary. Once a stream
+    handler has written bytes, a second response would land inside its chunked
+    body, so the failure goes back to aiohttp, which closes the connection. A
+    timeout also stays aiohttp's, which answers it as 504.
+    """
+    try:
+        return await handler(request)
+    except (web.HTTPException, asyncio.CancelledError, asyncio.TimeoutError):
+        raise
+    except Exception as error:
+        if request.writer is not None and request.writer.output_size > 0:
+            raise
+        traceback.print_exc(file=sys.stderr)
+        first_line = (str(error).splitlines() or [""])[0]
+        summary = f"{type(error).__name__}: {first_line}"[:300]
+        return web.json_response({"error": {
+            "code": "box_internal_error", "message": summary, "retriable": True,
+        }}, status=500)
+
+
 def build_app() -> web.Application:
     app = web.Application(
         client_max_size=_http_max_request_bytes(),
-        middlewares=[_client_certificate_middleware, _upgrade_admission],
+        middlewares=[_client_certificate_middleware, _upgrade_admission, _unhandled_error_middleware],
     )
     app.cleanup_ctx.append(loop_diagnostics.lifecycle)
     app.on_startup.append(destream.start)
