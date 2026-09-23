@@ -55,6 +55,8 @@ FROM node:22.19-slim
 # context for restricted-bash only — node_exec resolves binaries in the node's namespaces and
 # pod_exec inside the target container, so neither gains anything from this layer.
 #   bsdextrautils — provides `column` (moved out of bsdmainutils on bookworm)
+#   ripgrep       — the `grep` tool runs `rg`; without it pi downloads the latest release from
+#                   GitHub at call time, which fails offline and otherwise runs an unreviewed binary
 #   yq            — mikefarah/yq, installed as a WRAPPER; see the yq layer below
 #
 # yq is pinned to an exact version and checksum rather than `releases/latest`: an unverified
@@ -62,7 +64,7 @@ FROM node:22.19-slim
 ARG YQ_VERSION=v4.53.3
 ARG YQ_SHA256=fa52a4e758c63d38299163fbdd1edfb4c4963247918bf9c1c5d31d84789eded4
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl jq python3 ca-certificates sudo fonts-noto-cjk chromium bsdextrautils \
+    curl jq python3 ca-certificates sudo fonts-noto-cjk chromium bsdextrautils ripgrep \
     && curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" \
     && chmod +x kubectl && mv kubectl /usr/local/bin/ \
     && rm -rf /var/lib/apt/lists/*
