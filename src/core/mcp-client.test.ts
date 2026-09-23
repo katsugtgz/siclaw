@@ -11,6 +11,8 @@ import {
   isBundledCreateChartCommand,
   mergeMcpStdioEnv,
   visualMcpRequestTimeoutMs,
+  buildMcpInstructionsPrompt,
+  MCP_INSTRUCTIONS_MAX_BYTES,
 } from "./mcp-client.js";
 
 describe("jsonSchemaToTypebox", () => {
@@ -328,4 +330,49 @@ it("shares MCP cancellation and preserves raw structured data only for trusted S
   expect(stopped.details).toHaveProperty("error"); expect(client.callTool).toHaveBeenCalledOnce();
   const normal = createMcpToolDefinition("metrics", undefined, { name: "query" }, client);
   expect((await normal.execute("3", {}, undefined, undefined, {} as any)).details).not.toHaveProperty("rawResult");
+});
+
+describe("buildMcpInstructionsPrompt", () => {
+  it("renders one section per server, headed by its name and tool prefix, with the text intact", () => {
+    const guide = "Start here: inventory view=project.\nLeave project out of every call.";
+    const sections = buildMcpInstructionsPrompt([
+      { serverName: "devops", instructions: `\n${guide}\n\n` },
+      { serverName: "grafana", instructions: "Dashboards first." },
+    ]);
+    expect(sections).toEqual([
+      `\n## MCP server "devops"\n\nInstructions this server sent for its tools (\`mcp__devops__*\`):\n\n${guide}`,
+      `\n## MCP server "grafana"\n\nInstructions this server sent for its tools (\`mcp__grafana__*\`):\n\nDashboards first.`,
+    ]);
+  });
+
+  it("adds nothing when no server sent instructions", () => {
+    expect(buildMcpInstructionsPrompt([])).toEqual([]);
+  });
+
+  it("keeps text at exactly the cap untouched", () => {
+    const text = "a".repeat(MCP_INSTRUCTIONS_MAX_BYTES);
+    const [section] = buildMcpInstructionsPrompt([{ serverName: "big", instructions: text }]);
+    expect(section.endsWith(text)).toBe(true);
+    expect(section).not.toContain("[truncated");
+  });
+
+  it("cuts text over the cap at the cap and says so, with the size the server sent", () => {
+    const head = "a".repeat(MCP_INSTRUCTIONS_MAX_BYTES);
+    const tail = "TAIL-THAT-MUST-NOT-APPEAR";
+    const [section] = buildMcpInstructionsPrompt([{ serverName: "big", instructions: head + tail }]);
+    const sent = MCP_INSTRUCTIONS_MAX_BYTES + tail.length;
+    expect(section).toContain(`${head}\n\n[truncated: server "big" sent ${sent} bytes of instructions; only the first ${MCP_INSTRUCTIONS_MAX_BYTES} bytes are shown]`);
+    expect(section).not.toContain(tail);
+  });
+
+  it("does not split a multi-byte character at the cut", () => {
+    // 3-byte characters: the cap (16384) is not a multiple of 3, so a naive byte
+    // cut would end on a partial character and decode to U+FFFD.
+    const text = "界".repeat(MCP_INSTRUCTIONS_MAX_BYTES);
+    const [section] = buildMcpInstructionsPrompt([{ serverName: "wide", instructions: text }]);
+    const kept = section.slice(section.indexOf("界"), section.indexOf("\n\n[truncated"));
+    expect(kept).not.toContain("\uFFFD");
+    expect(Buffer.byteLength(kept, "utf8")).toBe(Math.floor(MCP_INSTRUCTIONS_MAX_BYTES / 3) * 3);
+    expect(section).toContain(`sent ${MCP_INSTRUCTIONS_MAX_BYTES * 3} bytes`);
+  });
 });

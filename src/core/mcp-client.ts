@@ -115,6 +115,64 @@ interface ManagedMcpClient {
   serverName: string;
   client: any; // Client from @modelcontextprotocol/sdk
   transport: any;
+  /**
+   * The `instructions` the server returned from `initialize`, as the SDK hands
+   * them over. Kept here and deliberately NOT on {@link McpServerConnection}:
+   * connections are reported upstream to the control plane (/api/sync-status),
+   * while this text is prompt material for this box's own sessions.
+   */
+  instructions?: string;
+}
+
+/** One connected server's `instructions`, for the system prompt. */
+export interface McpServerInstructions {
+  serverName: string;
+  instructions: string;
+}
+
+/**
+ * Per-server budget for `instructions` in the system prompt, in UTF-8 bytes.
+ * The text comes from a server an administrator bound, the same trust level as
+ * its tool descriptions; the cap only bounds what one server can put in front
+ * of the model.
+ */
+export const MCP_INSTRUCTIONS_MAX_BYTES = 16 * 1024;
+
+/** Cut to at most maxBytes of UTF-8 without splitting a code point. */
+function truncateUtf8(text: string, maxBytes: number): string {
+  const buf = Buffer.from(text, "utf8");
+  if (buf.length <= maxBytes) return text;
+  let end = maxBytes;
+  // buf[end] is the first byte left out; while it is a continuation byte
+  // (10xxxxxx) its code point began inside the kept range, so drop that too.
+  while (end > 0 && (buf[end] & 0xc0) === 0x80) end--;
+  return buf.subarray(0, end).toString("utf8");
+}
+
+/**
+ * Render servers' `instructions` as system-prompt sections, one
+ * `## MCP server "<name>"` section per server, in the order given.
+ *
+ * The MCP spec has the server send these once, at initialize, as its own guide
+ * to its tools — which tool to start from, how the tools relate. Tool
+ * descriptions cannot carry that: each describes one tool. Dropping the text
+ * leaves the model with no entry point for a server whose tools only make sense
+ * together.
+ *
+ * Text over {@link MCP_INSTRUCTIONS_MAX_BYTES} is cut there and says so, with
+ * the size the server actually sent, so the model knows it is reading part.
+ */
+export function buildMcpInstructionsPrompt(servers: McpServerInstructions[]): string[] {
+  return servers.map(({ serverName, instructions }) => {
+    const text = instructions.trim();
+    const bytes = Buffer.byteLength(text, "utf8");
+    const body = bytes <= MCP_INSTRUCTIONS_MAX_BYTES
+      ? text
+      : `${truncateUtf8(text, MCP_INSTRUCTIONS_MAX_BYTES)}\n\n` +
+        `[truncated: server "${serverName}" sent ${bytes} bytes of instructions; only the first ${MCP_INSTRUCTIONS_MAX_BYTES} bytes are shown]`;
+    return `\n## MCP server "${serverName}"\n\n` +
+      `Instructions this server sent for its tools (\`${buildMcpToolName(serverName, "*")}\`):\n\n${body}`;
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -497,6 +555,7 @@ export class McpClientManager {
         }
         console.log(`[mcp-client] Connected to "${serverName}" (${detectedTransport})`);
         const serverImplementationName = client.getServerVersion()?.name;
+        const instructions: string | undefined = client.getInstructions();
 
         // Publish a complete per-server inventory. A failed later page must not
         // leave a partial tool set that silently hides capabilities from the model.
@@ -545,7 +604,7 @@ export class McpClientManager {
           this.tools.push(toolDef);
         }
 
-        this.clients.push({ serverName, client, transport });
+        this.clients.push({ serverName, client, transport, instructions });
         this.connections.push({
           name: serverName, transport: detectedTransport, state: "connected",
           toolCount: mcpTools.length,
@@ -603,6 +662,17 @@ export class McpClientManager {
       toolNames: [...item.toolNames],
       ...(item.error ? { error: { ...item.error } } : {}),
     }));
+  }
+
+  /**
+   * The `instructions` of every connected server that sent any, in
+   * configuration order. A failed server has none by construction: it never
+   * reaches the client list. Uncapped; the prompt layer applies its budget in
+   * {@link buildMcpInstructionsPrompt}.
+   */
+  getServerInstructions(): McpServerInstructions[] {
+    return this.clients.flatMap(({ serverName, instructions }) =>
+      instructions?.trim() ? [{ serverName, instructions }] : []);
   }
 
   /**

@@ -31,8 +31,11 @@ async function listen(responder: Responder): Promise<string> {
   return `http://127.0.0.1:${(server.address() as AddressInfo).port}/mcp`;
 }
 
-/** The smallest streamable-http MCP server the SDK client will complete a handshake with. */
-const fakeMcpServer = (tools: string[]): Responder => (req, body, res) => {
+/**
+ * The smallest streamable-http MCP server the SDK client will complete a handshake with.
+ * `instructions`, when given, goes into the initialize result as the spec places it.
+ */
+const fakeMcpServer = (tools: string[], instructions?: string): Responder => (req, body, res) => {
   if (req.method !== "POST") {
     res.writeHead(405).end();
     return;
@@ -43,7 +46,10 @@ const fakeMcpServer = (tools: string[]): Responder => (req, body, res) => {
     return;
   }
   const result = msg.method === "initialize"
-    ? { protocolVersion: msg.params?.protocolVersion ?? "2025-03-26", capabilities: { tools: {} }, serverInfo: { name: "fake", version: "0" } }
+    ? {
+      protocolVersion: msg.params?.protocolVersion ?? "2025-03-26", capabilities: { tools: {} }, serverInfo: { name: "fake", version: "0" },
+      ...(instructions !== undefined ? { instructions } : {}),
+    }
     : msg.method === "tools/list"
       ? { tools: tools.map((name) => ({ name, inputSchema: { type: "object", properties: {} } })) }
       : undefined;
@@ -156,6 +162,55 @@ describe("McpClientManager.getServerConnections", () => {
     first[0].state = "connected";
     first[0].toolNames.push("x");
     expect(manager.getServerConnections()[0]).toMatchObject({ state: "failed", toolNames: [] });
+  });
+});
+
+describe("McpClientManager.getServerInstructions", () => {
+  it("keeps the instructions a server sent at initialize, and leaves out servers that sent none", async () => {
+    const guide = "Start here: inventory view=project.\nLeave project out of every call.";
+    const withGuide = await listen(fakeMcpServer(["inventory"], guide));
+    const blank = await listen(fakeMcpServer(["echo"], "  \n "));
+    const without = await listen(fakeMcpServer(["ping"]));
+    const manager = new McpClientManager({
+      mcpServers: {
+        devops: { transport: "streamable-http", url: withGuide },
+        blank: { transport: "streamable-http", url: blank },
+        plain: { transport: "streamable-http", url: without },
+      },
+    });
+    try {
+      await manager.initialize();
+      expect(manager.getServerConnections().map((c) => c.state)).toEqual(["connected", "connected", "connected"]);
+      expect(manager.getServerInstructions()).toEqual([{ serverName: "devops", instructions: guide }]);
+      // Connections are what a box reports upstream (/api/sync-status); the
+      // instructions are prompt material and must not ride along.
+      for (const c of manager.getServerConnections()) expect(c).not.toHaveProperty("instructions");
+    } finally {
+      await manager.shutdown();
+    }
+    expect(manager.getServerInstructions()).toEqual([]);
+  });
+
+  it("has none for a server that failed after sending them", async () => {
+    // initialize succeeds (and carries instructions), tools/list fails: the
+    // server never reaches the client list, so its text must not reach a prompt.
+    const url = await listen((req, body, res) => {
+      const msg = req.method === "POST" ? JSON.parse(body) : {};
+      if (msg.method === "tools/list") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ jsonrpc: "2.0", id: msg.id, error: { code: -32603, message: "boom" } }));
+        return;
+      }
+      fakeMcpServer([], "should not appear")(req, body, res);
+    });
+    const manager = new McpClientManager({ mcpServers: { broken: { transport: "streamable-http", url } } });
+    try {
+      await manager.initialize();
+      expect(manager.getServerConnections()[0]).toMatchObject({ name: "broken", state: "failed" });
+      expect(manager.getServerInstructions()).toEqual([]);
+    } finally {
+      await manager.shutdown();
+    }
   });
 });
 
