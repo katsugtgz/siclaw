@@ -455,6 +455,12 @@ export interface ToolRefs {
   /** Session-scoped Skill script lookup. Required for LocalSpawner isolation. */
   skillScriptResolver?: SkillScriptResolver;
   memoryDir?: string;
+  /**
+   * The box-wide code-view layer (virtual `<repo>@<sha>` paths + the mounted
+   * bare mirrors). The SAME instance the file tools route through, so
+   * `git_query` and `read`/`grep` answer from one authority reading.
+   */
+  codeView?: import("../tools/code-view/view.js").CodeView;
   /** See SessionEventEmitter. Undefined when running without a session SSE bus. */
   sessionEventEmitter?: SessionEventEmitter;
   /**

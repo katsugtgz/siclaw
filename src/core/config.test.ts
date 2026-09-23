@@ -1,5 +1,9 @@
 import { describe, it, expect, afterEach } from "vitest";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import {
+  reloadConfig,
   normalizeIdleTimeoutSec,
   MIN_AGENTBOX_IDLE_SEC,
   sanitizeLangfuseEnv,
@@ -84,5 +88,35 @@ describe("resolveTracingEnvironment — single source for startup + hot-reload",
   it("returns undefined when unset (so the caller omits the attribute)", () => {
     delete process.env.SICLAW_TRACING_ENVIRONMENT;
     expect(resolveTracingEnvironment()).toBeUndefined();
+  });
+});
+
+describe("paths.gitReposDir — where the box looks for bare-mirror mounts", () => {
+  const savedEnv = process.env.SICLAW_GITREPOS_DIR;
+  const savedConfigDir = process.env.SICLAW_CONFIG_DIR;
+  let cfgDir = "";
+  afterEach(() => {
+    if (savedEnv === undefined) delete process.env.SICLAW_GITREPOS_DIR;
+    else process.env.SICLAW_GITREPOS_DIR = savedEnv;
+    if (savedConfigDir === undefined) delete process.env.SICLAW_CONFIG_DIR;
+    else process.env.SICLAW_CONFIG_DIR = savedConfigDir;
+    if (cfgDir) fs.rmSync(cfgDir, { recursive: true, force: true });
+    reloadConfig();
+  });
+  function isolated() {
+    cfgDir = fs.mkdtempSync(path.join(os.tmpdir(), "siclaw-cfg-"));
+    process.env.SICLAW_CONFIG_DIR = cfgDir;
+  }
+
+  it("defaults to .siclaw/gitrepos — the K8s spawner mounts at /app/.siclaw/gitrepos, and the two must agree", () => {
+    isolated();
+    delete process.env.SICLAW_GITREPOS_DIR;
+    expect(reloadConfig().paths.gitReposDir).toBe(".siclaw/gitrepos");
+  });
+
+  it("SICLAW_GITREPOS_DIR overrides it", () => {
+    isolated();
+    process.env.SICLAW_GITREPOS_DIR = "/srv/mirrors";
+    expect(reloadConfig().paths.gitReposDir).toBe("/srv/mirrors");
   });
 });

@@ -6,6 +6,11 @@ import { describe, expect, it, vi } from "vitest";
 import { ToolRegistry, type ToolRefs } from "../core/tool-registry.js";
 import { resolveAgentHarness } from "../core/agent-context.js";
 import { allToolEntries } from "./all-entries.js";
+import { execFileSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { CodeView } from "./code-view/view.js";
 
 function refs(): ToolRefs {
   return {
@@ -60,6 +65,33 @@ describe("production tool registry", () => {
     const result = await transfer!.execute!("transfer-1", { route_key: "receiver", brief: "Verify the calculation" }, undefined as never);
     expect(result).toMatchObject({ details: { transferred: true } });
     expect(context.sessionEventEmitter).toHaveBeenCalledWith({ type: "handoff_requested", targetAgentId: "receiver", brief: "Verify the calculation" });
+  });
+
+  it("grants git_query through read_files, and only while a mirror is readable", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "all-entries-code-view-"));
+    try {
+      const reposDir = path.join(root, "repos");
+      const gitReposDir = path.join(root, "gitrepos");
+      fs.mkdirSync(reposDir, { recursive: true });
+      execFileSync("git", ["init", "-q", "--bare", path.join(gitReposDir, "app.git")]);
+      fs.writeFileSync(path.join(reposDir, ".gitrepos.json"), JSON.stringify({
+        version: 1, repos: [{ name: "app", host: "h", path: "g/app", bare: "mirrors/h/g/app.git" }],
+        rules: { exclude_dirs: [], max_file_bytes: 1024 },
+      }));
+      const registry = new ToolRegistry();
+      registry.register(...allToolEntries);
+      const names = (codeView: CodeView, groups: string[]) => registry.resolve({
+        mode: "web", refs: { ...refs(), codeView }, allowedTools: resolveCapabilities(groups),
+      }).map(tool => tool.name);
+      const mounted = new CodeView({ reposDir, gitReposDir, authorityTtlMs: 0 });
+      expect(names(mounted, ["read_files"])).toContain("git_query");
+      expect(names(mounted, ["run_commands", "search_memory"])).not.toContain("git_query");
+      // Same grant, nothing mounted: the tool must not be offered at all.
+      const unmounted = new CodeView({ reposDir, gitReposDir: path.join(root, "absent"), authorityTtlMs: 0 });
+      expect(names(unmounted, ["read_files"])).not.toContain("git_query");
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("keeps interactive input and channel updates registered after peer retirement", () => {

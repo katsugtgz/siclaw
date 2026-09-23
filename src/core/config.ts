@@ -109,7 +109,19 @@ export interface SiclawConfig {
   default?: { provider: string; modelId: string };
   modelRouting?: ModelRoutePolicy;
   embedding?: EmbeddingConfig;
-  paths: { userDataDir: string; skillsDir: string; credentialsDir: string; reposDir: string; docsDir: string; knowledgeDir: string };
+  paths: {
+    userDataDir: string; skillsDir: string; credentialsDir: string; reposDir: string; docsDir: string; knowledgeDir: string;
+    /**
+     * Where the box sees the supplier's bare mirrors, one read-only mount per
+     * repository at `<gitReposDir>/<name>.git`. The K8s spawner hard-codes the
+     * same path (`/app/.siclaw/gitrepos`) for the mounts it emits, exactly as it
+     * does for `reposDir` — see docs/design/agentbox-code-volume.md ("Git layer").
+     * Deliberately NOT under `reposDir`: that directory is the supplier's
+     * subPath mount (read-only, owned by another system) and is scanned into the
+     * prompt as the repository table, so nothing of ours may live inside it.
+     */
+    gitReposDir: string;
+  };
   server: {
     port: number;
     gatewayUrl: string;
@@ -262,6 +274,7 @@ const DEFAULTS: SiclawConfig = {
     reposDir: ".siclaw/repos",
     docsDir: ".siclaw/docs",
     knowledgeDir: ".siclaw/knowledge",
+    gitReposDir: ".siclaw/gitrepos",
   },
   server: { port: 3000, gatewayUrl: "", idleTimeoutSec: 300 },
   debugImage: "busybox:1.36",
@@ -411,6 +424,9 @@ export function loadConfig(): SiclawConfig {
   }
   if (process.env.SICLAW_DOCS_DIR) {
     cached.paths.docsDir = process.env.SICLAW_DOCS_DIR;
+  }
+  if (process.env.SICLAW_GITREPOS_DIR) {
+    cached.paths.gitReposDir = process.env.SICLAW_GITREPOS_DIR;
   }
   if (process.env.SICLAW_GATEWAY_URL) {
     cached.server.gatewayUrl = process.env.SICLAW_GATEWAY_URL;

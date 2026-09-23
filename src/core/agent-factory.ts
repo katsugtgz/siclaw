@@ -65,6 +65,9 @@ import {
 } from "./knowledge-citation-tool.js";
 import { resolveSkillDirectories } from "./skill-directories.js";
 import { createSkillScriptResolver } from "../tools/infra/script-resolver.js";
+import { codeViewFor, type CodeView } from "../tools/code-view/view.js";
+import { codeViewFindOps, codeViewLsOps, codeViewReadOps } from "../tools/code-view/file-ops.js";
+import { withCodeViewGrep } from "../tools/code-view/grep.js";
 
 import { allowsBackgroundExec } from "./background-execution-policy.js";
 import type { SessionMode, KubeconfigRef, MemoryRef, DpStateRef, MutableDpStateRef } from "./types.js";
@@ -240,6 +243,7 @@ function truncateWithBudget(content: string, maxChars: number): string {
  */
 function buildAppendSystemPrompt(
   memoryDir: string | null,
+  codeView: CodeView,
   knowledgeDir?: string,
   knowledgeCitationsEnabled = false,
   operationalKnowledge = true,
@@ -300,7 +304,13 @@ When the user does provide identifying info, IMMEDIATELY update \`${memoryDir}/P
   const config_ = loadConfig();
   const reposDir_ = path.resolve(process.cwd(), config_.paths.reposDir);
   const docsDir_ = path.resolve(process.cwd(), config_.paths.docsDir);
-  const overview = buildKnowledgeOverview({ reposDir: reposDir_, docsDir: docsDir_, memoryEnabled: !!memoryDir });
+  // The same authority (manifest ∩ mounts) that gates git_query and the virtual
+  // paths, read whenever this prompt is rebuilt — so the section never names a
+  // repository the tools would refuse at that moment.
+  const overview = buildKnowledgeOverview({
+    reposDir: reposDir_, docsDir: docsDir_, memoryEnabled: !!memoryDir,
+    gitHistoryRepos: codeView.readableRepositories(),
+  });
   if (overview) {
     parts.push(overview);
   }
@@ -571,6 +581,16 @@ export async function createSiclawSession(
     }
   }
 
+  // Virtual `<repo>@<sha>` views under reposDir, answered from the mounted bare
+  // mirrors (docs/design/agentbox-code-volume.md, "Git layer"). Created before
+  // the registry because `git_query` is a registry tool that must share this
+  // instance with the file tools below; with no mirrors mounted nothing routed
+  // through it behaves differently.
+  const codeView = codeViewFor({
+    reposDir: path.resolve(cwd, config.paths.reposDir),
+    gitReposDir: path.resolve(cwd, config.paths.gitReposDir),
+  });
+
   // ── Tool Registry: declarative resolution ──
   const registry = new ToolRegistry();
   registry.register(...allToolEntries);
@@ -590,6 +610,7 @@ export async function createSiclawSession(
       knowledgeIndexer,
       skillScriptResolver,
       memoryDir: memoryEnabled ? memoryDir : undefined,
+      codeView,
       sessionEventEmitter: opts?.sessionEventEmitter,
       allowInputRequest: opts?.allowInputRequest === true,
       handoffSupported: opts?.handoffSupported === true,
@@ -695,10 +716,13 @@ export async function createSiclawSession(
   const isBlockedFilePath = (candidate: string) =>
     isToolResultArtifactPath(candidate)
     || blockedFileDirs.some((blocked) => isPathInsideDir(candidate, blocked.dir));
+  // Every file tool below routes through `codeView` (created above); a path that
+  // is not virtual reaches the physical operation unchanged.
+  const readGate = (tool: string) => (p: string) => assertToolPathAllowed(p, readAllowedDirs, tool, blockedFileDirs);
 
   const restrictedFileTools = [
     createReadTool(cwd, {
-      operations: {
+      operations: codeViewReadOps(codeView, {
         readFile: async (p) => {
           assertToolPathAllowed(p, readAllowedDirs, "read", blockedFileDirs);
           const start = citationSupport?.captureMount();
@@ -709,7 +733,7 @@ export async function createSiclawSession(
           return content;
         },
         access: async (p) => { assertToolPathAllowed(p, readAllowedDirs, "read", blockedFileDirs); return fsAccess(p, fs.constants.R_OK); },
-      },
+      }, readGate("read")),
     }),
       createEditTool(cwd, {
         operations: {
@@ -724,32 +748,37 @@ export async function createSiclawSession(
           mkdir: async (d) => { assertToolPathAllowed(d, writeAllowedDirs, "write", blockedFileDirs); await fsMkdir(d, { recursive: true }); },
         },
       }),
-    withGrepPathReason(createGrepTool(cwd, {
+    // Order matters: withGrepPathReason must stay OUTERMOST so a refused
+    // physical path still gets its real reason; a virtual path never reaches
+    // pi's rg (withCodeViewGrep answers it) and its errors are already specific.
+    withGrepPathReason(withCodeViewGrep(createGrepTool(cwd, {
       operations: {
         isDirectory: (p) => { assertToolPathAllowed(p, readAllowedDirs, "grep", blockedFileDirs); return fs.statSync(p).isDirectory(); },
         readFile: (p) => { assertToolPathAllowed(p, readAllowedDirs, "grep", blockedFileDirs); return fs.readFileSync(p, "utf-8"); },
       },
-    }), readAllowedDirs, blockedFileDirs),
+    }), codeView, cwd, readGate("grep")), readAllowedDirs, blockedFileDirs),
     createFindTool(cwd, {
-      operations: {
+      operations: codeViewFindOps(codeView, {
         exists: (p) => { assertToolPathAllowed(p, readAllowedDirs, "find", blockedFileDirs); return fs.existsSync(p); },
         glob: (pattern, searchCwd, options) => {
           assertToolPathAllowed(searchCwd, readAllowedDirs, "find", blockedFileDirs);
+          // 🔴 codeViewFindOps runs this SAME globSync call (same options) over a
+          // commit's listing; change the options here and change them there.
           return globSync(pattern, { cwd: searchCwd, absolute: true, dot: true, ignore: options.ignore })
             .filter((p) => !isBlockedFilePath(p))
             .slice(0, options.limit);
         },
-      },
+      }, readGate("find")),
     }),
     createLsTool(cwd, {
-      operations: {
+      operations: codeViewLsOps(codeView, {
         exists: (p) => { assertToolPathAllowed(p, readAllowedDirs, "ls", blockedFileDirs); return fs.existsSync(p); },
         stat: (p) => { assertToolPathAllowed(p, readAllowedDirs, "ls", blockedFileDirs); return fs.statSync(p); },
         readdir: (p) => {
           assertToolPathAllowed(p, readAllowedDirs, "ls", blockedFileDirs);
           return fs.readdirSync(p).filter((entry) => !isBlockedFilePath(path.join(p, entry)));
         },
-      },
+      }, readGate("ls")),
     }),
   ].map((tool) => Object.assign(tool, { toolset: "filesystem" }) as ResolvedToolDefinition);
   // Push into customTools so they override framework defaults via extension mechanism.
@@ -840,6 +869,7 @@ export async function createSiclawSession(
       appendSystemPromptOverride: () =>
         buildAppendSystemPrompt(
           memoryEnabled ? memoryDir : null,
+          codeView,
           knowledgeDir,
           Boolean(citationSupport),
           compiledContext.harness.includeOperationalSafety,

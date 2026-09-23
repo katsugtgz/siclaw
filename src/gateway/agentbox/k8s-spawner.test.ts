@@ -89,15 +89,45 @@ vi.mock("node:fs", async () => {
     g.__onExistsSync?.(key);
     return hit ? true : (real.existsSync as any)(p, ...rest);
   }) as typeof real.existsSync;
+  // The git-mirror manifest and its realpath checks live under the same
+  // unreachable /app/.siclaw/code-root, so readFileSync / realpathSync get the
+  // same opt-in treatment: a path in the fake map answers from it (an Error
+  // value is THROWN), anything else goes to the real implementation.
+  g.__fakeFiles = new Map<string, string | Error>();
+  g.__fsReadCalls = [] as string[];
+  g.__fakeRealpaths = new Map<string, string | Error>();
+  const readFileSync = ((p: any, ...rest: any[]) => {
+    const key = String(p);
+    g.__fsReadCalls.push(key);
+    if (g.__fakeFiles.has(key)) {
+      const v = g.__fakeFiles.get(key);
+      if (v instanceof Error) throw v;
+      return v;
+    }
+    return (real.readFileSync as any)(p, ...rest);
+  }) as typeof real.readFileSync;
+  const realpathSync = ((p: any, ...rest: any[]) => {
+    const key = String(p);
+    if (g.__fakeRealpaths.has(key)) {
+      const v = g.__fakeRealpaths.get(key);
+      if (v instanceof Error) throw v;
+      return v;
+    }
+    return (real.realpathSync as any)(p, ...rest);
+  }) as typeof real.realpathSync;
   return {
     ...real,
     default: {
       ...real,
       mkdirSync: vi.fn((_p: string, _o?: any) => undefined as any),
       existsSync,
+      readFileSync,
+      realpathSync,
     },
     mkdirSync: vi.fn((_p: string, _o?: any) => undefined as any),
     existsSync,
+    readFileSync,
+    realpathSync,
   };
 });
 
@@ -1331,6 +1361,191 @@ describe("K8sSpawner — read-only code volume", () => {
     expect(userData.emptyDir).toEqual({});
     expect(userData.persistentVolumeClaim).toBeUndefined();
     expect(codeMount()).toBeTruthy();
+  });
+});
+
+describe("K8sSpawner — git mirrors from the code-view manifest", () => {
+  // Contract: docs/design/agentbox-code-volume.md ("Git layer").
+  const ROOT = "/app/.siclaw/code-root";
+  const READY = `${ROOT}/agents/proj-a/.ready`;
+  const MANIFEST = `${ROOT}/agents/proj-a/.gitrepos.json`;
+  const RULES = { exclude_dirs: ["node_modules"], max_file_bytes: 5242880 };
+
+  function readReturnsRunningAfter404() {
+    let r = 0;
+    readPodImpl.fn = async () => {
+      r++;
+      if (r === 1) throw Object.assign(new Error("nf"), { code: 404 });
+      return {
+        status: { phase: "Running", podIP: "10.9.9.9", conditions: [{ type: "Ready", status: "True" }] },
+        metadata: { name: "agentbox-proj-a", labels: {} },
+      };
+    };
+  }
+  function podBody() {
+    return calls.createNamespacedPod[0].body;
+  }
+  function codeMounts(): any[] {
+    return (podBody().spec.containers[0].volumeMounts as any[]).filter((m) => m.name === "code");
+  }
+  function gitMounts(): any[] {
+    return codeMounts().filter((m) => m.mountPath.startsWith("/app/.siclaw/gitrepos/"));
+  }
+  /** A bare mirror that exists: realpath is itself and HEAD is present. */
+  function mirror(bare: string) {
+    g.__fakeRealpaths.set(`${ROOT}/${bare}`, `${ROOT}/${bare}`);
+    g.__fakeExistingPaths.add(`${ROOT}/${bare}/HEAD`);
+  }
+  function manifest(repos: unknown[], extra: Record<string, unknown> = {}) {
+    g.__fakeFiles.set(MANIFEST, JSON.stringify({ version: 1, updated_at: "t", repos, rules: RULES, ...extra }));
+  }
+  async function spawnWithCode(claim = true) {
+    const s = new K8sSpawner(claim ? { codeVolume: { claimName: "agent-code" } } : {});
+    s.setCertManager(new FakeCertManager() as any);
+    await s.spawn({ agentId: "proj-a" });
+  }
+
+  let errors: string[];
+  beforeEach(() => {
+    g.__fakeExistingPaths.clear();
+    g.__fsExistsCalls.length = 0;
+    g.__fakeFiles.clear();
+    g.__fsReadCalls.length = 0;
+    g.__fakeRealpaths.clear();
+    g.__onExistsSync = undefined;
+    g.__fakeRealpaths.set(`${ROOT}/mirrors`, `${ROOT}/mirrors`);
+    readReturnsRunningAfter404();
+    errors = [];
+    vi.spyOn(console, "error").mockImplementation((...a: unknown[]) => { errors.push(a.map(String).join(" ")); });
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("ready marker + manifest → one read-only subPath mount per repository, after the tree mount", async () => {
+    g.__fakeExistingPaths.add(READY);
+    mirror("mirrors/gitlab.x/grp/app.git");
+    mirror("mirrors/gitlab.x/grp/sub/lib.git");
+    manifest([
+      { name: "app", host: "gitlab.x", path: "grp/app", bare: "mirrors/gitlab.x/grp/app.git" },
+      { name: "lib", host: "gitlab.x", path: "grp/sub/lib", bare: "mirrors/gitlab.x/grp/sub/lib.git" },
+    ]);
+
+    await spawnWithCode();
+
+    expect(codeMounts()).toEqual([
+      { name: "code", mountPath: "/app/.siclaw/repos", subPath: "agents/proj-a", readOnly: true },
+      { name: "code", mountPath: "/app/.siclaw/gitrepos/app.git", subPath: "mirrors/gitlab.x/grp/app.git", readOnly: true },
+      { name: "code", mountPath: "/app/.siclaw/gitrepos/lib.git", subPath: "mirrors/gitlab.x/grp/sub/lib.git", readOnly: true },
+    ]);
+    // Still ONE volume, and still no readOnly on its source (the CSI staging trap).
+    const vols = (podBody().spec.volumes as any[]).filter((v) => v.name === "code");
+    expect(vols).toEqual([{ name: "code", persistentVolumeClaim: { claimName: "agent-code" } }]);
+    expect(errors).toEqual([]);
+  });
+
+  it("no claim, or no ready marker → the manifest is never even read", async () => {
+    manifest([{ name: "app", host: "h", path: "p", bare: "mirrors/h/p.git" }]);
+    mirror("mirrors/h/p.git");
+    await spawnWithCode(false);
+    expect(g.__fsReadCalls.filter((p: string) => p.startsWith(ROOT))).toEqual([]);
+    expect(gitMounts()).toEqual([]);
+
+    calls.createNamespacedPod.length = 0;
+    readReturnsRunningAfter404();
+    await spawnWithCode(true); // claim, but no .ready
+    expect(g.__fsReadCalls.filter((p: string) => p.startsWith(ROOT))).toEqual([]);
+    expect(gitMounts()).toEqual([]);
+  });
+
+  it("no manifest → trees only, and it is not an error (a supplier without the git layer)", async () => {
+    g.__fakeExistingPaths.add(READY);
+    g.__fakeFiles.set(MANIFEST, Object.assign(new Error("ENOENT: no such file"), { code: "ENOENT" }));
+    await spawnWithCode();
+    expect(codeMounts().map((m) => m.mountPath)).toEqual(["/app/.siclaw/repos"]);
+    expect(errors).toEqual([]);
+  });
+
+  it.each([
+    ["not JSON", "{not json"],
+    ["an unknown version", JSON.stringify({ version: 2, repos: [], rules: RULES })],
+    ["repos not an array", JSON.stringify({ version: 1, repos: {}, rules: RULES })],
+    ["malformed rules", JSON.stringify({ version: 1, repos: [], rules: { exclude_dirs: "x", max_file_bytes: 1 } })],
+  ])("a manifest with %s → logged, no git mounts, and the box still gets its trees", async (_label, text) => {
+    g.__fakeExistingPaths.add(READY);
+    g.__fakeFiles.set(MANIFEST, text);
+    await spawnWithCode();
+    expect(codeMounts().map((m) => m.mountPath)).toEqual(["/app/.siclaw/repos"]);
+    expect(errors.some((e) => e.includes("is invalid"))).toBe(true);
+  });
+
+  it("an unreadable manifest (not ENOENT) is logged, not thrown", async () => {
+    g.__fakeExistingPaths.add(READY);
+    g.__fakeFiles.set(MANIFEST, Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" }));
+    await spawnWithCode();
+    expect(gitMounts()).toEqual([]);
+    expect(errors.some((e) => e.includes("cannot read"))).toBe(true);
+  });
+
+  it("a duplicated name or bare mounts NEITHER party (the API server rejects a duplicate mountPath)", async () => {
+    g.__fakeExistingPaths.add(READY);
+    for (const b of ["mirrors/h/a.git", "mirrors/h/b.git", "mirrors/h/c.git", "mirrors/h/ok.git"]) mirror(b);
+    manifest([
+      { name: "dup", host: "h", path: "a", bare: "mirrors/h/a.git" },
+      { name: "dup", host: "h", path: "b", bare: "mirrors/h/b.git" },
+      { name: "x", host: "h", path: "c", bare: "mirrors/h/c.git" },
+      { name: "y", host: "h", path: "c", bare: "mirrors/h/c.git" },
+      { name: "ok", host: "h", path: "ok", bare: "mirrors/h/ok.git" },
+    ]);
+    await spawnWithCode();
+    expect(gitMounts().map((m) => m.mountPath)).toEqual(["/app/.siclaw/gitrepos/ok.git"]);
+    expect(errors.filter((e) => e.includes("not mounted"))).toHaveLength(4);
+  });
+
+  it.each([
+    ["a traversal segment", { name: "a", bare: "mirrors/h/../../agents/other.git" }],
+    ["a path outside mirrors/", { name: "a", bare: "agents/proj-b/x.git" }],
+    ["no .git suffix", { name: "a", bare: "mirrors/h/p" }],
+    ["an invalid name", { name: "a/b", bare: "mirrors/h/p.git" }],
+    ["a name that is too long", { name: "a".repeat(64), bare: "mirrors/h/p.git" }],
+  ])("an entry with %s is skipped and logged; the others still mount", async (_label, bad) => {
+    g.__fakeExistingPaths.add(READY);
+    mirror("mirrors/h/good.git");
+    manifest([
+      { host: "h", path: "p", ...bad },
+      { name: "good", host: "h", path: "good", bare: "mirrors/h/good.git" },
+    ]);
+    await spawnWithCode();
+    expect(gitMounts().map((m) => m.subPath)).toEqual(["mirrors/h/good.git"]);
+    expect(errors.some((e) => e.includes("#0"))).toBe(true);
+  });
+
+  it("a bare that realpaths outside mirrors/ (a planted symlink) is refused", async () => {
+    g.__fakeExistingPaths.add(READY);
+    g.__fakeRealpaths.set(`${ROOT}/mirrors/h/evil.git`, `${ROOT}/agents/proj-b`);
+    g.__fakeExistingPaths.add(`${ROOT}/agents/proj-b/HEAD`);
+    manifest([{ name: "evil", host: "h", path: "evil", bare: "mirrors/h/evil.git" }]);
+    await spawnWithCode();
+    expect(gitMounts()).toEqual([]);
+    expect(errors.some((e) => e.includes("outside mirrors/"))).toBe(true);
+  });
+
+  it("a bare without HEAD is refused — kubelet would mount an empty directory in its place", async () => {
+    g.__fakeExistingPaths.add(READY);
+    g.__fakeRealpaths.set(`${ROOT}/mirrors/h/gone.git`, `${ROOT}/mirrors/h/gone.git`);
+    manifest([{ name: "gone", host: "h", path: "gone", bare: "mirrors/h/gone.git" }]);
+    await spawnWithCode();
+    expect(gitMounts()).toEqual([]);
+    expect(errors.some((e) => e.includes("no HEAD"))).toBe(true);
+  });
+
+  it("a bare that does not resolve at all is refused", async () => {
+    g.__fakeExistingPaths.add(READY);
+    g.__fakeRealpaths.set(`${ROOT}/mirrors/h/none.git`, Object.assign(new Error("ENOENT"), { code: "ENOENT" }));
+    manifest([{ name: "none", host: "h", path: "none", bare: "mirrors/h/none.git" }]);
+    await spawnWithCode();
+    expect(gitMounts()).toEqual([]);
+    expect(errors.some((e) => e.includes("cannot resolve"))).toBe(true);
   });
 });
 

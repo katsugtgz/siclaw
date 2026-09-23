@@ -28,6 +28,9 @@ import { registration as memorySearch } from "./query/memory-search.js";
 import { registration as memoryGet } from "./query/memory-get.js";
 import { registration as knowledgeSearch } from "./query/knowledge-search.js";
 import { registration as knowledgeCite } from "./query/knowledge-cite.js";
+// code-view — history of the mounted bare mirrors (the file tools' virtual
+// `<repo>@<sha>` paths are wired in agent-factory, outside the registry).
+import { registration as gitQuery } from "./code-view/git-query.js";
 // workflow — investigation_feedback / deep_search / propose_hypotheses /
 // end_investigation removed as part of the DP state-machine teardown
 // (see docs/design/2026-04-24-dp-mode-refactor-design.md §6.6).
@@ -56,6 +59,8 @@ export const allToolEntries: ToolEntry[] = [
   // ── query ──
   clusterList, hostList, k8sInspect,
   memorySearch, memoryGet, knowledgeSearch, knowledgeCite,
+  // ── code-view ──
+  gitQuery,
   // ── workflow ──
   saveFeedback, manageSchedule, taskReport, skillPreview,
   channelUpdate, requestInput,

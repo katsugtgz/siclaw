@@ -44,7 +44,7 @@ describe("resolveAgentHarness", () => {
     });
 
     expect(harness.allowedTools).toEqual([
-      "read", "grep", "find", "ls", "knowledge_search", "knowledge_cite",
+      "read", "grep", "find", "ls", "knowledge_search", "knowledge_cite", "git_query",
       "local_script", "write", "edit", "skill_preview",
       "task_create", "task_update", "task_list", "task_get",
       "task_report", "save_feedback", "channel_update", "request_input", "propose_execution",
@@ -69,7 +69,7 @@ describe("resolveAgentHarness", () => {
     });
 
     expect(harness.allowedTools).toEqual([
-      "read", "grep", "find", "ls", "knowledge_search", "knowledge_cite",
+      "read", "grep", "find", "ls", "knowledge_search", "knowledge_cite", "git_query",
     ]);
     expect(harness.mcpExposure).toBe("configured");
     expect(harness.memoryEnabled).toBe(false);

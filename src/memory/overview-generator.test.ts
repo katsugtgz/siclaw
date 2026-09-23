@@ -303,6 +303,63 @@ describe("buildKnowledgeOverview", () => {
     expect(result).not.toContain("not listed");
   });
 
+  // --- Git history ---
+
+  it("adds a Git history section after the repository table, naming the real path and git_query", () => {
+    fs.mkdirSync(reposDir);
+    fs.mkdirSync(path.join(reposDir, "app@latest"));
+    fs.writeFileSync(path.join(reposDir, "app@latest", "main.ts"), "");
+
+    const result = buildKnowledgeOverview({ reposDir, gitHistoryRepos: ["app", "web"] });
+    const table = result.indexOf("## Code Repositories");
+    const git = result.indexOf("## Git history");
+    expect(table).toBeGreaterThanOrEqual(0);
+    expect(git).toBeGreaterThan(table);
+    const section = result.slice(git);
+    expect(section).toContain(`\`${reposDir}/<name>@<sha>/…\``);
+    expect(section).toContain("`git_query` op `refs`");
+    expect(section).toContain("Repositories: `app`, `web`");
+    expect(section).not.toContain("more —");
+  });
+
+  it("leaves the physical table byte-identical, and adds nothing when no history is readable", () => {
+    fs.mkdirSync(reposDir);
+    for (let r = 0; r < 40; r++) {
+      const repo = path.join(reposDir, `repository-with-a-fairly-long-name-${String(r).padStart(2, "0")}`);
+      fs.mkdirSync(repo);
+      fs.writeFileSync(path.join(repo, "main.ts"), "");
+    }
+    const without = buildKnowledgeOverview({ reposDir });
+    expect(buildKnowledgeOverview({ reposDir, gitHistoryRepos: [] })).toBe(without);
+    const withGit = buildKnowledgeOverview({ reposDir, gitHistoryRepos: ["app"] });
+    const tableOf = (text: string) => text.slice(text.indexOf("## Code Repositories"), text.indexOf("\n\nUse `read`"));
+    // The table (and its own truncation note) comes first and does not shrink to make room.
+    expect(tableOf(withGit).startsWith(tableOf(without))).toBe(true);
+  });
+
+  it("is offered on its own when no physical view exists", () => {
+    fs.mkdirSync(reposDir);
+    const result = buildKnowledgeOverview({ reposDir, gitHistoryRepos: ["app"], memoryEnabled: false });
+    expect(result).not.toContain("## Code Repositories");
+    expect(result).toContain("## Git history");
+    expect(result).toContain(`Use \`read\` to view files in \`${reposDir}\`.`);
+  });
+
+  it("truncates the name list visibly, pointing at the manifest, within the budget", () => {
+    fs.mkdirSync(reposDir);
+    const names = Array.from({ length: 80 }, (_, i) => `repository-name-${String(i).padStart(2, "0")}`);
+    const result = buildKnowledgeOverview({ reposDir, gitHistoryRepos: names });
+    const m = /… and (\d+) more — the full list is `([^`]+)`\./.exec(result);
+    expect(m, "truncation note missing").toBeTruthy();
+    const listed = [...result.matchAll(/`repository-name-\d\d`/g)].length;
+    expect(listed).toBeGreaterThan(0);
+    expect(Number(m![1])).toBe(80 - listed);
+    expect(m![2]).toBe(`${reposDir}/.gitrepos.json`);
+    // Same discount as the table's truncation test: the rule, the note and the
+    // footer carry the real (absolute, in this fixture) mount path.
+    expect(result.length).toBeLessThanOrEqual(1200 + 150 + 3 * reposDir.length);
+  });
+
   it("stays within budget with large repos + many docs", () => {
     // Large repos
     fs.mkdirSync(reposDir);

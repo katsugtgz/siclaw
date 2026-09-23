@@ -60,13 +60,18 @@ FROM node:22.19-slim
 # pod_exec inside the target container, so neither gains anything from this layer.
 #   bsdextrautils — provides `column` (moved out of bsdmainutils on bookworm)
 #   yq            — mikefarah/yq, installed as a WRAPPER; see the yq layer below
+#   git           — NOT for the shell (it is not in the command whitelist and stays out of it):
+#                   the node process runs it, argv-only, against the read-only bare mirrors for
+#                   `<repo>@<sha>` paths and `git_query` (src/tools/code-view/git.ts,
+#                   docs/design/agentbox-code-volume.md "Git layer"). Debian's build links
+#                   libpcre2, which `git grep -P` needs to match ripgrep's regex dialect.
 #
 # yq is pinned to an exact version and checksum rather than `releases/latest`: an unverified
 # `latest` means the same source commit builds a different, unreviewed executable every time.
 ARG YQ_VERSION=v4.53.3
 ARG YQ_SHA256=fa52a4e758c63d38299163fbdd1edfb4c4963247918bf9c1c5d31d84789eded4
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl jq python3 ca-certificates sudo fonts-noto-cjk chromium bsdextrautils \
+    curl jq python3 ca-certificates sudo fonts-noto-cjk chromium bsdextrautils git \
     && curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" \
     && chmod +x kubectl && mv kubectl /usr/local/bin/ \
     && rm -rf /var/lib/apt/lists/*

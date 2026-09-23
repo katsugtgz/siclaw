@@ -18,7 +18,7 @@ one-use warm pool are specified in [Disposable script sandbox](script-sandbox.md
 
 ## 1. Directory Structure & Classification
 
-Tools are organized into 6 subdirectories under `src/tools/`, classified by
+Tools are organized into subdirectories under `src/tools/`, classified by
 their **security model** (how they handle user input and output):
 
 ```
@@ -27,6 +27,7 @@ src/tools/
   ├── script-exec/    Pre-audited scripts — no command validation
   ├── query/          Data queries (memory, DB, filesystem)
   ├── workflow/       User-facing workflow operations
+  ├── code-view/      Read-only git layer over the mounted bare mirrors
   └── infra/          Shared infrastructure (security, execution, output)
 ```
 
@@ -38,6 +39,7 @@ src/tools/
 | `script-exec/` | Tool executes a **pre-approved script file** (remote or local) | No command validation needed (scripts are reviewed); uses `resolveScript()` |
 | `query/` | Tool performs **read-only data retrieval** (no process spawn, no K8s interaction) | Pure function over memory indexer, DB, or filesystem |
 | `workflow/` | Tool orchestrates a **user-facing workflow** (investigation, skill management, scheduling) | Business logic, often stateful |
+| `code-view/` | Reads a **commit of a mounted repository** — the file tools' virtual `<repo>@<sha>` paths and `git_query` | Spawns only `git`, argv-only, through `runGit`'s allow-listed env and fixed `-c` prefix; never agent-supplied command text. See agentbox-code-volume.md ("Git layer") |
 | `infra/` | **Not a tool** — shared functions consumed by tools | Security pipeline, K8s execution helpers, output processing |
 
 ### Decision Tree: Where Does My New Tool Go?
@@ -577,6 +579,7 @@ Conditions are declared in each tool's `registration`, not in agent-factory:
 | `skill_preview` | `modes` | `["web", "channel"]` | Reads draft files from disk, renders side panel |
 | `memory_search`, `memory_get` | `available` | `(refs) => !!refs.memoryIndexer` | Depends on indexer instance |
 | `knowledge_search` | `available` | `(refs) => !!refs.knowledgeIndexer` | Hybrid index over this Agent's mounted knowledge |
+| `git_query` | `available` | `refs.codeView.readableRepositories().length > 0` | Only when some repository's history is readable (manifest ∩ mounts); an I/O fault reading either propagates rather than reading as "none" |
 
 Skill draft previews enforce a shared ceiling of 1 MiB, measured as
 serialized UTF-8 JSON (including file projections and escaping). A package
@@ -635,7 +638,11 @@ are intentionally different:
   is already Agent-scoped; standalone sessions use explicit local config.
 - **File I/O tools** (read/edit/write/grep/find/ls) are framework tools with
   path-restricted operations injection. `appendAllowedTools()` applies the same
-  name whitelist as `ToolRegistry.resolve()`.
+  name whitelist as `ToolRegistry.resolve()`. read/ls/find/grep additionally
+  answer virtual `<reposDir>/<repo>@<sha>/…` paths from the mounted bare mirrors
+  (`src/tools/code-view/`); grep does so by wrapping `execute`, because pi's grep
+  spawns ripgrep on the real filesystem. Same `CodeView` instance as `git_query`
+  (passed through `ToolRefs.codeView`).
 
 ### Knowledge Q&A retrieval stack
 

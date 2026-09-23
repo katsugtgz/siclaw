@@ -5,6 +5,7 @@ import { modelKnowledgeLocations, modelKnowledgePath } from "../knowledge/model-
 import { maskMarkdownCode } from "../core/knowledge-citation-tool.js";
 import { rewriteCatalogLinkPaths } from "../knowledge/catalog-graph.js";
 import { LIBRARY_INTRODUCTION_FILE, libraryIntroductionPreview, readLibraryIntroduction } from "../knowledge/library-introduction.js";
+import { CODE_VIEW_MANIFEST_FILE } from "../shared/code-view-manifest.js";
 
 const VERIFIED_ROUTES_BEGIN = "<!-- verified-routes:begin -->";
 const VERIFIED_ROUTES_END = "<!-- verified-routes:end -->";
@@ -17,7 +18,21 @@ export interface OverviewOpts {
   reposDir?: string;
   docsDir?: string;
   memoryEnabled?: boolean;
+  /**
+   * Repositories whose every commit is readable as `<reposDir>/<name>@<sha>/…`
+   * — the code-view authority (manifest ∩ mounts), computed by the caller so
+   * this module stays a pure filesystem scan. Empty/absent ⇒ no section.
+   */
+  gitHistoryRepos?: readonly string[];
 }
+
+/**
+ * What the Git history section's name list leaves for the Documentation table
+ * and the footer. The section's own header and addressing rule are never cut:
+ * without them the agent cannot know virtual paths exist at all, since they
+ * appear in no directory listing.
+ */
+const GIT_HISTORY_RESERVE = 200;
 
 /**
  * Build a concise knowledge overview from content directories.
@@ -34,8 +49,10 @@ export function buildKnowledgeOverview(opts: OverviewOpts): string {
 
   const repoEntries = reposDir ? scanRepos(reposDir) : [];
   const docEntries = docsDir ? scanDocs(docsDir) : [];
+  // Virtual paths live under reposDir; without it there is no path to name.
+  const gitRepos = reposDir ? [...(opts.gitHistoryRepos ?? [])] : [];
 
-  if (repoEntries.length === 0 && docEntries.length === 0) {
+  if (repoEntries.length === 0 && docEntries.length === 0 && gitRepos.length === 0) {
     return "";
   }
 
@@ -91,6 +108,37 @@ export function buildKnowledgeOverview(opts: OverviewOpts): string {
     }
   }
 
+  // --- Git history (after the physical table, which it never displaces) ---
+  // Any commit of these repositories is readable in place, but no `ls` shows
+  // it: the only way the agent learns the addressing rule is this section.
+  // See docs/design/agentbox-code-volume.md ("Git layer").
+  if (gitRepos.length > 0) {
+    const header = "\n\n## Git history\n" +
+      `Any commit of these repositories is readable with read/ls/find/grep at \`${reposPath}/<name>@<sha>/…\` ` +
+      "(7-40 hex SHA; such paths are not listed by `ls`). `git_query` op `refs` turns a branch, tag or MR into a SHA; " +
+      "`log`/`diff`/`show`/`blame` read history.\nRepositories:";
+    const items: string[] = [];
+    let sectionLen = header.length;
+    let omitted = 0;
+    for (const [i, name] of gitRepos.entries()) {
+      const item = `${i === 0 ? " " : ", "}\`${name}\``;
+      if (currentLen + sectionLen + item.length > TOTAL_BUDGET - GIT_HISTORY_RESERVE) {
+        omitted = gitRepos.length - i;
+        break;
+      }
+      items.push(item);
+      sectionLen += item.length;
+    }
+    // Visible truncation, same reason as the table above. The manifest is the
+    // one place listing them all (a name there that is not yet mounted gets
+    // its own explicit refusal from the tools).
+    const note = omitted > 0
+      ? `${items.length > 0 ? "," : ""} … and ${omitted} more — the full list is \`${reposPath}/${CODE_VIEW_MANIFEST_FILE}\`.`
+      : "";
+    parts.push(header + items.join("") + note);
+    currentLen += sectionLen + note.length;
+  }
+
   // --- Documentation (~300 chars budget) ---
   if (docEntries.length > 0) {
     const header = "\n\n## Documentation\n| Category | Files |\n|----------|-------|";
@@ -115,7 +163,7 @@ export function buildKnowledgeOverview(opts: OverviewOpts): string {
   // tools accept. The old text named `repos/ or docs/` unconditionally: two
   // paths that do not exist, one of which is not even mounted on most agents.
   const locations = [
-    repoEntries.length > 0 ? `\`${reposPath}\`` : "",
+    repoEntries.length > 0 || gitRepos.length > 0 ? `\`${reposPath}\`` : "",
     docEntries.length > 0 ? `\`${docsPath}\`` : "",
   ].filter(Boolean).join(" or ");
   parts.push(memoryEnabled

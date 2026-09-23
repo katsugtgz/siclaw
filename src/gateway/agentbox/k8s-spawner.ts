@@ -11,6 +11,11 @@ import * as path from "node:path";
 import type { BoxSpawner } from "./spawner.js";
 import type { AgentBoxConfig, AgentBoxHandle, AgentBoxInfo, AgentBoxStatus } from "./types.js";
 import { getBoxProfile } from "./box-profile.js";
+import {
+  CODE_VIEW_MANIFEST_FILE,
+  CodeViewManifestError,
+  parseCodeViewManifest,
+} from "../../shared/code-view-manifest.js";
 import { CertificateManager } from "../security/cert-manager.js";
 import { observeContainerLifecycle, type ContainerObservation } from "../capability/container-evidence.js";
 import {
@@ -152,6 +157,19 @@ const CODE_READY_MARKER = ".ready";
  * Paid only on the miss path, and only when a code PVC is configured at all.
  */
 const CODE_READY_RETRY_DELAY_MS = 200;
+
+/**
+ * Where a box sees the supplier's bare mirrors — one read-only subPath mount
+ * per repository at `<GIT_REPOS_MOUNT_PATH>/<name>.git`. It MUST equal
+ * `config.paths.gitReposDir` (src/core/config.ts) resolved against the box's
+ * /app, for the same reason CODE_MOUNT_PATH must equal `reposDir`: the box's
+ * code-view layer looks for the mounts there. See
+ * docs/design/agentbox-code-volume.md ("Git layer").
+ */
+const GIT_REPOS_MOUNT_PATH = "/app/.siclaw/gitrepos";
+
+/** The supplier's mirror pool, relative to the volume root. Every `bare` must resolve inside it. */
+const CODE_MIRRORS_DIR = "mirrors";
 
 /**
  * How long a box gets to shut down cleanly before SIGKILL.
@@ -818,6 +836,9 @@ export class K8sSpawner implements BoxSpawner {
     // extra work and emits neither a volume nor a mount.
     const codeClaimName = this.config.codeVolume?.claimName;
     const codeVolumeEnabled = !!codeClaimName && await this.codeTreeReady(agentId, safeAgentId);
+    // The git layer rides the same gate: only a box that gets its trees gets
+    // mirrors, so "no claim" and "no marker" stay byte-identical to before.
+    const gitRepoMounts = codeVolumeEnabled ? this.gitRepoMounts(agentId, safeAgentId) : [];
 
     // Pod definition
     const pod: k8s.V1Pod = {
@@ -1015,6 +1036,9 @@ export class K8sSpawner implements BoxSpawner {
                     readOnly: true,
                   } as k8s.V1VolumeMount]
                 : []),
+              // One bare mirror per repository the manifest grants, from the
+              // SAME volume (so no second PVC and no second readOnly trap).
+              ...gitRepoMounts,
               {
                 name: "client-cert",
                 mountPath: "/etc/siclaw/certs",
@@ -1148,6 +1172,115 @@ export class K8sSpawner implements BoxSpawner {
       `spawning WITHOUT the read-only code mount (the agent will see no source tree until its next cold start)`,
     );
     return false;
+  }
+
+  /**
+   * The read-only bare-mirror mounts this agent's manifest grants.
+   *
+   * Reads `agents/<safeAgentId>/.gitrepos.json` from the Runtime's own view of
+   * the WHOLE volume (CODE_ROOT_DIR — the box never sees `mirrors/`) and turns
+   * each surviving entry into `{name:"code", mountPath:<gitrepos>/<name>.git,
+   * subPath:<bare>, readOnly:true}`. See docs/design/agentbox-code-volume.md
+   * ("Git layer").
+   *
+   * Failure policy, and why it is not fail-fast:
+   *   - no manifest → no git mounts, silently. A supplier that has not adopted
+   *     the git layer is the normal steady state, like a missing `.ready`;
+   *   - a manifest that cannot be used as a whole → `console.error` and no git
+   *     mounts, but the box STILL spawns with its trees. The manifest is another
+   *     system's output (a boundary), and refusing the pod would take away the
+   *     physical views too — the one part that is fine;
+   *   - one bad entry → that entry is skipped and logged; the rest mount.
+   *
+   * 🔴 Every entry must pass `realpath` inside `mirrors/` and have a `HEAD`.
+   * kubelet CREATES a missing subPath (the same trap `.ready` exists for), so an
+   * unchecked entry mounts an empty directory the box would read as a broken
+   * repository; and a symlink planted on the volume must not turn a subPath
+   * into a window onto another agent's state.
+   */
+  private gitRepoMounts(agentId: string, safeAgentId: string): k8s.V1VolumeMount[] {
+    const base = path.resolve(CODE_ROOT_DIR);
+    const manifestPath = path.join(base, "agents", safeAgentId, CODE_VIEW_MANIFEST_FILE);
+    if (!manifestPath.startsWith(base + path.sep)) {
+      throw new Error(`[k8s-spawner] Path traversal detected in code manifest path: ${manifestPath}`);
+    }
+
+    let text: string;
+    try {
+      text = fs.readFileSync(manifestPath, "utf-8");
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return [];
+      console.error(
+        `[k8s-spawner] Agent ${agentId}: cannot read "${manifestPath}" (${(err as Error).message}); ` +
+        `spawning WITHOUT git mirrors (source trees are unaffected)`,
+      );
+      return [];
+    }
+
+    let manifest;
+    try {
+      manifest = parseCodeViewManifest(text);
+    } catch (err) {
+      if (!(err instanceof CodeViewManifestError)) throw err;
+      console.error(
+        `[k8s-spawner] Agent ${agentId}: "${manifestPath}" is invalid (${err.message}); ` +
+        `spawning WITHOUT git mirrors (source trees are unaffected)`,
+      );
+      return [];
+    }
+    for (const r of manifest.rejected) {
+      console.error(
+        `[k8s-spawner] Agent ${agentId}: manifest entry #${r.index}${r.name ? ` "${r.name}"` : ""} not mounted: ${r.reason}`,
+      );
+    }
+
+    // Resolved once: realpath of the pool itself, so a pool that is (legitimately)
+    // reached through a symlink on the volume does not fail every entry.
+    let mirrorsReal: string;
+    try {
+      mirrorsReal = fs.realpathSync(path.join(base, CODE_MIRRORS_DIR));
+    } catch (err) {
+      console.error(
+        `[k8s-spawner] Agent ${agentId}: manifest lists ${manifest.repos.length} mirror(s) but ` +
+        `"${path.join(base, CODE_MIRRORS_DIR)}" cannot be resolved (${(err as Error).message}); spawning WITHOUT git mirrors`,
+      );
+      return [];
+    }
+
+    const mounts: k8s.V1VolumeMount[] = [];
+    for (const repo of manifest.repos) {
+      const skip = (why: string) => console.error(
+        `[k8s-spawner] Agent ${agentId}: mirror "${repo.name}" (${repo.bare}) not mounted: ${why}`,
+      );
+      let real: string;
+      try {
+        real = fs.realpathSync(path.join(base, repo.bare));
+      } catch (err) {
+        skip(`cannot resolve (${(err as Error).message})`);
+        continue;
+      }
+      if (!real.startsWith(mirrorsReal + path.sep)) {
+        skip(`resolves to "${real}", outside ${CODE_MIRRORS_DIR}/`);
+        continue;
+      }
+      if (!fs.existsSync(path.join(real, "HEAD"))) {
+        skip("no HEAD (not a bare repository, or reclaimed)");
+        continue;
+      }
+      mounts.push({
+        name: "code",
+        mountPath: `${GIT_REPOS_MOUNT_PATH}/${repo.name}.git`,
+        subPath: repo.bare,
+        readOnly: true,
+      });
+    }
+    if (mounts.length > 0) {
+      console.log(
+        `[k8s-spawner] Agent ${agentId}: mounting ${mounts.length} git mirror(s): ` +
+        mounts.map((m) => m.mountPath).join(", "),
+      );
+    }
+    return mounts;
   }
 
   /**
