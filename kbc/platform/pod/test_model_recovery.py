@@ -3,6 +3,7 @@
 from copy import deepcopy
 from contextlib import asynccontextmanager
 import asyncio
+import json
 import uuid
 import pytest
 import model_access
@@ -290,3 +291,78 @@ async def test_cancelled_refresh_releases_pending_request(monkeypatch):
     with pytest.raises(asyncio.CancelledError):
         await task
     assert model_access._pending == {}
+
+
+def _codex_jwt(account, marker):
+    import base64
+    def part(value):
+        return base64.urlsafe_b64encode(json.dumps(value).encode()).decode().rstrip("=")
+    return ".".join([part({"alg": "none"}), part({"https://api.openai.com/auth": {"chatgpt_account_id": account},
+                                                  "marker": marker}), "signature"])
+
+
+def test_codex_subscription_api_is_a_valid_pi_protocol():
+    config = execution()
+    config["roles"]["compile"]["model"]["api"] = "openai-codex-responses"
+    config["roles"]["compile"]["auth_header"] = False
+    pi_config.validate_execution(config)
+    config["roles"]["compile"]["model"]["api"] = "openai-mystery"
+    with pytest.raises(ValueError, match="Unsupported Pi model protocol"):
+        pi_config.validate_execution(config)
+
+
+async def test_real_pi_worker_runs_codex_subscription_through_live_transport(tmp_path):
+    from pi_engine import PiAgentClient
+    from test_pi_engine import collect
+    from test_pi_responses import response
+    old_key, new_key = _codex_jwt("acct-fixture", "old"), _codex_jwt("acct-fixture", "new")
+    posts, upgrades, refreshes = [], [], []
+
+    async def codex(request):
+        if request.method != "POST":
+            upgrades.append(request.method)
+            return web.Response(status=426)
+        posts.append(dict(request.headers))
+        await request.read()
+        if len(posts) == 1:
+            return web.json_response({"error": {"message": "expired"}}, status=401)
+        return response(text="codex answer")
+
+    upstream_app = web.Application()
+    upstream_app.router.add_route("*", "/v1/codex/responses", codex)
+    # The real Codex backend decodes zstd bodies; the fixture only needs the raw bytes.
+    upstream_runner = web.AppRunner(upstream_app, auto_decompress=False)
+    await upstream_runner.setup()
+    upstream_site = web.TCPSite(upstream_runner, "127.0.0.1", 0)
+    await upstream_site.start()
+    upstream_url = f"http://127.0.0.1:{upstream_site._server.sockets[0].getsockname()[1]}/v1"
+    try:
+        app = web.Application()
+        app.on_startup.append(model_access.start)
+        app.router.add_post("/model-credentials/{run_id}/{request_id}", model_access.receive)
+        async with TestClient(TestServer(app)) as control:
+            async def emit(event):
+                refreshes.append(event)
+                async with control.post("/model-credentials/run/" + event["request_id"], json={"api_key": new_key}) as reply:
+                    assert reply.status == 200
+            model_access.configure("run", emit)
+            config = execution(old_key)["roles"]["compile"]
+            config["model"].update({"api": "openai-codex-responses", "baseUrl": upstream_url,
+                                    "reasoning": True, "input": ["text", "image"]})
+            config["auth_header"] = False
+            client = PiAgentClient(cwd=str(tmp_path), system_prompt="Answer briefly.", session_id="codex-subscription",
+                                   model_config=model_access.route(config), tools=[])
+            try:
+                await client.connect()
+                await client.query("Say hello")
+                events = await collect(client)
+            finally:
+                await client.disconnect()
+    finally:
+        await upstream_runner.cleanup()
+    assert events[-1].data["outcome"] == "completed", events[-1].data.get("error")
+    assert upgrades == [], "the loopback transport carries HTTP only; no WebSocket upgrade may be attempted"
+    assert len(posts) == len(refreshes) == 2  # admission refresh, then the rejected-bearer refresh
+    assert all(headers.get("chatgpt-account-id") == "acct-fixture" for headers in posts)
+    assert posts[1]["Authorization"] == "Bearer " + new_key
+    assert old_key not in str(refreshes) and new_key not in str(refreshes)

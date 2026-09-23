@@ -116,6 +116,10 @@ export class PiCompilerWorker {
         // The domain orchestrator owns retry and batch reconstruction. Neither
         // a second original prompt nor an implicit summary may replay writes.
         retry: { enabled: false }, compaction: { enabled: false },
+        // The box's loopback model proxy carries HTTP only. Providers that
+        // prefer WebSocket (the Codex subscription API) would otherwise spend a
+        // doomed upgrade upstream on every call before falling back to SSE.
+        transport: "sse",
       }),
       resourceLoaderOptions: {
         noExtensions: true, noSkills: true, noPromptTemplates: true,

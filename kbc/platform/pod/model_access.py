@@ -179,7 +179,10 @@ async def start(app):
     global _port
     proxy = web.Application(client_max_size=64 * 1024 * 1024)
     proxy.router.add_route("*", "/{token}/{tail:.*}", handle)
-    runner = web.AppRunner(proxy, handler_cancellation=True)
+    # Forward request bodies byte-for-byte. The Codex subscription client sends
+    # zstd-compressed JSON with Content-Encoding intact; decoding here would
+    # forward plain bytes under that header (or reject them without zstd).
+    runner = web.AppRunner(proxy, handler_cancellation=True, auto_decompress=False)
     await runner.setup()
     site = web.TCPSite(runner, "127.0.0.1", 0)
     await site.start()
