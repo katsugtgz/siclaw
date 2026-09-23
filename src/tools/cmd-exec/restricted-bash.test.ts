@@ -1978,3 +1978,33 @@ describe("restricted_bash — siforgectl delivery credential", () => {
     expect(result.content[0].text).toContain("no delivery-platform credential");
   });
 });
+
+// ── description: deployment CLIs are first-class ────────────────────────────
+//
+// A kubectl-first headline plus an "Allowed commands" list that omitted the extras (followed by
+// "all other binaries are blocked") read as: this tool is for kubectl, and the extras may be blocked.
+// Agents then never reached for them. These pin that the extras are named up front and never
+// contradicted by the whitelist prose.
+
+describe("restricted_bash — description advertises deployment CLIs", () => {
+  afterEach(() => { setExtraCommands({}); });
+
+  it("names the extras in the first sentence and in the allowed list", () => {
+    setExtraCommands({
+      acmectl: { category: "general", contexts: ["local"], description: "acme control plane CLI" },
+    });
+    const desc = createRestrictedBashTool().description;
+    const [headline] = desc.split("\n");
+    expect(headline).toContain("acmectl");
+    expect(headline.indexOf("acmectl")).toBeLessThan(headline.indexOf("kubectl"));
+    expect(desc).toMatch(/Allowed commands: [^\n]*\bacmectl\b/);
+    expect(desc).toContain('"acmectl --help"');
+  });
+
+  it("keeps a kubectl-and-text headline when the deployment added nothing", () => {
+    setExtraCommands({});
+    const desc = createRestrictedBashTool().description;
+    expect(desc.split("\n")[0]).toBe("Run read-only kubectl and whitelisted text-processing commands in this AgentBox.");
+    expect(desc).not.toContain("Deployment-installed CLIs");
+  });
+});
