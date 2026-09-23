@@ -32,6 +32,7 @@ vi.mock("./pi-execution.js", () => ({
   }),
 }));
 import { createSiclawSession } from "./agent-factory.js";
+import type { McpClientManager } from "./mcp-client.js";
 
 const sessions: Awaited<ReturnType<typeof createSiclawSession>>[] = [];
 beforeEach(async () => {
@@ -128,5 +129,22 @@ describe("factory resource boundaries", () => {
     const outside = path.join(fixture.root, "outside.md");
     await expect(write.execute("outside", { path: outside, content: "Denied" })).rejects.toThrow(/blocked/);
     await expect(fs.access(outside)).rejects.toThrow();
+  });
+
+  it("appends each shared MCP server's instructions to the dynamic prompt layer", async () => {
+    // A sub-agent is handed its parent's manager; the instructions come from
+    // that manager, so parent and child read the same text.
+    const shared = {
+      getTools: () => [],
+      getServerInstructions: () => [{ serverName: "devops", instructions: "Start here: inventory view=project." }],
+    } as unknown as McpClientManager;
+    const withMcp = await create("sre", true, { mcpManager: shared });
+    const append = withMcp.services.resourceLoader.getAppendSystemPrompt();
+    expect(append.filter((part) => part.includes("## MCP server"))).toEqual([
+      "\n## MCP server \"devops\"\n\nInstructions this server sent for its tools (`mcp__devops__*`):\n\nStart here: inventory view=project.",
+    ]);
+
+    const without = await create("sre");
+    expect(without.services.resourceLoader.getAppendSystemPrompt().some((part) => part.includes("## MCP server"))).toBe(false);
   });
 });

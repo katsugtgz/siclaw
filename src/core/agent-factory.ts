@@ -47,7 +47,7 @@ import {
   type ModelEnvelopeManifest,
 } from "./model-envelope.js";
 import { createPromptInspection, type PromptInspection } from "./prompt-inspection.js";
-import type { McpClientManager } from "./mcp-client.js";
+import { buildMcpInstructionsPrompt, type McpClientManager } from "./mcp-client.js";
 import { resolveSessionMcpTools } from "./session-mcp-tools.js";
 import { loadConfig, getEmbeddingConfig, getConfigPath, getDefaultLlm, isMemoryEnabled } from "./config.js";
 import { initExtraCommands } from "../tools/infra/extra-commands.js";
@@ -651,6 +651,11 @@ export async function createSiclawSession(
     mcpManager: opts?.mcpManager, mcpTools: opts?.mcpTools,
   });
   const mcpTools = discoveredMcpTools.map(tool => withToolResultArtifactCapture(tool, toolResultArtifactStore));
+  // Each connected server's own `instructions`, for the dynamic prompt layer
+  // below. Read from the manager this session resolved, not from config: a
+  // sub-agent sharing its parent's manager gets exactly the parent's text, and
+  // a session whose harness withholds MCP has no manager and gets none.
+  const mcpInstructionSections = buildMcpInstructionsPrompt(mcpManager?.getServerInstructions() ?? []);
   // Sandbox-only agents use the reviewed broker; the harness gate and artifact
   // recovery remain in effect for every other MCP selection.
   // Configured MCP tools are orthogonal to the built-in `allowedTools`
@@ -840,7 +845,7 @@ export async function createSiclawSession(
           compiledContext.harness.includeOperationalSafety,
         ).concat(compiledContext.harness.agentType === "knowledge_qa" && allowedTools?.includes("write")
           ? [`\n## Research Workspace\nSave working notes and generated results under \`${userDataDir}\`. Use available Skill helpers when computation or processing helps answer the question; reading a Skill does not authorize unrelated actions.`]
-          : []),
+          : [], mcpInstructionSections),
       // Extension registration order: compactionSafeguard handles session_before_compact.
       extensionFactories: [
         contextPruningExtension,
