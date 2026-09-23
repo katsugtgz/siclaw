@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { asFailureToken, asSafeFailureMessage, normalizeFailure, structuredBoxFailure } from "./failure.js";
+import { asFailureToken, asSafeFailureMessage, capabilityStartFailure, normalizeFailure, structuredBoxFailure } from "./failure.js";
+import { RpcResponseError, wrapRpcError } from "../../lib/error-envelope.js";
 
 describe("failure token normalization", () => {
   it("preserves model-call budget and final-stage identity without provider text", () => {
@@ -64,5 +65,42 @@ describe("failure token normalization", () => {
   it("does not manufacture failures from arrays or empty checkpoint objects", () => {
     expect(normalizeFailure([])).toBeUndefined();
     expect(normalizeFailure({})).toBeUndefined();
+  });
+});
+
+describe("capability start failure classification", () => {
+  const boxError = (status: number, body: Record<string, unknown>) =>
+    new RpcResponseError(wrapRpcError(Object.assign(new Error("box"), { status, ...body })));
+
+  it("marks a box that refuses its session configuration as spawn_config_refused", () => {
+    const failure = capabilityStartFailure(boxError(422, { code: "session_config_invalid", retriable: false }));
+    expect(failure).toMatchObject({
+      code: "spawn_config_refused",
+      stage: "capability_start",
+      exception_class: "RpcResponseError",
+      message: "spawn_config_refused:session_config_invalid",
+    });
+  });
+
+  it("keeps transient and unknown start failures retryable", () => {
+    for (const err of [
+      boxError(500, {}),
+      boxError(429, { retriable: false }),
+      boxError(409, {}),
+      boxError(422, { code: "busy", retriable: true }),
+      // A 4xx without the box's refusal code is not a configuration verdict,
+      // even though its HTTP status alone defaults it to non-retriable.
+      boxError(403, {}),
+      boxError(413, {}),
+      boxError(422, { retriable: false }),
+      new Error("socket hang up"),
+    ]) {
+      expect(capabilityStartFailure(err).code).toBe("start_failed");
+    }
+  });
+
+  it("never copies the box message into the checkpoint", () => {
+    const failure = capabilityStartFailure(boxError(422, { code: "session_config_invalid", retriable: false, message: "role compile: secret-ish detail" }));
+    expect(JSON.stringify(failure)).not.toContain("secret-ish");
   });
 });

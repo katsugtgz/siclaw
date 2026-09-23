@@ -116,6 +116,10 @@ export class PiCompilerWorker {
         // The domain orchestrator owns retry and batch reconstruction. Neither
         // a second original prompt nor an implicit summary may replay writes.
         retry: { enabled: false }, compaction: { enabled: false },
+        // The box's loopback model proxy carries HTTP only. Providers that
+        // prefer WebSocket (the Codex subscription API) would otherwise spend a
+        // doomed upgrade upstream on every call before falling back to SSE.
+        transport: "sse",
       }),
       resourceLoaderOptions: {
         noExtensions: true, noSkills: true, noPromptTemplates: true,
@@ -261,8 +265,28 @@ export class PiCompilerWorker {
   }
 }
 
-function providerStatus(error: unknown): number | undefined {
+// Anthropic error types for providers that report a stream error event after
+// the HTTP status was already 200 (the de-streaming shim, some gateways).
+const ANTHROPIC_ERROR_STATUS: Record<string, number> = {
+  invalid_request_error: 400, authentication_error: 401, billing_error: 402, permission_error: 403,
+  not_found_error: 404, request_too_large: 413, rate_limit_error: 429, api_error: 500,
+  overloaded_error: 529,
+};
+
+export function providerStatus(error: unknown): number | undefined {
   const text = error instanceof Error ? error.message : String(error);
+  try {
+    const parsed = JSON.parse(text) as { status?: unknown; error?: { type?: unknown } };
+    if (Number.isInteger(parsed?.status) && (parsed.status as number) >= 400 && (parsed.status as number) <= 599) {
+      return parsed.status as number;
+    }
+    const type = parsed?.error?.type;
+    // `type` is upstream text: an own-key check, so "constructor" or "__proto__"
+    // cannot resolve to an Object.prototype member.
+    if (typeof type === "string" && Object.hasOwn(ANTHROPIC_ERROR_STATUS, type)) return ANTHROPIC_ERROR_STATUS[type];
+  } catch {
+    // Not a JSON error body; fall back to the provider's text.
+  }
   const match = text.match(/(?:\bHTTP\s*|\bstatus(?:\s+code)?[\s:=]*|^)(4\d\d|5\d\d)\b/i);
   return match ? Number(match[1]) : undefined;
 }

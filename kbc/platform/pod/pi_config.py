@@ -12,7 +12,10 @@ from urllib.parse import urlsplit
 _roles: dict[str, dict] = {}
 _agent_type: dict | None = None
 _REQUIRED_ROLES = {"compile", "blue", "judge", "transcribe", "compare"}
-_APIS = {"anthropic-messages", "openai-completions", "openai-responses"}
+# openai-codex-responses is the ChatGPT subscription API. Its bearer rotates, so
+# it is only usable through the live model transport (model_access), which asks
+# the control plane for a fresh token when the provider rejects the current one.
+_APIS = {"anthropic-messages", "openai-completions", "openai-responses", "openai-codex-responses"}
 _THINKING_LEVELS = {"off", "minimal", "low", "medium", "high", "xhigh", "max"}
 
 
