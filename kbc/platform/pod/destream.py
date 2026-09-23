@@ -202,8 +202,11 @@ async def _destream_messages(request: web.Request, body: dict, url: str) -> web.
                 err = {"type": "error",
                        "error": {"type": "api_error",
                                  "message": raw[:500].decode("utf-8", "replace")}}
-            await resp.write(_sse("error", err if err.get("type") == "error"
-                                  else {"type": "error", "error": err}))
+            event = err if isinstance(err, dict) and err.get("type") == "error" else {"type": "error", "error": err}
+            # The stream already answered 200, so carry the upstream status in the
+            # event: the SDK error text is all the worker sees when it classifies
+            # rate limits (429/529) and quota refusals (402).
+            await resp.write(_sse("error", {**event, "status": up.status}))
             return resp
         for chunk in synth_events(json.loads(raw)):
             await resp.write(chunk)

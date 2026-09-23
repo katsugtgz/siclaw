@@ -141,6 +141,7 @@ async def test_destream_upstream_error_becomes_stream_error_event():
         events = _parse_sse(await resp.read())
         ev, data = next((e, d) for e, d in events if e == "error")
         assert data["error"]["type"] == "rate_limit_error", data
+        assert data["status"] == 429, data  # the worker classifies backoff from it
 
     await _run_with_fake_upstream(upstream, exercise)
     print("OK  destream maps upstream HTTP errors to SSE error events")
