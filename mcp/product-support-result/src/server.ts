@@ -30,9 +30,9 @@ const inputSchema = {
       properties: {
         ticket_type: {
           type: "string",
-          enum: ["consultation", "incident", "llm_incident", "requirement", "unknown"],
+          enum: ["consultation", "incident", "llm_incident", "requirement"],
           description:
-            "llm_incident covers failures while calling an LLM / model API or inference endpoint (gateway errors, auth, rate limits, quotas, a named model misbehaving). incident is every other fault. Preserve unknown when the conversation does not establish a type, including a final handoff result after the user cannot or declines to clarify; never guess a type to submit.",
+            "llm_incident covers failures while calling an LLM / model API or inference endpoint (gateway errors, auth, rate limits, quotas, a named model misbehaving). incident is every other fault. Give the most likely type on every turn, from what the conversation establishes so far; while label=false it is provisional and may change as the user clarifies. A label=true handoff must carry the type the conversation established.",
         },
         product: {
           type: "string",
@@ -41,7 +41,13 @@ const inputSchema = {
             "Concrete, knowledge-grounded product for requirements. For incidents and consultations, use a concrete product only when established by the conversation or authoritative product knowledge; otherwise leave this empty and preserve the user-visible entry in description.",
         },
         summary: { type: "string", maxLength: LIMITS.summaryMaxChars },
-        description: { type: "string", maxLength: LIMITS.descriptionMaxChars },
+        description: {
+          type: "string",
+          minLength: 1,
+          maxLength: LIMITS.descriptionMaxChars,
+          description:
+            "Required on every turn, including the first: a self-contained account a first-line engineer can act on without reading the conversation — the user's issue, the facts established so far, and what has been answered. Update it each turn. The channel may hand the ticket to a human at any moment without another Agent turn, and then this is the material they receive.",
+        },
         evidence: {
           type: "array",
           maxItems: LIMITS.evidenceMaxItems,
@@ -66,17 +72,17 @@ const inputSchema = {
           additionalProperties: false,
           required: ["region", "aspect", "model"],
           description:
-            "Optional; absent means all empty. Best-effort intake details for ticket_type=llm_incident. Fill only what the conversation establishes. While label=false and ticket_type=unknown, user-stated details may be kept temporarily. A final label=true result with ticket_type=unknown must omit this block or leave all fields empty; preserve unclassified clues in description and evidence. Fields must also be empty for consultation, incident and requirement.",
+            "Optional; absent means all empty. Intake details for ticket_type=llm_incident, filled only from what the conversation establishes. While label=false any field may be empty; list what is still needed in missing_fields. A label=true llm_incident requires region and aspect, and model when aspect is model: ask for them rather than handing off without them. Fields must be empty for consultation, incident and requirement.",
           properties: {
             region: {
               type: "string",
               enum: ["", "domestic", "overseas"],
-              description: "Deployment region the user calls the LLM API from, per the operator's classification rules; empty when not established.",
+              description: "Deployment region the user calls the LLM API from, per the operator's classification rules; empty only while still gathering.",
             },
             aspect: {
               type: "string",
               enum: ["", "platform_api", "network", "model"],
-              description: "Failing part of the path: the API platform / gateway itself, network reachability, or a specific model; empty when not established.",
+              description: "Failing part of the path: the API platform / gateway itself, network reachability, or a specific model; empty only while still gathering.",
             },
             model: {
               type: "string",
@@ -92,7 +98,7 @@ const inputSchema = {
 
 export function createProductSupportResultServer(): Server {
   const server = new Server(
-    { name: "mcp-product-support-result", version: "0.2.2" },
+    { name: "mcp-product-support-result", version: "0.3.0" },
     { capabilities: { tools: {} } },
   );
 

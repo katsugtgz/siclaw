@@ -23,19 +23,29 @@ both MCP text content and `structuredContent`.
 }
 ```
 
-`ticket_type` is one of `consultation`, `incident`, `llm_incident`,
-`requirement`, or `unknown`. A `label=true` result marks the Agent's final
+`ticket_type` is one of `consultation`, `incident`, `llm_incident` or
+`requirement`. A `label=true` result marks the Agent's final
 conversation turn: intake is complete and the channel can offer its human
 handoff button. The user triggers that workflow; the result itself does not
 initiate a handoff or create a ticket. End with an acknowledgment that the
 information is prepared, without further questions or claims of completed actions.
 
-A `label=true` result must provide a non-empty summary and description and
-have no blocking clarification fields. The type may remain `unknown` when
-the user cannot or declines to clarify; preserve that uncertainty and the
-handoff request in the description instead of inventing a classification.
-An empty `missing_fields` means no further Agent clarification is needed,
-not that every fact is known.
+### Every turn is handoff-ready material
+
+A channel may hand the ticket to a human at any moment without another Agent
+turn — for example when the user presses an urgent-handoff button. First-line
+support then receives the **latest** result as it stands. Every result,
+whatever its `label`, therefore carries:
+
+- a non-empty `description`: a self-contained account of the user's issue, the
+  facts established so far and what has been answered, updated each turn;
+- the most likely `ticket_type` from the conversation so far. While
+  `label=false` it is provisional and may change as the user clarifies; there is
+  no `unknown` value to fall back on.
+
+A `label=true` result must additionally provide a non-empty summary and have no
+blocking clarification fields. An empty `missing_fields` means no further Agent
+clarification is needed, not that every fact is known.
 Requirements must also name a concrete product grounded in product knowledge.
 For incidents and consultations, a concrete `product` must be established by
 the conversation or authoritative product knowledge; otherwise leave it empty,
@@ -50,7 +60,8 @@ or inference endpoint: gateway errors, authentication and rate-limit or quota
 failures, broken streaming, or a specific named model misbehaving. `incident`
 remains every other fault.
 
-The `llm` block carries best-effort intake details for first-line support:
+The `llm` block carries the intake details first-line support routes an LLM
+incident on:
 
 ```json
 {
@@ -73,16 +84,16 @@ The `llm` block carries best-effort intake details for first-line support:
 | `llm.aspect` | `""`, `platform_api`, `network`, `model` | Failing part of the path: the API platform or gateway, network reachability, or a specific model |
 | `llm.model` | free text | Model name as the user stated it |
 
-These fields are hints, not gates. Fill each one only from what the
-conversation establishes and leave it empty otherwise; a `label=true`
-`llm_incident` does not require any of them. While still gathering, the
-identifiers `llm_region`, `llm_aspect` and `llm_model` may appear in
-`missing_fields`. While `label=false` and `ticket_type=unknown`, the block may
-temporarily retain details stated by the user. If the final handoff remains
-`unknown`, leave all three fields empty and retain those clues in `description`
-and `evidence`, without asserting an LLM incident. For `consultation`, `incident` or `requirement`,
-all three fields must be empty, so a stray value is never read as an
-established fact. The block is optional on input: omitting it means all three
+Fill each field only from what the conversation establishes. While still
+gathering (`label=false`) any of them may be empty, and the identifiers
+`llm_region`, `llm_aspect` and `llm_model` may appear in `missing_fields`. A
+`label=true` `llm_incident` requires `region` and `aspect`, and `model` when
+the aspect is `model`: the Agent asks for them instead of handing off without
+them. A user who needs a human before answering has the channel's own handoff
+action, which does not wait for a `label=true` result. For `consultation`,
+`incident` or `requirement`, all three fields must be empty, so a stray value
+is never read as an established fact; unconfirmed clues belong in
+`description` and `evidence`. The block is optional on input: omitting it means all three
 fields are empty, which is the correct value for every type except
 `llm_incident`. It is always present in the returned result.
 

@@ -9,7 +9,7 @@ async function withClient(
 ): Promise<void> {
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const server = createProductSupportResultServer();
-  const client = new Client({ name: "product-support-result-test", version: "0.2.2" });
+  const client = new Client({ name: "product-support-result-test", version: "0.3.0" });
 
   await server.connect(serverTransport);
   await client.connect(clientTransport);
@@ -36,7 +36,7 @@ describe("product support result MCP", () => {
             properties?: {
               ticket_type?: { enum?: string[] };
               summary?: { maxLength?: number };
-              description?: { maxLength?: number };
+              description?: { minLength?: number; maxLength?: number };
               evidence?: { maxItems?: number };
               missing_fields?: { maxItems?: number; items?: { pattern?: string } };
               llm?: {
@@ -55,12 +55,12 @@ describe("product support result MCP", () => {
         "incident",
         "llm_incident",
         "requirement",
-        "unknown",
       ]);
       expect(advertisedSchema.properties?.info?.required).not.toContain("llm");
       expect(advertisedSchema.properties?.info?.properties?.llm?.properties?.region?.enum).toEqual(["", "domestic", "overseas"]);
       expect(advertisedSchema.properties?.info?.properties?.llm?.properties?.aspect?.enum).toEqual(["", "platform_api", "network", "model"]);
       expect(advertisedSchema.properties?.info?.properties?.summary?.maxLength).toBe(200);
+      expect(advertisedSchema.properties?.info?.properties?.description?.minLength).toBe(1);
       expect(advertisedSchema.properties?.info?.properties?.description?.maxLength).toBe(2000);
       expect(advertisedSchema.properties?.info?.properties?.evidence?.maxItems).toBe(20);
       expect(advertisedSchema.properties?.info?.properties?.missing_fields?.maxItems).toBe(20);
@@ -112,32 +112,28 @@ describe("product support result MCP", () => {
     });
   });
 
-  it("returns an unknown type for a final handoff after clarification is declined", async () => {
+  it("rejects a non-handoff turn without a description", async () => {
     await withClient(async (client) => {
       const response = await client.callTool(
         {
           name: TOOL_NAME,
           arguments: {
-            label: true,
+            label: false,
             info: {
-              ticket_type: "unknown",
+              ticket_type: "consultation",
               product: "",
-              summary: "Needs support",
-              description: "User cannot describe the issue, declines further clarification, and requests human support.",
+              summary: "",
+              description: "",
               evidence: [],
-              missing_fields: [],
-              llm: { region: "", aspect: "", model: "" },
+              missing_fields: ["error_message"],
             },
           },
         },
         CallToolResultSchema,
       );
 
-      expect(response.isError).toBeUndefined();
-      expect(response.structuredContent).toMatchObject({
-        label: true,
-        info: { ticket_type: "unknown", product: "", missing_fields: [] },
-      });
+      expect(response.isError).toBe(true);
+      expect(response.structuredContent).toBeUndefined();
     });
   });
 
@@ -148,13 +144,15 @@ describe("product support result MCP", () => {
         { llm: { region: "domestic", aspect: "", model: "" } },
         { llm: { region: "", aspect: "network", model: "" } },
         { llm: { region: "", aspect: "", model: "example-model" } },
+        { ticket_type: "unknown" },
+        { ticket_type: "llm_incident" },
       ]) {
         const response = await client.callTool({
           name: TOOL_NAME,
           arguments: {
             label: true,
             info: {
-              ticket_type: "unknown",
+              ticket_type: "incident",
               product: "",
               summary: "User requests human support",
               description: "User declined further clarification.",
