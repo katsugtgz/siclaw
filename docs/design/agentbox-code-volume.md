@@ -344,9 +344,14 @@ Known, accepted differences from a physical view:
 
 ### `git_query`
 
-A registry tool in the `read_files` capability group — history is useless
-without the file tools that read the SHAs it returns, and vice versa. It is
-offered only when the authoritative set is non-empty at session build.
+A registry tool in its own `read_code` capability group. Reading a project's
+history is a grant about that project's source, while `read_files` is every
+type's baseline, so the two are selected separately. `read_code` is only useful
+together with `read_files` (the SHAs it returns are read with the file tools at
+`<repo>@<sha>` paths), so a selection naming it should name both. Note the split
+covers the tool only: the `<repo>@<sha>` views themselves are still served by the
+file tools, i.e. by `read_files`. It is offered only when the authoritative set
+is non-empty at session build.
 
 | op | Answers |
 |---|---|
@@ -430,10 +435,13 @@ type picker. Deployments upgrading from a product-specific key must migrate thei
 stored agent types before starting the new Runtime; no alias is provided. Keep
 control-plane migrations and business prompts with the system that owns them.
 
-A built-in agent type whose capability set is byte-identical to `sre`. This type
-exists because the control plane wants to manage one fleet's prompt and lifecycle
-separately, not because the mount needs different tools — the mount is decided by
-the ready marker and is available to any agent the supplier prepares.
+A built-in agent type whose capability groups are host-configured, like
+`ticket`: `AGENT_TYPES["coding"].capabilities` is `null`, the control plane's
+released type definition carries the selection, and an empty delivery is refused
+(`CODING_CAPABILITIES_REQUIRED`) rather than read as unrestricted. The runtime
+keeps no copy of the list. This is what lets the type hold `read_code`, which no
+locked type has. The mount itself is still decided by the ready marker and is
+available to any agent the supplier prepares.
 
 Its built-in `defaultPrompt` states only the three facts this runtime owns: the
 trees are a read-only snapshot rather than a checkout, they are reachable only

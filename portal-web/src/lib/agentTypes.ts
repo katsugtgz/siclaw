@@ -8,7 +8,7 @@ export interface AgentTypeOption {
   key: AgentTypeKey
   label: string
   description: string
-  /** Locked capability-group keys (read-only in the UI), or null for Custom compatibility. */
+  /** Locked capability-group keys (read-only in the UI), or null when the agent's own selection applies. */
   capabilities: string[] | null
   /** True when this type starts with no skills bound. */
   defaultNoSkills: boolean
@@ -47,7 +47,7 @@ export const AGENT_TYPES: AgentTypeOption[] = [
     key: "coding",
     label: "Coding Agent",
     description: "Managed project coding agent: inspects the project's clusters with a read-only snapshot of its source at hand.",
-    capabilities: ["inspect_infra", "run_commands", "run_scripts", "run_sandbox", "read_files", "write_sandbox", "search_memory", "plan_tasks", "spawn_subagents", "session_output", "transfer_conversation"],
+    capabilities: null,
     defaultNoSkills: false,
   },
   {

@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { describe, it, expect } from "vitest";
+import { CapabilitiesRequiredError } from "../shared/capability-configuration.js";
 import {
   AGENT_TYPES,
   COMPLETE_CATALOG_KNOWLEDGE_QA_DEFAULT_PROMPT,
@@ -37,10 +38,14 @@ describe("agent-types", () => {
     expect(AGENT_TYPES.custom.defaultPrompt).toBeNull();
   });
 
-  it("coding locks byte-identical capabilities to sre", () => {
-    // The type exists to add a read-only source mount, not tools. Divergence
-    // here would be a capability grant nobody reviewed — in either direction.
-    expect(AGENT_TYPES["coding"].capabilities).toEqual(AGENT_TYPES.sre.capabilities);
+  it("coding takes its capabilities from the host and refuses to run without them", () => {
+    // The control plane's released type definition owns the selection (it is
+    // the only place that can grant read_code); an empty delivery is not
+    // "unrestricted" for this type.
+    expect(AGENT_TYPES["coding"].capabilities).toBeNull();
+    expect(() => effectiveCapabilityKeys("coding", null)).toThrow(CapabilitiesRequiredError);
+    expect(() => effectiveCapabilityKeys("coding", [])).toThrow("Coding Agent requires explicit tool capabilities");
+    expect(effectiveCapabilityKeys("coding", ["read_files", "read_code"])).toEqual(["read_files", "read_code"]);
   });
 
   it("the Portal mirror matches this registry (locked capabilities + description)", () => {

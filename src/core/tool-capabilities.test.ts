@@ -27,7 +27,7 @@ describe("resolveCapabilities", () => {
 
   it("a single group resolves to exactly that group's tools", () => {
     expect(resolveCapabilities(["read_files"])).toEqual([
-      "read", "grep", "find", "ls", "knowledge_search", "knowledge_cite", "git_query",
+      "read", "grep", "find", "ls", "knowledge_search", "knowledge_cite",
     ]);
   });
 
@@ -45,7 +45,7 @@ describe("resolveCapabilities", () => {
   it("multiple groups resolve to the union of their tools", () => {
     const result = resolveCapabilities(["read_files", "search_memory"]);
     expect(new Set(result)).toEqual(
-      new Set(["read", "grep", "find", "ls", "knowledge_search", "knowledge_cite", "git_query", "memory_search", "memory_get"]),
+      new Set(["read", "grep", "find", "ls", "knowledge_search", "knowledge_cite", "memory_search", "memory_get"]),
     );
   });
 
@@ -53,14 +53,14 @@ describe("resolveCapabilities", () => {
     // Construct overlap synthetically would require shared tools; instead assert
     // no duplicates appear when the same group is listed twice.
     const result = resolveCapabilities(["read_files", "read_files"]);
-    expect(result).toEqual(["read", "grep", "find", "ls", "knowledge_search", "knowledge_cite", "git_query"]);
+    expect(result).toEqual(["read", "grep", "find", "ls", "knowledge_search", "knowledge_cite"]);
     expect(result!.length).toBe(new Set(result).size);
   });
 
   it("unknown group keys are warned + ignored, valid subset is used", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const result = resolveCapabilities(["read_files", "does_not_exist"]);
-    expect(result).toEqual(["read", "grep", "find", "ls", "knowledge_search", "knowledge_cite", "git_query"]);
+    expect(result).toEqual(["read", "grep", "find", "ls", "knowledge_search", "knowledge_cite"]);
     expect(warn).toHaveBeenCalledOnce();
     expect(warn.mock.calls[0][0]).toContain("does_not_exist");
   });
@@ -70,6 +70,11 @@ describe("resolveCapabilities", () => {
     // All keys invalid → valid subset is empty → [] (a real, restrictive
     // whitelist), distinct from the null=all-tools case.
     expect(resolveCapabilities(["nope"])).toEqual([]);
+  });
+
+  it("repository history is its own group, not part of read_files", () => {
+    expect(resolveCapabilities(["read_files"])).not.toContain("git_query");
+    expect(resolveCapabilities(["read_code"])).toEqual(["git_query"]);
   });
 
   it("no baseline tools are injected (only selected groups appear)", () => {
@@ -82,6 +87,7 @@ describe("resolveCapabilities", () => {
       "inspect_infra",
       "no_tools",
       "plan_tasks",
+      "read_code",
       "read_files",
       "run_commands",
       "run_local_scripts",
@@ -119,7 +125,7 @@ describe("encodeToolCapabilitiesForDb", () => {
     const encoded = encodeToolCapabilitiesForDb(["read_files"]);
     expect(encoded).not.toBeNull();
     const decoded = JSON.parse(encoded as string) as string[];
-    expect(resolveCapabilities(decoded)).toEqual(["read", "grep", "find", "ls", "knowledge_search", "knowledge_cite", "git_query"]);
+    expect(resolveCapabilities(decoded)).toEqual(["read", "grep", "find", "ls", "knowledge_search", "knowledge_cite"]);
   });
 
   it("rejects non-array, non-null/undefined values (HTTP 400 at the boundary)", () => {

@@ -26,7 +26,7 @@
  * is the built-in type contract; Custom has no built-in contract.
  */
 
-import { TicketCapabilitiesError } from "../shared/ticket-configuration.js";
+import { CapabilitiesRequiredError } from "../shared/capability-configuration.js";
 import { AgentRetiredError } from "../shared/agent-retirement.js";
 
 export type AgentType = "sre" | "knowledge_qa" | "product_support" | "ticket" | "coding" | "custom";
@@ -184,7 +184,7 @@ export const PRODUCT_SUPPORT_DEFAULT_PROMPT =
  *
  *   1. The source trees under `.siclaw/repos` are a read-only snapshot, one
  *      top-level directory per `<repo>@<view>` — not a working copy and not a
- *      git repository (the box image ships no git).
+ *      git repository (history is read through `git_query`, which needs read_code).
  *   2. They are reachable ONLY through the file tools. `restricted_bash` runs a
  *      command whitelist that contains no `ls`/`cat`/`find` and refuses text
  *      operands containing `/`, so a shell attempt returns a refusal rather
@@ -281,13 +281,12 @@ export const AGENT_TYPES: Record<AgentType, AgentTypeDef> = {
   "coding": {
     label: "Coding Agent",
     description: "Managed project coding agent: inspects the project's clusters with a read-only snapshot of its source at hand.",
-    // Deliberately byte-identical to `sre`. This type is an SRE that additionally
-    // gets its project's source mounted read-only; nothing about the mount changes
-    // which tools it needs, and every rationale on the sre entry above (the
-    // run_commands / spawn_subagents / session_output triangle, and the
-    // transfer_conversation leg) applies here unchanged. Keep the two lists in
-    // step: a divergence here is a capability grant nobody asked for.
-    capabilities: ["inspect_infra", "run_commands", "run_scripts", "run_sandbox", "read_files", "write_sandbox", "search_memory", "plan_tasks", "spawn_subagents", "session_output", "transfer_conversation"],
+    // Host-configured, like ticket: the control plane's released type definition
+    // carries the selection (SIForge owns it, so it can grant read_code — the
+    // project's repository history — which no locked type has). The runtime keeps
+    // no copy: a second list here is the one the console could not show. An empty
+    // delivery is REFUSED (effectiveCapabilityKeys), never read as unrestricted.
+    capabilities: null,
     // The control plane (its released type definition) owns the business
     // prompt; this is only the runtime invariant, so the two stay single-source.
     defaultPrompt: CODING_DEFAULT_PROMPT,
@@ -341,12 +340,13 @@ export function requireAgentType(v: unknown): AgentType {
 /**
  * Resolve the effective capability-group keys for an agent, given its type and
  * its own stored selection. Built-in types override with their locked set;
- * custom uses the agent's own selection.
+ * custom uses the agent's own selection; ticket and coding use the host's
+ * selection and refuse to run without one.
  */
 export function effectiveCapabilityKeys(agentType: AgentType, ownToolCapabilities: string[] | null): string[] | null {
   const def = AGENT_TYPES[agentType];
-  if (agentType === "ticket" && (!ownToolCapabilities || ownToolCapabilities.length === 0)) {
-    throw new TicketCapabilitiesError();
+  if ((agentType === "ticket" || agentType === "coding") && (!ownToolCapabilities || ownToolCapabilities.length === 0)) {
+    throw new CapabilitiesRequiredError(agentType);
   }
   return def.capabilities ?? ownToolCapabilities;
 }

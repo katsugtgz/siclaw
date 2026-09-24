@@ -67,7 +67,7 @@ describe("production tool registry", () => {
     expect(context.sessionEventEmitter).toHaveBeenCalledWith({ type: "handoff_requested", targetAgentId: "receiver", brief: "Verify the calculation" });
   });
 
-  it("grants git_query through read_files, and only while a mirror is readable", () => {
+  it("grants git_query through read_code, not read_files, and only while a mirror is readable", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "all-entries-code-view-"));
     try {
       const reposDir = path.join(root, "repos");
@@ -84,11 +84,12 @@ describe("production tool registry", () => {
         mode: "web", refs: { ...refs(), codeView }, allowedTools: resolveCapabilities(groups),
       }).map(tool => tool.name);
       const mounted = new CodeView({ reposDir, gitReposDir, authorityTtlMs: 0 });
-      expect(names(mounted, ["read_files"])).toContain("git_query");
+      expect(names(mounted, ["read_files", "read_code"])).toContain("git_query");
+      expect(names(mounted, ["read_files"])).not.toContain("git_query");
       expect(names(mounted, ["run_commands", "search_memory"])).not.toContain("git_query");
       // Same grant, nothing mounted: the tool must not be offered at all.
       const unmounted = new CodeView({ reposDir, gitReposDir: path.join(root, "absent"), authorityTtlMs: 0 });
-      expect(names(unmounted, ["read_files"])).not.toContain("git_query");
+      expect(names(unmounted, ["read_files", "read_code"])).not.toContain("git_query");
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

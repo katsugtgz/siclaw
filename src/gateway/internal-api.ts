@@ -15,7 +15,7 @@ import { matchesSessionPrincipal, matchesPrivateUser } from "./security/session-
  *   DELETE /api/internal/agent-tasks/:id   — delete a task
  */
 
-import { TicketCapabilitiesError } from "../shared/ticket-configuration.js";
+import { CapabilitiesRequiredError } from "../shared/capability-configuration.js";
 import http from "node:http";
 import { randomUUID } from "node:crypto";
 import type { FrontendWsClient } from "./frontend-ws-client.js";
@@ -410,7 +410,7 @@ export async function handleToolCapabilities(
     // agentType rides along for capabilities and legacy-row prompt fallback.
     sendJson(res, 200, { allowedTools, agentType, subagentTierMenu });
   } catch (err) {
-    if (err instanceof TicketCapabilitiesError) {
+    if (err instanceof CapabilitiesRequiredError) {
       sendJson(res, err.status, { error: err.toJSON() });
       return;
     }

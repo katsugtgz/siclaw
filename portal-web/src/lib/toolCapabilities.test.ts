@@ -13,6 +13,7 @@ describe("CAPABILITY_GROUPS shape", () => {
       "inspect_infra",
       "no_tools",
       "plan_tasks",
+      "read_code",
       "read_files",
       "run_commands",
       "run_local_scripts",
@@ -105,17 +106,18 @@ describe("countToolsForSelection", () => {
   })
 
   it("counts a single group's tools", () => {
-    expect(countToolsForSelection(new Set(["read_files"]))).toBe(7)
+    expect(countToolsForSelection(new Set(["read_files"]))).toBe(6)
+    expect(countToolsForSelection(new Set(["read_code"]))).toBe(1)
     expect(countToolsForSelection(new Set(["scheduling"]))).toBe(1)
   })
 
   it("counts the deduped union across multiple groups", () => {
-    // read_files (7) + search_memory (2), no shared tools → 9 distinct.
-    expect(countToolsForSelection(new Set(["read_files", "search_memory"]))).toBe(9)
+    // read_files (6) + search_memory (2), no shared tools → 8 distinct.
+    expect(countToolsForSelection(new Set(["read_files", "search_memory"]))).toBe(8)
   })
 
   it("ignores unknown keys in the selection", () => {
-    expect(countToolsForSelection(new Set(["read_files", "ghost"]))).toBe(7)
+    expect(countToolsForSelection(new Set(["read_files", "ghost"]))).toBe(6)
     expect(countToolsForSelection(new Set(["ghost"]))).toBe(0)
   })
 

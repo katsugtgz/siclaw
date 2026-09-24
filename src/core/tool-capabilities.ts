@@ -29,10 +29,13 @@ export const CAPABILITY_GROUPS: Record<string, string[]> = {
   // A non-empty selection of this group resolves to an empty concrete whitelist.
   // Unlike []/null group selections, it never opts into unrestricted tools.
   no_tools:        [],
-  // git_query reads the same repositories' history that read/grep/find/ls reach
-  // at `<repo>@<sha>` paths: one capability, since each is useless without the
-  // other (a SHA from git_query is read with the file tools).
-  read_files:      ["read", "grep", "find", "ls", "knowledge_search", "knowledge_cite", "git_query"],
+  read_files:      ["read", "grep", "find", "ls", "knowledge_search", "knowledge_cite"],
+  // Repository history (refs / log / diff / show / blame) is its own grant, not a
+  // side effect of reading files: reading a project's history is a decision about
+  // that project's source, while read_files is every type's baseline. It is only
+  // useful together with read_files — a SHA from git_query is read with the file
+  // tools at `<repo>@<sha>` paths — so a selection naming it should name both.
+  read_code:       ["git_query"],
   write_sandbox:   ["write", "edit", "skill_preview"],   // includes skill authoring
   inspect_infra:   ["cluster_list", "host_list"],   // read-only fleet discovery (registry)
   // `k8s_inspect` sits here rather than in `inspect_infra` on purpose. That group is REGISTRY metadata

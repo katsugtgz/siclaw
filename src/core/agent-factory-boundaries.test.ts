@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { resolveCapabilities } from "./tool-capabilities.js";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -127,7 +128,7 @@ describe("factory resource boundaries", () => {
       rules: { exclude_dirs: ["node_modules"], max_file_bytes: 1024 },
     }));
 
-    const result = await create("sre");
+    const result = await create("custom", true, { allowedTools: resolveCapabilities(["read_files", "read_code"]) });
     const tool = (name: string) => result.customTools.find(t => t.name === name)!;
     const text = (r: { content: Array<{ type: string; text?: string }> }) => r.content.map(c => c.text ?? "").join("");
     const virtualRoot = path.join(fixture.root, "repos", `app@${sha.slice(0, 8)}`);
@@ -145,7 +146,7 @@ describe("factory resource boundaries", () => {
   });
 
   it("does not offer git_query when no mirror is mounted", async () => {
-    const result = await create("sre");
+    const result = await create("custom", true, { allowedTools: resolveCapabilities(["read_files", "read_code"]) });
     expect(result.customTools.map(t => t.name)).not.toContain("git_query");
     expect(result.customTools.map(t => t.name)).toContain("read");
   });
