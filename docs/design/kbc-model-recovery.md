@@ -5,21 +5,47 @@ checkpoint identity. Credentials are replaceable access material: updating the
 key or credential binding on the same model must not require rebuilding the box.
 
 When Runtime negotiates `credential_refresh` at session creation, model clients
-use a loopback transport inside the box. Before an upstream request it resolves
-the bound model's credential through the parent run's existing event channel.
-Successful refreshes are cached for 15 seconds and concurrent refreshes are
-serialized. A refresh times out after 20 seconds. Neither the key nor the
-refresh response is forwarded to public events or persisted in run state.
+use a loopback transport inside the box. It resolves the bound model's current
+credential through the parent run's event channel, but a request only waits for
+that when the provider rejected its credential (401/402/403). A static API key
+is otherwise used as installed. A rotating subscription bearer
+(`openai-codex-responses`) is also refreshed ahead, at most every 15 seconds and
+in the background, so no request waits for it. Refreshes are single-flight per
+model route and time out after 20 seconds. A failed or unanswered refresh keeps
+the current credential, is counted per route and logged as
+`kbc.model_credential.refresh_failed` with metadata only; for 15 seconds after
+it, further rejections return without waiting for another refresh. Neither the key nor
+the refresh response is forwarded to public events or persisted in run state.
 The control plane validates the model's organization, ID, endpoint and protocol
 before returning its current credential. Redirects are not followed.
 
-An explicit 401/403 or transient 408/429/5xx response can be retried once after
-refreshing credentials. A 402 is retried only when the credential changed.
-Long Retry-After delays are returned to the caller instead of bypassed. Only the
+Credential requests are control frames with their own box stream,
+`GET /control-events/:runId`, advertised by `relay_ready.control_events`.
+Runtime consumes it beside the ordered event relay, so a request is answered
+even while an earlier artifact batch is still being persisted; the event relay
+keeps its one-frame-at-a-time backpressure. Without a control consumer (an
+older Runtime, or before it attaches) the box sends the request on the ordered
+stream as before, and an older box never advertises the stream. An unavailable
+control plane therefore cannot stall a model call for longer than one refresh
+timeout, and only after a credential rejection.
+
+A 401/403 is retried once after the refresh; a 402 only when the credential
+changed. A transient 408/429/5xx is retried once without a refresh. When the
+refresh after a rejection fails, the provider's own error is returned. Long
+Retry-After delays are returned to the caller instead of bypassed. Only the
 failed HTTP request is retried: SDK conversation state and completed host tools
 remain intact. Partial streams and ambiguous connection failures are not
 replayed. Owner-facing provider errors are preserved with rotated keys redacted.
 No new deployment environment variables or dependencies are required.
+
+## Artifact persistence refusals
+
+Runtime retries one artifact batch until the consumer commits it, for at most
+10 minutes. A permanent refusal (`CONFLICT`, validation, permission or missing
+run) is not retried: Runtime reports that the platform refused the batch and
+fails the run with `RelayArtifactRejectedError`, keeping work saved by earlier
+batches. A test-session error frame forwards the box's validated `code`,
+`failure_code` and `api_error_status` tokens to the consumer.
 
 Interactive tests resolve the current configured test model separately from the
 compiler snapshot. Each test session pins that model and consumer fingerprint.

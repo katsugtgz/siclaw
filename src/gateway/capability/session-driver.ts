@@ -73,6 +73,8 @@ interface BoxEvent {
   exception_class?: string;
   reason?: string;
   observation?: ExecutionObservation;
+  /** relay_ready: the box serves a separate control-event stream. */
+  control_events?: number;
 }
 
 export interface DriveCapabilitySessionOptions {
@@ -117,10 +119,36 @@ export const defaultStreamReconnectPolicy: StreamReconnectPolicy = {
 // Allow the control-plane WS reconnect (up to 30s backoff) to recover during
 // event persistence. This deadline never resets on retries or heartbeat traffic.
 const EVENT_PERSIST_RETRY_MS = 120_000;
+// An artifact batch may wait out a longer consumer outage (e.g. an apiserver
+// rollout); the box itself gives up on an unacknowledged barrier after 10min.
+const ARTIFACT_PERSIST_RETRY_MS = 10 * 60_000;
+
+// Consumer refusals that no retry of the SAME batch can change: a fenced or
+// superseded writer, an invalid batch, a missing or foreign run.
+const PERMANENT_PERSIST_CODES = new Set(["CONFLICT", "VALIDATION_ERROR", "BAD_REQUEST", "FORBIDDEN", "UNAUTHORIZED", "NOT_FOUND"]);
+
+function isPermanentPersistError(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const { code, retriable } = err as { code?: unknown; retriable?: unknown };
+  return typeof code === "string" && (PERMANENT_PERSIST_CODES.has(code) || retriable === false);
+}
+
+// A box that serves /control-events delivers credential requests there, so
+// they are answered while this relay is still persisting an earlier frame.
+const CONTROL_RECONNECT_MIN_MS = 1_000;
+const CONTROL_RECONNECT_MAX_MS = 30_000;
+
+type RelayFailureName =
+  | "RelayArtifactPersistenceError"
+  | "RelayArtifactRejectedError"
+  | "RelayEventCommitError"
+  | "RelayTurnPersistenceError"
+  | "RelayEventAckError"
+  | "RelayStreamError";
 
 // These controlled names survive the existing safe exception_class projection.
 // Keep the original cause for server logs; never put provider text in receipts.
-function relayFailure(name: "RelayArtifactPersistenceError" | "RelayEventCommitError" | "RelayTurnPersistenceError" | "RelayEventAckError" | "RelayStreamError", cause: unknown): Error {
+function relayFailure(name: RelayFailureName, cause: unknown): Error {
   const error = new Error(cause instanceof Error ? cause.message : "Capability relay failed", { cause });
   error.name = name;
   return error;
@@ -150,6 +178,9 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
   // relaying an event — e.g. the artifact persist loop giving up because the run
   // was cancelled or reaped — is a relay decision and must fail the run as before.
   let relayError: unknown;
+  const controlTasks = new Set<Promise<void>>();
+  let controlLane: Promise<void> | undefined;
+  let relayClosed = false;
   try {
     for (;;) {
       // onComment: the box emits `: heartbeat` SSE comments between data events. A
@@ -167,6 +198,7 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
           if (event.type === "relay_ready" && event.event_ack === 1) {
             acknowledgedStream = true;
             replaySupported = true;
+            if (event.control_events === 1) controlLane ??= runControlLane();
             continue;
           }
           try {
@@ -239,6 +271,35 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
   } finally {
     // Bounded background drain; terminal state and artifact ACKs do not await it.
     void observations.close();
+    // The control lane stops at its next frame or heartbeat. Each control
+    // reply already in flight is bounded by its RPC and POST timeouts.
+    relayClosed = true;
+    await Promise.allSettled([...controlTasks]);
+  }
+
+  /** Consume the box's control-event stream until this relay closes. */
+  async function runControlLane(): Promise<void> {
+    let delayMs = CONTROL_RECONNECT_MIN_MS;
+    while (!relayClosed && !runSettled()) {
+      try {
+        for await (const raw of client.streamPath(`/control-events/${runId}`)) {
+          if (relayClosed) return;
+          delayMs = CONTROL_RECONNECT_MIN_MS;
+          const evt = raw as BoxEvent;
+          if (evt.type === "control_ready") continue;
+          const task = handleControlEvent(evt).finally(() => controlTasks.delete(task));
+          controlTasks.add(task);
+        }
+      } catch (err) {
+        if (relayClosed || runSettled()) return;
+        console.warn(
+          `[capability] run=${runId} control stream lost; reconnecting in ${delayMs}ms: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      if (relayClosed) return;
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      delayMs = Math.min(delayMs * 2, CONTROL_RECONNECT_MAX_MS);
+    }
   }
 
   /** True once the run is terminal or its live record is gone (endRun drops it). */
@@ -274,6 +335,31 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
     ).catch((error) => { throw relayFailure("RelayEventCommitError", error); });
   }
 
+  async function handleControlEvent(evt: BoxEvent): Promise<void> {
+    manager.touch(runId);
+    console.log(`[capability] run=${runId} box control event: ${evt.type}`);
+    if (evt.type !== "refresh_credentials") return;
+    if (!evt.request_id || !/^[a-f0-9]{32}$/.test(evt.request_id)) return;
+    // Private control traffic only: never publish the LLM block as an
+    // event, observation, checkpoint, or error body.
+    let reply: { api_key?: unknown; error?: string };
+    try {
+      const input = await frontendClient.request(CAPABILITY_FETCH_INPUT, {
+        run_id: runId, ref: "model-credential", model: evt.model,
+      }) as { api_key?: unknown };
+      reply = input.api_key ? { api_key: input.api_key } : { error: "credential_refresh_unavailable" };
+    } catch {
+      reply = { error: "credential_refresh_failed" };
+    }
+    try {
+      await client.postJson(`/model-credentials/${runId}/${evt.request_id}`, reply, 10_000);
+    } catch {
+      // The box owns a bounded refresh timeout. A lost reply must not
+      // tear down its authoring session or discard its checkpoints.
+      console.warn(`[capability] credential refresh reply unavailable run=${runId}`);
+    }
+  }
+
   async function relayBoxEvent(evt: BoxEvent): Promise<void> {
     // ANY box event means the box is alive → bump activity so the watchdog never
     // reaps an actively-working run (e.g. a long compile emitting only `log`).
@@ -294,28 +380,11 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
       console.log(`[capability] run=${runId} box event: ${evt.type}`);
     }
     switch (evt.type) {
-      case "refresh_credentials": {
-        if (!evt.request_id || !/^[a-f0-9]{32}$/.test(evt.request_id)) break;
-        // Private control traffic only: never publish the LLM block as an
-        // event, observation, checkpoint, or error body.
-        let reply: { api_key?: unknown; error?: string };
-        try {
-          const input = await frontendClient.request(CAPABILITY_FETCH_INPUT, {
-            run_id: runId, ref: "model-credential", model: evt.model,
-          }) as { api_key?: unknown };
-          reply = input.api_key ? { api_key: input.api_key } : { error: "credential_refresh_unavailable" };
-        } catch {
-          reply = { error: "credential_refresh_failed" };
-        }
-        try {
-          await client.postJson(`/model-credentials/${runId}/${evt.request_id}`, reply, 10_000);
-        } catch {
-          // The box owns a bounded refresh timeout. A lost reply must not
-          // tear down its authoring session or discard its checkpoints.
-          console.warn(`[capability] credential refresh reply unavailable run=${runId}`);
-        }
+      case "refresh_credentials":
+        // A box without a control stream (or before it attached) sends the
+        // request in order; answer it inline as before.
+        await handleControlEvent(evt);
         break;
-      }
       case "execution_observation":
         observations.enqueue(evt.observation);
         break;
@@ -348,9 +417,10 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
         }
         break;
       case "syncArtifacts":
-        // One box sync event is one consumer transaction. Keep retrying the
-        // SAME batch until acknowledged; consuming later turn_done/done frames
-        // before its workspace is durable would expose a torn draft.
+        // One box sync event is one consumer transaction. Retry the SAME batch
+        // until acknowledged; consuming later turn_done/done frames before its
+        // workspace is durable would expose a torn draft. A permanent refusal
+        // or an outage past the deadline fails the run instead of stalling it.
         {
           const artifacts = (evt.artifacts ?? []).flatMap((a) => {
             if (!a || typeof a.path !== "string" || !a.path) {
@@ -384,16 +454,28 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
             ...(evt.completed_checkpoint_id ? { completed_checkpoint_id: evt.completed_checkpoint_id } : {}),
             artifacts,
           };
+          const deadline = Date.now() + ARTIFACT_PERSIST_RETRY_MS;
           let delayMs = 250;
           for (;;) {
             try {
               await frontendClient.request(CAPABILITY_PERSIST_ARTIFACTS, request);
               break;
             } catch (err) {
+              const reason = err instanceof Error ? err.message : String(err);
+              if (isPermanentPersistError(err)) {
+                console.error(`[capability] run=${runId} persistArtifacts rejected permanently: ${truncateForLog(reason)}`);
+                emit("summary", { text: "The platform refused to save this workspace batch, so the session was stopped. Saved work up to the previous batch is kept." });
+                throw relayFailure("RelayArtifactRejectedError", err);
+              }
               const rec = manager.get(runId);
               if (!rec || isTerminalCapabilityStatus(rec.status)) {
                 throw relayFailure("RelayArtifactPersistenceError", new Error(
-                  `persistArtifacts retry aborted because run ${runId} is no longer active: ${err instanceof Error ? err.message : String(err)}`,
+                  `persistArtifacts retry aborted because run ${runId} is no longer active: ${reason}`,
+                ));
+              }
+              if (Date.now() + delayMs >= deadline) {
+                throw relayFailure("RelayArtifactPersistenceError", new Error(
+                  `persistArtifacts did not succeed within ${ARTIFACT_PERSIST_RETRY_MS}ms for run ${runId}: ${reason}`,
                 ));
               }
               console.error(

@@ -483,6 +483,32 @@ describe("FrontendWsClient", () => {
     client.close();
   });
 
+  it("request() keeps the peer's error code on rejection", async () => {
+    const client = await createClient();
+
+    const connectPromise = client.connect();
+    const ws = openLatestWs();
+    await connectPromise;
+
+    const requestPromise = client.request("capability.persistArtifacts");
+
+    const frame = JSON.parse(ws._sent[0]);
+    ws.emit("message", JSON.stringify({
+      type: "res",
+      id: frame.id,
+      ok: false,
+      error: { code: "CONFLICT", message: "authoring run does not own this operation" },
+    }));
+
+    await expect(requestPromise).rejects.toMatchObject({
+      name: "RpcResponseError",
+      code: "CONFLICT",
+      message: "authoring run does not own this operation",
+    });
+
+    client.close();
+  });
+
   // ── close() rejects pending RPCs ─────────────────────────────
 
   it("close() rejects all pending RPCs", async () => {
