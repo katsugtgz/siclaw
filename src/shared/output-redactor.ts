@@ -145,13 +145,22 @@ const GENERIC_SECRET_PATTERNS: RegExp[] = [
  * the client resolves itself ($VAR, ${VAR}, OpenCode's {env:VAR}) or a
  * documentation placeholder (<Your API Key>). Product docs and knowledge-base
  * answers print exactly these in copyable config; masking them breaks the
- * config without protecting anything. `${VAR:-default}` is not exempt because
- * the default can be a literal credential.
+ * config without protecting anything.
+ *
+ * Each form is kept narrow because `printenv` output prints values already
+ * expanded, so a literal secret can start with `$` or `<`:
+ * - a bare `$NAME` must read as an environment variable name (upper case,
+ *   letters before the first underscore), so `$Summer2024` or `$ABC123` redact;
+ * - a placeholder must close its `>`;
+ * - `${VAR:-default}` is not exempt because the default can be a literal.
  */
-const SECRET_REFERENCE_VALUE = /^(?:\$[A-Za-z_][A-Za-z0-9_]*|\$\{[A-Za-z_][A-Za-z0-9_]*\}|\{env:[A-Za-z_][A-Za-z0-9_]*\}|<[^<>]*>?)$/;
+const SECRET_REFERENCE_VALUE =
+  /^(?:\$[A-Z]+(?:_[A-Z0-9]+)*|\$\{[A-Za-z_][A-Za-z0-9_]*\}|\{env:[A-Za-z_][A-Za-z0-9_]*\}|<[^<>"'\n]+>)$/;
+// A placeholder at the start of an assignment value; `\S+` stops at its first space.
+const LEADING_PLACEHOLDER = /^["']?<[^<>"'\n]+>["']?(?=\s|$)/;
 
 function isSecretReferenceValue(value: string): boolean {
-  const unquoted = value.replace(/^(["'])(.*)\1$/s, "$2").replace(/^["']/, "");
+  const unquoted = value.replace(/^(["'])(.*)\1$/s, "$2");
   return SECRET_REFERENCE_VALUE.test(unquoted);
 }
 
@@ -159,9 +168,13 @@ function isSecretReferenceValue(value: string): boolean {
  * Only the key-name heuristics may pass a reference through. Literal patterns
  * (configured credentials, token formats) always redact, whatever they look like.
  */
-function isUnredactedReference(pattern: RegExp, match: string): boolean {
+function isUnredactedReference(pattern: RegExp, match: string, offset: number, text: string): boolean {
   if (pattern === JSON_SECRET_FIELD_PATTERN) return isSecretReferenceValue(match);
-  if (pattern === ENV_SECRET_ASSIGNMENT_PATTERN) return isSecretReferenceValue(match.slice(match.indexOf("=") + 1));
+  if (pattern === ENV_SECRET_ASSIGNMENT_PATTERN) {
+    const valueStart = match.indexOf("=") + 1;
+    return isSecretReferenceValue(match.slice(valueStart))
+      || LEADING_PLACEHOLDER.test(text.slice(offset + valueStart));
+  }
   return false;
 }
 
@@ -175,8 +188,8 @@ export function redactText(text: string, config: RedactionConfig): string {
   for (const pattern of config.patterns) {
     // Reset lastIndex for stateful (global) regexes
     pattern.lastIndex = 0;
-    result = result.replace(pattern, (match) =>
-      isUnredactedReference(pattern, match) ? match : "[REDACTED]");
+    result = result.replace(pattern, (match: string, offset: number, whole: string) =>
+      isUnredactedReference(pattern, match, offset, whole) ? match : "[REDACTED]");
   }
   return result;
 }

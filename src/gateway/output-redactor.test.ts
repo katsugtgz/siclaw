@@ -192,6 +192,9 @@ describe("buildRedactionConfig — generic secret patterns", () => {
       "OPENAI_API_KEY=<Your API Key>",
       'export OPENAI_API_KEY="<Your API Key>"',
       "OPENAI_API_KEY=$SIFLOW_API_KEY",
+      'OPENAI_API_KEY="$SIFLOW_API_KEY"',
+      "API_KEY=<your-api-key> # replace",
+      "TOKEN=$TOKEN",
     ];
     for (const input of cases) expect(redactText(input, cfg)).toBe(input);
   });
@@ -200,6 +203,16 @@ describe("buildRedactionConfig — generic secret patterns", () => {
     expect(redactText('"api_key": "${SIFLOW_API_KEY:-literalfallback}"', cfg)).toBe('"api_key": "[REDACTED]"');
     expect(redactText('"apiKey": "plainliteralvalue"', cfg)).toBe('"apiKey": "[REDACTED]"');
     expect(redactText('export OPENAI_API_KEY="plainliteral"', cfg)).toBe("export [REDACTED]");
+  });
+
+  it("redacts literal values that only resemble a reference or placeholder", () => {
+    // printenv prints expanded values: these are the secrets themselves.
+    expect(redactText("PASSWORD=$Summer2024abc", cfg)).toBe("[REDACTED]");
+    expect(redactText("PASSWORD=$ABC123XYZ", cfg)).toBe("[REDACTED]");
+    expect(redactText("PASSWORD=<Xk9mQ2vLp8Zt", cfg)).toBe("[REDACTED]");
+    expect(redactText("TOKEN=<abc>def", cfg)).toBe("[REDACTED]");
+    expect(redactText('{"password": "$Summer2024abc"}', cfg)).toBe('{"password": "[REDACTED]"}');
+    expect(redactText('{"token": "<a8f3c1d9e7b2a4f6"}', cfg)).toBe('{"token": "[REDACTED]"}');
   });
 
   it("never exempts a configured credential that looks like a reference", () => {
