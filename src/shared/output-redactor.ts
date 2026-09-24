@@ -161,19 +161,33 @@ const PLACEHOLDER = /^<([^<>"'\n]+)>$/;
 // A placeholder at the start of an assignment value; `\S+` stops at its first space.
 const LEADING_PLACEHOLDER = /^["']?<([^<>"'\n]+)>["']?(?=\s|$)/;
 
+// Words that name what a placeholder stands for. A body must contain one: shape
+// alone cannot tell `<your-api-key>` from a passphrase like `<correcthorsebatterystaple>`.
+const PLACEHOLDER_WORDS = new Set([
+  "access", "api", "apikey", "bearer", "credential", "credentials", "key", "pass", "passwd",
+  "password", "secret", "token", "your",
+]);
+const PLACEHOLDER_CJK_WORDS = /密钥|令牌|密码|凭证|口令|你的|您的/u;
+
 /**
- * A documentation placeholder describes the value instead of holding one:
- * several letter-only words (`Your API Key`), one UPPER_SNAKE or lower-kebab
- * name (`API_KEY`, `your-api-key`), or a CJK description (`你的API密钥`).
- * A single token with mixed case or digits reads as a value and redacts.
+ * A documentation placeholder describes the value instead of holding one. It
+ * has a placeholder shape — several letter-only words (`Your API Key`), one
+ * UPPER_SNAKE or lower-kebab name (`API_KEY`, `your-api-key`), or a CJK
+ * description (`你的API密钥`), never a digit — and it names what it stands for
+ * (PLACEHOLDER_WORDS as a whole word, or a CJK equivalent). Anything else reads
+ * as a value and redacts.
  */
 function isPlaceholderBody(body: string): boolean {
   const text = body.trim();
   if (/\d/.test(text)) return false;
-  if (/\s/.test(text)) return text.split(/\s+/).every((word) => /^[\p{L}_-]+$/u.test(word));
-  return /^[A-Z]+(?:_[A-Z]+)*$/.test(text)
-    || /^[a-z]+(?:[-_][a-z]+)*$/.test(text)
-    || (/\p{Script=Han}/u.test(text) && /^[\p{L}_-]+$/u.test(text));
+  const shaped = /\s/.test(text)
+    ? text.split(/\s+/).every((word) => /^[\p{L}_-]+$/u.test(word))
+    : /^[A-Z]+(?:_[A-Z]+)*$/.test(text)
+      || /^[a-z]+(?:[-_][a-z]+)*$/.test(text)
+      || (/\p{Script=Han}/u.test(text) && /^[\p{L}_-]+$/u.test(text));
+  if (!shaped) return false;
+  return PLACEHOLDER_CJK_WORDS.test(text)
+    || text.split(/[\s_\-\p{Script=Han}]+/u).some((word) => PLACEHOLDER_WORDS.has(word.toLowerCase()));
 }
 
 function isSecretReferenceValue(value: string): boolean {
