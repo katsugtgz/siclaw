@@ -151,17 +151,40 @@ const GENERIC_SECRET_PATTERNS: RegExp[] = [
  * expanded, so a literal secret can start with `$` or `<`:
  * - a bare `$NAME` must read as an environment variable name (upper case,
  *   letters before the first underscore), so `$Summer2024` or `$ABC123` redact;
- * - a placeholder must close its `>`;
+ * - a placeholder must close its `>` and read as a description, not a value
+ *   (see isPlaceholderBody), so `<MyProductionPassword123>` redacts;
  * - `${VAR:-default}` is not exempt because the default can be a literal.
  */
 const SECRET_REFERENCE_VALUE =
-  /^(?:\$[A-Z]+(?:_[A-Z0-9]+)*|\$\{[A-Za-z_][A-Za-z0-9_]*\}|\{env:[A-Za-z_][A-Za-z0-9_]*\}|<[^<>"'\n]+>)$/;
+  /^(?:\$[A-Z]+(?:_[A-Z0-9]+)*|\$\{[A-Za-z_][A-Za-z0-9_]*\}|\{env:[A-Za-z_][A-Za-z0-9_]*\})$/;
+const PLACEHOLDER = /^<([^<>"'\n]+)>$/;
 // A placeholder at the start of an assignment value; `\S+` stops at its first space.
-const LEADING_PLACEHOLDER = /^["']?<[^<>"'\n]+>["']?(?=\s|$)/;
+const LEADING_PLACEHOLDER = /^["']?<([^<>"'\n]+)>["']?(?=\s|$)/;
+
+/**
+ * A documentation placeholder describes the value instead of holding one:
+ * several letter-only words (`Your API Key`), one UPPER_SNAKE or lower-kebab
+ * name (`API_KEY`, `your-api-key`), or a CJK description (`你的API密钥`).
+ * A single token with mixed case or digits reads as a value and redacts.
+ */
+function isPlaceholderBody(body: string): boolean {
+  const text = body.trim();
+  if (/\d/.test(text)) return false;
+  if (/\s/.test(text)) return text.split(/\s+/).every((word) => /^[\p{L}_-]+$/u.test(word));
+  return /^[A-Z]+(?:_[A-Z]+)*$/.test(text)
+    || /^[a-z]+(?:[-_][a-z]+)*$/.test(text)
+    || (/\p{Script=Han}/u.test(text) && /^[\p{L}_-]+$/u.test(text));
+}
 
 function isSecretReferenceValue(value: string): boolean {
   const unquoted = value.replace(/^(["'])(.*)\1$/s, "$2");
-  return SECRET_REFERENCE_VALUE.test(unquoted);
+  const placeholder = PLACEHOLDER.exec(unquoted);
+  return placeholder ? isPlaceholderBody(placeholder[1]) : SECRET_REFERENCE_VALUE.test(unquoted);
+}
+
+function startsWithPlaceholder(value: string): boolean {
+  const placeholder = LEADING_PLACEHOLDER.exec(value);
+  return placeholder !== null && isPlaceholderBody(placeholder[1]);
 }
 
 /**
@@ -173,7 +196,7 @@ function isUnredactedReference(pattern: RegExp, match: string, offset: number, t
   if (pattern === ENV_SECRET_ASSIGNMENT_PATTERN) {
     const valueStart = match.indexOf("=") + 1;
     return isSecretReferenceValue(match.slice(valueStart))
-      || LEADING_PLACEHOLDER.test(text.slice(offset + valueStart));
+      || startsWithPlaceholder(text.slice(offset + valueStart));
   }
   return false;
 }

@@ -194,6 +194,9 @@ describe("buildRedactionConfig — generic secret patterns", () => {
       "OPENAI_API_KEY=$SIFLOW_API_KEY",
       'OPENAI_API_KEY="$SIFLOW_API_KEY"',
       "API_KEY=<your-api-key> # replace",
+      '"apiKey": "<API_KEY>"',
+      '"api_key": "<你的API密钥>"',
+      "OPENAI_API_KEY=<your api key>",
       "TOKEN=$TOKEN",
     ];
     for (const input of cases) expect(redactText(input, cfg)).toBe(input);
@@ -211,6 +214,11 @@ describe("buildRedactionConfig — generic secret patterns", () => {
     expect(redactText("PASSWORD=$ABC123XYZ", cfg)).toBe("[REDACTED]");
     expect(redactText("PASSWORD=<Xk9mQ2vLp8Zt", cfg)).toBe("[REDACTED]");
     expect(redactText("TOKEN=<abc>def", cfg)).toBe("[REDACTED]");
+    // A closed <...> holding a value-shaped token is a secret, not a placeholder.
+    expect(redactText("PASSWORD=<MyProductionPassword123>", cfg)).toBe("[REDACTED]");
+    expect(redactText("PASSWORD=<MyProductionPassword>", cfg)).toBe("[REDACTED]");
+    expect(redactText('{"password": "<MyProductionPassword123>"}', cfg)).toBe('{"password": "[REDACTED]"}');
+    expect(redactText('{"token": "<a8f3c1d9e7b2a4f6>"}', cfg)).toBe('{"token": "[REDACTED]"}');
     expect(redactText('{"password": "$Summer2024abc"}', cfg)).toBe('{"password": "[REDACTED]"}');
     expect(redactText('{"token": "<a8f3c1d9e7b2a4f6"}', cfg)).toBe('{"token": "[REDACTED]"}');
   });
