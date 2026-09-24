@@ -1468,6 +1468,67 @@ def asset_attribution_edges(
     return edges
 
 
+# Text documents whose bodies may embed screenshots a reader relies on. MDX is
+# the Mintlify/Docusaurus page format; its image syntax is ordinary Markdown or
+# an HTML ``<img src="...">`` inside components such as ``<Frame>``.
+EMBEDDING_DOCUMENT_EXTS = (".md", ".mdx")
+_NON_PATH_TARGET_RE = re.compile(r"^(?:[a-z][a-z0-9+.-]*:|//)", re.IGNORECASE)
+
+
+def embedded_image_edges(
+    workdir: str, sources: list[str] | None = None,
+) -> dict[str, list[str]]:
+    """Map each raw ``.md``/``.mdx`` document to the images its body embeds.
+
+    Review scope only — never coverage accounting. ``asset_attribution_edges``
+    must stay byte-identical to the control plane's coverage ledger, which reads
+    ``.md`` bodies and relative targets only. Image review asks a different
+    question: which pixels does a page that cites this document inherit
+    responsibility for? A documentation-site archive answers it with ``.mdx``
+    pages and site-root targets (``![x](/product/media/shot.png)``), both of
+    which the coverage reader skips, so screenshots never reached blind
+    transcription while the pages that reproduced their surrounding text did.
+
+    A relative target resolves against the document's directory. A site-root
+    target resolves against the Raw root first, then each deeper ancestor of the
+    document (a site nested below Raw); the first existing image wins. URLs and
+    other schemes are ignored. Only existing IMAGE_SOURCE_EXTS files become
+    edges, so the result is always a superset of the coverage edges' images."""
+    sources = source_inventory(workdir) if sources is None else sources
+    images = {s for s in sources
+              if posixpath.splitext(s)[1].lower() in IMAGE_SOURCE_EXTS}
+    if not images:
+        return {}
+    raw = Path(workdir) / "raw"
+    edges: dict[str, list[str]] = {}
+    for doc in sources:
+        if not doc.lower().endswith(EMBEDDING_DOCUMENT_EXTS):
+            continue
+        try:
+            text = (raw / doc).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        base = posixpath.dirname(doc)
+        parts = base.split("/") if base else []
+        roots = [""] + ["/".join(parts[:i]) for i in range(1, len(parts) + 1)]
+        hits: set[str] = set()
+        for target in document_link_targets(text):
+            if _NON_PATH_TARGET_RE.match(target):
+                continue
+            if target.startswith("/"):
+                candidates = [posixpath.normpath(posixpath.join(root, target.lstrip("/")))
+                              for root in roots]
+            else:
+                candidates = [posixpath.normpath(posixpath.join(base, target))]
+            for candidate in candidates:
+                if candidate in images:
+                    hits.add(candidate)
+                    break
+        if hits:
+            edges[doc] = sorted(hits)
+    return edges
+
+
 def document_attachment_edges(
     workdir: str, sources: list[str] | None = None,
 ) -> dict[str, list[str]]:
@@ -3793,9 +3854,10 @@ def media_citing_pages(workdir: str) -> dict[str, list[str]]:
     this page is responsible for. Three discovery paths, UNIONED:
       1. direct sources image entries — an image cited directly;
       2. body ``(source: …)`` image citations — basename match tolerated;
-      3. attribution-edge reverse lookup — a page that cites a DOCUMENT ``d`` in
+      3. embed-edge reverse lookup — a page that cites a DOCUMENT ``d`` in
          its sources list inherits the numeric check of every image ``d``
-         embeds in its body.
+         embeds in its body (``.md`` or ``.mdx``; relative or site-root target,
+         see ``embedded_image_edges``).
     Path 3 is what keeps image re-verification alive under coverage v2: agents
     now cite DOCUMENTS (images auto-attach, see coverage/asset_attribution_edges)
     rather than listing images one-by-one, so without it the fresh-eyes numeric
@@ -3809,7 +3871,9 @@ def media_citing_pages(workdir: str) -> dict[str, list[str]]:
     for p in raw_images:
         by_basename.setdefault(posixpath.basename(p), []).append(p)
     raw_set = set(raw_images)
-    edges = asset_attribution_edges(workdir)
+    # Review scope, not the coverage edges: a docs-site archive embeds its
+    # screenshots from .mdx pages with site-root paths (see embedded_image_edges).
+    edges = embedded_image_edges(workdir)
     out: dict[str, list[str]] = {}
     for rel, page in candidate_pages(workdir).items():
         if "error" in page:

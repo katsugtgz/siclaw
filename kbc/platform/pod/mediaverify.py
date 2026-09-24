@@ -19,7 +19,7 @@ from pathlib import Path
 
 
 from redblue import _agent_json  # JSON call + one lenient retry, shared shape
-from selfcheck import _is_en, read_selfcheck
+from selfcheck import _is_en, candidate_pages, embedded_image_edges, read_selfcheck
 from media_progress import MediaProgress
 
 TRANSCRIPTS_PATH = "authoring/MEDIA_TRANSCRIPTS.json"
@@ -229,16 +229,43 @@ def comparison_segments(text: str):
         start = max(start + 1, end - _COMPARE_OVERLAP_CHARS)
 
 
+def _embedding_note(embedded_by: dict[str, list[str]] | None, locale: str | None) -> str:
+    """Tell the comparer which cited documents carry each image.
+
+    A page that learned from a document tags the DOCUMENT, not the screenshot
+    inside it, so an image-tag-only comparison checks nothing on such a page.
+    Document-tagged claims may only be reported as visible contradictions: the
+    document text legitimately says more than any one screenshot shows."""
+    if not embedded_by:
+        return ""
+    mapping = json.dumps(embedded_by, ensure_ascii=False, sort_keys=True)
+    if _is_en(locale):
+        return ("\nSome transcribed images reach this page through a document it cites, which embeds them "
+                f"(image → embedding documents): {mapping}\n"
+                "A claim tagged with such a document may describe that document's screenshot. For those claims "
+                "report only \"不一致\" (inconsistent) — the transcript visibly contradicts the claim, e.g. the text "
+                "describes fields, options or steps the screenshot of the same dialog does not show. Never report "
+                "\"超出转写范围\" for a document-tagged claim: the document text may support what the image does not show.")
+    return ("\n部分已转写图片是经本页引用的文档嵌入而来(图片 → 嵌入它的文档):" + mapping + "\n"
+            "挂这些文档来源的断言可能在描述文档里的截图。对这类断言只报「不一致」——转写明显与断言冲突,"
+            "例如正文写的字段、选项或步骤在同一弹窗截图里并不存在;不要对挂文档来源的断言报「超出转写范围」,"
+            "文档正文本来就可以支持图片里没有的信息。")
+
+
 async def compare_page(engine, tmp_dir: str, page_rel: str, page_text: str,
-                       transcripts: dict[str, dict], locale: str | None = None) -> list[dict]:
+                       transcripts: dict[str, dict], locale: str | None = None,
+                       embedded_by: dict[str, list[str]] | None = None) -> list[dict]:
     """Compare the entire page in bounded, overlapping text-only sessions.
 
     A single deadline covers the whole page. A failed/malformed segment raises:
     the caller may retry or record exhaustion, but cannot mark the page passed.
+    `embedded_by` (image → cited documents embedding it) lets the comparer
+    check document-tagged claims against those documents' screenshots.
     """
     if not page_text.strip():
         raise ValueError("Cannot verify an empty page")
     system, user = _compare_prompts(locale)
+    embedding = _embedding_note(embedded_by, locale)
     out, seen = [], set()
     budget = float(_env("KBC_MV_COMPARE_TIMEOUT", "300"))
     deadline = time.monotonic() + budget
@@ -252,7 +279,7 @@ async def compare_page(engine, tmp_dir: str, page_rel: str, page_text: str,
             data = await _agent_json(
                 engine, stage="compare", system=system,
                 user=user.format(page=page_rel, page_text=segment,
-                                 transcripts_json=json.dumps(transcripts, ensure_ascii=False)) + scope,
+                                 transcripts_json=json.dumps(transcripts, ensure_ascii=False)) + embedding + scope,
                 model=_compare_model(), role="compare", cwd=tmp_dir, roots=[tmp_dir],
                 timeout=max(0.001, deadline - time.monotonic()))
             if not isinstance(data, dict) or not isinstance(data.get("findings"), list):
@@ -293,6 +320,23 @@ async def run_blind_verify(engine, workdir: str, pending: dict[str, list[str]],
     errors: list[str] = []
     transcripts: dict[str, dict] = {}
     hits = 0
+    try:
+        # Which cited documents carry each pending image. Advisory context for
+        # the comparer only; a failure falls back to image-tag comparison.
+        embed_edges = embedded_image_edges(workdir)
+        page_sources = {rel: list(page.get("sources") or [])
+                        for rel, page in candidate_pages(workdir).items()
+                        if rel in pending and "error" not in page}
+    except Exception:
+        embed_edges, page_sources = {}, {}
+
+    def _embedded_by(page: str, imgs: list[str]) -> dict[str, list[str]]:
+        out = {}
+        for img in imgs:
+            docs = sorted(d for d in page_sources.get(page, []) if img in embed_edges.get(d, ()))
+            if docs:
+                out[img] = docs
+        return out
 
     async def _one(img: str):
         nonlocal hits
@@ -353,7 +397,8 @@ async def run_blind_verify(engine, workdir: str, pending: dict[str, list[str]],
             return
         async with sem:
             try:
-                raw_findings = await compare_page(engine, empty, page, text, ts, locale=locale)
+                raw_findings = await compare_page(engine, empty, page, text, ts, locale=locale,
+                                                  embedded_by=_embedded_by(page, imgs))
                 kept, suppressed = raw_findings, []  # Numeric overlap is not proof of semantic support.
                 findings.extend(kept)
                 suppressed_all.extend(suppressed)
