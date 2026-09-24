@@ -244,6 +244,63 @@ async def test_control_frame_uses_the_ordered_queue_without_a_control_consumer()
     assert queue.get_nowait() == {"type": "refresh_credentials", "request_id": "r1"}
 
 
+async def test_control_frame_sent_before_the_control_stream_attaches_is_replayed(monkeypatch):
+    # Startup race: the runtime opens the control stream right after relay_ready,
+    # but a refresh can be requested first. It must not wait behind a batch.
+    queue = asyncio.Queue()
+    relay = EventRelay(queue)
+    request = {"type": "refresh_credentials", "request_id": "r1"}
+    await relay.send_control(request)
+    assert queue.get_nowait() == request  # still offered in order to runtimes without a control stream
+    control = Socket()
+    monkeypatch.setattr("event_relay.web.StreamResponse", lambda **kwargs: control)
+    task = asyncio.create_task(relay.stream_control(SimpleNamespace(query={})))
+    try:
+        await until(lambda: len(control.frames) == 2)
+        assert control.frames == [{"type": "control_ready"}, request]
+    finally:
+        await stop(task)
+
+
+async def test_control_frame_sent_while_the_control_stream_is_down_waits_for_it(monkeypatch):
+    queue = asyncio.Queue()
+    relay = EventRelay(queue)
+    first = Socket()
+    monkeypatch.setattr("event_relay.web.StreamResponse", lambda **kwargs: first)
+    task = asyncio.create_task(relay.stream_control(SimpleNamespace(query={})))
+    await until(lambda: relay._control_response is first)
+    await stop(task)
+    assert relay._control_response is None
+
+    # The control consumer exists but is reconnecting: the frame must not enter
+    # the ordered queue, where an unacknowledged batch could hold it.
+    request = {"type": "refresh_credentials", "request_id": "r2"}
+    await relay.send_control(request)
+    assert queue.qsize() == 0
+    second = Socket()
+    monkeypatch.setattr("event_relay.web.StreamResponse", lambda **kwargs: second)
+    task = asyncio.create_task(relay.stream_control(SimpleNamespace(query={})))
+    try:
+        await until(lambda: len(second.frames) == 2)
+        assert second.frames == [{"type": "control_ready"}, request]
+    finally:
+        await stop(task)
+
+
+async def test_an_expired_control_frame_is_not_replayed(monkeypatch):
+    relay = EventRelay(asyncio.Queue())
+    monkeypatch.setattr(EventRelay, "CONTROL_REPLAY_SECS", 0.0)
+    await relay.send_control({"type": "refresh_credentials", "request_id": "old"})
+    control = Socket()
+    monkeypatch.setattr("event_relay.web.StreamResponse", lambda **kwargs: control)
+    task = asyncio.create_task(relay.stream_control(SimpleNamespace(query={})))
+    try:
+        await until(lambda: relay._control_response is control)
+        assert control.frames == [{"type": "control_ready"}]
+    finally:
+        await stop(task)
+
+
 async def test_compile_run_sends_credential_requests_on_the_control_lane(tmp_path, monkeypatch):
     import compile_box
     run = compile_box.CompileRun("control-run", str(tmp_path), 1)
