@@ -9,7 +9,7 @@ async function withClient(
 ): Promise<void> {
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const server = createProductSupportResultServer();
-  const client = new Client({ name: "product-support-result-test", version: "0.3.0" });
+  const client = new Client({ name: "product-support-result-test", version: "0.4.0" });
 
   await server.connect(serverTransport);
   await client.connect(clientTransport);

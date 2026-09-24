@@ -1,6 +1,6 @@
 {
   "name": "mcp-product-support-result",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Stateless MCP validator for product-support handoff results",
   "type": "module",
   "bin": {
