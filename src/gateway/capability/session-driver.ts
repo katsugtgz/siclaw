@@ -181,6 +181,8 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
   const controlTasks = new Set<Promise<void>>();
   let controlLane: Promise<void> | undefined;
   let relayClosed = false;
+  // Closes the control stream with the relay; the box heartbeats it forever.
+  const controlAbort = new AbortController();
   try {
     for (;;) {
       // onComment: the box emits `: heartbeat` SSE comments between data events. A
@@ -271,9 +273,12 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
   } finally {
     // Bounded background drain; terminal state and artifact ACKs do not await it.
     void observations.close();
-    // The control lane stops at its next frame or heartbeat. Each control
-    // reply already in flight is bounded by its RPC and POST timeouts.
+    // Abort the control stream now: the box keeps it open with heartbeats,
+    // which are not yielded, so the lane would otherwise wait for a frame that
+    // never comes. Each control reply already in flight is bounded by its RPC
+    // and POST timeouts.
     relayClosed = true;
+    controlAbort.abort();
     await Promise.allSettled([...controlTasks]);
   }
 
@@ -282,7 +287,7 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
     let delayMs = CONTROL_RECONNECT_MIN_MS;
     while (!relayClosed && !runSettled()) {
       try {
-        for await (const raw of client.streamPath(`/control-events/${runId}`)) {
+        for await (const raw of client.streamPath(`/control-events/${runId}`, { signal: controlAbort.signal })) {
           if (relayClosed) return;
           delayMs = CONTROL_RECONNECT_MIN_MS;
           const evt = raw as BoxEvent;

@@ -480,6 +480,37 @@ describe("driveCapabilitySession — box event → capability wire mapping", () 
     expect(fe.request.mock.calls.filter((c: any[]) => c[0] === CAPABILITY_PERSIST_ARTIFACTS)).toHaveLength(1);
   });
 
+  it("closes the control stream when the relay ends, although the box keeps it open", async () => {
+    const mgr = fakeManager();
+    mgr.get.mockReturnValue({ runId: "r1", status: "running" });
+    let controlSignal: AbortSignal | undefined;
+    let controlClosed!: () => void;
+    const closed = new Promise<void>((resolve) => { controlClosed = resolve; });
+    const client = {
+      postJson: vi.fn().mockResolvedValue({ ok: true }),
+      async *streamPath(path: string, opts?: { signal?: AbortSignal }) {
+        if (path === "/control-events/r1") {
+          controlSignal = opts?.signal;
+          yield { type: "control_ready" };
+          // Heartbeats only from here on: nothing is yielded until the abort.
+          await new Promise<void>((_, reject) => {
+            opts?.signal?.addEventListener("abort", () => {
+              controlClosed();
+              reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
+            });
+          });
+          return;
+        }
+        yield { type: "relay_ready", event_ack: 1, control_events: 1 };
+        await new Promise((resolve) => setTimeout(resolve, 10)); // let the control lane attach
+        yield { type: "end", event_id: `${"a".repeat(32)}:1` };
+      },
+    };
+    await driveCapabilitySession({ client: client as any, runId: "r1", frontendClient: fakeFrontend(), manager: mgr });
+    expect(controlSignal?.aborted).toBe(true);
+    await closed;
+  });
+
   it("a permanent consumer refusal fails the relay at once instead of retrying forever", async () => {
     const fe = fakeFrontend();
     fe.request = vi.fn().mockImplementation(async (method: string) => {
