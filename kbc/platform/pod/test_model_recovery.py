@@ -85,19 +85,23 @@ async def test_rejected_key_rotates_inside_same_model_request(protocol):
         async with session.post(url, json={"messages": [{"role": "tool", "content": "already executed"}]}) as response:
             assert response.status == 200
             assert (await response.json())["answer"] == "recovered"
-        assert len(calls) == len(refreshes) == 2
+        # Static keys never refresh ahead: only the rejection asks for one.
+        assert len(calls) == 2 and len(refreshes) == 1
         assert calls[0]["body"] == calls[1]["body"]
         assert "old-key" not in str(refreshes) and "new-key" not in str(refreshes)
 
 
-@pytest.mark.parametrize("status,expected_calls", [(503, 2), (429, 2), (402, 1), (401, 2), (400, 1)])
-async def test_recovery_is_bounded_and_does_not_retry_unchanged_billing_refusal(status, expected_calls):
+@pytest.mark.parametrize("status,expected_calls,expected_refreshes",
+                         [(503, 2, 0), (429, 2, 0), (402, 1, 1), (401, 2, 1), (400, 1, 0)])
+async def test_recovery_is_bounded_and_does_not_retry_unchanged_billing_refusal(status, expected_calls, expected_refreshes):
     async def respond(request, calls, current):
         return web.json_response({"error": "unavailable"}, status=status)
     async with recovery_proxy(respond) as (session, url, calls, refreshes):
         async with session.post(url, json={}) as response:
             assert response.status == status
         assert len(calls) == expected_calls
+        # Only a rejected credential waits for the control plane.
+        assert len(refreshes) == expected_refreshes
 
 
 async def test_transient_provider_recovers_without_replaying_a_turn():
@@ -109,13 +113,51 @@ async def test_transient_provider_recovers_without_replaying_a_turn():
         assert len(calls) == 2
 
 
-async def test_refresh_failure_never_sends_stale_key_to_provider():
+async def test_static_key_is_used_without_waiting_for_the_control_plane():
     async def respond(request, calls, current):
-        raise AssertionError("must not call upstream")
-    async with recovery_proxy(respond, refresh_error=True) as (session, url, calls, _):
+        assert request.headers["Authorization"] == "Bearer old-key"
+        return web.json_response({"answer": "ok"})
+    async with recovery_proxy(respond, refresh_error=True) as (session, url, calls, refreshes):
         async with session.post(url, json={}) as response:
-            assert response.status == 503
-        assert calls == []
+            assert response.status == 200
+        assert len(calls) == 1 and refreshes == []
+
+
+async def test_failed_refresh_after_rejection_returns_the_providers_answer():
+    async def respond(request, calls, current):
+        return web.json_response({"error": {"message": "invalid key"}}, status=401)
+    async with recovery_proxy(respond, refresh_error=True) as (session, url, calls, refreshes):
+        async with session.post(url, json={}) as response:
+            # The provider's authentication failure, not a synthetic 503.
+            assert response.status == 401
+            assert "invalid key" in await response.text()
+        assert len(calls) == 2 and len(refreshes) == 1
+        target = next(iter(model_access._routes.values()))
+        assert target["refresh_failures"] == 1 and target["api_key"] == "old-key"
+        # A second rejection right after a failed refresh does not wait again.
+        async with session.post(url, json={}) as response:
+            assert response.status == 401
+        assert len(calls) == 4 and len(refreshes) == 1
+
+
+async def test_unanswered_refresh_never_delays_a_rotating_bearer(monkeypatch):
+    monkeypatch.setattr(model_access, "_REFRESH_TIMEOUT_SECS", 0.2)
+    async def respond(request, calls, current):
+        return web.json_response({"answer": "ok"})
+    async with recovery_proxy(respond, protocol="openai-codex-responses") as (session, url, calls, refreshes):
+        target = next(iter(model_access._routes.values()))
+        target["attempted"] -= model_access._REFRESH_AHEAD_SECS
+        emitted = []
+        async def silent(event):
+            emitted.append(event)  # the control plane never answers
+        monkeypatch.setattr(model_access, "_emit", silent)
+        started = asyncio.get_running_loop().time()
+        async with session.post(url, json={}) as response:
+            assert response.status == 200
+        assert asyncio.get_running_loop().time() - started < 0.2
+        assert [event["type"] for event in emitted] == ["refresh_credentials"]
+        await target["refresh"]
+        assert target["refresh_failures"] == 1 and target["api_key"] == "old-key"
 
 
 async def test_credential_refresh_rejects_partial_contract_change_atomically(monkeypatch):
@@ -274,7 +316,7 @@ async def test_parallel_key_failures_share_one_rotation():
                 assert response.status == 200
                 await response.read()
         await asyncio.gather(*(ask() for _ in range(5)))
-        assert len(refreshes) == 2
+        assert len(refreshes) == 1
 
 
 async def test_cancelled_refresh_releases_pending_request(monkeypatch):
@@ -282,14 +324,19 @@ async def test_cancelled_refresh_releases_pending_request(monkeypatch):
     async def emit(event):
         emitted.set()
     monkeypatch.setattr(model_access, "_emit", emit)
-    monkeypatch.setattr(model_access, "_lock", asyncio.Lock())
     monkeypatch.setattr(model_access, "_pending", {})
-    target = {"identity": {"source_model_id": "fixture"}, "api_key": "old", "refreshed": 0.0}
-    task = asyncio.create_task(model_access.refresh(target))
+    target = {"identity": {"source_model_id": "fixture", "api": "openai-completions"}, "api_key": "old",
+              "attempted": 0.0, "refresh": None, "refresh_failures": 0}
+    waiter = asyncio.create_task(model_access.refresh_rejected(target, "old"))
     await emitted.wait()
-    task.cancel()
+    # A cancelled waiter leaves the shared refresh running for other requests.
+    waiter.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await task
+        await waiter
+    assert not target["refresh"].done()
+    target["refresh"].cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await target["refresh"]
     assert model_access._pending == {}
 
 
@@ -362,7 +409,7 @@ async def test_real_pi_worker_runs_codex_subscription_through_live_transport(tmp
         await upstream_runner.cleanup()
     assert events[-1].data["outcome"] == "completed", events[-1].data.get("error")
     assert upgrades == [], "the loopback transport carries HTTP only; no WebSocket upgrade may be attempted"
-    assert len(posts) == len(refreshes) == 2  # admission refresh, then the rejected-bearer refresh
+    assert len(posts) == 2 and len(refreshes) == 1  # the rejected-bearer refresh
     assert all(headers.get("chatgpt-account-id") == "acct-fixture" for headers in posts)
     assert posts[1]["Authorization"] == "Bearer " + new_key
     assert old_key not in str(refreshes) and new_key not in str(refreshes)

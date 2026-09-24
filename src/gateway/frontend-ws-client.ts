@@ -11,7 +11,7 @@
 
 import crypto from "node:crypto";
 import WebSocket from "ws";
-import { wrapRpcError } from "../lib/error-envelope.js";
+import { RpcResponseError, wrapRpcError } from "../lib/error-envelope.js";
 
 // ── Public types ─────────────────────────────────────────────
 
@@ -341,7 +341,16 @@ export class FrontendWsClient {
         const errMsg = typeof msg.error === "string"
           ? msg.error
           : msg.error?.message ?? `RPC error (id=${msg.id})`;
-        entry.reject(new Error(errMsg));
+        // Keep the peer's classification: callers tell a permanent refusal
+        // (e.g. CONFLICT from a fenced writer) from a transient failure by it.
+        entry.reject(typeof msg.error?.code === "string"
+          ? new RpcResponseError({
+              code: msg.error.code,
+              message: errMsg,
+              retriable: typeof msg.error.retriable === "boolean" ? msg.error.retriable : true,
+              ...(typeof msg.error.status === "number" ? { status: msg.error.status } : {}),
+            })
+          : new Error(errMsg));
       }
       return;
     }

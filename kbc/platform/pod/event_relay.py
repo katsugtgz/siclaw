@@ -1,4 +1,10 @@
-"""One consumer and one unacknowledged durable frame per live compile run."""
+"""One consumer and one unacknowledged durable frame per live compile run.
+
+Control frames (credential refresh requests) have their own stream so they
+never wait behind a durable frame that is still awaiting its persistence ACK.
+The event stream advertises it; without a control consumer, control frames
+fall back to the ordered event queue.
+"""
 import asyncio
 import contextlib
 import json
@@ -20,6 +26,9 @@ class EventRelay:
         self._pending: dict | None = None
         self._ack: asyncio.Future | None = None
         self._last_ack: str | None = None
+        self._control_task: asyncio.Task | None = None
+        self._control_response: web.StreamResponse | None = None
+        self._control_lock = asyncio.Lock()
 
     @property
     def active(self) -> bool:
@@ -33,6 +42,45 @@ class EventRelay:
         if not self._ack.done():
             self._ack.set_result(True)
         return True
+
+    async def send_control(self, event: dict) -> None:
+        """Deliver a control frame on the control stream, else in order."""
+        response = self._control_response
+        if response is not None:
+            try:
+                async with self._control_lock:
+                    await self._write(response, event)
+                return
+            except (ConnectionError, RuntimeError):
+                pass  # the control consumer went away; use the ordered stream
+        await self.events.put(event)
+
+    async def stream_control(self, request: web.Request):
+        """Single-consumer SSE for control frames; a new attachment takes over."""
+        task = asyncio.current_task()
+        previous = self._control_task
+        if previous is not None and not previous.done():
+            previous.cancel()
+            with contextlib.suppress(asyncio.CancelledError, ConnectionError):
+                await previous
+        self._control_task = task
+        response = web.StreamResponse(headers={
+            "Content-Type": "text/event-stream", "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        })
+        try:
+            await response.prepare(request)
+            await self._write(response, {"type": "control_ready"})
+            self._control_response = response
+            while True:
+                await asyncio.sleep(25)
+                async with self._control_lock:
+                    await response.write(b": heartbeat\n\n")
+        finally:
+            if self._control_response is response:
+                self._control_response = None
+            if self._control_task is task:
+                self._control_task = None
 
     async def stream(self, request: web.Request, legacy_replay):
         acknowledged = request.query.get("ack") == "1"
@@ -57,7 +105,7 @@ class EventRelay:
         try:
             await response.prepare(request)
             if acknowledged:
-                await self._write(response, {"type": "relay_ready", "event_ack": 1})
+                await self._write(response, {"type": "relay_ready", "event_ack": 1, "control_events": 1})
             elif request.query.get("replay") == "1":
                 for event in legacy_replay():
                     await self._write(response, event)

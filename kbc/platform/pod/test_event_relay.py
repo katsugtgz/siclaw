@@ -65,7 +65,7 @@ async def test_write_loss_replays_same_durable_frame_until_ack(monkeypatch, kind
     second = attach(monkeypatch, relay, new)
     try:
         await new.writing.wait()
-        assert new.frames == [{"type": "relay_ready", "event_ack": 1}, lost]
+        assert new.frames == [{"type": "relay_ready", "event_ack": 1, "control_events": 1}, lost]
         assert relay.acknowledge(lost["event_id"])
         await asyncio.wait_for(queue.join(), 1)
         assert relay.acknowledge(lost["event_id"]) is False
@@ -209,3 +209,51 @@ async def test_http_reconnect_replays_failure_before_end(monkeypatch, tmp_path):
         assert ack.status == 200
         await asyncio.wait_for(second.read(), 2)
         await asyncio.wait_for(run.events.join(), 2)
+
+
+async def test_control_stream_delivers_while_a_batch_awaits_its_ack(monkeypatch):
+    queue = asyncio.Queue()
+    relay = EventRelay(queue)
+    await queue.put({"type": "syncArtifacts", "artifacts": [{"path": "eval/a.md", "content": "a"}]})
+    events = Socket()
+    stream = attach(monkeypatch, relay, events)
+    await events.writing.wait()
+    batch = events.frames[-1]
+    control = Socket()
+    monkeypatch.setattr("event_relay.web.StreamResponse", lambda **kwargs: control)
+    control_task = asyncio.create_task(relay.stream_control(SimpleNamespace(query={})))
+    try:
+        await until(lambda: relay._control_response is control)
+        # The batch is unacknowledged, yet the credential request is delivered
+        # at once on the control stream and never enters the durable queue.
+        await relay.send_control({"type": "refresh_credentials", "request_id": "r1"})
+        assert control.frames == [{"type": "control_ready"}, {"type": "refresh_credentials", "request_id": "r1"}]
+        assert events.frames[-1] == batch and queue.qsize() == 0
+        assert relay.acknowledge(batch["event_id"])
+        await asyncio.wait_for(queue.join(), 1)
+    finally:
+        await stop(control_task)
+        await stop(stream)
+    assert relay._control_response is None
+
+
+async def test_control_frame_uses_the_ordered_queue_without_a_control_consumer():
+    queue = asyncio.Queue()
+    relay = EventRelay(queue)
+    await relay.send_control({"type": "refresh_credentials", "request_id": "r1"})
+    assert queue.get_nowait() == {"type": "refresh_credentials", "request_id": "r1"}
+
+
+async def test_compile_run_sends_credential_requests_on_the_control_lane(tmp_path, monkeypatch):
+    import compile_box
+    run = compile_box.CompileRun("control-run", str(tmp_path), 1)
+    control = Socket()
+    monkeypatch.setattr("event_relay.web.StreamResponse", lambda **kwargs: control)
+    task = asyncio.create_task(run.event_relay.stream_control(SimpleNamespace(query={})))
+    try:
+        await until(lambda: run.event_relay._control_response is control)
+        await run.emit_control({"type": "refresh_credentials", "request_id": "r1"})
+        assert control.frames[-1] == {"type": "refresh_credentials", "request_id": "r1"}
+        assert run.events.qsize() == 0
+    finally:
+        await stop(task)

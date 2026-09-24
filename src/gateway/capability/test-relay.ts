@@ -18,11 +18,16 @@ import type { FrontendWsClient } from "../frontend-ws-client.js";
 import type { CapabilityEventFrame } from "./contract.js";
 import { CAPABILITY_EVENT } from "./contract.js";
 import { ExecutionObservationRelay, type ExecutionObservation } from "./execution-observation.js";
+import { asFailureToken } from "./failure.js";
 
 interface TestBoxEvent {
   type: string;
   text?: string;
   error?: string;
+  /** Error frames: machine tokens naming the failure (never provider text). */
+  code?: string;
+  failure_code?: string;
+  api_error_status?: number;
   session_id?: string;
   observation?: ExecutionObservation;
 }
@@ -54,6 +59,19 @@ export function shouldRelayTestSession(opened: { idempotent_replay?: boolean }):
   return !opened.idempotent_replay;
 }
 
+/** Only validated tokens cross into the consumer, so it can name the cause. */
+function failureTokens(evt: TestBoxEvent): Record<string, string | number> {
+  const tokens: Record<string, string | number> = {};
+  const code = asFailureToken(evt.code);
+  const failureCode = asFailureToken(evt.failure_code);
+  if (code) tokens.code = code;
+  if (failureCode) tokens.failure_code = failureCode;
+  if (Number.isInteger(evt.api_error_status) && evt.api_error_status! >= 100 && evt.api_error_status! <= 599) {
+    tokens.api_error_status = evt.api_error_status!;
+  }
+  return tokens;
+}
+
 /**
  * Relay the test-session event stream until the box closes it (`end`, emitted
  * on teardown/close). Errors propagate to the caller — which only logs: a dead
@@ -77,6 +95,7 @@ export async function driveTestSession(opts: DriveTestSessionOptions): Promise<v
           test_session_id: testSessionId,
           kind: evt.type,
           text: evt.text ?? evt.error ?? "",
+          ...(evt.type === "error" ? failureTokens(evt) : {}),
         },
       };
       frontendClient.emitEvent(CAPABILITY_EVENT, frame);

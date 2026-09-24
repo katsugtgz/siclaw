@@ -16,6 +16,7 @@ Surface (driven by the runtime):
   POST /message/{run_id}   {message} inject one user turn into the persistent session (prepare/compile/patch are all ordinary turns)
   POST /command/{run_id}   {command_id, command} execute one typed authoring action; idempotent per live run
   GET  /events/{run_id}    structured SSE stream (session/log/summary/turn_done/syncArtifacts/plan_proposed/error/end)
+  GET  /control-events/{run_id}  control SSE stream (refresh_credentials), independent of the ordered /events ACK sequence
   POST /test-session/{run_id}  start a test session: pin the current draft as an immutable snapshot + a read-only consumer session (reuses this pod)
   POST /test-reference-assist/{run_id}  suggest or polish one raw-grounded reference answer
   POST /test-message/{tid} · GET /test-events/{tid} · POST /test-session/{tid}/close
@@ -70,7 +71,7 @@ import selfcheck
 import review_notes
 from engine import selected_readonly_engine, engine_kind, create_agent_client
 from agent_protocol import AgentClient, AgentEvent, AgentTransportError, EngineTool, is_result as message_is_result, message_field
-from execution_observation import observe_sessions
+from execution_observation import _failure_code as model_failure_code, observe_sessions
 from pi_engine import sdk_version as pi_sdk_version
 from pi_file_tools import FileTools
 import pi_config
@@ -844,6 +845,10 @@ class CompileRun:
 
     async def emit(self, ev: dict):
         await self.events.put(ev)
+
+    async def emit_control(self, ev: dict):
+        """Control traffic must not wait behind an unacknowledged artifact batch."""
+        await self.event_relay.send_control(ev)
 
     def _begin_turn(
         self,
@@ -7057,7 +7062,8 @@ async def _consume_test_turn_stream(run: "TestRun", client) -> None:
                 await run.emit(_error_event(
                     msg.data.get("error") or "The model request did not complete",
                     code="test_model_failed", stage="test",
-                    api_error_status=msg.data.get("api_error_status")))
+                    api_error_status=msg.data.get("api_error_status"),
+                    failure_code=model_failure_code(msg.data)))
                 await run.emit({"type": "turn_done", "text": _loc(
                     run, "The model request failed. You can retry this question.",
                     "模型请求失败，可以重新发送此问题。")})
@@ -7830,7 +7836,7 @@ async def handle_session(request: web.Request):
     _ensure_workdir_constitution(run.workdir, run.locale)
     RUNS[run_id] = run
     if body.get("credential_refresh") is True:
-        model_access.configure(run_id, run.emit)
+        model_access.configure(run_id, run.emit_control)
     run.task = asyncio.create_task(_run_wrapper(run))
     return web.json_response({"ok": True, "run_id": run_id})
 
@@ -8259,6 +8265,13 @@ async def handle_events(request: web.Request):
                  **({"commit_input": True} if commit else {})}] if artifacts or commit else []
 
     return await run.event_relay.stream(request, legacy_replay)
+
+
+async def handle_control_events(request: web.Request):
+    run = RUNS.get(request.match_info["run_id"])
+    if not run:
+        return web.Response(status=404, text="unknown run")
+    return await run.event_relay.stream_control(request)
 
 
 async def handle_health(request: web.Request):
@@ -8873,6 +8886,7 @@ def build_app() -> web.Application:
         web.post("/command/{run_id}", handle_command),
         web.post("/artifacts/ack/{run_id}", handle_artifacts_ack),
         web.get("/events/{run_id}", handle_events),
+        web.get("/control-events/{run_id}", handle_control_events),
         web.post("/events/ack/{run_id}", handle_event_ack),
         # Test session: read-only consumer session over a pinned draft snapshot.
         web.post("/test-session/{run_id}", handle_open_test),
