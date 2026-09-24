@@ -55,10 +55,10 @@ describe("parseProductSupportResult", () => {
     const result = parseProductSupportResult({
       label: false,
       info: {
-        ticket_type: "unknown",
+        ticket_type: "incident",
         product: "",
         summary: "",
-        description: "",
+        description: "A training task fails to start; the product and the error message are not known yet.",
         evidence: [],
         missing_fields: ["affected_product", "error_message"],
         llm: emptyLlm(),
@@ -67,6 +67,22 @@ describe("parseProductSupportResult", () => {
 
     expect(result.label).toBe(false);
     expect(result.info.missing_fields).toEqual(["affected_product", "error_message"]);
+  });
+
+  it("requires a description on every turn, not only the handoff", () => {
+    // The channel can hand the ticket to a human without another Agent turn,
+    // so the latest result's description is what first-line support receives.
+    for (const description of ["", "   "]) {
+      const input = validResult({ label: false });
+      input.info = { ...(input.info as Record<string, unknown>), summary: "", description };
+      expect(() => parseProductSupportResult(input)).toThrow(/description must be non-empty on every turn/);
+    }
+  });
+
+  it("does not require a summary before the handoff", () => {
+    const input = validResult({ label: false });
+    input.info = { ...(input.info as Record<string, unknown>), summary: "" };
+    expect(parseProductSupportResult(input).info.summary).toBe("");
   });
 
   it("requires a concrete product for a ticket-ready requirement", () => {
@@ -86,23 +102,11 @@ describe("parseProductSupportResult", () => {
         )).toThrow(/requires info\.product/);
   });
 
-  it("preserves an unknown type when the user declines clarification and requests handoff", () => {
-    const result = parseProductSupportResult({
-      label: true,
-      info: {
-        ticket_type: "unknown",
-        product: "",
-        summary: "User requests human support",
-        description: "After one clarification, the user cannot describe the issue and declines further questions. Type and product remain unknown.",
-        evidence: ["User explicitly requested human support."],
-        missing_fields: [],
-      },
-    });
-
-    expect(result.label).toBe(true);
-    expect(result.info.ticket_type).toBe("unknown");
-    expect(result.info.product).toBe("");
-    expect(result.info.llm).toEqual(emptyLlm());
+  it.each([true, false])("rejects an unknown ticket type (label=%s)", (label) => {
+    // Every turn carries the most likely type; there is no unknown to fall back on.
+    const input = validResult({ label });
+    input.info = { ...(input.info as Record<string, unknown>), ticket_type: "unknown" };
+    expect(() => parseProductSupportResult(input)).toThrow(/ticket_type must be one of: consultation, incident, llm_incident, requirement$/);
   });
 
   it("requires a boolean label", () => {
@@ -162,7 +166,7 @@ describe("parseProductSupportResult", () => {
     expect(() => parseProductSupportResult(input)).toThrow(/evidence\[0\] must not be blank/);
   });
 
-  it("canonicalizes a ticket-ready llm_incident with best-effort intake details", () => {
+  it("canonicalizes a ticket-ready llm_incident with its intake details", () => {
     const result = parseProductSupportResult(
       validResult({
         info: {
@@ -185,23 +189,41 @@ describe("parseProductSupportResult", () => {
     });
   });
 
-  it("lets an llm_incident hand off with empty intake details instead of forcing a guess", () => {
+  it("hands off an llm_incident with region and aspect, and no model unless the aspect is a model", () => {
     const result = parseProductSupportResult(
       validResult({
         info: {
           ticket_type: "llm_incident",
           product: "",
           summary: "Model API requests time out",
-          description: "The user reports timeouts on every request; region and model were not stated.",
+          description: "Every request to the domestic model API endpoint times out since 10:00.",
           evidence: ["timeout"],
           missing_fields: [],
-          llm: { region: "", aspect: "network", model: "" },
+          llm: { region: "domestic", aspect: "network", model: "" },
         },
       }),
     );
 
     expect(result.label).toBe(true);
-    expect(result.info.llm).toEqual({ region: "", aspect: "network", model: "" });
+    expect(result.info.llm).toEqual({ region: "domestic", aspect: "network", model: "" });
+  });
+
+  it.each([
+    [{ region: "", aspect: "network", model: "" }, /requires info\.llm\.region and info\.llm\.aspect/],
+    [{ region: "overseas", aspect: "", model: "" }, /requires info\.llm\.region and info\.llm\.aspect/],
+    [{ region: "", aspect: "", model: "" }, /requires info\.llm\.region and info\.llm\.aspect/],
+    [{ region: "overseas", aspect: "model", model: " " }, /aspect=model requires info\.llm\.model/],
+  ])("rejects an llm_incident handoff without its routing facts: %j", (llm, re) => {
+    const input = validResult();
+    input.info = { ...(input.info as Record<string, unknown>), ticket_type: "llm_incident", llm };
+    expect(() => parseProductSupportResult(input)).toThrow(re);
+  });
+
+  it("rejects an llm_incident handoff that omits the llm block", () => {
+    const input = validResult();
+    input.info = { ...(input.info as Record<string, unknown>), ticket_type: "llm_incident" };
+    delete (input.info as Record<string, unknown>).llm;
+    expect(() => parseProductSupportResult(input)).toThrow(/requires info\.llm\.region/);
   });
 
   it("keeps llm intake identifiers usable in missing_fields while still gathering", () => {
@@ -211,7 +233,7 @@ describe("parseProductSupportResult", () => {
         ticket_type: "llm_incident",
         product: "",
         summary: "",
-        description: "",
+        description: "Model API calls return HTTP 401; the region and the failing aspect are not known yet.",
         evidence: ["HTTP 401"],
         missing_fields: ["llm_region", "llm_aspect"],
         llm: { region: "", aspect: "", model: "example-model-v2" },
@@ -245,32 +267,20 @@ describe("parseProductSupportResult", () => {
     }
   });
 
-  it("lets an unresolved turn record llm details the user already stated", () => {
-    // During intake ticket_type is unknown by construction; a region heard in
-    // the first message must have somewhere to live before the type resolves.
+  it("lets a gathering llm_incident record the details the user already stated", () => {
     const result = parseProductSupportResult({
       label: false,
       info: {
-        ticket_type: "unknown",
+        ticket_type: "llm_incident",
         product: "",
         summary: "",
-        description: "",
+        description: "Domestic model API calls fail; the failing aspect is not known yet.",
         evidence: [],
-        missing_fields: ["actual_behavior"],
+        missing_fields: ["llm_aspect"],
         llm: { region: "domestic", aspect: "", model: "" },
       },
     });
     expect(result.info.llm.region).toBe("domestic");
-  });
-
-  it.each([
-    { region: "domestic", aspect: "", model: "" },
-    { region: "", aspect: "network", model: "" },
-    { region: "", aspect: "", model: "example-model" },
-  ])("rejects LLM-specific fields in a final unknown handoff: %j", (llm) => {
-    const input = validResult();
-    input.info = { ...(input.info as Record<string, unknown>), ticket_type: "unknown", llm };
-    expect(() => parseProductSupportResult(input)).toThrow(/llm fields must be empty/);
   });
 
   it("mirrors the advertised schema: enum values are exact and length applies to the raw string", () => {

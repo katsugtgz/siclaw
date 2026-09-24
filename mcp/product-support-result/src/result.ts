@@ -3,7 +3,6 @@ export const TICKET_TYPES = [
   "incident",
   "llm_incident",
   "requirement",
-  "unknown",
 ] as const;
 
 export type TicketType = (typeof TICKET_TYPES)[number];
@@ -43,10 +42,11 @@ export const LIMITS = {
 } as const;
 
 /**
- * Best-effort intake details for an `llm_incident`. Every field may stay empty:
- * the block exists so first-line support sees what the conversation did
- * establish, not so the agent is forced to guess. Only the enum shape is
- * validated; none of the fields is required for a ticket-ready result.
+ * Intake details for an `llm_incident`. While gathering (`label=false`) every
+ * field may stay empty. A handoff (`label=true`) requires region and aspect,
+ * and the model name when the aspect is `model`: first-line support routes an
+ * LLM incident on exactly these facts, so the agent asks for them instead of
+ * handing off without them.
  */
 export interface LlmIncidentInfo {
   region: "" | LlmRegion;
@@ -251,17 +251,23 @@ export function parseProductSupportResult(input: unknown): ProductSupportResult 
     },
   };
 
-  // Unknown intake may temporarily retain user-stated LLM details. A final
-  // unknown handoff keeps those clues in description/evidence instead: typed
-  // LLM fields must not imply that an LLM incident has been established.
-  const gatheringUnknown = !result.label && result.info.ticket_type === "unknown";
-  if (result.info.ticket_type !== "llm_incident" && !gatheringUnknown) {
+  // Typed LLM fields assert that an LLM incident is established, so they stay
+  // empty for every other type; unconfirmed clues belong in description and
+  // evidence.
+  if (result.info.ticket_type !== "llm_incident") {
     const { region, aspect, model } = result.info.llm;
     if (region !== "" || aspect !== "" || model !== "") {
       throw new Error(
-        "input.info.llm fields must be empty unless ticket_type is llm_incident or label=false with ticket_type=unknown; preserve unclassified clues in description and evidence",
+        "input.info.llm fields must be empty unless ticket_type is llm_incident; preserve unconfirmed clues in description and evidence",
       );
     }
+  }
+
+  // Every turn, not only the handoff: the channel may hand the ticket to a
+  // human at any moment without another Agent turn (an urgent-handoff button),
+  // and then the latest result's description is all first-line support gets.
+  if (result.info.description.length === 0) {
+    throw new Error("input.info.description must be non-empty on every turn; state the current understanding of the issue");
   }
 
   if (!result.label) {
@@ -271,14 +277,22 @@ export function parseProductSupportResult(input: unknown): ProductSupportResult 
   if (result.info.summary.length === 0) {
     throw new Error("label=true requires a non-empty info.summary");
   }
-  if (result.info.description.length === 0) {
-    throw new Error("label=true requires a non-empty info.description");
-  }
   if (result.info.missing_fields.length > 0) {
     throw new Error("label=true requires info.missing_fields to be empty");
   }
   if (result.info.ticket_type === "requirement" && result.info.product.length === 0) {
     throw new Error("label=true with ticket_type=requirement requires info.product");
+  }
+  if (result.info.ticket_type === "llm_incident") {
+    const { region, aspect, model } = result.info.llm;
+    if (region === "" || aspect === "") {
+      throw new Error(
+        "label=true with ticket_type=llm_incident requires info.llm.region and info.llm.aspect; ask the user instead of handing off without them",
+      );
+    }
+    if (aspect === "model" && model.length === 0) {
+      throw new Error("label=true with info.llm.aspect=model requires info.llm.model");
+    }
   }
 
   return result;
