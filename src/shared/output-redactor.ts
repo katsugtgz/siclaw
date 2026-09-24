@@ -109,6 +109,13 @@ export function buildRedactionConfigForModelConfig(
   return buildRedactionConfig(undefined, undefined, extras);
 }
 
+// Generic "apiKey": "value" or "api_key": "value" in JSON output
+const JSON_SECRET_FIELD_PATTERN =
+  /(?<="(?:api[_-]?[Kk]ey|apikey|token|secret|password|access_key|secret_key)":\s*")[^"]{8,}(?=")/g;
+// ENV assignment: API_KEY=value, SECRET_TOKEN=value (printenv/env output)
+const ENV_SECRET_ASSIGNMENT_PATTERN =
+  /\b(?:API_KEY|ANTHROPIC_API_KEY|OPENAI_API_KEY|SECRET_KEY|ACCESS_KEY|AWS_SECRET_ACCESS_KEY|TOKEN|SECRET_TOKEN|PASSWORD)=\S+/g;
+
 /**
  * Built-in patterns for common secret/token formats.
  * Each regex uses a non-capturing group and global flag.
@@ -129,11 +136,34 @@ const GENERIC_SECRET_PATTERNS: RegExp[] = [
   /\bBearer\s+[A-Za-z0-9\-_.~+/]{20,}=*\b/g,
   // PEM private key blocks
   /-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----/g,
-  // Generic "apiKey": "value" or "api_key": "value" in JSON output
-  /(?<="(?:api[_-]?[Kk]ey|apikey|token|secret|password|access_key|secret_key)":\s*")[^"]{8,}(?=")/g,
-  // ENV assignment: API_KEY=value, SECRET_TOKEN=value (printenv/env output)
-  /\b(?:API_KEY|ANTHROPIC_API_KEY|OPENAI_API_KEY|SECRET_KEY|ACCESS_KEY|AWS_SECRET_ACCESS_KEY|TOKEN|SECRET_TOKEN|PASSWORD)=\S+/g,
+  JSON_SECRET_FIELD_PATTERN,
+  ENV_SECRET_ASSIGNMENT_PATTERN,
 ];
+
+/**
+ * Values a secret-named field may hold without holding a secret: a reference
+ * the client resolves itself ($VAR, ${VAR}, OpenCode's {env:VAR}) or a
+ * documentation placeholder (<Your API Key>). Product docs and knowledge-base
+ * answers print exactly these in copyable config; masking them breaks the
+ * config without protecting anything. `${VAR:-default}` is not exempt because
+ * the default can be a literal credential.
+ */
+const SECRET_REFERENCE_VALUE = /^(?:\$[A-Za-z_][A-Za-z0-9_]*|\$\{[A-Za-z_][A-Za-z0-9_]*\}|\{env:[A-Za-z_][A-Za-z0-9_]*\}|<[^<>]*>?)$/;
+
+function isSecretReferenceValue(value: string): boolean {
+  const unquoted = value.replace(/^(["'])(.*)\1$/s, "$2").replace(/^["']/, "");
+  return SECRET_REFERENCE_VALUE.test(unquoted);
+}
+
+/**
+ * Only the key-name heuristics may pass a reference through. Literal patterns
+ * (configured credentials, token formats) always redact, whatever they look like.
+ */
+function isUnredactedReference(pattern: RegExp, match: string): boolean {
+  if (pattern === JSON_SECRET_FIELD_PATTERN) return isSecretReferenceValue(match);
+  if (pattern === ENV_SECRET_ASSIGNMENT_PATTERN) return isSecretReferenceValue(match.slice(match.indexOf("=") + 1));
+  return false;
+}
 
 /**
  * Replace all sensitive patterns in text with [REDACTED].
@@ -145,7 +175,8 @@ export function redactText(text: string, config: RedactionConfig): string {
   for (const pattern of config.patterns) {
     // Reset lastIndex for stateful (global) regexes
     pattern.lastIndex = 0;
-    result = result.replace(pattern, "[REDACTED]");
+    result = result.replace(pattern, (match) =>
+      isUnredactedReference(pattern, match) ? match : "[REDACTED]");
   }
   return result;
 }

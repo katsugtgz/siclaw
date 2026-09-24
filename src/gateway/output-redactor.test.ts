@@ -183,6 +183,30 @@ describe("buildRedactionConfig — generic secret patterns", () => {
     expect(redactText("SECRET_TOKEN=foo", cfg)).toContain("[REDACTED]");
   });
 
+  it("keeps env references and placeholders in secret-named fields", () => {
+    const cases = [
+      '"apiKey": "{env:SIFLOW_API_KEY}"',
+      '"api_key": "$SIFLOW_API_KEY"',
+      '"api_key": "${SIFLOW_API_KEY}"',
+      '"apiKey": "<Your API Key>"',
+      "OPENAI_API_KEY=<Your API Key>",
+      'export OPENAI_API_KEY="<Your API Key>"',
+      "OPENAI_API_KEY=$SIFLOW_API_KEY",
+    ];
+    for (const input of cases) expect(redactText(input, cfg)).toBe(input);
+  });
+
+  it("still redacts literal values and defaulted references in secret-named fields", () => {
+    expect(redactText('"api_key": "${SIFLOW_API_KEY:-literalfallback}"', cfg)).toBe('"api_key": "[REDACTED]"');
+    expect(redactText('"apiKey": "plainliteralvalue"', cfg)).toBe('"apiKey": "[REDACTED]"');
+    expect(redactText('export OPENAI_API_KEY="plainliteral"', cfg)).toBe("export [REDACTED]");
+  });
+
+  it("never exempts a configured credential that looks like a reference", () => {
+    const literal = buildRedactionConfig(undefined, undefined, ["{env:NOT_A_REF}"]);
+    expect(redactText("value {env:NOT_A_REF} here", literal)).toBe("value [REDACTED] here");
+  });
+
   it("leaves unrelated text untouched", () => {
     // No known secret pattern; pure prose should pass through unchanged.
     const input = "hello world, pods are healthy.";
