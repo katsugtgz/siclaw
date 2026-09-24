@@ -14,7 +14,6 @@ is never added to the source inventory (hidden-file policy stays in
 
 from __future__ import annotations
 
-import fnmatch
 import json
 import posixpath
 import re
@@ -49,9 +48,10 @@ def _frontmatter_hidden(path: Path) -> bool:
 
 
 def _navigation_pages(config: object) -> set[str] | None:
-    """Every page reference under ``navigation``; None when there is no usable
-    navigation (then "not in navigation" would be noise, not a signal). An
-    object marked ``"hidden": true`` contributes nothing."""
+    """Every page reference under ``navigation`` (``pages`` entries and a
+    group's ``root`` landing page); None when there is no usable navigation
+    (then "not in navigation" would be noise, not a signal). An object marked
+    ``"hidden": true`` contributes nothing."""
     if not isinstance(config, dict) or "navigation" not in config:
         return None
     pages: set[str] = set()
@@ -69,7 +69,7 @@ def _navigation_pages(config: object) -> set[str] | None:
             if node.get("hidden") is True:
                 return
             for key, value in node.items():
-                walk(value, key == "pages" or (in_pages and key == "page"))
+                walk(value, key in ("pages", "root") or (in_pages and key == "page"))
 
     walk(config["navigation"], False)
     return pages or None
@@ -96,23 +96,77 @@ def _ignore_rules(path: Path) -> list[tuple[str, bool, str]]:
     return rules
 
 
+def _ignore_regex(body: str) -> re.Pattern[str]:
+    """Translate a gitignore glob (leading/trailing ``/`` already removed) to a
+    regex over a ``/``-joined path: ``**`` spans directories, ``*`` and ``?``
+    stay within one segment, ``[...]`` is a character class."""
+    out: list[str] = []
+    i, n = 0, len(body)
+    while i < n:
+        if body.startswith("**/", i):
+            out.append("(?:.*/)?")
+            i += 3
+        elif body.startswith("/**", i) and i + 3 == n:
+            out.append("/.*")
+            i += 3
+        elif body.startswith("**", i):
+            out.append(".*")
+            i += 2
+        elif body[i] == "*":
+            out.append("[^/]*")
+            i += 1
+        elif body[i] == "?":
+            out.append("[^/]")
+            i += 1
+        elif body[i] == "[" and "]" in body[i + 2:]:
+            close = body.index("]", i + 2)
+            chars = body[i + 1:close]
+            if chars.startswith("!"):
+                chars = "^" + chars[1:]
+            out.append("[" + chars.replace("\\", "\\\\") + "]")
+            i = close + 1
+        else:
+            out.append(re.escape(body[i]))
+            i += 1
+    return re.compile("".join(out))
+
+
 def _ignore_match(rel: str, pattern: str) -> bool:
-    """Gitignore-style subset: a trailing ``/`` names a directory; a pattern
-    with a leading or inner ``/`` is anchored at the site root, otherwise it
-    matches one path segment at any depth."""
+    """Gitignore semantics (``.mintignore`` follows ``.gitignore``): a trailing
+    ``/`` names a directory; a pattern with a leading or inner ``/`` is anchored
+    at the site root, otherwise it matches at any depth; ``**`` spans
+    directories. A matching directory ignores everything beneath it."""
     directory = pattern.endswith("/")
-    anchored = "/" in pattern.rstrip("/")
     body = pattern.strip("/")
     if not body:
         return False
+    if "/" not in pattern.rstrip("/"):
+        body = "**/" + body
+    regex = _ignore_regex(body)
     parts = rel.split("/")
-    if anchored:
-        depth = body.count("/") + 1
-        if len(parts) < depth + (1 if directory else 0):
-            return False
-        return fnmatch.fnmatchcase("/".join(parts[:depth]), body)
-    segments = parts[:-1] if directory else parts
-    return any(fnmatch.fnmatchcase(segment, body) for segment in segments)
+    for depth in range(1, len(parts) + 1):
+        is_dir = depth < len(parts)
+        if (is_dir or not directory) and regex.fullmatch("/".join(parts[:depth])):
+            return True
+    return False
+
+
+def publication_fingerprint(workdir: str, sources: list[str]) -> int:
+    """Changes whenever a publication signal could: a source path, a page or
+    site config body (size/mtime), or a site ignore file (outside the
+    inventory)."""
+    raw = Path(workdir) / "raw"
+    stamps: list[tuple] = []
+    roots = {posixpath.dirname(s) for s in sources if posixpath.basename(s) in SITE_CONFIGS}
+    watched = [s for s in sources if s.lower().endswith(PAGE_EXTS) or posixpath.basename(s) in SITE_CONFIGS]
+    watched += [posixpath.join(root, name) if root else name for root in sorted(roots) for name in IGNORE_FILES]
+    for rel in watched:
+        try:
+            st = (raw / rel).stat()
+            stamps.append((rel, st.st_mtime_ns, st.st_size))
+        except OSError:
+            stamps.append((rel, None, None))
+    return hash((tuple(sources), tuple(stamps)))
 
 
 def publication_signals(workdir: str, sources: list[str]) -> dict[str, list[dict]]:
