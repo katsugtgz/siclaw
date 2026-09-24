@@ -60,6 +60,7 @@ import destream
 import model_access
 import incremental
 import mediaverify
+import source_publication
 import office_ingest
 from mtls_auth import (
     client_certificate_error as _client_certificate_error,
@@ -4600,6 +4601,27 @@ def _batch_navigation_context(run: "CompileRun", batch: dict) -> tuple[bool, str
         return False, ""
 
 
+_PUBLICATION_CACHE: dict[str, tuple[int, dict[str, list[dict]]]] = {}
+
+
+def _source_publication_signals(workdir: str) -> dict[str, list[dict]]:
+    """Per-source publication status from the documentation site's own files.
+    Advisory context only: a failure means "no signal", never a blocked turn.
+    Raw is frozen during a compile, so one scan per inventory serves every
+    batch hand-off of a long train (one entry per workdir)."""
+    try:
+        sources = selfcheck.source_inventory(workdir)
+        key = hash(tuple(sources))
+        cached = _PUBLICATION_CACHE.get(workdir)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        signals = source_publication.publication_signals(workdir, sources)
+        _PUBLICATION_CACHE[workdir] = (key, signals)
+        return signals
+    except Exception:
+        return {}
+
+
 def _batch_relay_brief(run: "CompileRun", plan: dict, batch: dict, k: int, n: int,
                        locale: str | None = None) -> str:
     """The hand-off a fresh batch session would otherwise have to guess.
@@ -4673,7 +4695,9 @@ def _batch_relay_brief(run: "CompileRun", plan: dict, batch: dict, k: int, n: in
             ("本区域已有页(优先并入而不是新建):" + listed)
         )
     header = "\n\nHand-off from the batches before you:\n" if en else "\n\n前序批次交接:\n"
-    return header + "\n".join(f"- {line}" for line in lines)
+    publication = source_publication.publication_notice(
+        _source_publication_signals(run.workdir), sources, en=en)
+    return header + "\n".join(f"- {line}" for line in lines) + publication
 
 
 def _compose_batch_directive(batch: dict, k: int, n: int, notes: str,
@@ -4877,6 +4901,7 @@ def _compose_final_directive(workdir: str, n: int, notes: str,
     # never. Final review is the one moment the whole library exists, and it is
     # already the place where machine-computed worklists make silence impossible.
     domain_now = selfcheck.read_repo_meta(workdir).get("domain", "")
+    unpublished = _source_publication_signals(workdir)
     if selfcheck._is_en(locale):
         lines = [f"[Batch compile · final review] All {n} batches are compiled. Now do the cross-batch "
                  "close-out (the checklists below are machine-computed — handle every item, silent skipping "
@@ -4905,6 +4930,14 @@ def _compose_final_directive(workdir: str, n: int, notes: str,
         lines.append(f"{step}) Check authoring/EXCLUSIONS.json: sources you decided not to compile (including "
                      "images/PDF and other media) must be explicitly accounted for.")
         step += 1
+        if unpublished:
+            lines.append(f"{step}) Unpublished sources ({len(unpublished)} page source(s); machine-computed from the "
+                         "documentation site's own frontmatter, ignore file and navigation): every page and index "
+                         "entry compiled from them must say the source site marks this content unpublished/hidden "
+                         "and must not present it as currently available. Do not exclude them yourself — that is "
+                         "the owner's decision. By folder:")
+            lines += source_publication.publication_summary(unpublished, en=True)
+            step += 1
         lines.append(f"{step}) Call report_domain once for the FINISHED library — one sentence naming the "
                      "field it covers, for another agent deciding whether to open it at all. "
                      + (f"It currently reads {domain_now!r}; correct it if the finished corpus is wider "
@@ -4938,6 +4971,12 @@ def _compose_final_directive(workdir: str, n: int, notes: str,
     step += 1
     lines.append(f"{step}) 核对 authoring/EXCLUSIONS.json:决定不编的源(含图片/PDF 等媒体)必须显式入账。")
     step += 1
+    if unpublished:
+        lines.append(f"{step}) 未发布的源({len(unpublished)} 个页面源,由文档站自身的 frontmatter、忽略文件和导航机械算出):"
+                     "由它们编出的页面和 index 条目必须写明「源站点把这部分内容标记为未发布/隐藏」,不得写成当前可用;"
+                     "不要自行排除——是否排除由负责人决定。按目录:")
+        lines += source_publication.publication_summary(unpublished, en=False)
+        step += 1
     lines.append(f"{step}) 对**编完的整库**调一次 report_domain:一句话说清这个库属于什么领域,"
                  "给别的智能体判断「要不要打开这个库」用。"
                  + (f"当前是 {domain_now!r};如果编完的全库比这句更宽或已不是这个领域,就改正它。"
@@ -8094,8 +8133,14 @@ async def _dispatch_authoring_turn(
         grandfather_legacy_format=not full_compile,
         authoring_action=action or ("compile.full" if full_compile else ""),
     )  # arm the stall watchdog — every model turn, incl. the owner's
+    model_text = text
+    if full_compile:
+        # A single-turn compile has no batch hand-off, so the publication
+        # status rides the kickoff itself (bounded; empty when nothing flagged).
+        model_text += source_publication.publication_notice(
+            _source_publication_signals(run.workdir), en=selfcheck._is_en(getattr(run, "locale", None)))
     try:
-        await run.client.query(text)
+        await run.client.query(model_text)
     except BaseException:
         if full_compile:
             run._full_compile_pending = False
