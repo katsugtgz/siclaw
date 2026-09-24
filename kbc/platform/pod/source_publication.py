@@ -1,9 +1,15 @@
 """Publication-status signals for documentation-site sources.
 
-A documentation-site archive keeps pages it does not publish: frontmatter
-``hidden: true``, a site ignore file (Mintlify ``.mintignore``) or simply no
-entry in the site navigation (``docs.json`` / ``mint.json``). The compiler
-reads Raw bodies, so without a signal such pages compile as live product.
+A documentation-site archive can keep pages its site does not publish at all:
+Mintlify builds nothing listed in the site ignore file (``.mintignore``, which
+follows ``.gitignore`` syntax). The compiler reads Raw bodies, so without a
+signal such pages compile as live product.
+
+Only the ignore file is evidence of "not published". A page that is hidden
+(frontmatter ``hidden: true``) or simply absent from the navigation
+(``docs.json`` / ``mint.json``) is still published: anyone with its URL can
+open it, it is only left out of the sidebar and, by default, search. Those
+states are deliberately not reported.
 
 This module only REPORTS status. Whether unpublished content belongs in a
 knowledge base is the owner's decision; nothing here excludes, drops or
@@ -14,7 +20,6 @@ is never added to the source inventory (hidden-file policy stays in
 
 from __future__ import annotations
 
-import json
 import posixpath
 import re
 from pathlib import Path
@@ -22,57 +27,9 @@ from pathlib import Path
 PAGE_EXTS = (".md", ".mdx")
 SITE_CONFIGS = ("docs.json", "mint.json")
 IGNORE_FILES = (".mintignore",)
-_FRONTMATTER_BYTES = 4 * 1024
-_CONFIG_BYTES = 2 * 1024 * 1024
 _NOTE_CHARS = 200
-_HIDDEN_RE = re.compile(r"^hidden\s*:\s*(?:true|yes|on)\s*(?:#.*)?$", re.IGNORECASE | re.MULTILINE)
 
-HIDDEN = "frontmatter_hidden"
 IGNORED = "site_ignore_file"
-NOT_IN_NAVIGATION = "not_in_site_navigation"
-
-
-def _frontmatter_hidden(path: Path) -> bool:
-    try:
-        with open(path, "rb") as stream:
-            head = stream.read(_FRONTMATTER_BYTES).decode("utf-8", errors="replace")
-    except OSError:
-        return False
-    head = head.lstrip("﻿")
-    if not head.startswith("---"):
-        return False
-    end = head.find("\n---", 3)
-    if end < 0:
-        return False
-    return bool(_HIDDEN_RE.search(head[3:end]))
-
-
-def _navigation_pages(config: object) -> set[str] | None:
-    """Every page reference under ``navigation`` (``pages`` entries and a
-    group's ``root`` landing page); None when there is no usable navigation
-    (then "not in navigation" would be noise, not a signal). An object marked
-    ``"hidden": true`` contributes nothing."""
-    if not isinstance(config, dict) or "navigation" not in config:
-        return None
-    pages: set[str] = set()
-
-    def walk(node: object, in_pages: bool) -> None:
-        if isinstance(node, str):
-            if in_pages:
-                pages.add(node.strip().lstrip("/"))
-            return
-        if isinstance(node, list):
-            for item in node:
-                walk(item, in_pages)
-            return
-        if isinstance(node, dict):
-            if node.get("hidden") is True:
-                return
-            for key, value in node.items():
-                walk(value, key in ("pages", "root") or (in_pages and key == "page"))
-
-    walk(config["navigation"], False)
-    return pages or None
 
 
 def _ignore_rules(path: Path) -> list[tuple[str, bool, str]]:
@@ -131,36 +88,46 @@ def _ignore_regex(body: str) -> re.Pattern[str]:
     return re.compile("".join(out))
 
 
-def _ignore_match(rel: str, pattern: str) -> bool:
-    """Gitignore semantics (``.mintignore`` follows ``.gitignore``): a trailing
-    ``/`` names a directory; a pattern with a leading or inner ``/`` is anchored
-    at the site root, otherwise it matches at any depth; ``**`` spans
-    directories. A matching directory ignores everything beneath it."""
-    directory = pattern.endswith("/")
+def _pattern_matches(path: str, is_dir: bool, pattern: str) -> bool:
+    """Whether one gitignore pattern matches this exact path: a trailing ``/``
+    matches directories only; a pattern with a leading or inner ``/`` is
+    anchored at the site root, otherwise it matches at any depth."""
+    if pattern.endswith("/") and not is_dir:
+        return False
     body = pattern.strip("/")
     if not body:
         return False
     if "/" not in pattern.rstrip("/"):
         body = "**/" + body
-    regex = _ignore_regex(body)
+    return _ignore_regex(body).fullmatch(path) is not None
+
+
+def _ignored_by(rel: str, rules: list[tuple[str, bool, str]]) -> tuple[str, str] | None:
+    """(pattern, note) of the rule that ignores ``rel``, or None.
+
+    Gitignore order: each directory on the way down is decided first, by the
+    last rule that matches it. Once a directory is ignored nothing beneath it
+    can be re-included, so ``drafts/`` followed by ``!drafts/keep.mdx`` still
+    ignores the file. Otherwise the last rule matching the file decides."""
     parts = rel.split("/")
     for depth in range(1, len(parts) + 1):
-        is_dir = depth < len(parts)
-        if (is_dir or not directory) and regex.fullmatch("/".join(parts[:depth])):
-            return True
-    return False
+        path, is_dir = "/".join(parts[:depth]), depth < len(parts)
+        decided: tuple[str, bool, str] | None = None
+        for rule in rules:
+            if _pattern_matches(path, is_dir, rule[0]):
+                decided = rule
+        if decided is not None and not decided[1]:
+            return decided[0], decided[2]
+    return None
 
 
 def publication_fingerprint(workdir: str, sources: list[str]) -> int:
-    """Changes whenever a publication signal could: a source path, a page or
-    site config body (size/mtime), or a site ignore file (outside the
-    inventory)."""
+    """Changes whenever a publication signal could: a source path or a site
+    ignore file (outside the inventory, so its size/mtime is read here)."""
     raw = Path(workdir) / "raw"
     stamps: list[tuple] = []
     roots = {posixpath.dirname(s) for s in sources if posixpath.basename(s) in SITE_CONFIGS}
-    watched = [s for s in sources if s.lower().endswith(PAGE_EXTS) or posixpath.basename(s) in SITE_CONFIGS]
-    watched += [posixpath.join(root, name) if root else name for root in sorted(roots) for name in IGNORE_FILES]
-    for rel in watched:
+    for rel in (posixpath.join(root, name) if root else name for root in sorted(roots) for name in IGNORE_FILES):
         try:
             st = (raw / rel).stat()
             stamps.append((rel, st.st_mtime_ns, st.st_size))
@@ -170,28 +137,14 @@ def publication_fingerprint(workdir: str, sources: list[str]) -> int:
 
 
 def publication_signals(workdir: str, sources: list[str]) -> dict[str, list[dict]]:
-    """raw-relative page path → [{"signal": ..., "detail": ...}] for pages a
-    documentation site marks as unpublished. Pages with no signal are absent.
+    """raw-relative page path → [{"signal": ..., "detail": ...}] for pages their
+    documentation site does not publish. Pages with no signal are absent.
 
     Site roots are the directories holding ``docs.json``/``mint.json`` in the
-    inventory; a page belongs to its deepest enclosing site. Pages outside any
-    site root only carry the frontmatter signal."""
+    inventory; a page belongs to its deepest enclosing site, whose ignore file
+    decides. Pages outside any site root carry no signal."""
     raw = Path(workdir) / "raw"
-    roots: dict[str, set[str] | None] = {}
-    for source in sources:
-        if posixpath.basename(source) not in SITE_CONFIGS:
-            continue
-        root = posixpath.dirname(source)
-        path = raw / source
-        try:
-            if path.stat().st_size > _CONFIG_BYTES:
-                continue
-            config = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        nav = _navigation_pages(config)
-        merged = (roots.get(root) or set()) | (nav or set())
-        roots[root] = merged or None
+    roots = sorted({posixpath.dirname(s) for s in sources if posixpath.basename(s) in SITE_CONFIGS})
     ignore_rules = {
         root: [rule for name in IGNORE_FILES
                for rule in _ignore_rules(raw / root / name if root else raw / name)]
@@ -201,36 +154,23 @@ def publication_signals(workdir: str, sources: list[str]) -> dict[str, list[dict
     for source in sources:
         if not source.lower().endswith(PAGE_EXTS):
             continue
-        signals: list[dict] = []
-        if _frontmatter_hidden(raw / source):
-            signals.append({"signal": HIDDEN, "detail": "hidden: true"})
         enclosing = [r for r in roots if r == "" or source.startswith(r + "/")]
-        if enclosing:
-            root = max(enclosing, key=len)
-            rel = source[len(root) + 1:] if root else source
-            ignored, detail = False, ""
-            for pattern, negated, note in ignore_rules.get(root, []):
-                if _ignore_match(rel, pattern):
-                    ignored, detail = (not negated), (f"{pattern} — {note}" if note else pattern)
-            if ignored:
-                name = posixpath.join(root, IGNORE_FILES[0]) if root else IGNORE_FILES[0]
-                signals.append({"signal": IGNORED, "detail": f"{name}: {detail}"[:_NOTE_CHARS * 2]})
-            nav = roots[root]
-            stem = posixpath.splitext(rel)[0]
-            # Snippets are included into other pages, never navigated to; the
-            # site-root index is the home page whether or not navigation lists it.
-            if (nav is not None and stem != "index" and "snippets" not in rel.split("/")[:-1]
-                    and stem not in nav):
-                signals.append({"signal": NOT_IN_NAVIGATION, "detail": ""})
-        if signals:
-            out[source] = signals
+        if not enclosing:
+            continue
+        root = max(enclosing, key=len)
+        rel = source[len(root) + 1:] if root else source
+        hit = _ignored_by(rel, ignore_rules[root])
+        if hit is None:
+            continue
+        pattern, note = hit
+        name = posixpath.join(root, IGNORE_FILES[0]) if root else IGNORE_FILES[0]
+        detail = f"{name}: {pattern} — {note}" if note else f"{name}: {pattern}"
+        out[source] = [{"signal": IGNORED, "detail": detail[:_NOTE_CHARS * 2]}]
     return out
 
 
-_LABELS_EN = {HIDDEN: "frontmatter hidden", IGNORED: "site ignore file",
-              NOT_IN_NAVIGATION: "not in site navigation"}
-_LABELS_ZH = {HIDDEN: "frontmatter 标记 hidden", IGNORED: "站点忽略文件",
-              NOT_IN_NAVIGATION: "不在站点导航"}
+_LABELS_EN = {IGNORED: "site ignore file"}
+_LABELS_ZH = {IGNORED: "站点忽略文件"}
 
 
 def _describe(signals: list[dict], en: bool) -> str:
@@ -256,14 +196,14 @@ def publication_notice(signals: dict[str, list[dict]], paths: list[str] | None =
         lines.append(f"- … {more} more" if en else f"- …另有 {more} 个")
     if en:
         head = ("\n\nSource publication status (computed from the documentation site's own files): "
-                "these sources are marked as NOT published on their site. Compile them as usual — do not "
-                "exclude them on your own; excluding is the owner's decision. But every page and index entry "
-                "compiled from them must state that the source site marks this content as unpublished/hidden "
-                "(quote the reason when one is given) and must not present it as a currently available product "
-                "or feature:\n")
+                "their site's ignore file excludes these sources, so the site does not publish them. Compile "
+                "them as usual — do not exclude them on your own; excluding is the owner's decision. But every "
+                "page and index entry compiled from them must state that the source site does not publish this "
+                "content (quote the reason when one is given) and must not present it as a currently available "
+                "product or feature:\n")
     else:
-        head = ("\n\n源发布状态(由文档站自身文件机械算出):下列源在其站点标记为**未发布**。照常编译,不要自行排除——"
-                "是否排除由负责人决定;但由它们编出的页面和 index 条目必须写明「源站点把这部分内容标记为未发布/隐藏」"
+        head = ("\n\n源发布状态(由文档站自身文件机械算出):下列源被其站点的忽略文件排除,站点**不发布**它们。照常编译,"
+                "不要自行排除——是否排除由负责人决定;但由它们编出的页面和 index 条目必须写明「源站点不发布这部分内容」"
                 "(有原因就引用原因),不得把它写成当前可用的产品或功能:\n")
     return head + "\n".join(lines)
 
