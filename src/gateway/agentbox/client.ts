@@ -486,7 +486,7 @@ export class AgentBoxClient {
    * streams structured events on /events/:runId; agentbox uses /api/stream/:id.
    * Both speak `data: <json>\n\n` with `: heartbeat` comment lines.
    */
-  async *streamPath(path: string, opts?: { onComment?: () => void }): AsyncIterable<unknown> {
+  async *streamPath(path: string, opts?: { onComment?: () => void; signal?: AbortSignal }): AsyncIterable<unknown> {
     const url = `${this.endpoint}${path}`;
 
     // Use https.request for HTTPS with mTLS
@@ -497,6 +497,7 @@ export class AgentBoxClient {
 
     const resp = await fetch(url, {
       headers: { Accept: "text/event-stream" },
+      signal: opts?.signal,
     });
 
     if (!resp.ok) {
@@ -544,7 +545,10 @@ export class AgentBoxClient {
         }
       }
     } catch (err) {
-      console.error(`[agentbox-client] SSE stream error path=${path}:`, err instanceof Error ? err.message : err);
+      // A caller-requested abort is a normal close, not a stream failure.
+      if (!opts?.signal?.aborted) {
+        console.error(`[agentbox-client] SSE stream error path=${path}:`, err instanceof Error ? err.message : err);
+      }
       throw err;
     } finally {
       console.log(`[agentbox-client] SSE closed path=${path} (${eventCount} events)`);
@@ -555,7 +559,7 @@ export class AgentBoxClient {
   /**
    * SSE stream over HTTPS with mTLS, on an arbitrary path.
    */
-  private async *streamPathHttps(path: string, opts?: { onComment?: () => void }): AsyncIterable<unknown> {
+  private async *streamPathHttps(path: string, opts?: { onComment?: () => void; signal?: AbortSignal }): AsyncIterable<unknown> {
     const urlObj = new URL(path, this.endpoint);
 
     const res = await new Promise<import("node:http").IncomingMessage>((resolve, reject) => {
@@ -567,6 +571,7 @@ export class AgentBoxClient {
           method: "GET",
           headers: { Accept: "text/event-stream" },
           agent: this.httpsAgent!,
+          signal: opts?.signal,
         },
         resolve,
       );
@@ -624,7 +629,10 @@ export class AgentBoxClient {
       // so any remaining unterminated text stays buffered as before.
       buffer += decoder.decode();
     } catch (err) {
-      console.error(`[agentbox-client] SSE stream error path=${path}:`, err instanceof Error ? err.message : err);
+      // A caller-requested abort is a normal close, not a stream failure.
+      if (!opts?.signal?.aborted) {
+        console.error(`[agentbox-client] SSE stream error path=${path}:`, err instanceof Error ? err.message : err);
+      }
       throw err;
     } finally {
       console.log(`[agentbox-client] SSE closed (HTTPS) path=${path} (${eventCount} events)`);
