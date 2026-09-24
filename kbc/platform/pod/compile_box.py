@@ -4933,8 +4933,8 @@ def _compose_final_directive(workdir: str, n: int, notes: str,
         step += 1
         if unpublished:
             lines.append(f"{step}) Unpublished sources ({len(unpublished)} page source(s); machine-computed from the "
-                         "documentation site's own frontmatter, ignore file and navigation): every page and index "
-                         "entry compiled from them must say the source site marks this content unpublished/hidden "
+                         "documentation site's own ignore file): every page and index "
+                         "entry compiled from them must say the source site does not publish this content "
                          "and must not present it as currently available. Do not exclude them yourself — that is "
                          "the owner's decision. By folder:")
             lines += source_publication.publication_summary(unpublished, en=True)
@@ -4973,8 +4973,8 @@ def _compose_final_directive(workdir: str, n: int, notes: str,
     lines.append(f"{step}) 核对 authoring/EXCLUSIONS.json:决定不编的源(含图片/PDF 等媒体)必须显式入账。")
     step += 1
     if unpublished:
-        lines.append(f"{step}) 未发布的源({len(unpublished)} 个页面源,由文档站自身的 frontmatter、忽略文件和导航机械算出):"
-                     "由它们编出的页面和 index 条目必须写明「源站点把这部分内容标记为未发布/隐藏」,不得写成当前可用;"
+        lines.append(f"{step}) 未发布的源({len(unpublished)} 个页面源,由文档站自身的忽略文件机械算出):"
+                     "由它们编出的页面和 index 条目必须写明「源站点不发布这部分内容」,不得写成当前可用;"
                      "不要自行排除——是否排除由负责人决定。按目录:")
         lines += source_publication.publication_summary(unpublished, en=False)
         step += 1

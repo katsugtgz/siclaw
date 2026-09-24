@@ -49,26 +49,44 @@ def test_publication_signals_from_site_files():
         assert ".mintignore" not in sources  # the ignore file stays out of the inventory
         signals = sp.publication_signals(td, sources)
         kinds = {path: [s["signal"] for s in items] for path, items in signals.items()}
-        assert "gpu/overview.mdx" not in kinds and "gpu/nested/page.mdx" not in kinds, kinds
-        assert "snippets/note.mdx" not in kinds and "index.mdx" not in kinds, kinds
-        assert "gpu/media/shot.png" not in kinds, kinds
-        assert kinds["siverse/overview.mdx"] == [sp.HIDDEN, sp.IGNORED], kinds
-        detail = signals["siverse/overview.mdx"][1]["detail"]
+        # Only the ignore file means "not published". Hidden pages and pages
+        # missing from navigation are still served by URL, so they carry nothing.
+        assert kinds == {
+            "siverse/overview.mdx": [sp.IGNORED],
+            "gpu/old.draft.mdx": [sp.IGNORED],
+        }, kinds
+        detail = signals["siverse/overview.mdx"][0]["detail"]
         assert "Temporarily hidden: Siverse (not part of current GTM launch)" in detail, detail
-        assert kinds["beta/secret.mdx"] == [sp.NOT_IN_NAVIGATION], kinds  # hidden nav tab
-        assert kinds["gpu/old.draft.mdx"] == [sp.IGNORED, sp.NOT_IN_NAVIGATION], kinds
-        assert kinds["gpu/keep.draft.mdx"] == [sp.NOT_IN_NAVIGATION], kinds  # negated ignore
-        assert kinds["README.md"] == [sp.NOT_IN_NAVIGATION], kinds
+        assert "gpu/keep.draft.mdx" not in kinds  # negated file rule, parent not ignored
 
 
-def test_no_site_config_only_frontmatter_counts():
+def test_hidden_and_unlisted_pages_are_not_unpublished():
+    # Mintlify serves a hidden or navigation-absent page to anyone with its URL.
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
-        _mk(base, "raw/a.md", "---\nhidden: true\n---\nx")
-        _mk(base, "raw/b.md", "no frontmatter\nhidden: true\n")
-        _mk(base, "raw/.mintignore", "a.md\n")  # no site root → not consulted
-        signals = sp.publication_signals(td, selfcheck.source_inventory(td))
-        assert signals == {"a.md": [{"signal": sp.HIDDEN, "detail": "hidden: true"}]}, signals
+        _mk(base, "raw/docs.json", json.dumps({"navigation": {"groups": [{"group": "G", "pages": ["listed"]}]}}))
+        _mk(base, "raw/listed.mdx", "---\ntitle: L\n---\nbody")
+        _mk(base, "raw/unlisted.mdx", "---\ntitle: U\n---\nbody")
+        _mk(base, "raw/hidden.mdx", "---\ntitle: H\nhidden: true\n---\nbody")
+        assert sp.publication_signals(td, selfcheck.source_inventory(td)) == {}
+
+
+def test_ignore_file_outside_a_site_root_is_not_consulted():
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "raw/a.md", "x")
+        _mk(base, "raw/.mintignore", "a.md\n")  # no docs.json/mint.json → not a site
+        assert sp.publication_signals(td, selfcheck.source_inventory(td)) == {}
+
+
+def test_a_file_under_an_ignored_directory_cannot_be_re_included():
+    rules = [("drafts/", False, ""), ("drafts/keep.mdx", True, "")]
+    assert sp._ignored_by("drafts/keep.mdx", rules) == ("drafts/", "")  # git keeps ignoring it
+    assert sp._ignored_by("drafts/other.mdx", rules) == ("drafts/", "")
+    # Re-including the directory itself does work, as in git.
+    assert sp._ignored_by("drafts/keep.mdx", rules + [("drafts/", True, "")]) is None
+    # A file rule negated under a directory that is not ignored also works.
+    assert sp._ignored_by("a/keep.draft.mdx", [("*.draft.mdx", False, ""), ("keep.draft.mdx", True, "")]) is None
 
 
 def test_ignore_rules_follow_gitignore_globstar():
@@ -87,20 +105,9 @@ def test_ignore_rules_follow_gitignore_globstar():
         ("a/d.mdx", "a/[!bc].mdx", True),
         ("a/b.mdx", "a/[!bc].mdx", False),
     ]
-    wrong = [(rel, pattern) for rel, pattern, expected in cases if sp._ignore_match(rel, pattern) != expected]
+    wrong = [(rel, pattern) for rel, pattern, expected in cases
+             if (sp._ignored_by(rel, [(pattern, False, "")]) is not None) != expected]
     assert not wrong, wrong
-
-
-def test_group_root_page_is_in_navigation():
-    with tempfile.TemporaryDirectory() as td:
-        base = Path(td)
-        _mk(base, "raw/docs.json", json.dumps({"navigation": {"groups": [
-            {"group": "Guide", "root": "guide/overview", "pages": ["guide/a"]}]}}))
-        _mk(base, "raw/guide/overview.mdx", "---\ntitle: O\n---\nbody")
-        _mk(base, "raw/guide/a.mdx", "---\ntitle: A\n---\nbody")
-        _mk(base, "raw/guide/orphan.mdx", "---\ntitle: X\n---\nbody")
-        signals = sp.publication_signals(td, selfcheck.source_inventory(td))
-        assert set(signals) == {"guide/orphan.mdx"}, signals
 
 
 def test_fingerprint_follows_site_files_not_only_paths():
@@ -113,13 +120,11 @@ def test_fingerprint_follows_site_files_not_only_paths():
         _mk(base, "raw/.mintignore", "gpu/\n")  # outside the inventory
         after_ignore = sp.publication_fingerprint(td, sources)
         assert after_ignore != before
-        _mk(base, "raw/gpu/overview.mdx", "---\ntitle: GPU\nhidden: true\n---\nbody")
-        assert sp.publication_fingerprint(td, sources) != after_ignore
         assert selfcheck.source_inventory(td) == sources  # same paths throughout
 
 
 def test_notice_is_bounded_and_advisory():
-    signals = {f"s/p{i:02d}.mdx": [{"signal": sp.HIDDEN, "detail": "hidden: true"}] for i in range(30)}
+    signals = {f"s/p{i:02d}.mdx": [{"signal": sp.IGNORED, "detail": ".mintignore: s/"}] for i in range(30)}
     notice = sp.publication_notice(signals, en=True, limit=5)
     assert notice.count("\n- ") == 6 and "25 more" in notice, notice
     assert "do not exclude them on your own" in notice
@@ -139,17 +144,17 @@ def test_compile_directives_carry_publication_status():
         run = SimpleNamespace(workdir=td)
         batch = {"sources": ["siverse/overview.mdx", "gpu/overview.mdx"]}
         brief = compile_box._batch_relay_brief(run, {"batches": [batch]}, batch, 1, 1, locale="en")
-        assert "siverse/overview.mdx: frontmatter hidden; site ignore file" in brief, brief
+        assert "siverse/overview.mdx: site ignore file (.mintignore: siverse/" in brief, brief
         assert "gpu/overview.mdx" not in brief.split("Source publication status", 1)[1], brief
         clean = {"sources": ["gpu/overview.mdx"]}
         assert "publication status" not in compile_box._batch_relay_brief(
             run, {"batches": [clean]}, clean, 1, 1, locale="en")
 
         final_en = compile_box._compose_final_directive(td, 1, "", locale="en")
-        assert "Unpublished sources (5 page source(s)" in final_en, final_en
-        assert "   - gpu/ (2)" in final_en and "   - (root) (1)" in final_en, final_en
+        assert "Unpublished sources (2 page source(s)" in final_en, final_en
+        assert "   - gpu/ (1)" in final_en and "   - siverse/ (1)" in final_en, final_en
         final_zh = compile_box._compose_final_directive(td, 1, "", locale="zh")
-        assert "未发布的源(5 个页面源" in final_zh, final_zh
+        assert "未发布的源(2 个页面源" in final_zh, final_zh
 
 
 async def test_single_turn_full_compile_carries_publication_status():
