@@ -197,6 +197,8 @@ describe("buildRedactionConfig — generic secret patterns", () => {
       '"apiKey": "<API_KEY>"',
       '"api_key": "<你的API密钥>"',
       "OPENAI_API_KEY=<your api key>",
+      '"token": "<token>"',
+      '"password": "<您的密码>"',
       "TOKEN=$TOKEN",
     ];
     for (const input of cases) expect(redactText(input, cfg)).toBe(input);
@@ -219,6 +221,14 @@ describe("buildRedactionConfig — generic secret patterns", () => {
     expect(redactText("PASSWORD=<MyProductionPassword>", cfg)).toBe("[REDACTED]");
     expect(redactText('{"password": "<MyProductionPassword123>"}', cfg)).toBe('{"password": "[REDACTED]"}');
     expect(redactText('{"token": "<a8f3c1d9e7b2a4f6>"}', cfg)).toBe('{"token": "[REDACTED]"}');
+    // Placeholder-shaped but naming nothing: a passphrase, not a placeholder.
+    expect(redactText("PASSWORD=<correcthorsebatterystaple>", cfg)).toBe("[REDACTED]");
+    expect(redactText('{"password": "<correcthorsebatterystaple>"}', cfg)).toBe('{"password": "[REDACTED]"}');
+    expect(redactText("PASSWORD=<correct-horse-battery-staple>", cfg)).toBe("[REDACTED]");
+    expect(redactText("PASSWORD=<CORRECTHORSE>", cfg)).toBe("[REDACTED]");
+    expect(redactText("PASSWORD=<mypassword>", cfg)).toBe("[REDACTED]");
+    expect(redactText('{"password": "<correct horse battery staple>"}', cfg)).toBe('{"password": "[REDACTED]"}');
+    expect(redactText('{"password": "<正确马电池订书钉>"}', cfg)).toBe('{"password": "[REDACTED]"}');
     expect(redactText('{"password": "$Summer2024abc"}', cfg)).toBe('{"password": "[REDACTED]"}');
     expect(redactText('{"token": "<a8f3c1d9e7b2a4f6"}', cfg)).toBe('{"token": "[REDACTED]"}');
   });
