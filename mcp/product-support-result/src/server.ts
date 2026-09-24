@@ -98,7 +98,7 @@ const inputSchema = {
 
 export function createProductSupportResultServer(): Server {
   const server = new Server(
-    { name: "mcp-product-support-result", version: "0.3.0" },
+    { name: "mcp-product-support-result", version: "0.4.0" },
     { capabilities: { tools: {} } },
   );
 
