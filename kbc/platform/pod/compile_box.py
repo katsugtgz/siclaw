@@ -16,6 +16,7 @@ Surface (driven by the runtime):
   POST /message/{run_id}   {message} inject one user turn into the persistent session (prepare/compile/patch are all ordinary turns)
   POST /command/{run_id}   {command_id, command} execute one typed authoring action; idempotent per live run
   GET  /events/{run_id}    structured SSE stream (session/log/summary/turn_done/syncArtifacts/plan_proposed/error/end)
+  GET  /control-events/{run_id}  control SSE stream (refresh_credentials), independent of the ordered /events ACK sequence
   POST /test-session/{run_id}  start a test session: pin the current draft as an immutable snapshot + a read-only consumer session (reuses this pod)
   POST /test-reference-assist/{run_id}  suggest or polish one raw-grounded reference answer
   POST /test-message/{tid} · GET /test-events/{tid} · POST /test-session/{tid}/close
@@ -60,6 +61,7 @@ import destream
 import model_access
 import incremental
 import mediaverify
+import source_publication
 import office_ingest
 from mtls_auth import (
     client_certificate_error as _client_certificate_error,
@@ -70,7 +72,7 @@ import selfcheck
 import review_notes
 from engine import selected_readonly_engine, engine_kind, create_agent_client
 from agent_protocol import AgentClient, AgentEvent, AgentTransportError, EngineTool, is_result as message_is_result, message_field
-from execution_observation import observe_sessions
+from execution_observation import _failure_code as model_failure_code, observe_sessions
 from pi_engine import sdk_version as pi_sdk_version
 from pi_file_tools import FileTools
 import pi_config
@@ -844,6 +846,10 @@ class CompileRun:
 
     async def emit(self, ev: dict):
         await self.events.put(ev)
+
+    async def emit_control(self, ev: dict):
+        """Control traffic must not wait behind an unacknowledged artifact batch."""
+        await self.event_relay.send_control(ev)
 
     def _begin_turn(
         self,
@@ -4600,6 +4606,28 @@ def _batch_navigation_context(run: "CompileRun", batch: dict) -> tuple[bool, str
         return False, ""
 
 
+_PUBLICATION_CACHE: dict[str, tuple[int, dict[str, list[dict]]]] = {}
+
+
+def _source_publication_signals(workdir: str) -> dict[str, list[dict]]:
+    """Per-source publication status from the documentation site's own files.
+    Advisory context only: a failure means "no signal", never a blocked turn.
+    One scan serves every batch hand-off of a long train while the site's
+    files are unchanged (one entry per workdir; a later run may bring new Raw
+    to the same workdir, so the key covers the files the signals read)."""
+    try:
+        sources = selfcheck.source_inventory(workdir)
+        key = source_publication.publication_fingerprint(workdir, sources)
+        cached = _PUBLICATION_CACHE.get(workdir)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        signals = source_publication.publication_signals(workdir, sources)
+        _PUBLICATION_CACHE[workdir] = (key, signals)
+        return signals
+    except Exception:
+        return {}
+
+
 def _batch_relay_brief(run: "CompileRun", plan: dict, batch: dict, k: int, n: int,
                        locale: str | None = None) -> str:
     """The hand-off a fresh batch session would otherwise have to guess.
@@ -4673,7 +4701,9 @@ def _batch_relay_brief(run: "CompileRun", plan: dict, batch: dict, k: int, n: in
             ("本区域已有页(优先并入而不是新建):" + listed)
         )
     header = "\n\nHand-off from the batches before you:\n" if en else "\n\n前序批次交接:\n"
-    return header + "\n".join(f"- {line}" for line in lines)
+    publication = source_publication.publication_notice(
+        _source_publication_signals(run.workdir), sources, en=en)
+    return header + "\n".join(f"- {line}" for line in lines) + publication
 
 
 def _compose_batch_directive(batch: dict, k: int, n: int, notes: str,
@@ -4877,6 +4907,7 @@ def _compose_final_directive(workdir: str, n: int, notes: str,
     # never. Final review is the one moment the whole library exists, and it is
     # already the place where machine-computed worklists make silence impossible.
     domain_now = selfcheck.read_repo_meta(workdir).get("domain", "")
+    unpublished = _source_publication_signals(workdir)
     if selfcheck._is_en(locale):
         lines = [f"[Batch compile · final review] All {n} batches are compiled. Now do the cross-batch "
                  "close-out (the checklists below are machine-computed — handle every item, silent skipping "
@@ -4905,6 +4936,14 @@ def _compose_final_directive(workdir: str, n: int, notes: str,
         lines.append(f"{step}) Check authoring/EXCLUSIONS.json: sources you decided not to compile (including "
                      "images/PDF and other media) must be explicitly accounted for.")
         step += 1
+        if unpublished:
+            lines.append(f"{step}) Unpublished sources ({len(unpublished)} page source(s); machine-computed from the "
+                         "documentation site's own ignore file): every page and index "
+                         "entry compiled from them must say the source site does not publish this content "
+                         "and must not present it as currently available. Do not exclude them yourself — that is "
+                         "the owner's decision. By folder:")
+            lines += source_publication.publication_summary(unpublished, en=True)
+            step += 1
         lines.append(f"{step}) Call report_domain once for the FINISHED library — one sentence naming the "
                      "field it covers, for another agent deciding whether to open it at all. "
                      + (f"It currently reads {domain_now!r}; correct it if the finished corpus is wider "
@@ -4938,6 +4977,12 @@ def _compose_final_directive(workdir: str, n: int, notes: str,
     step += 1
     lines.append(f"{step}) 核对 authoring/EXCLUSIONS.json:决定不编的源(含图片/PDF 等媒体)必须显式入账。")
     step += 1
+    if unpublished:
+        lines.append(f"{step}) 未发布的源({len(unpublished)} 个页面源,由文档站自身的忽略文件机械算出):"
+                     "由它们编出的页面和 index 条目必须写明「源站点不发布这部分内容」,不得写成当前可用;"
+                     "不要自行排除——是否排除由负责人决定。按目录:")
+        lines += source_publication.publication_summary(unpublished, en=False)
+        step += 1
     lines.append(f"{step}) 对**编完的整库**调一次 report_domain:一句话说清这个库属于什么领域,"
                  "给别的智能体判断「要不要打开这个库」用。"
                  + (f"当前是 {domain_now!r};如果编完的全库比这句更宽或已不是这个领域,就改正它。"
@@ -7057,7 +7102,8 @@ async def _consume_test_turn_stream(run: "TestRun", client) -> None:
                 await run.emit(_error_event(
                     msg.data.get("error") or "The model request did not complete",
                     code="test_model_failed", stage="test",
-                    api_error_status=msg.data.get("api_error_status")))
+                    api_error_status=msg.data.get("api_error_status"),
+                    failure_code=model_failure_code(msg.data)))
                 await run.emit({"type": "turn_done", "text": _loc(
                     run, "The model request failed. You can retry this question.",
                     "模型请求失败，可以重新发送此问题。")})
@@ -7830,7 +7876,7 @@ async def handle_session(request: web.Request):
     _ensure_workdir_constitution(run.workdir, run.locale)
     RUNS[run_id] = run
     if body.get("credential_refresh") is True:
-        model_access.configure(run_id, run.emit)
+        model_access.configure(run_id, run.emit_control)
     run.task = asyncio.create_task(_run_wrapper(run))
     return web.json_response({"ok": True, "run_id": run_id})
 
@@ -8094,8 +8140,14 @@ async def _dispatch_authoring_turn(
         grandfather_legacy_format=not full_compile,
         authoring_action=action or ("compile.full" if full_compile else ""),
     )  # arm the stall watchdog — every model turn, incl. the owner's
+    model_text = text
+    if full_compile:
+        # A single-turn compile has no batch hand-off, so the publication
+        # status rides the kickoff itself (bounded; empty when nothing flagged).
+        model_text += source_publication.publication_notice(
+            _source_publication_signals(run.workdir), en=selfcheck._is_en(getattr(run, "locale", None)))
     try:
-        await run.client.query(text)
+        await run.client.query(model_text)
     except BaseException:
         if full_compile:
             run._full_compile_pending = False
@@ -8259,6 +8311,13 @@ async def handle_events(request: web.Request):
                  **({"commit_input": True} if commit else {})}] if artifacts or commit else []
 
     return await run.event_relay.stream(request, legacy_replay)
+
+
+async def handle_control_events(request: web.Request):
+    run = RUNS.get(request.match_info["run_id"])
+    if not run:
+        return web.Response(status=404, text="unknown run")
+    return await run.event_relay.stream_control(request)
 
 
 async def handle_health(request: web.Request):
@@ -8873,6 +8932,7 @@ def build_app() -> web.Application:
         web.post("/command/{run_id}", handle_command),
         web.post("/artifacts/ack/{run_id}", handle_artifacts_ack),
         web.get("/events/{run_id}", handle_events),
+        web.get("/control-events/{run_id}", handle_control_events),
         web.post("/events/ack/{run_id}", handle_event_ack),
         # Test session: read-only consumer session over a pinned draft snapshot.
         web.post("/test-session/{run_id}", handle_open_test),

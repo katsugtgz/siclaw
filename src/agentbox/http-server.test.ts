@@ -817,7 +817,7 @@ describe("http-server — prompt + session lifecycle", () => {
     expect(seen).not.toContain("�");
   });
 
-  it("refuses Ticket prompts until the configured result tool is available", async () => {
+  it("refuses a DECLARED Ticket result tool that the instance cannot call, and runs without one", async () => {
     const { handleToolCapabilities } = await import("../gateway/internal-api.js");
     const { createToolsHandler } = await vi.importActual<typeof import("./sync-handlers.js")>("./sync-handlers.js");
     let status = 0;
@@ -834,9 +834,15 @@ describe("http-server — prompt + session lifecycle", () => {
     expect(sm.agentTypeState).toBe("ticket");
     expect(sm.allowedToolsState).toContain("read");
     const session = await sm.getOrCreate("ticket-result");
-    const missing = await getJson(port, "/api/prompt", "POST", { text: "review", sessionId: "ticket-result" });
-    expect(missing.status).toBe(400);
-    expect(session.brain.prompt).not.toHaveBeenCalled();
+    // A Ticket instance that declares no result contract is a multi-turn
+    // assistant, not a broken closure workflow: it runs, and nothing instructs
+    // it to submit a result it has no tool for.
+    const noContract = await getJson(port, "/api/prompt", "POST", { text: "review", sessionId: "ticket-result" });
+    await flushAsync();
+    expect(noContract.status).toBe(200);
+    expect(session.brain.prompt).toHaveBeenCalledWith("review", undefined);
+    (session.brain.prompt as any).mockClear();
+    // Declaring one the instance cannot call stays a configuration error.
     const unavailable = await getJson(port, "/api/prompt", "POST", { text: "review", sessionId: "ticket-result", requiredResultToolName: "mcp__review__submit" });
     expect(unavailable.status).toBe(400);
     expect(session.brain.prompt).not.toHaveBeenCalled();

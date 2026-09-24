@@ -135,6 +135,36 @@ async def test_partial_transcription_skips_comparison():
     print("OK  partial transcription skips comparison (page retries whole)")
 
 
+async def test_document_embedded_images_reach_comparer():
+    """A page citing a document (not the image) still gets its embedded
+    screenshots compared, and the comparer is told which document carries them."""
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "raw/c/ns.mdx", "Choose billing type and region.\n![c](/c/media/create-ns.png)\n")
+        _mk(base, "raw/c/media/create-ns.png", "PNGBYTES-NS")
+        _mk(base, "candidate/p.md",
+            "---\nsources:\n  - resource: c/ns.mdx\n---\nChoose billing type and region. (source: c/ns.mdx)")
+        fake = FakeEngine()
+        result = await mediaverify.run_blind_verify(fake, td, {"p.md": ["c/media/create-ns.png"]})
+        assert fake.calls == {"transcribe": 1, "compare": 1}, fake.calls
+        assert result["completed_pages"] == ["p.md"], result
+        prompt = fake.users["compare"][0]
+        assert '"c/media/create-ns.png": ["c/ns.mdx"]' in prompt, prompt
+        assert "Never report" in prompt and "document-tagged claim" in prompt, prompt
+
+        # An image-only citation carries no embedding note (unchanged prompt).
+        _mk(base, "candidate/q.md", "---\n---\nx (source: c/media/create-ns.png)")
+        fake2 = FakeEngine()
+        await mediaverify.run_blind_verify(fake2, td, {"q.md": ["c/media/create-ns.png"]})
+        assert "embedding documents" not in fake2.users["compare"][0]
+
+        # zh prompt carries the same mapping.
+        fake3 = FakeEngine()
+        await mediaverify.run_blind_verify(fake3, td, {"p.md": ["c/media/create-ns.png"]}, locale="zh")
+        assert "嵌入它的文档" in fake3.users["compare"][0] and "c/ns.mdx" in fake3.users["compare"][0]
+    print("OK  document-embedded images reach the comparer with their embedding documents")
+
+
 def test_repair_prompt():
     findings = [{"page": "p.md", "image": "s/i1.png", "kind": "超出转写范围",
                  "claim": "GPU 型号 NVIDIA H20", "expected": "转写中无此信息",
@@ -153,6 +183,7 @@ def test_repair_prompt():
 def main():
     asyncio.run(test_blind_flow_and_isolation())
     asyncio.run(test_partial_transcription_skips_comparison())
+    asyncio.run(test_document_embedded_images_reach_comparer())
     test_repair_prompt()
     print("ALL OK  test_mediaverify")
 

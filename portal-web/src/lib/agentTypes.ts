@@ -39,7 +39,7 @@ export const AGENT_TYPES: AgentTypeOption[] = [
   {
     key: "ticket",
     label: "Ticket Agent",
-    description: "Runs tenant-defined ticket workflows with a required structured result tool.",
+    description: "Runs tenant-defined ticket workflows, optionally behind a structured result contract.",
     capabilities: null,
     defaultNoSkills: true,
   },

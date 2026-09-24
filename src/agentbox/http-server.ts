@@ -987,11 +987,19 @@ export function createHttpServer(
     // holds its whole transcript. For a brand-new session the load is one cheap
     // empty round-trip.
     const resumed = await sessionManager.ensureSessionContext(body.sessionId);
-    if (sessionManager.agentTypeState === "ticket" && !requiredResultToolName) {
-      logPromptResponse(400, "rejected", "Ticket Agent requires a result tool");
-      sendJson(res, 400, { error: "Ticket Agent requires a host-configured result tool" });
-      return;
-    }
+    // A Ticket instance without a result contract is a legitimate configuration:
+    // the type means "tenant-defined ticket workflow", and only some of those
+    // workflows end in one structured result. A closure dispatch does; an
+    // assistant answering an operator over many turns does not, and rejecting it
+    // here made that shape impossible to build at all.
+    //
+    // The invariant this gate used to assert moves rather than disappears: it is
+    // no longer "a Ticket Agent produces a structured result" but "a DECLARED
+    // result contract is honoured". The declaration is the host's, and the rest
+    // of that contract is still enforced — the tool must exist (below), the
+    // model is repaired once if it finishes without calling it (pi-agent-brain),
+    // and the caller's own tracker fails the run with TURN_RESULT_MISSING if no
+    // result arrives. Nothing here was the only line of defence.
     if (body.requireExistingSession === true && !resumed) {
       const detail = {
         code: SESSION_CONTEXT_UNAVAILABLE_CODE,
@@ -1012,8 +1020,16 @@ export function createHttpServer(
       body.allowInputRequest === true,
       body.handoffSupported === true,
       parseHandoffPolicy(body.handoffPolicy),
+      Boolean(requiredResultToolName),
     );
-    if (sessionManager.agentTypeState === "ticket" && !managed.toolNames.includes(requiredResultToolName!)) {
+    // Still fail closed when a Ticket instance DID declare a contract: a named
+    // result tool it cannot call is a misbinding, and letting the turn run would
+    // surface it much later as a missing result instead of as a config error.
+    // Scoped to Ticket as before — other types may also carry a result contract
+    // through a custom harness, and whether an unavailable tool should stop them
+    // is a separate question this change does not answer.
+    if (sessionManager.agentTypeState === "ticket" && requiredResultToolName
+        && !managed.toolNames.includes(requiredResultToolName)) {
       logPromptResponse(400, "rejected", "Ticket result tool is unavailable", managed.id);
       sendJson(res, 400, { error: "The configured Ticket result tool is unavailable; check the instance MCP binding" });
       return;

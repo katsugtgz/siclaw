@@ -434,6 +434,134 @@ describe("driveCapabilitySession — box event → capability wire mapping", () 
     expect(mgr.touchHeartbeat).not.toHaveBeenCalled();
   }, 10_000);
 
+  it("answers a credential refresh while an artifact batch is still being persisted", async () => {
+    // Production 2026-09-24: a consumer that kept refusing a batch held the
+    // serial relay, so the box's credential request was never answered and
+    // every test turn's model call failed at the box's 20s refresh timeout.
+    const fe = fakeFrontend();
+    let credentialAnswered!: () => void;
+    const answered = new Promise<void>((resolve) => { credentialAnswered = resolve; });
+    fe.request = vi.fn().mockImplementation(async (method: string) => {
+      if (method === CAPABILITY_PERSIST_ARTIFACTS) {
+        await answered; // persistence completes only after the refresh reply
+        return { ok: true };
+      }
+      if (method === "capability.fetchInput") return { api_key: "rotated" };
+      return { ok: true };
+    });
+    const requestId = "c".repeat(32);
+    const postJson = vi.fn().mockImplementation(async (path: string) => {
+      if (path.startsWith("/model-credentials/")) credentialAnswered();
+      return { ok: true };
+    });
+    const mgr = fakeManager();
+    mgr.get.mockReturnValue({ runId: "r1", status: "running" });
+    const model = { source_model_id: "m", id: "m", baseUrl: "https://m.invalid", api: "openai-completions" };
+    const paths: string[] = [];
+    const client = {
+      postJson,
+      async *streamPath(path: string) {
+        paths.push(path);
+        if (path === "/control-events/r1") {
+          yield { type: "control_ready" };
+          yield { type: "refresh_credentials", request_id: requestId, model };
+          return;
+        }
+        // The event stream stays strictly ordered: nothing after the batch is
+        // read before the batch is persisted.
+        yield { type: "relay_ready", event_ack: 1, control_events: 1 };
+        yield { type: "syncArtifacts", event_id: `${"a".repeat(32)}:1`, artifacts: [{ path: "eval/a.md", content: "a" }] };
+        yield { type: "end", event_id: `${"a".repeat(32)}:2` };
+      },
+    };
+    await driveCapabilitySession({ client: client as any, runId: "r1", frontendClient: fe, manager: mgr });
+    expect(paths).toEqual(["/events/r1?ack=1", "/control-events/r1"]);
+    expect(postJson).toHaveBeenCalledWith(`/model-credentials/r1/${requestId}`, { api_key: "rotated" }, 10_000);
+    expect(fe.request.mock.calls.filter((c: any[]) => c[0] === CAPABILITY_PERSIST_ARTIFACTS)).toHaveLength(1);
+  });
+
+  it("closes the control stream when the relay ends, although the box keeps it open", async () => {
+    const mgr = fakeManager();
+    mgr.get.mockReturnValue({ runId: "r1", status: "running" });
+    let controlSignal: AbortSignal | undefined;
+    let controlClosed!: () => void;
+    const closed = new Promise<void>((resolve) => { controlClosed = resolve; });
+    const client = {
+      postJson: vi.fn().mockResolvedValue({ ok: true }),
+      async *streamPath(path: string, opts?: { signal?: AbortSignal }) {
+        if (path === "/control-events/r1") {
+          controlSignal = opts?.signal;
+          yield { type: "control_ready" };
+          // Heartbeats only from here on: nothing is yielded until the abort.
+          await new Promise<void>((_, reject) => {
+            opts?.signal?.addEventListener("abort", () => {
+              controlClosed();
+              reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
+            });
+          });
+          return;
+        }
+        yield { type: "relay_ready", event_ack: 1, control_events: 1 };
+        await new Promise((resolve) => setTimeout(resolve, 10)); // let the control lane attach
+        yield { type: "end", event_id: `${"a".repeat(32)}:1` };
+      },
+    };
+    await driveCapabilitySession({ client: client as any, runId: "r1", frontendClient: fakeFrontend(), manager: mgr });
+    expect(controlSignal?.aborted).toBe(true);
+    await closed;
+  });
+
+  it("a permanent consumer refusal fails the relay at once instead of retrying forever", async () => {
+    const fe = fakeFrontend();
+    fe.request = vi.fn().mockImplementation(async (method: string) => {
+      if (method === CAPABILITY_PERSIST_ARTIFACTS) {
+        throw Object.assign(new Error("authoring operation was superseded or already finished"), { name: "RpcResponseError", code: "CONFLICT", retriable: true });
+      }
+      return { ok: true };
+    });
+    const mgr = fakeManager();
+    mgr.get.mockReturnValue({ runId: "r1", status: "running" });
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await expect(driveCapabilitySession({
+        client: fakeClient([
+          { type: "syncArtifacts", artifacts: [{ path: "candidate/a.md", content: "# A" }] },
+          { type: "turn_done", text: "must not be consumed" },
+        ]),
+        runId: "r1", frontendClient: fe, manager: mgr,
+      })).rejects.toMatchObject({ name: "RelayArtifactRejectedError" });
+    } finally {
+      errSpy.mockRestore();
+    }
+    expect(fe.request.mock.calls.filter((c: any[]) => c[0] === CAPABILITY_PERSIST_ARTIFACTS)).toHaveLength(1);
+    expect(emits(fe).some((event: any) => event.type === "summary" && /refused to save/.test(event.payload.text))).toBe(true);
+    expect(emits(fe).some((event: any) => event.type === "turn")).toBe(false);
+  });
+
+  it("a transient persistence outage is bounded by a deadline", async () => {
+    vi.useFakeTimers();
+    const fe = fakeFrontend();
+    fe.request = vi.fn().mockImplementation(async (method: string) => {
+      if (method === CAPABILITY_PERSIST_ARTIFACTS) throw new Error("FrontendWsClient is not connected");
+      return { ok: true };
+    });
+    const mgr = fakeManager();
+    mgr.get.mockReturnValue({ runId: "r1", status: "running" });
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const outcome = driveCapabilitySession({
+        client: fakeClient([{ type: "syncArtifacts", artifacts: [{ path: "candidate/a.md", content: "# A" }] }]),
+        runId: "r1", frontendClient: fe, manager: mgr,
+      });
+      const settled = expect(outcome).rejects.toMatchObject({ name: "RelayArtifactPersistenceError", message: expect.stringContaining("did not succeed within") });
+      await vi.advanceTimersByTimeAsync(11 * 60_000);
+      await settled;
+    } finally {
+      errSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
   it("stops retrying when the run is cancelled or reaped", async () => {
     const fe = fakeFrontend();
     let attempts = 0;

@@ -2654,6 +2654,43 @@ def test_media_citing_pages_via_attribution_edge():
     print("OK  media_citing_pages via attribution edge (doc-only citation still verifies embedded images)")
 
 
+def test_media_citing_pages_via_mdx_site_root_embed():
+    """A docs-site archive (Mintlify) embeds screenshots from .mdx pages with
+    site-root paths. A page citing that document must inherit those images for
+    review, while the coverage edges stay the control plane's .md-only reading."""
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "raw/gpu/cluster/manage-namespaces.mdx",
+            "---\ntitle: NS\n---\n1. Choose billing type, region and image.\n"
+            "![create](/gpu/cluster/media/create-ns.png)\n"
+            "<Frame><img src=\"/gpu/cluster/media/list-ns.png\" /></Frame>\n"
+            "![rel](media/release-ns.png)\n"
+            "![remote](https://cdn.example.com/x.png)\n"
+            "```md\n![example](/gpu/cluster/media/in-code.png)\n```\n")
+        for name in ("create-ns", "list-ns", "release-ns", "in-code"):
+            _mk(base, f"raw/gpu/cluster/media/{name}.png")
+        # A site nested below Raw resolves site-root targets against its own root.
+        _mk(base, "raw/site/docs.json", "{}")
+        _mk(base, "raw/site/guide/start.mdx", "![s](/guide/media/start.png)\n")
+        _mk(base, "raw/site/guide/media/start.png")
+        _mk(base, "candidate/index.md",
+            "---\nokf_version: \"0.2\"\n---\n# Index\n- [ns](ns.md)\n- [g](g.md)")
+        _mk(base, "candidate/ns.md",
+            "---\ntype: Topic\nsources:\n  - resource: gpu/cluster/manage-namespaces.mdx\n---\nCreate a namespace.")
+        _mk(base, "candidate/g.md",
+            "---\ntype: Topic\nsources:\n  - resource: site/guide/start.mdx\n---\nStart.")
+        citing = selfcheck.media_citing_pages(td)
+        assert citing == {
+            "g.md": ["site/guide/media/start.png"],
+            "ns.md": ["gpu/cluster/media/create-ns.png", "gpu/cluster/media/list-ns.png",
+                      "gpu/cluster/media/release-ns.png"],
+        }, citing
+        assert sorted(selfcheck.pending_media_verification(td)) == ["g.md", "ns.md"]
+        # Coverage parity: the control-plane-mirrored edges are unchanged.
+        assert selfcheck.asset_attribution_edges(td) == {}, selfcheck.asset_attribution_edges(td)
+    print("OK  media_citing_pages via .mdx site-root embeds (coverage edges unchanged)")
+
+
 def test_asset_provenance_fixture():
     """Local attribution receipts and Raw coverage match the fixture."""
     fx = Path(__file__).resolve().parent / "fixtures" / "asset-provenance"
@@ -2799,6 +2836,7 @@ def main():
     test_document_link_targets()
     test_coverage_v2_auto_attach()
     test_media_citing_pages_via_attribution_edge()
+    test_media_citing_pages_via_mdx_site_root_embed()
     test_asset_provenance_fixture()
     test_body_source_annotations()
     test_code_body_source_annotations_are_first_class_provenance()
