@@ -71,6 +71,53 @@ def test_no_site_config_only_frontmatter_counts():
         assert signals == {"a.md": [{"signal": sp.HIDDEN, "detail": "hidden: true"}]}, signals
 
 
+def test_ignore_rules_follow_gitignore_globstar():
+    cases = [
+        ("x.draft.mdx", "**/*.draft.mdx", True),
+        ("a/b/x.draft.mdx", "**/*.draft.mdx", True),
+        ("a/b/drafts/x.mdx", "**/drafts/", True),
+        ("a/internal/b/c.mdx", "**/internal/**", True),
+        ("a/c.mdx", "a/**/c.mdx", True),
+        ("a/b/c.mdx", "a/**/c.mdx", True),
+        ("a/drafts/x.mdx", "drafts/", True),
+        ("drafts", "drafts/", False),  # a file named like the directory
+        ("guide/a.mdx", "guide/*.mdx", True),
+        ("guide/sub/a.mdx", "guide/*.mdx", False),
+        ("x/guide/a.mdx", "/guide/a.mdx", False),
+        ("a/d.mdx", "a/[!bc].mdx", True),
+        ("a/b.mdx", "a/[!bc].mdx", False),
+    ]
+    wrong = [(rel, pattern) for rel, pattern, expected in cases if sp._ignore_match(rel, pattern) != expected]
+    assert not wrong, wrong
+
+
+def test_group_root_page_is_in_navigation():
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "raw/docs.json", json.dumps({"navigation": {"groups": [
+            {"group": "Guide", "root": "guide/overview", "pages": ["guide/a"]}]}}))
+        _mk(base, "raw/guide/overview.mdx", "---\ntitle: O\n---\nbody")
+        _mk(base, "raw/guide/a.mdx", "---\ntitle: A\n---\nbody")
+        _mk(base, "raw/guide/orphan.mdx", "---\ntitle: X\n---\nbody")
+        signals = sp.publication_signals(td, selfcheck.source_inventory(td))
+        assert set(signals) == {"guide/orphan.mdx"}, signals
+
+
+def test_fingerprint_follows_site_files_not_only_paths():
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _site(base)
+        sources = selfcheck.source_inventory(td)
+        before = sp.publication_fingerprint(td, sources)
+        assert sp.publication_fingerprint(td, sources) == before
+        _mk(base, "raw/.mintignore", "gpu/\n")  # outside the inventory
+        after_ignore = sp.publication_fingerprint(td, sources)
+        assert after_ignore != before
+        _mk(base, "raw/gpu/overview.mdx", "---\ntitle: GPU\nhidden: true\n---\nbody")
+        assert sp.publication_fingerprint(td, sources) != after_ignore
+        assert selfcheck.source_inventory(td) == sources  # same paths throughout
+
+
 def test_notice_is_bounded_and_advisory():
     signals = {f"s/p{i:02d}.mdx": [{"signal": sp.HIDDEN, "detail": "hidden: true"}] for i in range(30)}
     notice = sp.publication_notice(signals, en=True, limit=5)

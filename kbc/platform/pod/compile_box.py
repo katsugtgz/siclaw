@@ -4607,11 +4607,12 @@ _PUBLICATION_CACHE: dict[str, tuple[int, dict[str, list[dict]]]] = {}
 def _source_publication_signals(workdir: str) -> dict[str, list[dict]]:
     """Per-source publication status from the documentation site's own files.
     Advisory context only: a failure means "no signal", never a blocked turn.
-    Raw is frozen during a compile, so one scan per inventory serves every
-    batch hand-off of a long train (one entry per workdir)."""
+    One scan serves every batch hand-off of a long train while the site's
+    files are unchanged (one entry per workdir; a later run may bring new Raw
+    to the same workdir, so the key covers the files the signals read)."""
     try:
         sources = selfcheck.source_inventory(workdir)
-        key = hash(tuple(sources))
+        key = source_publication.publication_fingerprint(workdir, sources)
         cached = _PUBLICATION_CACHE.get(workdir)
         if cached is not None and cached[0] == key:
             return cached[1]
