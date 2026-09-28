@@ -39,6 +39,7 @@ describe("product support result MCP", () => {
               description?: { minLength?: number; maxLength?: number };
               evidence?: { maxItems?: number };
               missing_fields?: { maxItems?: number; items?: { pattern?: string } };
+              modules?: { maxItems?: number; items?: { pattern?: string; maxLength?: number } };
               llm?: {
                 properties?: {
                   region?: { enum?: string[] };
@@ -57,6 +58,10 @@ describe("product support result MCP", () => {
         "requirement",
       ]);
       expect(advertisedSchema.properties?.info?.required).not.toContain("llm");
+      expect(advertisedSchema.properties?.info?.required).not.toContain("modules");
+      expect(advertisedSchema.properties?.info?.properties?.modules?.maxItems).toBe(10);
+      expect(advertisedSchema.properties?.info?.properties?.modules?.items?.pattern).toBe("^[a-z][a-z0-9_-]*$");
+      expect(advertisedSchema.properties?.info?.properties?.modules?.items?.maxLength).toBe(64);
       expect(advertisedSchema.properties?.info?.properties?.llm?.properties?.region?.enum).toEqual(["", "domestic", "overseas"]);
       expect(advertisedSchema.properties?.info?.properties?.llm?.properties?.aspect?.enum).toEqual(["", "platform_api", "network", "model"]);
       expect(advertisedSchema.properties?.info?.properties?.summary?.maxLength).toBe(200);
@@ -99,6 +104,7 @@ describe("product support result MCP", () => {
           description: "User cannot find the access setting.",
           evidence: [],
           missing_fields: [],
+          modules: [],
           llm: { region: "", aspect: "", model: "" },
         },
       });

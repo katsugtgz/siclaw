@@ -3,7 +3,7 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { LIMITS, MISSING_FIELD_PATTERN, parseProductSupportResult } from "./result.js";
+import { LIMITS, MISSING_FIELD_PATTERN, MODULE_ID_PATTERN, parseProductSupportResult } from "./result.js";
 
 export const TOOL_NAME = "submit_product_support_result";
 
@@ -67,6 +67,18 @@ const inputSchema = {
             pattern: MISSING_FIELD_PATTERN,
           },
         },
+        modules: {
+          type: "array",
+          description:
+            "Optional; absent means empty. Component tags for this issue: module_id values from the component catalogue the Agent was given, each a first-level product, second-level system or third-level component. Tag the most specific level the conversation and knowledge support and never a guessed deeper one; several tags may be combined, across products, but not a component together with its own parent. Empty means no component is established yet. Resubmit the full current set on every turn. Never required for label=true. Items are trimmed and post-trim duplicates are removed.",
+          maxItems: LIMITS.modulesMaxItems,
+          items: {
+            type: "string",
+            minLength: 1,
+            maxLength: LIMITS.moduleIdMaxChars,
+            pattern: MODULE_ID_PATTERN,
+          },
+        },
         llm: {
           type: "object",
           additionalProperties: false,
@@ -98,7 +110,7 @@ const inputSchema = {
 
 export function createProductSupportResultServer(): Server {
   const server = new Server(
-    { name: "mcp-product-support-result", version: "0.4.0" },
+    { name: "mcp-product-support-result", version: "0.5.0" },
     { capabilities: { tools: {} } },
   );
 
