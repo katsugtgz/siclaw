@@ -3,7 +3,7 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { LIMITS, parseTicketWatchResult, STATES } from "./result.js";
+import { LIMITS, parseTicketWatchResult, STATES, MODULE_ID_PATTERN } from "./result.js";
 
 export const TOOL_NAME = "submit_ticket_watch_result";
 
@@ -89,6 +89,33 @@ const inputSchema = {
         },
       },
     },
+    closure: {
+      type: "object",
+      additionalProperties: false,
+      description:
+        "Your current proposal for the ticket's closure fields — what the engineer will confirm when they mark the ticket resolved. The harness writes result_type and result to the ticket and keeps modules until the ticket system can store them. Each field you send REPLACES your previous proposal for it; each field you omit keeps it. A field the engineer has changed on the ticket is theirs from then on: your brief names it as held, and resubmitting it changes nothing. Change a field only when the evidence changed; every change is audited on the ticket.",
+      properties: {
+        modules: {
+          type: "array",
+          maxItems: LIMITS.maxModules,
+          items: { type: "string", maxLength: LIMITS.moduleIdMaxChars, pattern: MODULE_ID_PATTERN },
+          description:
+            "The components this issue concerns, as module_id values from the ticket-modules skill: a first-level product, second-level system or third-level component. Aim for the third level once an investigation or the engineer has established the component; until then keep the level the evidence supports. Send the complete current set; [] means no component is established.",
+        },
+        result_type: {
+          type: "string",
+          maxLength: LIMITS.resultTypeMaxChars,
+          description:
+            "The fault type — or, for a consultation, the consultation type — as a short single-line category in the ticket's language, without trailing punctuation. Propose it only once an investigation or the engineer has established the category; omit it until then.",
+        },
+        result: {
+          type: "string",
+          maxLength: LIMITS.resultMaxChars,
+          description:
+            "For a fault, the cause and what was done; for a consultation, the answer given. The customer reads it when the engineer marks the ticket resolved, so write only what can be shown as written: established facts, no internal hostnames, task ids or tool names, and say plainly when the cause is still undetermined.",
+        },
+      },
+    },
     note: {
       type: "string",
       maxLength: LIMITS.noteMaxChars,
@@ -100,7 +127,7 @@ const inputSchema = {
 
 export function createTicketWatchResultServer(): Server {
   const server = new Server(
-    { name: "mcp-ticket-watch-result", version: "0.1.0" },
+    { name: "mcp-ticket-watch-result", version: "0.2.0" },
     { capabilities: { tools: {} } },
   );
 

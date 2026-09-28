@@ -57,6 +57,9 @@ free conversation should be a separate Agent without this contract.
 | `understanding.ruled_out` | `{claim, by_task}` — causes an investigation excluded. | ≤10 entries; claim ≤300 |
 | `understanding.open_questions` | What is still unknown, including unproven suspicions. | ≤10 entries, ≤300 each |
 | `understanding.from_l1` | What the L1 engineer said that should outlive this run. | ≤10 entries, ≤300 each |
+| `closure.modules` | Component tags as the channel's `module_id` values, as a whole list. | ≤10 ids, `^[a-z][a-z0-9_-]*$`, ≤64 characters each, no repeats |
+| `closure.result_type` | Proposed fault or consultation type, one line. | ≤100 characters |
+| `closure.result` | Proposed cause and actions, or the answer, as the customer may read it. | ≤2000 characters |
 | `note` | One internal line about this run. Required when `state` is `done`. | ≤500 characters |
 
 Strings are returned trimmed; nothing is coerced, defaulted or truncated.
@@ -105,6 +108,21 @@ cannot check that the task exists or that it concluded any such thing. That
 check belongs to the harness, which knows the ticket's own task history; until
 it lands, the guarantee here is structural, not evidential.
 
+### Closure fields are a proposal, and the harness writes them
+
+`closure` is the assistant's running proposal for what the engineer will
+confirm when they mark the ticket resolved: the components the issue concerns,
+the fault type and the cause. It follows the same present-replaces rule as
+`understanding`.
+
+The tool writes nothing. The harness writes `result_type` and `result` to the
+ticket after the turn is stored, and it is the harness that can see what this
+tool cannot: it reads the ticket first, never overwrites a field a person has
+changed (that field is theirs from then on), and stops writing once the ticket
+leaves the handling states. `modules` is kept by the harness until the ticket
+system can store it. The engineer's resolve form shows the current values as
+defaults, so the person confirming is always the last writer.
+
 ## What is deliberately absent
 
 - **No state the agent can reschedule itself with.** The lease, the fencing
@@ -113,12 +131,12 @@ it lands, the guarantee here is structural, not evidential.
 - **No `stalled`.** It exists in the harness as its verdict after repeated
   failed runs. A run that believes it is stuck is still `watching` and says so
   in `note`.
-- **No text bound for the ticket or the group.** Whether a run may write a note
-  onto the ticket — and whether that goes through a gated tool or a field here —
-  is an open design question. Adding the field later is additive; shipping it
-  before the conflict-handling is decided would not be.
-- **No customer-visible field of any kind.** The customer never perceives this
-  assistant. `note` is internal to the team.
+- **No write the agent makes itself.** `closure` is a proposal; the harness
+  decides whether it reaches the ticket, as described above. Nothing is ever
+  written to the group.
+- **Nothing reaches the customer without a person.** `closure.result` becomes
+  customer-visible only when the engineer submits the resolve form, with the
+  proposal as its default. `note` stays internal to the team.
 
 ## Assistant and API setup
 

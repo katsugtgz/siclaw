@@ -266,3 +266,68 @@ describe("the envelope", () => {
     expect(() => parseTicketWatchResult(quietTurn({ note: "𝄞".repeat(LIMITS.noteMaxChars) }))).not.toThrow();
   });
 });
+
+describe("closure", () => {
+  it("carries the assistant's proposal for the ticket's closure fields", () => {
+    const parsed = parseTicketWatchResult(
+      quietTurn({
+        closure: {
+          modules: ["storage-object-upload", "billing"],
+          result_type: " 存储配额不足 ",
+          result: "对象存储配额已用满，扩容后上传恢复。",
+        },
+      }),
+    );
+    expect(parsed.closure).toEqual({
+      modules: ["storage-object-upload", "billing"],
+      result_type: "存储配额不足",
+      result: "对象存储配额已用满，扩容后上传恢复。",
+    });
+  });
+
+  it("replaces only the fields it names, and an empty proposal changes nothing", () => {
+    expect(parseTicketWatchResult(quietTurn({ closure: { modules: ["billing"] } })).closure).toEqual({
+      modules: ["billing"],
+    });
+    expect(parseTicketWatchResult(quietTurn({ closure: {} })).closure).toEqual({});
+    expect("closure" in parseTicketWatchResult(quietTurn())).toBe(false);
+  });
+
+  it("lets modules be emptied, since [] is a real retraction", () => {
+    expect(parseTicketWatchResult(quietTurn({ closure: { modules: [] } })).closure).toEqual({ modules: [] });
+  });
+
+  it("takes module ids in the channel's own form only", () => {
+    for (const bad of ["Billing", "storage object", "1st-level", "-billing", "对象存储"]) {
+      expect(() => parseTicketWatchResult(quietTurn({ closure: { modules: ["billing", bad] } }))).toThrow(
+        "input.closure.modules[1] must be a module_id",
+      );
+    }
+    expect(() => parseTicketWatchResult(quietTurn({ closure: { modules: ["billing", "billing"] } }))).toThrow(
+      "must not repeat a module_id",
+    );
+    expect(() =>
+      parseTicketWatchResult(
+        quietTurn({ closure: { modules: Array.from({ length: LIMITS.maxModules + 1 }, (_, i) => `module-${i}`) } }),
+      ),
+    ).toThrow(`at most ${LIMITS.maxModules} entries`);
+  });
+
+  it("keeps result_type to one line and refuses blank or null fields", () => {
+    expect(() => parseTicketWatchResult(quietTurn({ closure: { result_type: "网络\n故障" } }))).toThrow(
+      "input.closure.result_type must be a single line",
+    );
+    expect(() => parseTicketWatchResult(quietTurn({ closure: { result: "  " } }))).toThrow(
+      "input.closure.result must not be blank",
+    );
+    expect(() => parseTicketWatchResult(quietTurn({ closure: { result_type: null } }))).toThrow(
+      "input.closure.result_type must not be null",
+    );
+    expect(() => parseTicketWatchResult(quietTurn({ closure: { status: "resolved" } }))).toThrow(
+      "input.closure.status is not allowed",
+    );
+    expect(() =>
+      parseTicketWatchResult(quietTurn({ closure: { result: "因".repeat(LIMITS.resultMaxChars + 1) } })),
+    ).toThrow(`at most ${LIMITS.resultMaxChars} characters`);
+  });
+});

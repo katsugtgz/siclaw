@@ -59,7 +59,17 @@ export const LIMITS = {
   listItemMaxChars: 300,
   maxListItems: 10,
   noteMaxChars: 500,
+  /** The ticket channel's module_id column and its tag budget. */
+  moduleIdMaxChars: 64,
+  maxModules: 10,
+  /** Siticket's result_type is a single-line category; result is free text. */
+  resultTypeMaxChars: 100,
+  resultMaxChars: 2000,
 } as const;
+
+/** The ticket channel's own module_id rule. Existence is the harness's and the channel's check. */
+export const MODULE_ID_PATTERN = "^[a-z][a-z0-9_-]*$";
+const MODULE_ID_RE = new RegExp(MODULE_ID_PATTERN);
 
 /** One thing an investigation established is NOT the cause. */
 export interface RuledOut {
@@ -80,12 +90,28 @@ export interface Understanding {
   from_l1?: string[];
 }
 
+/**
+ * The assistant's current proposal for the ticket's closure fields — what the
+ * engineer will be asked to confirm when they mark the ticket resolved.
+ *
+ * Same field-level replace as `understanding`: a field present replaces the
+ * previous proposal for it, a field absent keeps it. The harness writes the
+ * ticket; this tool writes nothing and cannot tell whether a person has since
+ * edited a field, which is exactly why the write is not the model's to make.
+ */
+export interface Closure {
+  modules?: string[];
+  result_type?: string;
+  result?: string;
+}
+
 export interface TicketWatchResult {
   state: WatchState;
   next_check_after_seconds?: number;
   last_seen_message_id?: string;
   open_sre_tasks?: string[];
   understanding?: Understanding;
+  closure?: Closure;
   note?: string;
 }
 
@@ -95,8 +121,11 @@ const TOP_KEYS = new Set<keyof TicketWatchResult>([
   "last_seen_message_id",
   "open_sre_tasks",
   "understanding",
+  "closure",
   "note",
 ]);
+
+const CLOSURE_KEYS = new Set<keyof Closure>(["modules", "result_type", "result"]);
 
 const UNDERSTANDING_KEYS = new Set<keyof Understanding>([
   "timeline",
@@ -222,6 +251,49 @@ function readUnderstanding(value: unknown): Understanding {
   return understanding;
 }
 
+function readModules(value: unknown): string[] {
+  const path = "input.closure.modules";
+  const modules = readArray(value, path, LIMITS.maxModules).map((item, index) => {
+    const id = readText(item, `${path}[${index}]`, LIMITS.moduleIdMaxChars);
+    if (!MODULE_ID_RE.test(id)) {
+      throw new Error(`${path}[${index}] must be a module_id from the ticket-modules skill: lowercase letters, digits, '-' or '_', starting with a letter`);
+    }
+    return id;
+  });
+  if (new Set(modules).size !== modules.length) {
+    throw new Error(`${path} must not repeat a module_id`);
+  }
+  return modules;
+}
+
+function readClosure(value: unknown): Closure {
+  const record = readObject(value, "input.closure");
+  rejectUnknownKeys(record, CLOSURE_KEYS as Set<string>, "input.closure");
+  for (const key of Object.keys(record)) {
+    if (record[key] === null) {
+      throw new Error(`input.closure.${key} must not be null; omit the field to keep your previous proposal`);
+    }
+  }
+  // An empty object is legal and changes nothing, as with understanding.
+  const closure: Closure = {};
+  if ("modules" in record) {
+    closure.modules = readModules(record.modules);
+  }
+  if ("result_type" in record) {
+    const text = readText(record.result_type, "input.closure.result_type", LIMITS.resultTypeMaxChars);
+    // The ticket shows it as one line in the resolve card; a multi-line value
+    // would be flattened by whoever renders it next.
+    if (/[\r\n]/.test(text)) {
+      throw new Error("input.closure.result_type must be a single line");
+    }
+    closure.result_type = text;
+  }
+  if ("result" in record) {
+    closure.result = readText(record.result, "input.closure.result", LIMITS.resultMaxChars);
+  }
+  return closure;
+}
+
 function readCheckAfterSeconds(value: unknown): number {
   if (typeof value !== "number" || !Number.isInteger(value)) {
     throw new Error("input.next_check_after_seconds must be an integer number of seconds");
@@ -309,6 +381,9 @@ export function parseTicketWatchResult(input: unknown): TicketWatchResult {
   }
   if ("understanding" in record) {
     result.understanding = readUnderstanding(record.understanding);
+  }
+  if ("closure" in record) {
+    result.closure = readClosure(record.closure);
   }
   if ("note" in record) {
     result.note = readText(record.note, "input.note", LIMITS.noteMaxChars);
