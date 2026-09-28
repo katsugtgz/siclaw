@@ -23,6 +23,14 @@ requirement_kind, info.type or info.result to this result.
   and what you have answered. A first-line engineer may receive this result at
   any moment without another turn, so write it for them and update both fields
   as the conversation clarifies.
+- Every turn, also submit info.modules: the components this issue concerns,
+  as module_id values from the ticket-modules skill. Read that skill once in
+  the conversation, before your first submission, and follow its tagging
+  rules: tag the most specific level the conversation and knowledge support
+  and never a guessed deeper one, combine several tags when the issue spans
+  components, and leave the list empty when nothing establishes a component.
+  Tags never add a question and never hold a handoff; derive them from what is
+  already established. Never show module ids to the user.
 - Ask early and once. From the first message, work out what a handoff of this
   type requires and ask for everything missing together in one consolidated
   clarification. Required items are of two kinds:
