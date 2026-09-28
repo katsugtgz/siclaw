@@ -2569,9 +2569,10 @@ it("records a sub-agent's pre-execution security block as outcome=blocked, not s
     },
   }));
   const req = { description: "Inspect node", renderedTasks: [{ item: "node", prompt: "Inspect containerd" }],
-    subagentType: "general-purpose", runInBackground: false, parentSessionId: "parent", parentAgentId: "agent", userId: "user", taskListId: "ledger", spawnId: "initial",
-    onProgress: (p: any) => { if (p?.steps) steps.splice(0, steps.length, ...p.steps); } };
-  await mgr.createSpawnSubagentExecutor()(req);
+    subagentType: "general-purpose", runInBackground: false, parentSessionId: "parent", parentAgentId: "agent", userId: "user", taskListId: "ledger", spawnId: "initial" };
+  await mgr.createSpawnSubagentExecutor()(req, (p: any) => {
+    if (p?.steps) steps.splice(0, steps.length, ...p.steps);
+  });
   await vi.waitFor(() => expect(mgr.subagentRuns.size).toBe(0));
   const tools = persisted.filter(row => row.role === "tool");
   expect(tools.map(row => row.outcome)).toEqual(["blocked", "error", "error", "success"]);
@@ -2579,9 +2580,11 @@ it("records a sub-agent's pre-execution security block as outcome=blocked, not s
   // The persisted metadata drops the blocked/error flags (they are the outcome) but keeps the reason.
   expect(tools[0].metadata).toMatchObject({ reason: "command_blocked" });
   expect(tools[0].metadata.blocked).toBeUndefined();
-  // Live steps streamed to the parent card carry the same outcome.
+  // Live cards keep a binary outcome: a blocked call is shown as an error,
+  // while the persisted row above retains the distinct blocked outcome.
   const liveTools = steps.filter(s => s.kind === "tool");
-  if (liveTools.length) expect(liveTools.map(s => s.outcome)).toEqual(["blocked", "error", "error", "success"]);
+  expect(liveTools).toHaveLength(4);
+  expect(liveTools.map(s => s.outcome)).toEqual(["error", "error", "error", "success"]);
 });
 
 it("records a synthetic-turn tool result's security block as outcome=blocked", async () => {
