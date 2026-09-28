@@ -2544,6 +2544,58 @@ it("persists guidance delivered to a live child", async () => {
 });
 
 
+it("records a sub-agent's pre-execution security block as outcome=blocked, not success", async () => {
+  // Regression: delegated (a2a) sessions derived the tool outcome from isError alone. A checker
+  // block returns isError=false with details.blocked=true and the block JSON as content, so
+  // 2,120 of 3,404 production blocks were stored as "success" (top-level rows say "blocked").
+  const mgr = new AgentBoxSessionManager() as any;
+  const persisted: any[] = [];
+  mgr.persistEnsureChatSession = async () => {};
+  mgr.persistAppendMessage = async (row: any) => { persisted.push(row); return "row"; };
+  mgr.persistAppendDelegationEvent = async () => {};
+  const blockJson = JSON.stringify({ error: 'journalctl "-24h" is not allowed.' }, null, 2);
+  const steps: any[] = [];
+  (globalThis as any).__fakeBrainFactories.push((emitter: any) => ({
+    prompt: async () => {
+      const tool = (id: string, result: any, isError: boolean, cmd: string) => {
+        emitter.emit("event", { type: "tool_execution_start", toolCallId: id, toolName: "node_exec", args: { command: cmd } });
+        emitter.emit("event", { type: "tool_execution_end", toolCallId: id, toolName: "node_exec", result, isError });
+      };
+      tool("c1", { content: [{ type: "text", text: blockJson }], details: { blocked: true, reason: "command_blocked" } }, false, "journalctl -u containerd --since '-24h'");
+      tool("c2", { content: [{ type: "text", text: "boom" }], details: { error: true } }, false, "false");
+      tool("c3", { content: [{ type: "text", text: "thrown" }] }, true, "exit 1");
+      tool("c4", { content: [{ type: "text", text: "ok" }], details: { exitCode: 0 } }, false, "uptime");
+      emitter.emit("event", { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Done" }] } });
+    },
+  }));
+  const req = { description: "Inspect node", renderedTasks: [{ item: "node", prompt: "Inspect containerd" }],
+    subagentType: "general-purpose", runInBackground: false, parentSessionId: "parent", parentAgentId: "agent", userId: "user", taskListId: "ledger", spawnId: "initial",
+    onProgress: (p: any) => { if (p?.steps) steps.splice(0, steps.length, ...p.steps); } };
+  await mgr.createSpawnSubagentExecutor()(req);
+  await vi.waitFor(() => expect(mgr.subagentRuns.size).toBe(0));
+  const tools = persisted.filter(row => row.role === "tool");
+  expect(tools.map(row => row.outcome)).toEqual(["blocked", "error", "error", "success"]);
+  expect(tools[0]).toMatchObject({ toolName: "node_exec", content: blockJson, sessionId: expect.any(String), delegationId: "initial" });
+  // The persisted metadata drops the blocked/error flags (they are the outcome) but keeps the reason.
+  expect(tools[0].metadata).toMatchObject({ reason: "command_blocked" });
+  expect(tools[0].metadata.blocked).toBeUndefined();
+  // Live steps streamed to the parent card carry the same outcome.
+  const liveTools = steps.filter(s => s.kind === "tool");
+  if (liveTools.length) expect(liveTools.map(s => s.outcome)).toEqual(["blocked", "error", "error", "success"]);
+});
+
+it("records a synthetic-turn tool result's security block as outcome=blocked", async () => {
+  const mgr = new AgentBoxSessionManager() as any;
+  const persisted: any[] = [];
+  mgr.persistAppendMessage = async (row: any) => { persisted.push(row); return "row"; };
+  await mgr.persistSyntheticMessage("s", { role: "toolResult", toolName: "bash", isError: false,
+    content: [{ type: "text", text: '{"error": "rm is not allowed."}' }], details: { blocked: true, reason: "command_blocked" } });
+  await mgr.persistSyntheticMessage("s", { role: "toolResult", toolName: "bash", isError: true, content: [{ type: "text", text: "x" }] });
+  await mgr.persistSyntheticMessage("s", { role: "toolResult", toolName: "bash", isError: false, content: [{ type: "text", text: "x" }] });
+  expect(persisted.map(row => row.outcome)).toEqual(["blocked", "error", "success"]);
+  expect(persisted[0].metadata).toEqual({ reason: "command_blocked" });
+});
+
 it("rejects an unusable transcript instead of silently resuming empty context", async () => {
   const mgr = new AgentBoxSessionManager() as any;
   const req = {description: "Inspect", renderedTasks: [{item: "node", prompt: "Inspect"}],

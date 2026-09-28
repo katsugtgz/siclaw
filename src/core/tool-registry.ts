@@ -136,7 +136,7 @@ export interface SubagentStep {
   toolName?: string;
   toolInput?: string;
   content?: string;
-  outcome?: "success" | "error";
+  outcome?: "success" | "error" | "blocked";
   durationMs?: number | null;
 }
 
