@@ -56,6 +56,15 @@ describe("ticket watch result MCP", () => {
         "open_questions",
         "from_l1",
       ]);
+      const closure = schema.properties?.closure as {
+        additionalProperties?: boolean;
+        properties?: Record<string, Record<string, unknown>>;
+      };
+      expect(closure.additionalProperties).toBe(false);
+      expect(Object.keys(closure.properties ?? {})).toEqual(["modules", "result_type", "result"]);
+      expect((closure.properties?.modules?.items as { pattern?: string }).pattern).toBe("^[a-z][a-z0-9_-]*$");
+      expect(closure.properties?.result_type?.maxLength).toBe(LIMITS.resultTypeMaxChars);
+      expect(closure.properties?.result?.maxLength).toBe(LIMITS.resultMaxChars);
       const ruledOut = understanding.properties?.ruled_out as {
         items?: { required?: string[] };
       };

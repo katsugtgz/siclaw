@@ -46,6 +46,7 @@ describe("parseProductSupportResult", () => {
         description: "task-123 remains Pending.",
         evidence: ["task_id=task-123", "status=Pending"],
         missing_fields: [],
+        modules: [],
         llm: { region: "", aspect: "", model: "" },
       },
     });
@@ -150,6 +151,12 @@ describe("parseProductSupportResult", () => {
       };
       expect(() => parseProductSupportResult(input)).toThrow(/lowercase snake_case field identifier/);
     }
+  });
+
+  it("checks identifier patterns on the value as sent, as the host does before dispatch", () => {
+    const input = validResult({ label: false });
+    input.info = { ...(input.info as Record<string, unknown>), missing_fields: [" module "] };
+    expect(() => parseProductSupportResult(input)).toThrow(/missing_fields\[0\] must be a lowercase snake_case field identifier/);
   });
 
   it("rejects extra fields at both schema levels", () => {
@@ -361,5 +368,57 @@ describe("parseProductSupportResult", () => {
     const partial = validResult();
     partial.info = { ...(partial.info as Record<string, unknown>), llm: { region: "", aspect: "" } };
     expect(() => parseProductSupportResult(partial)).toThrow(/input\.info\.llm\.model is required/);
+  });
+
+  it("carries component tags at any level, deduplicated", () => {
+    const input = validResult();
+    input.info = {
+      ...(input.info as Record<string, unknown>),
+      modules: ["storage-object-upload", "billing", "storage-object-upload", "platform_ops"],
+    };
+    expect(parseProductSupportResult(input).info.modules).toEqual([
+      "storage-object-upload",
+      "billing",
+      "platform_ops",
+    ]);
+  });
+
+  it("treats absent or empty modules as no component established, even on a handoff", () => {
+    const absent = validResult();
+    delete (absent.info as Record<string, unknown>).modules;
+    expect(parseProductSupportResult(absent).info.modules).toEqual([]);
+
+    const empty = validResult({ label: false });
+    empty.info = { ...(empty.info as Record<string, unknown>), modules: [] };
+    expect(parseProductSupportResult(empty).info.modules).toEqual([]);
+  });
+
+  it("rejects values that are not module ids, at the caller's index", () => {
+    // " billing " too: the host refuses it against the advertised pattern before
+    // dispatch, so the parser must not quietly accept it on the other path.
+    for (const bad of ["GPU Cloud", "gpu cloud", "1st-level", "-gpu", "日志服务", " billing ", "billing "]) {
+      const input = validResult();
+      input.info = { ...(input.info as Record<string, unknown>), modules: ["billing", bad] };
+      expect(() => parseProductSupportResult(input)).toThrow(/input\.info\.modules\[1\] must be a module_id/);
+    }
+    const blank = validResult();
+    blank.info = { ...(blank.info as Record<string, unknown>), modules: ["  "] };
+    expect(() => parseProductSupportResult(blank)).toThrow(/input\.info\.modules\[0\] must not be blank/);
+    const notArray = validResult();
+    notArray.info = { ...(notArray.info as Record<string, unknown>), modules: "billing" };
+    expect(() => parseProductSupportResult(notArray)).toThrow(/input\.info\.modules must be an array of strings/);
+  });
+
+  it("bounds component tags by count and id length", () => {
+    const many = validResult();
+    many.info = {
+      ...(many.info as Record<string, unknown>),
+      modules: Array.from({ length: LIMITS.modulesMaxItems + 1 }, (_, i) => `module-${i}`),
+    };
+    expect(() => parseProductSupportResult(many)).toThrow(/input\.info\.modules must have at most 10 items/);
+
+    const long = validResult();
+    long.info = { ...(long.info as Record<string, unknown>), modules: ["m" + "a".repeat(LIMITS.moduleIdMaxChars)] };
+    expect(() => parseProductSupportResult(long)).toThrow(/input\.info\.modules\[0\] must be at most 64 characters/);
   });
 });

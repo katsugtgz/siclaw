@@ -97,6 +97,29 @@ is never read as an established fact; unconfirmed clues belong in
 fields are empty, which is the correct value for every type except
 `llm_incident`. It is always present in the returned result.
 
+### Component tags (`modules`)
+
+`modules` lists the components the issue concerns, as `module_id` values from
+the component catalogue the Agent was given. A tag may be a first-level
+product, a second-level system or a third-level component, and several may be
+combined, across products:
+
+```json
+"modules": ["storage-object-upload", "billing"]
+```
+
+Tags are best effort. The Agent tags the most specific level the conversation
+and product knowledge support, never a guessed deeper one, and resubmits the
+full current set on every turn. An empty list means no component is
+established yet; there is no placeholder value for "unknown". Tags never gate
+a handoff: a `label=true` result is valid with an empty list.
+
+Each item must match the channel's `module_id` rule, `^[a-z][a-z0-9_-]*$`.
+Whether the id exists is the channel's check, not this server's: the server
+has no catalogue and makes no calls. The field is optional on input, so a
+prompt that predates it keeps producing accepted results; it is always present
+in the returned result.
+
 ### Size limits
 
 The validated result is persisted downstream as one row's metadata, so every
@@ -110,6 +133,7 @@ shorten it. Limits are in characters, not bytes.
 | `product`, `llm.model` | 128 |
 | `evidence` | 20 items, 300 characters each |
 | `missing_fields` | 20 items, 64 characters each |
+| `modules` | 10 items, 64 characters each |
 
 Limits apply to the raw value before trimming, exactly as a host that
 validates the advertised schema before dispatch applies `maxLength`, so the
@@ -119,9 +143,12 @@ parser is never more lenient than the schema the model was shown.
 
 The parser mirrors the advertised JSON Schema and adds nothing the schema does
 not say: enum values (`ticket_type`, `llm.region`, `llm.aspect`) must be the
-exact lowercase spelling. String fields are trimmed. `evidence` and
-`missing_fields` items are trimmed and post-trim duplicates are removed, so the
-returned arrays can be shorter than the caller's.
+exact lowercase spelling. String fields are trimmed. `evidence` items are
+trimmed and post-trim duplicates are removed. `missing_fields` and `modules`
+items must match their advertised pattern exactly as sent — the host checks
+that pattern before dispatch, so surrounding spaces are refused rather than
+trimmed — and duplicates are removed. The returned arrays can therefore be
+shorter than the caller's.
 
 The server validates each call independently. It does not know Siclaw session
 or turn identity, so "exactly one successful result per turn" is not enforced

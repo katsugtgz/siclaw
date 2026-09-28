@@ -3,7 +3,7 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { LIMITS, MISSING_FIELD_PATTERN, parseProductSupportResult } from "./result.js";
+import { LIMITS, MISSING_FIELD_PATTERN, MODULE_ID_PATTERN, parseProductSupportResult } from "./result.js";
 
 export const TOOL_NAME = "submit_product_support_result";
 
@@ -58,13 +58,25 @@ const inputSchema = {
         missing_fields: {
           type: "array",
           description:
-            "Fields that still justify a user clarification, as machine identifiers only; never user-facing questions or diagnostic instructions. Must be empty for label=true; preserve unavailable facts in description instead of continuing questions after intake ends. Items are trimmed and post-trim duplicates are removed.",
+            "Fields that still justify a user clarification, as machine identifiers only; never user-facing questions or diagnostic instructions. Must be empty for label=true; preserve unavailable facts in description instead of continuing questions after intake ends. Each identifier must be sent exactly, without surrounding spaces; duplicates are removed.",
           maxItems: LIMITS.missingFieldsMaxItems,
           items: {
             type: "string",
             minLength: 1,
             maxLength: LIMITS.missingFieldMaxChars,
             pattern: MISSING_FIELD_PATTERN,
+          },
+        },
+        modules: {
+          type: "array",
+          description:
+            "Optional; absent means empty. Component tags for this issue: module_id values from the component catalogue the Agent was given, each a first-level product, second-level system or third-level component. Tag the most specific level the conversation and knowledge support and never a guessed deeper one; several tags may be combined, across products, but not a component together with its own parent. Empty means no component is established yet. Resubmit the full current set on every turn. Never required for label=true. Each id must be sent exactly, without surrounding spaces; duplicates are removed.",
+          maxItems: LIMITS.modulesMaxItems,
+          items: {
+            type: "string",
+            minLength: 1,
+            maxLength: LIMITS.moduleIdMaxChars,
+            pattern: MODULE_ID_PATTERN,
           },
         },
         llm: {
@@ -98,7 +110,7 @@ const inputSchema = {
 
 export function createProductSupportResultServer(): Server {
   const server = new Server(
-    { name: "mcp-product-support-result", version: "0.4.0" },
+    { name: "mcp-product-support-result", version: "0.5.0" },
     { capabilities: { tools: {} } },
   );
 

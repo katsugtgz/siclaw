@@ -39,6 +39,8 @@ export const LIMITS = {
   evidenceItemMaxChars: 300,
   missingFieldsMaxItems: 20,
   missingFieldMaxChars: 64,
+  modulesMaxItems: 10,
+  moduleIdMaxChars: 64,
 } as const;
 
 /**
@@ -61,6 +63,13 @@ export interface ProductSupportInfo {
   description: string;
   evidence: string[];
   missing_fields: string[];
+  /**
+   * Component tags: module_id values from the component catalogue the Agent
+   * was given, at whatever level the conversation supports. Empty means no
+   * component is established. Best effort on every turn and never a handoff
+   * requirement, so it constrains nothing below.
+   */
+  modules: string[];
   llm: LlmIncidentInfo;
 }
 
@@ -82,13 +91,20 @@ const INFO_KEYS = new Set([
 // four of the five ticket types, so requiring the block would only turn the
 // most common shape into a host-side schema rejection on the turn's one
 // mandatory tool call.
-const INFO_OPTIONAL_KEYS = new Set(["llm"]);
+// modules is optional for the same reason, and because a prompt that predates
+// the field must keep producing accepted results: absent means "no component
+// established", which is also its most common value.
+const INFO_OPTIONAL_KEYS = new Set(["llm", "modules"]);
 const LLM_KEYS = new Set(["region", "aspect", "model"]);
 const TICKET_TYPE_SET = new Set<string>(TICKET_TYPES);
 const LLM_REGION_SET = new Set<string>(LLM_REGIONS);
 const LLM_ASPECT_SET = new Set<string>(LLM_ASPECTS);
 export const MISSING_FIELD_PATTERN = "^[a-z][a-z0-9_]*$";
 const MISSING_FIELD_RE = new RegExp(MISSING_FIELD_PATTERN);
+// The channel's own module_id rule. Whether an id exists is the channel's
+// check: this server has no catalogue and makes no calls.
+export const MODULE_ID_PATTERN = "^[a-z][a-z0-9_-]*$";
+const MODULE_ID_RE = new RegExp(MODULE_ID_PATTERN);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -153,7 +169,12 @@ function readEnum<T extends string>(
 interface StringArrayRules {
   maxItems: number;
   itemMaxChars: number;
-  /** Validated against each item at its ORIGINAL index, before dedup. */
+  /**
+   * Validated against each item's RAW value at its ORIGINAL index, before
+   * dedup. Raw, because the host checks the advertised pattern before dispatch:
+   * trimming first would make this parser accept " id " while the primary path
+   * refuses it, and the model would learn the rule from a retry.
+   */
   itemPattern?: { re: RegExp; message: string };
 }
 
@@ -173,7 +194,7 @@ function readStringArray(value: unknown, path: string, rules: StringArrayRules):
     if (text.length === 0) {
       throw new Error(`${itemPath} must not be blank`);
     }
-    if (rules.itemPattern && !rules.itemPattern.re.test(text)) {
+    if (rules.itemPattern && !rules.itemPattern.re.test(item as string)) {
       throw new Error(`${itemPath} ${rules.itemPattern.message}`);
     }
     // Post-trim duplicates are dropped; this canonicalization is documented in
@@ -244,6 +265,17 @@ export function parseProductSupportResult(input: unknown): ProductSupportResult 
           message: "must be a lowercase snake_case field identifier",
         },
       }),
+      modules:
+        input.info.modules === undefined
+          ? []
+          : readStringArray(input.info.modules, "input.info.modules", {
+              maxItems: LIMITS.modulesMaxItems,
+              itemMaxChars: LIMITS.moduleIdMaxChars,
+              itemPattern: {
+                re: MODULE_ID_RE,
+                message: "must be a module_id: lowercase letters, digits, '-' or '_', starting with a letter",
+              },
+            }),
       llm:
         input.info.llm === undefined
           ? { region: "", aspect: "", model: "" }
