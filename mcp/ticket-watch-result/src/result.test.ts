@@ -298,7 +298,7 @@ describe("closure", () => {
   });
 
   it("takes module ids in the channel's own form only", () => {
-    for (const bad of ["Billing", "storage object", "1st-level", "-billing", "对象存储"]) {
+    for (const bad of ["Billing", "storage object", "1st-level", "-billing", "对象存储", " billing "]) {
       expect(() => parseTicketWatchResult(quietTurn({ closure: { modules: ["billing", bad] } }))).toThrow(
         "input.closure.modules[1] must be a module_id",
       );
