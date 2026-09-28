@@ -255,7 +255,9 @@ function readModules(value: unknown): string[] {
   const path = "input.closure.modules";
   const modules = readArray(value, path, LIMITS.maxModules).map((item, index) => {
     const id = readText(item, `${path}[${index}]`, LIMITS.moduleIdMaxChars);
-    if (!MODULE_ID_RE.test(id)) {
+    // On the raw value: the host checks the advertised pattern before dispatch,
+    // so a trimmed " id " accepted here would be refused on the primary path.
+    if (!MODULE_ID_RE.test(item as string)) {
       throw new Error(`${path}[${index}] must be a module_id from the ticket-modules skill: lowercase letters, digits, '-' or '_', starting with a letter`);
     }
     return id;
