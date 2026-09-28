@@ -143,9 +143,12 @@ parser is never more lenient than the schema the model was shown.
 
 The parser mirrors the advertised JSON Schema and adds nothing the schema does
 not say: enum values (`ticket_type`, `llm.region`, `llm.aspect`) must be the
-exact lowercase spelling. String fields are trimmed. `evidence`,
-`missing_fields` and `modules` items are trimmed and post-trim duplicates are
-removed, so the returned arrays can be shorter than the caller's.
+exact lowercase spelling. String fields are trimmed. `evidence` items are
+trimmed and post-trim duplicates are removed. `missing_fields` and `modules`
+items must match their advertised pattern exactly as sent — the host checks
+that pattern before dispatch, so surrounding spaces are refused rather than
+trimmed — and duplicates are removed. The returned arrays can therefore be
+shorter than the caller's.
 
 The server validates each call independently. It does not know Siclaw session
 or turn identity, so "exactly one successful result per turn" is not enforced

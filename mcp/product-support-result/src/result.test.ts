@@ -153,6 +153,12 @@ describe("parseProductSupportResult", () => {
     }
   });
 
+  it("checks identifier patterns on the value as sent, as the host does before dispatch", () => {
+    const input = validResult({ label: false });
+    input.info = { ...(input.info as Record<string, unknown>), missing_fields: [" module "] };
+    expect(() => parseProductSupportResult(input)).toThrow(/missing_fields\[0\] must be a lowercase snake_case field identifier/);
+  });
+
   it("rejects extra fields at both schema levels", () => {
     expect(() => parseProductSupportResult({ ...validResult(), action: "create_ticket" })).toThrow(/input\.action is not allowed/);
 
@@ -364,11 +370,11 @@ describe("parseProductSupportResult", () => {
     expect(() => parseProductSupportResult(partial)).toThrow(/input\.info\.llm\.model is required/);
   });
 
-  it("carries component tags at any level, trimmed and deduplicated", () => {
+  it("carries component tags at any level, deduplicated", () => {
     const input = validResult();
     input.info = {
       ...(input.info as Record<string, unknown>),
-      modules: [" storage-object-upload ", "billing", "storage-object-upload", "platform_ops"],
+      modules: ["storage-object-upload", "billing", "storage-object-upload", "platform_ops"],
     };
     expect(parseProductSupportResult(input).info.modules).toEqual([
       "storage-object-upload",
@@ -388,7 +394,9 @@ describe("parseProductSupportResult", () => {
   });
 
   it("rejects values that are not module ids, at the caller's index", () => {
-    for (const bad of ["GPU Cloud", "gpu cloud", "1st-level", "-gpu", "日志服务"]) {
+    // " billing " too: the host refuses it against the advertised pattern before
+    // dispatch, so the parser must not quietly accept it on the other path.
+    for (const bad of ["GPU Cloud", "gpu cloud", "1st-level", "-gpu", "日志服务", " billing ", "billing "]) {
       const input = validResult();
       input.info = { ...(input.info as Record<string, unknown>), modules: ["billing", bad] };
       expect(() => parseProductSupportResult(input)).toThrow(/input\.info\.modules\[1\] must be a module_id/);
