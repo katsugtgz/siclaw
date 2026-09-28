@@ -169,7 +169,12 @@ function readEnum<T extends string>(
 interface StringArrayRules {
   maxItems: number;
   itemMaxChars: number;
-  /** Validated against each item at its ORIGINAL index, before dedup. */
+  /**
+   * Validated against each item's RAW value at its ORIGINAL index, before
+   * dedup. Raw, because the host checks the advertised pattern before dispatch:
+   * trimming first would make this parser accept " id " while the primary path
+   * refuses it, and the model would learn the rule from a retry.
+   */
   itemPattern?: { re: RegExp; message: string };
 }
 
@@ -189,7 +194,7 @@ function readStringArray(value: unknown, path: string, rules: StringArrayRules):
     if (text.length === 0) {
       throw new Error(`${itemPath} must not be blank`);
     }
-    if (rules.itemPattern && !rules.itemPattern.re.test(text)) {
+    if (rules.itemPattern && !rules.itemPattern.re.test(item as string)) {
       throw new Error(`${itemPath} ${rules.itemPattern.message}`);
     }
     // Post-trim duplicates are dropped; this canonicalization is documented in
