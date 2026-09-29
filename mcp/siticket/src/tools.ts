@@ -10,9 +10,30 @@ import { REQUESTS_PER_MINUTE, SiticketError } from "./client.js";
 export const MESSAGE_LIMIT_DEFAULT = 50;
 export const MESSAGE_LIMIT_MAX = 500;
 
+/**
+ * The image formats the runtime hands to the model (src/core/mcp-client.ts).
+ * SVG is left out on purpose: it is a document that happens to render, not a
+ * picture, and nothing a customer pastes into a group needs it.
+ */
+export const IMAGE_TYPES: readonly string[] = ["image/png", "image/jpeg", "image/webp"];
+/** The runtime's own cap on one inbound image (image-url-ingest.ts). */
+export const IMAGE_MAX_BYTES = 6 * 1024 * 1024;
+
 export interface ToolContext {
   client: SiticketClient;
   pinnedTicketId?: string;
+  /**
+   * Image attachment urls get_ticket_messages returned, per ticket. They are
+   * the only urls view_ticket_image fetches: an address the model read in a
+   * message's text, or made up, is never requested.
+   */
+  seenImages?: Map<string, Set<string>>;
+  /**
+   * Fetches an attachment. It must not carry the Siticket token: the url points
+   * at the object store, not at Siticket. Without one, images cannot be viewed.
+   */
+  fetchAttachment?: (url: string, signal: AbortSignal) => Promise<Response>;
+  requestTimeoutMs?: number;
 }
 
 /**
@@ -85,7 +106,108 @@ export async function getTicketMessages(ctx: ToolContext, args: Record<string, u
     limit,
     after_message_id: after,
   });
+  recordImages(ctx, ticketId, page);
   return annotateMessagePage(page);
+}
+
+/** Remembers the image attachments of a page, as Siticket returned them. */
+function recordImages(ctx: ToolContext, ticketId: string, page: unknown): void {
+  if (!ctx.seenImages || page === null || typeof page !== "object") return;
+  const messages = (page as { messages?: unknown }).messages;
+  if (!Array.isArray(messages)) return;
+  for (const message of messages) {
+    const attachments = (message as { attachments?: unknown } | null)?.attachments;
+    if (!Array.isArray(attachments)) continue;
+    for (const attachment of attachments) {
+      const { type, url } = (attachment ?? {}) as { type?: unknown; url?: unknown };
+      if (type !== "image" || typeof url !== "string" || !url) continue;
+      let seen = ctx.seenImages.get(ticketId);
+      if (!seen) {
+        seen = new Set();
+        ctx.seenImages.set(ticketId, seen);
+      }
+      seen.add(url);
+    }
+  }
+}
+
+export interface ViewedImage {
+  url: string;
+  mimeType: string;
+  bytes: number;
+  data: string;
+}
+
+/**
+ * Fetches one image attachment of the ticket's conversation for the model to
+ * look at: a customer's screenshot of an error is often the only exact record
+ * of it. Only urls get_ticket_messages returned for this ticket are fetched, a
+ * redirect is refused rather than followed, and the body is read against the
+ * size cap as it arrives, so a missing or false Content-Length cannot make the
+ * process buffer more than the cap.
+ */
+export async function viewTicketImage(ctx: ToolContext, args: Record<string, unknown>): Promise<ViewedImage> {
+  const ticketId = resolveTicketId(args.ticket_id, ctx.pinnedTicketId);
+  const url = typeof args.url === "string" ? args.url.trim() : "";
+  if (!url) throw new SiticketError("url is required");
+  if (!ctx.fetchAttachment || !ctx.seenImages) {
+    throw new SiticketError("Viewing images is not available in this session");
+  }
+  if (!ctx.seenImages.get(ticketId)?.has(url)) {
+    throw new SiticketError(
+      "Only an image attachment that get_ticket_messages returned for this ticket can be viewed. " +
+        "Read the messages first, and pass the attachment's url exactly as it was returned.",
+    );
+  }
+  if (!/^https?:\/\//i.test(url)) throw new SiticketError("The attachment url is not an http(s) address");
+
+  const controller = new AbortController();
+  const timeoutMs = ctx.requestTimeoutMs ?? 15000;
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    let response: Response;
+    try {
+      response = await ctx.fetchAttachment(url, controller.signal);
+    } catch (error) {
+      if (controller.signal.aborted) throw new SiticketError(`The image did not arrive within ${timeoutMs}ms`);
+      throw new SiticketError(`The image could not be fetched: ${(error as Error).message}`);
+    }
+    if (!response.ok) throw new SiticketError(`The image could not be fetched (HTTP ${response.status})`);
+    const mimeType = (response.headers.get("content-type") ?? "").split(";")[0].trim().toLowerCase();
+    if (!IMAGE_TYPES.includes(mimeType)) {
+      throw new SiticketError(`This attachment is ${mimeType || "of an unknown type"}, not an image that can be viewed`);
+    }
+    const tooLarge = () =>
+      new SiticketError(`The image is larger than ${IMAGE_MAX_BYTES / (1024 * 1024)} MB and was not fetched`);
+    const declared = Number(response.headers.get("content-length"));
+    if (Number.isFinite(declared) && declared > IMAGE_MAX_BYTES) throw tooLarge();
+    const chunks: Uint8Array[] = [];
+    let bytes = 0;
+    const reader = response.body?.getReader();
+    if (reader) {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        bytes += value.byteLength;
+        if (bytes > IMAGE_MAX_BYTES) {
+          await reader.cancel();
+          throw tooLarge();
+        }
+        chunks.push(value);
+      }
+    }
+    return { url, mimeType, bytes, data: Buffer.concat(chunks).toString("base64") };
+  } catch (error) {
+    if (error instanceof SiticketError) throw error;
+    if (controller.signal.aborted) throw new SiticketError(`The image did not arrive within ${timeoutMs}ms`);
+    throw new SiticketError(`The image could not be read: ${(error as Error).message}`);
+  } finally {
+    clearTimeout(timer);
+    // A refused response still has its body streaming: without this the
+    // connection keeps downloading the object after the call has returned.
+    // After a complete read there is nothing left to cancel.
+    controller.abort();
+  }
 }
 
 export async function listTicketModules(ctx: ToolContext): Promise<unknown> {
@@ -127,6 +249,20 @@ export const TOOL_DEFINITIONS = [
         },
       },
       required: ["ticket_id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "view_ticket_image",
+    description:
+      "Look at an image posted in the ticket's conversation — a screenshot of an error, a console, a monitoring chart. Pass the url of an attachment whose type is image, exactly as get_ticket_messages returned it for this ticket; any other url is refused, so read the messages first. Returns the image itself. Only PNG, JPEG and WebP up to 6 MB can be viewed; logs, archives and other files cannot be opened here. Looking costs time and context, so open an image when what it shows matters to the ticket, not every image by default.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ticket_id: { type: "string", description: "The ticket whose conversation the image was posted in." },
+        url: { type: "string", description: "The image attachment's url, exactly as get_ticket_messages returned it." },
+      },
+      required: ["ticket_id", "url"],
       additionalProperties: false,
     },
   },

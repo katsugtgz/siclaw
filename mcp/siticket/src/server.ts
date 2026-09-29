@@ -7,17 +7,25 @@ import {
   getTicketMessages,
   listTicketModules,
   TOOL_DEFINITIONS,
+  viewTicketImage,
   type ToolContext,
 } from "./tools.js";
 
 export function createSiticketServer(config: SiticketConfig, fetchImpl?: typeof fetch): Server {
+  const doFetch = fetchImpl ?? fetch;
   const ctx: ToolContext = {
     client: new SiticketClient(config, fetchImpl),
     pinnedTicketId: config.pinnedTicketId,
+    seenImages: new Map(),
+    // No Authorization header: the url is the object store's, and the Siticket
+    // token must never leave for another host. A redirect could lead anywhere,
+    // so it is refused rather than followed.
+    fetchAttachment: (url, signal) => doFetch(url, { method: "GET", redirect: "error", signal }),
+    requestTimeoutMs: config.requestTimeoutMs,
   };
 
   const server = new Server(
-    { name: "mcp-siticket", version: "0.1.0" },
+    { name: "mcp-siticket", version: "0.2.0" },
     { capabilities: { tools: {} } },
   );
 
@@ -39,6 +47,15 @@ export function createSiticketServer(config: SiticketConfig, fetchImpl?: typeof 
         case "list_ticket_modules":
           data = await listTicketModules(ctx);
           break;
+        case "view_ticket_image": {
+          const image = await viewTicketImage(ctx, args);
+          return {
+            content: [
+              { type: "text", text: JSON.stringify({ url: image.url, mime_type: image.mimeType, bytes: image.bytes }) },
+              { type: "image", data: image.data, mimeType: image.mimeType },
+            ],
+          };
+        }
         default:
           return {
             content: [{ type: "text", text: `Unknown tool: ${request.params.name}` }],
