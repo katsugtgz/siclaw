@@ -93,7 +93,7 @@ const inputSchema = {
       type: "object",
       additionalProperties: false,
       description:
-        "Your current proposal for the ticket's closure fields — what the engineer will confirm when they mark the ticket resolved. The harness writes result_type and result to the ticket and keeps modules until the ticket system can store them. Each field you send REPLACES your previous proposal for it; each field you omit keeps it. A field the engineer has changed on the ticket is theirs from then on: your brief names it as held, and resubmitting it changes nothing. Change a field only when the evidence changed; every change is audited on the ticket.",
+        "Your current proposal for the ticket's closure fields — what the engineer will confirm when they mark the ticket resolved; the harness writes them to the ticket. Each field holds one kind of content and nothing from another: description the problem, result_type its category, result the cause and what was done, modules the components. Each field you send REPLACES your previous proposal for it; each field you omit keeps it. A field the engineer has changed on the ticket is theirs from then on: your brief names it as held, and resubmitting it changes nothing. Change a field only when the evidence changed; every change is audited on the ticket.",
       properties: {
         modules: {
           type: "array",
@@ -101,6 +101,12 @@ const inputSchema = {
           items: { type: "string", maxLength: LIMITS.moduleIdMaxChars, pattern: MODULE_ID_PATTERN },
           description:
             "The components this issue concerns, as module_id values from the ticket-modules skill: a first-level product, second-level system or third-level component. Aim for the third level once an investigation or the engineer has established the component; until then keep the level the evidence supports. Send the complete current set; [] means no component is established.",
+        },
+        description: {
+          type: "string",
+          maxLength: LIMITS.descriptionMaxChars,
+          description:
+            "The problem as the customer has it: the symptom, its scope and impact, the environment it happens in (cluster, namespace, region, model) and since when. The ticket already carries the pre-ticket assistant's description; start from it and send a new one only when the conversation or an investigation established more about the problem itself, rewriting the whole text rather than appending. No cause and no action taken — those belong in result. The customer can read it, so no internal hostnames, task ids or tool names.",
         },
         result_type: {
           type: "string",
@@ -127,7 +133,7 @@ const inputSchema = {
 
 export function createTicketWatchResultServer(): Server {
   const server = new Server(
-    { name: "mcp-ticket-watch-result", version: "0.2.0" },
+    { name: "mcp-ticket-watch-result", version: "0.3.0" },
     { capabilities: { tools: {} } },
   );
 

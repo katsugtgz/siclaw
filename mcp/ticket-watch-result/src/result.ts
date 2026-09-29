@@ -62,6 +62,8 @@ export const LIMITS = {
   /** The ticket channel's module_id column and its tag budget. */
   moduleIdMaxChars: 64,
   maxModules: 10,
+  /** Matches the pre-ticket assistant's description, which the follow refines. */
+  descriptionMaxChars: 2000,
   /** Siticket's result_type is a single-line category; result is free text. */
   resultTypeMaxChars: 100,
   resultMaxChars: 2000,
@@ -94,6 +96,10 @@ export interface Understanding {
  * The assistant's current proposal for the ticket's closure fields — what the
  * engineer will be asked to confirm when they mark the ticket resolved.
  *
+ * Each field holds one kind of content, so none has to be read to know what
+ * another says: `description` the problem itself, `result_type` its category,
+ * `result` the cause and what was done, `modules` the components.
+ *
  * Same field-level replace as `understanding`: a field present replaces the
  * previous proposal for it, a field absent keeps it. The harness writes the
  * ticket; this tool writes nothing and cannot tell whether a person has since
@@ -101,6 +107,7 @@ export interface Understanding {
  */
 export interface Closure {
   modules?: string[];
+  description?: string;
   result_type?: string;
   result?: string;
 }
@@ -125,7 +132,7 @@ const TOP_KEYS = new Set<keyof TicketWatchResult>([
   "note",
 ]);
 
-const CLOSURE_KEYS = new Set<keyof Closure>(["modules", "result_type", "result"]);
+const CLOSURE_KEYS = new Set<keyof Closure>(["modules", "description", "result_type", "result"]);
 
 const UNDERSTANDING_KEYS = new Set<keyof Understanding>([
   "timeline",
@@ -280,6 +287,13 @@ function readClosure(value: unknown): Closure {
   const closure: Closure = {};
   if ("modules" in record) {
     closure.modules = readModules(record.modules);
+  }
+  if ("description" in record) {
+    closure.description = readText(
+      record.description,
+      "input.closure.description",
+      LIMITS.descriptionMaxChars,
+    );
   }
   if ("result_type" in record) {
     const text = readText(record.result_type, "input.closure.result_type", LIMITS.resultTypeMaxChars);

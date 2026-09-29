@@ -58,6 +58,7 @@ free conversation should be a separate Agent without this contract.
 | `understanding.open_questions` | What is still unknown, including unproven suspicions. | ≤10 entries, ≤300 each |
 | `understanding.from_l1` | What the L1 engineer said that should outlive this run. | ≤10 entries, ≤300 each |
 | `closure.modules` | Component tags as the channel's `module_id` values, as a whole list. | ≤10 ids, `^[a-z][a-z0-9_-]*$`, ≤64 characters each, no repeats |
+| `closure.description` | The problem itself — symptom, scope, environment, since when — as the customer may read it. | ≤2000 characters, the pre-ticket assistant's bound |
 | `closure.result_type` | Proposed fault or consultation type, one line. | ≤100 characters |
 | `closure.result` | Proposed cause and actions, or the answer, as the customer may read it. | ≤2000 characters |
 | `note` | One internal line about this run. Required when `state` is `done`. | ≤500 characters |
@@ -111,16 +112,28 @@ it lands, the guarantee here is structural, not evidential.
 ### Closure fields are a proposal, and the harness writes them
 
 `closure` is the assistant's running proposal for what the engineer will
-confirm when they mark the ticket resolved: the components the issue concerns,
-the fault type and the cause. It follows the same present-replaces rule as
-`understanding`.
+confirm when they mark the ticket resolved. It follows the same
+present-replaces rule as `understanding`, and each field holds one kind of
+content, so none has to be read to know what another says:
 
-The tool writes nothing. The harness writes `result_type` and `result` to the
-ticket after the turn is stored, and it is the harness that can see what this
-tool cannot: it reads the ticket first, never overwrites a field a person has
-changed (that field is theirs from then on), and stops writing once the ticket
-leaves the handling states. `modules` is kept by the harness until the ticket
-system can store it. The engineer's resolve form shows the current values as
+| Field | Holds | Never holds |
+| --- | --- | --- |
+| `description` | The problem: symptom, scope and impact, environment, since when | The cause or what was done |
+| `result_type` | Its category, one line | Detail |
+| `result` | The cause and what was done, or the answer given | Hostnames, task ids, tool names |
+| `modules` | The components, as `module_id` values | — |
+
+`description` starts where the pre-ticket assistant left it: a customer who
+could not explain the problem to it often can once an engineer is talking to
+them, and the follow folds what that conversation established into the same
+text rather than appending to it.
+
+The tool writes nothing. The harness writes all four fields to the ticket after
+the turn is stored, and it is the harness that can see what this tool cannot:
+it reads the ticket first, replaces the pre-ticket `description` and `modules`
+it found at the claim, never overwrites a field a person has changed (that
+field is theirs from then on), and stops writing once the ticket leaves the
+handling states. The engineer's resolve form shows the current values as
 defaults, so the person confirming is always the last writer.
 
 ## What is deliberately absent
