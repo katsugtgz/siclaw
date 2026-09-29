@@ -553,6 +553,14 @@ describe("knowledge_search on a multi-library mount", () => {
     expect(unknown.error).toContain("Unknown library");
     expect(unknown.libraries.map((lib: { library: string }) => lib.library)).toEqual(["repos/a", "repos/b", "repos/c"]);
 
+    // A miss across libraries points at each library's page catalog, which an
+    // answer-only prompt already carries; its index is only the fallback.
+    const miss = JSON.parse((await tool.execute("c5", { query: "zzz-unrelated" })).content[0].text as string);
+    expect(miss.results).toEqual([]);
+    expect(miss.message).toContain("No label-matched knowledge page");
+    expect(miss.message).toContain("page catalog, which is in your instructions when it fits and otherwise in its index");
+    expect(miss.message).not.toContain("then Read its index");
+
     // The index matches names case-insensitively; a zero-hit search inside a
     // library selected that way is an empty result, not an "unknown library".
     const caseZero = JSON.parse((await tool.execute("c4", { query: "zzz", library: "示例 beta" })).content[0].text as string);
@@ -597,7 +605,7 @@ describe("knowledge_search on a multi-library mount", () => {
     expect(entities.unlabeledPages).toBe(0);
   });
 
-  it("points a weak in-library match at that library's index instead of asking for another rewording", async () => {
+  it("points a weak in-library match at that library's page catalog instead of asking for another rewording", async () => {
     mountThreeLibraries();
     await resolver.sync();
     const tool = createKnowledgeSearchTool(resolver);
@@ -605,7 +613,8 @@ describe("knowledge_search on a multi-library mount", () => {
     const payload = JSON.parse((await tool.execute("c-weak", { query: "Widget 性能 基线 验收", library: "repos/a", topK: 5 })).content[0].text as string);
     expect(payload.results.length).toBeGreaterThan(0);
     expect(payload.results[0].score).toBeLessThan(0.7);
-    expect(payload.message).toContain("Read repos/a/index.md");
+    // The catalog is in an answer-only prompt already; the index is where it is otherwise.
+    expect(payload.message).toContain("Follow its page catalog (in your instructions when it is there, otherwise repos/a/index.md)");
     expect(payload.message).not.toContain("Refine the query");
   });
 
