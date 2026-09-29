@@ -1588,12 +1588,13 @@ export function applyModelParamsForCandidate(
   brain: BrainSession,
   candidate: ModelRouteCandidate,
   turnModelConfig: Record<string, unknown> | undefined,
+  options: { applyReasoningEffort?: boolean } = {},
 ): void {
   if (!brain.applyModelParams) return;
   const raw = readCandidateParams(candidate.modelConfig) ?? readCandidateParams(turnModelConfig);
-  if (!raw) return;
-  const effort = raw.reasoning_effort;
+  const effort = raw?.reasoning_effort;
   brain.applyModelParams({
-    reasoningEffort: typeof effort === "string" ? effort : undefined,
+    reasoningEffort: options.applyReasoningEffort !== false && typeof effort === "string" ? effort : undefined,
+    fastMode: raw?.service_tier === "priority",
   });
 }

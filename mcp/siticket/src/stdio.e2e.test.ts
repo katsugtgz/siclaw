@@ -35,6 +35,10 @@ const PAGE = {
   next_after_message_id: "946",
 };
 const MODULES = { rows: [{ primary_product: "SRE" }], total: 1 };
+const IMAGE_BYTES = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+
+const ENDLESS = ["forbidden", "html", "large"] as const;
+const downloads = new Map<string, { chunksAfterClose: number; closed: boolean; refusedAt: number }>();
 
 let upstream: Server;
 let baseUrl: string;
@@ -59,7 +63,40 @@ beforeAll(async () => {
       return;
     }
     if (url.pathname === "/openapi/ticket/customer_im/chat-history") {
+      if (url.searchParams.get("ticket_id") === "t-img") {
+        res.end(JSON.stringify({ code: 0, message: "ok", data: { ticket_id: "t-img", messages: [
+          { message_id: "1", sender_role: "customer", attachments: [
+            { type: "image", url: `${baseUrl}/oss/a.png` },
+            ...ENDLESS.map((kind) => ({ type: "image", url: `${baseUrl}/oss/endless-${kind}` })),
+          ] },
+        ] } }));
+        return;
+      }
       res.end(JSON.stringify({ code: 0, message: "ok", data: PAGE }));
+      return;
+    }
+    if (url.pathname === "/oss/a.png") {
+      res.setHeader("content-type", "image/png");
+      res.end(Buffer.from(IMAGE_BYTES));
+      return;
+    }
+    if (url.pathname.startsWith("/oss/endless-")) {
+      // A body that never ends on its own: only the client closing the
+      // connection stops it, which is what the refusal test measures.
+      const kind = url.pathname.slice("/oss/endless-".length);
+      const download = { chunksAfterClose: 0, closed: false, refusedAt: 0 };
+      downloads.set(kind, download);
+      if (kind === "forbidden") res.statusCode = 403;
+      res.setHeader("content-type", kind === "html" ? "text/html" : "image/png");
+      if (kind === "large") res.setHeader("content-length", String(64 * 1024 * 1024));
+      const timer = setInterval(() => {
+        if (download.refusedAt) download.chunksAfterClose++;
+        res.write(Buffer.alloc(16 * 1024));
+      }, 20);
+      res.on("close", () => {
+        download.closed = true;
+        clearInterval(timer);
+      });
       return;
     }
     if (url.pathname === "/openapi/ticket_role/module/list") {
@@ -140,7 +177,7 @@ function payload(response: Record<string, any>): unknown {
 }
 
 describe("stdio end to end", () => {
-  it("serves the three read tools and returns upstream data unwrapped", async () => {
+  it("serves the read tools and returns upstream data unwrapped", async () => {
     const client = new StdioClient({ SITICKET_API_URL: baseUrl, SITICKET_API_TOKEN: "sk-e2e" });
     await client.start();
     try {
@@ -148,6 +185,7 @@ describe("stdio end to end", () => {
       expect(tools.result.tools.map((tool: { name: string }) => tool.name)).toEqual([
         "get_ticket",
         "get_ticket_messages",
+        "view_ticket_image",
         "list_ticket_modules",
       ]);
 
@@ -210,5 +248,47 @@ describe("stdio end to end", () => {
       SITICKET_API_TOKEN_FILE: "",
     });
     await expect(client.exitCode()).resolves.toBe(1);
+  });
+  it("hands an attachment image to the model without sending the Siticket token to the object store", async () => {
+    const client = new StdioClient({ SITICKET_API_URL: baseUrl, SITICKET_API_TOKEN: "sk-e2e" });
+    await client.start();
+    try {
+      await client.call("tools/call", { name: "get_ticket_messages", arguments: { ticket_id: "t-img" } });
+      const before = seen.length;
+      const viewed = await client.call("tools/call", {
+        name: "view_ticket_image",
+        arguments: { ticket_id: "t-img", url: `${baseUrl}/oss/a.png` },
+      });
+      const image = viewed.result.content.find((item: { type: string }) => item.type === "image");
+      expect(image).toMatchObject({ type: "image", mimeType: "image/png" });
+      expect(Buffer.from(image.data, "base64")).toEqual(Buffer.from(IMAGE_BYTES));
+      const at = seen.indexOf("/oss/a.png", before);
+      expect(at).toBeGreaterThanOrEqual(0);
+      expect(authorization[at]).toBe("");
+    } finally {
+      client.stop();
+    }
+  });
+  it("closes the download when it refuses an attachment, long before the request timeout", async () => {
+    const client = new StdioClient({ SITICKET_API_URL: baseUrl, SITICKET_API_TOKEN: "sk-e2e", SITICKET_TIMEOUT_MS: "30000" });
+    await client.start();
+    try {
+      await client.call("tools/call", { name: "get_ticket_messages", arguments: { ticket_id: "t-img" } });
+      for (const kind of ENDLESS) {
+        const refused = await client.call("tools/call", {
+          name: "view_ticket_image",
+          arguments: { ticket_id: "t-img", url: `${baseUrl}/oss/endless-${kind}` },
+        });
+        expect(refused.result.isError, kind).toBe(true);
+        const download = downloads.get(kind)!;
+        download.refusedAt = Date.now();
+        for (let waited = 0; !download.closed && waited < 1000; waited += 20) {
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+        expect(download.closed, `${kind}: connection still open ${Date.now() - download.refusedAt}ms after the refusal`).toBe(true);
+      }
+    } finally {
+      client.stop();
+    }
   });
 });

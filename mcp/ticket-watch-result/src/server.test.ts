@@ -61,7 +61,8 @@ describe("ticket watch result MCP", () => {
         properties?: Record<string, Record<string, unknown>>;
       };
       expect(closure.additionalProperties).toBe(false);
-      expect(Object.keys(closure.properties ?? {})).toEqual(["modules", "result_type", "result"]);
+      expect(Object.keys(closure.properties ?? {})).toEqual(["modules", "description", "result_type", "result"]);
+      expect(closure.properties?.description?.maxLength).toBe(LIMITS.descriptionMaxChars);
       expect((closure.properties?.modules?.items as { pattern?: string }).pattern).toBe("^[a-z][a-z0-9_-]*$");
       expect(closure.properties?.result_type?.maxLength).toBe(LIMITS.resultTypeMaxChars);
       expect(closure.properties?.result?.maxLength).toBe(LIMITS.resultMaxChars);

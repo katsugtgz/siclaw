@@ -286,16 +286,19 @@ export function createKnowledgeSearchTool(resolver: KnowledgeResolver): ToolDefi
               ...(result.staleCandidates > 0 ? { staleCandidates: result.staleCandidates } : {}),
               ...(results.length === 0 ? {
                 message: multiLibrary
-                  ? "No label-matched knowledge page found. Use listLibraries=true to pick the library whose domain covers the task, then Read its index or search with library=<root>."
+                  // An answer-only prompt already carries each library's page
+                  // catalog (buildKnowledgeWikiCatalog); sending the Agent to read
+                  // the index again would undo that, so the index is the fallback.
+                  ? "No label-matched knowledge page found. Pick the library whose domain covers the task (listLibraries=true compares them) and choose pages from its page catalog, which is in your instructions when it fits and otherwise in its index; or search with library=<root>."
                   : "No label-matched knowledge page found. Use the complete Wiki catalog to choose and Read plausible pages, or inspect the label catalog with listLabels=true.",
               } : crossLibraryTie ? {
                 message: "Several libraries match about equally. Use listLibraries=true to compare their domains, or search each with library=<root> before reading a leaf.",
               } : weakOrAmbiguous && library && result.libraries[0] ? {
                 // Inside one library a weak match usually means the answering page
                 // carries no label for these terms; another rewording rarely helps.
-                message: `Weak label match inside this library; its pages may not be labeled for these terms. Read ${result.libraries[0].root}/index.md and follow its catalog instead of refining the query again.`,
+                message: `Weak label match inside this library; its pages may not be labeled for these terms. Follow its page catalog (in your instructions when it is there, otherwise ${result.libraries[0].root}/index.md) instead of refining the query again.`,
               } : weakOrAmbiguous && multiLibrary && result.routing.selected.length === 1 && result.libraries[0] ? {
-                message: `Weak label match; the query routes to ${result.libraries[0].name || result.libraries[0].root}. Read ${result.libraries[0].root}/index.md and follow its catalog rather than refining the query again.`,
+                message: `Weak label match; the query routes to ${result.libraries[0].name || result.libraries[0].root}. Follow its page catalog (in your instructions when it is there, otherwise ${result.libraries[0].root}/index.md) rather than refining the query again.`,
               } : weakOrAmbiguous ? {
                 message: "Weak or ambiguous label match. Refine the query with an entity, component, task, environment, or version, or use the complete Wiki catalog before reading a leaf.",
               } : {}),

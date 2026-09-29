@@ -273,6 +273,7 @@ describe("closure", () => {
       quietTurn({
         closure: {
           modules: ["storage-object-upload", "billing"],
+          description: " 客户在华东区上传对象到 bucket 时返回 403，自 14:00 起全部失败。 ",
           result_type: " 存储配额不足 ",
           result: "对象存储配额已用满，扩容后上传恢复。",
         },
@@ -280,9 +281,28 @@ describe("closure", () => {
     );
     expect(parsed.closure).toEqual({
       modules: ["storage-object-upload", "billing"],
+      description: "客户在华东区上传对象到 bucket 时返回 403，自 14:00 起全部失败。",
       result_type: "存储配额不足",
       result: "对象存储配额已用满，扩容后上传恢复。",
     });
+  });
+
+  it("bounds the description like the pre-ticket assistant's, and keeps it multi-line", () => {
+    const multiLine = "现象：推理 Pod Pending\n范围：siclaw-e2e-fixture 命名空间的 6 个副本";
+    expect(parseTicketWatchResult(quietTurn({ closure: { description: multiLine } })).closure).toEqual({
+      description: multiLine,
+    });
+    expect(() => parseTicketWatchResult(quietTurn({ closure: { description: "  " } }))).toThrow(
+      "input.closure.description must not be blank",
+    );
+    expect(() => parseTicketWatchResult(quietTurn({ closure: { description: null } }))).toThrow(
+      "input.closure.description must not be null",
+    );
+    expect(() =>
+      parseTicketWatchResult(
+        quietTurn({ closure: { description: "象".repeat(LIMITS.descriptionMaxChars + 1) } }),
+      ),
+    ).toThrow(`at most ${LIMITS.descriptionMaxChars} characters`);
   });
 
   it("replaces only the fields it names, and an empty proposal changes nothing", () => {

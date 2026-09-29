@@ -213,18 +213,18 @@ describe("AgentBoxSessionManager — placing a child on its model", () => {
     modelConfig: { apiKey: "k", models: [], params: { reasoning_effort: "high" } },
   };
 
-  it("does NOT touch runtime params when no tier was involved", async () => {
-    // Compatibility contract: before tiering, a child was placed with
-    // registerProvider + setModel and nothing else. Applying the parent
-    // candidate's params here would start honouring a reasoning_effort that every
-    // child has ignored, changing behaviour for deployments with no tiers at all.
+  it("keeps reasoning inherited but applies Fast mode when no tier was involved", async () => {
+    // Fast mode is independent of thinking. Preserve the existing untiered
+    // reasoning default instead of applying the parent's reasoning override.
     const mgr = new AgentBoxSessionManager();
     const brain = fakeBrain();
 
     await (mgr as any).putBrainOnCandidate(brain, candidate, "briefing", false, false);
 
-    expect(brain.calls).toEqual(["register:p", "setModel:m"]);
-    expect(brain.applied).toHaveLength(0);
+    expect(brain.calls).toEqual(["register:p", "setModel:m", "applyParams"]);
+    expect(brain.applied).toEqual([{ reasoningEffort: undefined, fastMode: false }]);
+    await (mgr as any).putBrainOnCandidate(brain, { ...candidate, modelConfig: { ...candidate.modelConfig, params: { ...candidate.modelConfig.params, service_tier: "priority" } } }, "briefing", false, false);
+    expect(brain.applied.at(-1)).toEqual({ reasoningEffort: undefined, fastMode: true });
   });
 
   it("applies the candidate's params once a tier is in play", async () => {
@@ -234,7 +234,7 @@ describe("AgentBoxSessionManager — placing a child on its model", () => {
     await (mgr as any).putBrainOnCandidate(brain, candidate, "briefing", true, true);
 
     expect(brain.calls).toContain("applyParams");
-    expect(brain.applied[0]).toEqual({ reasoningEffort: "high" });
+    expect(brain.applied[0]).toEqual({ reasoningEffort: "high", fastMode: false });
   });
 
   it("restores the parent's params BEFORE the candidate's, so an explicit setting wins", async () => {
@@ -247,7 +247,7 @@ describe("AgentBoxSessionManager — placing a child on its model", () => {
       brain, candidate, "briefing", false, true, { reasoningEffort: "low" },
     );
 
-    expect(brain.applied).toEqual([{ reasoningEffort: "low" }, { reasoningEffort: "high" }]);
+    expect(brain.applied).toEqual([{ reasoningEffort: "low" }, { reasoningEffort: "high", fastMode: false }]);
     // And both land after the model switch, which is what re-clamps to the target.
     expect(brain.calls.indexOf("setModel:m")).toBeLessThan(brain.calls.indexOf("applyParams"));
   });

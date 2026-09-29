@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import { zstdDecompressSync } from "node:zlib";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -14,6 +15,7 @@ import {
   SettingsManager,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
+import { applyModelParamsForCandidate } from "./model-routing.js";
 import { PiAgentBrain } from "./brains/pi-agent-brain.js";
 import { AgentMailbox } from "./agent-mailbox.js";
 import { createWaitAgentTool } from "../tools/workflow/agent-mailbox-tools.js";
@@ -60,7 +62,8 @@ function mockNetwork(respond: (request: Request, body: any) => Response | Promis
   vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
     const request = new Request(input, init);
     expect(new URL(request.url).hostname).toBe("pi-contract.invalid");
-    const body = JSON.parse(await request.text());
+    const bytes = Buffer.from(await request.arrayBuffer());
+    const body = JSON.parse((request.headers.get("content-encoding") === "zstd" ? zstdDecompressSync(bytes) : bytes).toString());
     requests.push({ request, body });
     return respond(request, body);
   });
@@ -504,5 +507,56 @@ describe("installed Pi SDK contract", () => {
         .map(e => e.message.llmCall.round)).toEqual([1]);
     }
     expect(first.sessionManager.getSessionFile()).not.toBe(second.sessionManager.getSessionFile());
+  });
+});
+
+
+describe("subscription Fast mode on the real Pi wire", () => {
+  it("sends priority, clears disabled/absent settings, and isolates other providers", async () => {
+    const requests = mockNetwork((_req, body) => {
+      if (body.messages) return completion({ content: "OK" });
+      const item = { type: "message", id: "msg-fast-test", role: "assistant", status: "completed",
+        content: [{ type: "output_text", text: "OK", annotations: [] }] };
+      const events = [
+        { type: "response.output_item.added", output_index: 0, item: { ...item, content: [] } },
+        { type: "response.content_part.added", output_index: 0, content_index: 0, part: { type: "output_text", text: "" } },
+        { type: "response.output_text.delta", output_index: 0, content_index: 0, delta: "OK" },
+        { type: "response.output_item.done", output_index: 0, item },
+        { type: "response.completed", response: { id: "resp-fast-test", status: "completed", service_tier: "default",
+          output: [item], usage: { input_tokens: 20, output_tokens: 2, total_tokens: 22 } } },
+      ];
+      return new Response(events.map(e => `data: ${JSON.stringify(e)}\n\n`).join(""), {
+        headers: { "content-type": "text/event-stream" },
+      });
+    });
+    const { brain, session, modelRuntime, model: ordinary } = await createFixture([], { transport: "sse" });
+    const token = `e30.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "test-account" } })).toString("base64url")}.test`;
+    modelRuntime.registerProvider("codex-test", {
+      baseUrl: "https://pi-contract.invalid", api: "openai-codex-responses", authHeader: false,
+      models: [{ id: "gpt-6-luna", name: "Test Codex", reasoning: true, input: ["text"],
+        contextWindow: 128000, maxTokens: 2048, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }],
+    });
+    await modelRuntime.setRuntimeApiKey("codex-test", token);
+    const codex = modelRuntime.getModel("codex-test", "gpt-6-luna")!;
+    await brain.setModel(codex);
+    const candidate = { provider: "codex-test", modelId: codex.id };
+    applyModelParamsForCandidate(brain, candidate, { params: { reasoning_effort: "low", service_tier: "priority" } });
+    await brain.prompt("Confirm Fast mode.");
+    expect(session.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "stop" });
+    expect(requests.at(-1)?.body).toMatchObject({ service_tier: "priority", reasoning: { effort: "low" } });
+    const saved = brain.captureModelParams()!;
+    applyModelParamsForCandidate(brain, candidate, { params: { reasoning_effort: "low" } });
+    await brain.prompt("Confirm standard mode.");
+    expect(requests.at(-1)?.body.service_tier).toBeUndefined();
+    brain.applyModelParams(saved);
+    await brain.prompt("Confirm restored Fast mode.");
+    expect(requests.at(-1)?.body.service_tier).toBe("priority");
+    await brain.setModel(ordinary);
+    await brain.prompt("Confirm other provider.");
+    expect(requests.at(-1)?.body.service_tier).toBeUndefined();
+    await brain.setModel(codex);
+    applyModelParamsForCandidate(brain, candidate, undefined);
+    await brain.prompt("Confirm legacy model defaults.");
+    expect(requests.at(-1)?.body.service_tier).toBeUndefined();
   });
 });

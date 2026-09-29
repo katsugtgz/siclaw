@@ -1,8 +1,9 @@
 # mcp-siticket
 
-Read-only stdio MCP server over the Siticket OpenAPI. It gives an agent the
-three things it needs to follow one ticket: the ticket record, the conversation
-attached to it, and the product module table tickets are routed on.
+Read-only stdio MCP server over the Siticket OpenAPI. It gives an agent what it
+needs to follow one ticket: the ticket record, the conversation attached to it,
+the images posted in that conversation, and the product module table tickets
+are routed on.
 
 There is deliberately **no tool that lists or searches tickets**, so an agent
 cannot walk the ticket list. That is not isolation: every read names a ticket
@@ -17,6 +18,7 @@ every other id before a request is sent.
 | --- | --- | --- |
 | `get_ticket` | `ticket_id` | Status, title, the customer's original query, the accumulated description, handlers, reviewers, watchers, closing result and result type, the customer and processing group ids, and the start/finish/end timestamps. |
 | `get_ticket_messages` | `ticket_id`, `after_message_id?`, `limit?` | One page of the ticket's conversation, oldest first, plus `ticket_context`, `has_more` and `next_after_message_id`. `limit` is 1–500 (default 50; Siticket's own default is 100). |
+| `view_ticket_image` | `ticket_id`, `url` | The image itself (MCP `image` content: PNG, JPEG or WebP, at most 6 MB), with its url, type and size. Only a url that `get_ticket_messages` returned as an `image` attachment of the same ticket is accepted. |
 | `list_ticket_modules` | — | Every module row: `primary_product` / `secondary_system` / `tertiary_component` with owners, plus `l2_support`, `l3_owner`, `major_incident_lead`, `incident_decision_maker`. |
 
 Several properties of the upstream data are worth stating, because each one
@@ -47,6 +49,24 @@ invites a wrong conclusion that the payload alone does not correct:
   it; `get_ticket_messages` returns RFC3339 with a `Z`. Both describe the same
   clock. Siticket's offset-less form is a deliberately frozen external response,
   so the tool descriptions carry the warning rather than the payload being fixed.
+
+`view_ticket_image` exists because a customer's screenshot is often the only
+exact record of an error, and a url in a tool result is text the model cannot
+look at. Its bounds are what make it safe to hand to a model that reads
+customer-written text:
+
+- **It fetches only what Siticket returned.** The server remembers, per ticket,
+  the `attachments[].url` of every `image` attachment `get_ticket_messages`
+  returned in this process. Any other url — one written in a message's text, a
+  file attachment, another ticket's image, or one made up — is refused before a
+  request is sent. After a restart the model reads the messages again first.
+- **The Siticket token stays with Siticket.** Attachment urls point at the
+  object store, so the request carries no `Authorization` header, and a
+  redirect is refused rather than followed.
+- **It is bounded.** Only the formats the runtime passes to the model (PNG,
+  JPEG, WebP; not SVG, which is a document) and at most 6 MB, the runtime's own
+  cap on an inbound image. The body is counted as it arrives, so a missing or
+  false `Content-Length` cannot make the process buffer more.
 
 `list_ticket_modules` returns the entire table (about 73 rows, ~21 KB) with no
 filter. Deciding which module a symptom belongs to is a judgement about wording,

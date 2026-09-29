@@ -119,11 +119,25 @@ export class PiAgentBrain implements BrainSession {
     this.mailboxCheckpoints.clear();
   }
 
+  private fastMode = false;
+
   constructor(
     readonly session: AgentSession,
     private readonly toolsetsByName: ReadonlyMap<string, string> = new Map(),
     readonly llmCalls?: LlmCallRecorder,
   ) {
+    // Pi's generic streamSimple drops provider-specific serviceTier options.
+    // Apply the Codex wire value before the existing payload/recording hooks.
+    const previousPayload = session.agent.onPayload;
+    session.agent.onPayload = (payload, model) => {
+      if (model.api === "openai-codex-responses" && payload && typeof payload === "object") {
+        const body = { ...payload } as Record<string, unknown>;
+        if (this.fastMode) body.service_tier = "priority";
+        else delete body.service_tier;
+        payload = body;
+      }
+      return previousPayload ? previousPayload(payload, model) : payload;
+    };
     const previous = session.agent.beforeToolCall;
     session.agent.beforeToolCall = async (context, signal) => {
       const calls = context.assistantMessage.content.filter(c => c.type === "toolCall");
@@ -596,13 +610,14 @@ export class PiAgentBrain implements BrainSession {
   captureModelParams(): BrainModelParams | undefined {
     try {
       const level = this.session.thinkingLevel;
-      return typeof level === "string" ? { reasoningEffort: level } : undefined;
+      return typeof level === "string" ? { reasoningEffort: level, fastMode: this.fastMode } : undefined;
     } catch {
       return undefined;
     }
   }
 
   applyModelParams(params: BrainModelParams): void {
+    this.fastMode = params.fastMode === true;
     // reasoningEffort → session thinking level. pi maps this to the provider's
     // reasoning_effort / reasoning:{effort} per the provider's thinkingLevelMap.
     const effort = params.reasoningEffort?.trim();

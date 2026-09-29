@@ -1,6 +1,6 @@
 {
   "name": "@scitix/mcp-siticket",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Local stdio MCP server exposing one Siticket ticket, its conversation and the product module table",
   "type": "module",
   "private": true,
