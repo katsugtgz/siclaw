@@ -132,6 +132,8 @@ export interface BrainToolDefinition {
 export interface BrainModelParams {
   /** Reasoning effort: off|minimal|low|medium|high|xhigh. */
   reasoningEffort?: string;
+  /** Request Codex priority processing; absent/false restores standard mode. */
+  fastMode?: boolean;
 }
 
 export interface BrainContextUsage {

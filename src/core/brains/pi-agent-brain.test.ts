@@ -535,7 +535,7 @@ describe("PiAgentBrain", () => {
       // the only way down.
       const session = makeFakeSession({ thinkingLevel: "xhigh" });
       const brain = new PiAgentBrain(session);
-      expect(brain.captureModelParams()).toEqual({ reasoningEffort: "xhigh" });
+      expect(brain.captureModelParams()).toEqual({ reasoningEffort: "xhigh", fastMode: false });
     });
 
     it("returns undefined rather than throwing when the level is unavailable", () => {

@@ -750,6 +750,10 @@ export class AgentBoxSessionManager {
         // parent model running at `xhigh`.
         if (restoreParams && brain.applyModelParams) brain.applyModelParams(restoreParams);
         applyModelParamsForCandidate(brain, resolved, resolved.modelConfig);
+      } else {
+        // Untiered children retain their historical reasoning default, while
+        // honoring the selected model's independent Fast setting.
+        applyModelParamsForCandidate(brain, resolved, resolved.modelConfig, { applyReasoningEffort: false });
       }
 
       if (checkFit && brain.checkContextFitForModelPrompt) {
