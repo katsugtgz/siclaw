@@ -36,8 +36,8 @@ export interface BootstrapRuntimeOptions {
   k8sImage?: string;
   /** K8s-only: persistent volume claim for shared agent data. */
   k8sPersistenceClaimName?: string;
-  /** K8s-only: persistent volume claim holding read-only per-agent source trees.
-   *  See docs/design/agentbox-code-volume.md. */
+  /** K8s-only: persistent volume claim holding the read-only code mirrors and
+   *  per-agent manifests. See docs/design/agentbox-code-volume.md. */
   k8sCodeClaimName?: string;
 }
 
@@ -224,12 +224,13 @@ function createSpawner(
     const nodeSelector = parseNodeSelector(process.env.SICLAW_AGENTBOX_NODE_SELECTOR);
 
     // Read-only source-code volume — see docs/design/agentbox-code-volume.md.
-    // ONE switch, and it is infrastructure only: the name of a PVC an external
-    // supplier writes per-agent source trees into. There is deliberately no
-    // paired "enabled" policy flag and nothing arrives per-agent from a portal —
-    // whether a given agent gets the mount is decided by that supplier's ready
-    // marker on the volume itself, so a second control-plane opinion could only
-    // disagree with it. Unset (the default) ⇒ the spawner emits no code volume.
+    // ONE switch, and it is infrastructure only: the name of a PVC on which an
+    // external supplier keeps bare mirrors and one manifest per agent. There is
+    // deliberately no paired "enabled" policy flag and nothing arrives per-agent
+    // from a portal — whether a given agent gets the mount is decided by the
+    // presence of that agent's manifest on the volume itself, so a second
+    // control-plane opinion could only disagree with it. Unset (the default) ⇒
+    // the spawner emits no code volume.
     const codeClaimName = process.env.SICLAW_CODE_CLAIM_NAME?.trim() || undefined;
     const k8sCodeClaimName = opts.k8sCodeClaimName?.trim() || codeClaimName;
 

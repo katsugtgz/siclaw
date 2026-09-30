@@ -260,7 +260,9 @@ describe("refusals", () => {
     expect(unknown.message).toContain("app");
     const sha = errorOf(await query({ op: "show", ref: "0123456789abcdef0123456789abcdef01234567" }));
     expect(sha.reason).toBe("ref_unreachable");
-    expect(sha.message).toContain("code-mcp");
+    expect(sha.message).toContain("may not have fetched it yet");
+    expect(sha.message).toContain('git_query op "refs"');
+    expect(sha.message).not.toMatch(/code-mcp/i);
     const ref = errorOf(await query({ op: "log", ref: "no-such-branch" }));
     expect(ref.reason).toBe("ref_unreachable");
     expect(ref.message).toContain('op "refs"');

@@ -65,49 +65,57 @@ vi.mock("@kubernetes/client-node", () => {
   return { KubeConfig: FakeKubeConfig, CoreV1Api: FakeCoreV1Api };
 });
 
-// Mock fs.mkdirSync used by ensureUserDir (persistence enabled), and make
-// fs.existsSync steerable for the read-only code volume, whose gate is a marker
-// FILE on a volume this process does not have in a test.
+// Mock fs.mkdirSync used by ensureUserDir (persistence enabled), and make the
+// reads of the read-only code volume steerable: its gate is a manifest FILE on
+// a volume this process does not have in a test.
 //
-// existsSync consults an opt-in path set and otherwise DELEGATES to the real
-// implementation, so no other suite in this file sees a different filesystem.
-// Every lookup is recorded, which is how the "checked twice" retry contract is
-// asserted — that retry exists for an NFS attribute-cache miss and is otherwise
-// invisible from the outside.
+// Every fake is opt-in and otherwise DELEGATES to the real implementation, so
+// no other suite in this file sees a different filesystem. Every existsSync /
+// readFileSync / realpathSync is recorded: that is how "no claim ⇒ the volume
+// is never touched" and the "looked twice" retry contract are asserted — that
+// retry exists for an NFS attribute-cache miss and is otherwise invisible from
+// the outside.
 vi.mock("node:fs", async () => {
   const real = await vi.importActual<typeof import("node:fs")>("node:fs");
   const g = globalThis as any;
   g.__fakeExistingPaths = new Set<string>();
   g.__fsExistsCalls = [] as string[];
-  g.__onExistsSync = undefined as ((p: string) => void) | undefined;
   const existsSync = ((p: any, ...rest: any[]) => {
     const key = String(p);
     g.__fsExistsCalls.push(key);
-    const hit = g.__fakeExistingPaths.has(key);
-    // Fired AFTER the verdict is read, so a hook that creates the file models a
-    // file appearing BETWEEN two looks rather than during one.
-    g.__onExistsSync?.(key);
-    return hit ? true : (real.existsSync as any)(p, ...rest);
+    return g.__fakeExistingPaths.has(key) ? true : (real.existsSync as any)(p, ...rest);
   }) as typeof real.existsSync;
-  // The git-mirror manifest and its realpath checks live under the same
-  // unreachable /app/.siclaw/code-root, so readFileSync / realpathSync get the
-  // same opt-in treatment: a path in the fake map answers from it (an Error
+  // The manifest and the realpath checks live under the same unreachable
+  // /app/.siclaw/code-root: a path in the fake map answers from it (an Error
   // value is THROWN), anything else goes to the real implementation.
   g.__fakeFiles = new Map<string, string | Error>();
   g.__fsReadCalls = [] as string[];
+  g.__onReadFileSync = undefined as ((p: string) => void) | undefined;
   g.__fakeRealpaths = new Map<string, string | Error>();
+  g.__fsRealpathCalls = [] as string[];
   const readFileSync = ((p: any, ...rest: any[]) => {
     const key = String(p);
     g.__fsReadCalls.push(key);
+    let outcome: { value: unknown } | { error: unknown };
     if (g.__fakeFiles.has(key)) {
       const v = g.__fakeFiles.get(key);
-      if (v instanceof Error) throw v;
-      return v;
+      outcome = v instanceof Error ? { error: v } : { value: v };
+    } else {
+      try {
+        outcome = { value: (real.readFileSync as any)(p, ...rest) };
+      } catch (err) {
+        outcome = { error: err };
+      }
     }
-    return (real.readFileSync as any)(p, ...rest);
+    // Fired AFTER the verdict is taken, so a hook that creates the file models
+    // a file appearing BETWEEN two looks rather than during one.
+    g.__onReadFileSync?.(key);
+    if ("error" in outcome) throw outcome.error;
+    return outcome.value;
   }) as typeof real.readFileSync;
   const realpathSync = ((p: any, ...rest: any[]) => {
     const key = String(p);
+    g.__fsRealpathCalls.push(key);
     if (g.__fakeRealpaths.has(key)) {
       const v = g.__fakeRealpaths.get(key);
       if (v instanceof Error) throw v;
@@ -1212,8 +1220,12 @@ describe("K8sSpawner — per-agent persistence (PVC override)", () => {
 });
 
 describe("K8sSpawner — read-only code volume", () => {
-  // The contract this suite pins lives in docs/design/agentbox-code-volume.md.
-  const READY = "/app/.siclaw/code-root/agents/proj-a/.ready";
+  // The contract this suite pins lives in docs/design/agentbox-code-volume.md
+  // ("The mount gate", "Git layer").
+  const ROOT = "/app/.siclaw/code-root";
+  const MANIFEST = `${ROOT}/agents/proj-a/.gitrepos.json`;
+  const RULES = { exclude_dirs: ["node_modules"], max_file_bytes: 5242880 };
+  const DIR_MOUNT = { name: "code", mountPath: "/app/.siclaw/repos", subPath: "agents/proj-a", readOnly: true };
 
   function readReturnsRunningAfter404() {
     let r = 0;
@@ -1226,7 +1238,6 @@ describe("K8sSpawner — read-only code volume", () => {
       };
     };
   }
-
   function podBody() {
     return calls.createNamespacedPod[0].body;
   }
@@ -1236,34 +1247,74 @@ describe("K8sSpawner — read-only code volume", () => {
   function mounts(): any[] {
     return podBody().spec.containers[0].volumeMounts as any[];
   }
-  function codeMount() {
-    return mounts().find((m) => m.name === "code");
+  function codeMounts(): any[] {
+    return mounts().filter((m) => m.name === "code");
   }
-  function readyLookups(): string[] {
-    return (g.__fsExistsCalls as string[]).filter((p) => p.endsWith("/.ready"));
+  function dirMount() {
+    return codeMounts().find((m) => m.mountPath === "/app/.siclaw/repos");
+  }
+  function gitMounts(): any[] {
+    return codeMounts().filter((m) => m.mountPath.startsWith("/app/.siclaw/gitrepos/"));
+  }
+  /** Every filesystem call this spawn made against the code volume. */
+  function volumeTouches(): string[] {
+    return [...g.__fsExistsCalls, ...g.__fsReadCalls, ...g.__fsRealpathCalls].filter((p: string) => p.startsWith(ROOT));
+  }
+  function manifestReads(): string[] {
+    return (g.__fsReadCalls as string[]).filter((p) => p === MANIFEST);
+  }
+  /** A bare mirror that exists: realpath is itself and HEAD is present. */
+  function mirror(bare: string) {
+    g.__fakeRealpaths.set(`${ROOT}/${bare}`, `${ROOT}/${bare}`);
+    g.__fakeExistingPaths.add(`${ROOT}/${bare}/HEAD`);
+  }
+  function manifest(repos: unknown[], extra: Record<string, unknown> = {}) {
+    g.__fakeFiles.set(MANIFEST, JSON.stringify({ version: 1, updated_at: "t", repos, rules: RULES, ...extra }));
+  }
+  async function spawnWithCode(opts: { claim?: boolean; agentId?: string; persistence?: boolean } = {}) {
+    const { claim = true, agentId = "proj-a", persistence = false } = opts;
+    const s = new K8sSpawner({
+      ...(claim ? { codeVolume: { claimName: "agent-code" } } : {}),
+      ...(persistence ? { persistence: { enabled: true, claimName: "siclaw-data" } } : {}),
+    });
+    s.setCertManager(new FakeCertManager() as any);
+    await s.spawn({ agentId });
   }
 
+  let errors: string[];
+  let warnings: string[];
   beforeEach(() => {
     g.__fakeExistingPaths.clear();
     g.__fsExistsCalls.length = 0;
-    g.__onExistsSync = undefined;
+    g.__fakeFiles.clear();
+    g.__fsReadCalls.length = 0;
+    g.__onReadFileSync = undefined;
+    g.__fakeRealpaths.clear();
+    g.__fsRealpathCalls.length = 0;
+    g.__fakeRealpaths.set(`${ROOT}/mirrors`, `${ROOT}/mirrors`);
     readReturnsRunningAfter404();
+    errors = [];
+    warnings = [];
+    vi.spyOn(console, "error").mockImplementation((...a: unknown[]) => { errors.push(a.map(String).join(" ")); });
+    vi.spyOn(console, "warn").mockImplementation((...a: unknown[]) => { warnings.push(a.map(String).join(" ")); });
   });
-
   afterEach(() => {
-    g.__onExistsSync = undefined;
+    g.__onReadFileSync = undefined;
+    vi.restoreAllMocks();
   });
 
-  it("no code claim configured → the pod is unchanged and the volume is never consulted", async () => {
+  // ── The gate ──────────────────────────────────────────────────────────────
+
+  it("no code claim configured → the pod is unchanged and the volume is never touched", async () => {
     // The regression this guards is not "the mount is wrong", it is "a
     // deployment that never opted in got a different pod". Assert the FULL
     // volume/mount shape rather than the absence of one name, and assert that
-    // the marker was not even looked for — the claim check must short-circuit
-    // before any filesystem work.
-    const s = new K8sSpawner({ persistence: { enabled: true, claimName: "siclaw-data" } });
-    s.setCertManager(new FakeCertManager() as any);
+    // nothing on the volume was even looked at — the claim check must
+    // short-circuit before any filesystem work.
+    manifest([{ name: "app", host: "h", path: "p", bare: "mirrors/h/p.git" }]);
+    mirror("mirrors/h/p.git");
 
-    await s.spawn({ agentId: "proj-a" });
+    await spawnWithCode({ claim: false, persistence: true });
 
     expect(volumeNames()).toEqual([
       "credentials", "config", "skills-local", "knowledge-local", "user-data", "client-cert", "tmp",
@@ -1277,153 +1328,33 @@ describe("K8sSpawner — read-only code volume", () => {
       "/etc/siclaw/certs",
       "/tmp",
     ]);
-    expect(readyLookups()).toEqual([]);
+    expect(volumeTouches()).toEqual([]);
   });
 
-  it("code claim + ready marker → read-only mount at the repos dir, scoped by subPath", async () => {
-    g.__fakeExistingPaths.add(READY);
-    const s = new K8sSpawner({ codeVolume: { claimName: "agent-code" } });
-    s.setCertManager(new FakeCertManager() as any);
-
-    await s.spawn({ agentId: "proj-a" });
-
-    const vol = (podBody().spec.volumes as any[]).find((v) => v.name === "code");
-    expect(vol.persistentVolumeClaim).toEqual({ claimName: "agent-code" });
-    // 🔴 readOnly on the volume SOURCE stages the CSI volume read-only and hangs
-    // the pod in ContainerCreating until the spawn deadline. It belongs on the
-    // mount, and only on the mount.
-    expect(vol.persistentVolumeClaim.readOnly).toBeUndefined();
-    expect(vol.readOnly).toBeUndefined();
-
-    expect(codeMount()).toEqual({
-      name: "code",
-      mountPath: "/app/.siclaw/repos",
-      subPath: "agents/proj-a",
-      readOnly: true,
-    });
-    // The mount path must stay the configured reposDir: that directory is
-    // already in the file tools' read whitelist and already scanned into the
-    // system prompt, which is why the box itself needs no change.
-    expect(codeMount().mountPath).toBe("/app/.siclaw/repos");
-  });
-
-  it("code claim but no ready marker → no volume, no mount, and the marker is checked twice", async () => {
-    const s = new K8sSpawner({ codeVolume: { claimName: "agent-code" } });
-    s.setCertManager(new FakeCertManager() as any);
-
-    await s.spawn({ agentId: "proj-a" });
+  it("code claim but no manifest → no volume, no mount, the manifest looked for twice, and the reason logged", async () => {
+    await spawnWithCode();
 
     expect(volumeNames()).not.toContain("code");
-    expect(codeMount()).toBeUndefined();
+    expect(codeMounts()).toEqual([]);
     // kubelet would happily CREATE the missing subPath directory, so an
-    // unchecked mount hands the agent an empty tree it cannot tell from a
-    // codebase that says nothing. The retry is the NFS attribute-cache hedge.
-    expect(readyLookups()).toEqual([READY, READY]);
+    // unchecked mount hands the box an empty directory. The retry is the NFS
+    // attribute-cache hedge; nothing else on the volume is consulted.
+    expect(manifestReads()).toEqual([MANIFEST, MANIFEST]);
+    expect(volumeTouches()).toEqual([MANIFEST, MANIFEST]);
+    expect(warnings.some((w) => w.includes(MANIFEST) && w.includes("absent after a retry"))).toBe(true);
+    expect(errors).toEqual([]);
   });
 
-  it("a marker that appears between the two looks is honoured (NFS attribute-cache hedge)", async () => {
-    g.__onExistsSync = (p: string) => { if (p === READY) g.__fakeExistingPaths.add(READY); };
-    const s = new K8sSpawner({ codeVolume: { claimName: "agent-code" } });
-    s.setCertManager(new FakeCertManager() as any);
+  it("a manifest that appears between the two looks is honoured (NFS attribute-cache hedge)", async () => {
+    g.__onReadFileSync = (p: string) => { if (p === MANIFEST && !g.__fakeFiles.has(MANIFEST)) manifest([]); };
 
-    await s.spawn({ agentId: "proj-a" });
+    await spawnWithCode();
 
-    expect(readyLookups()).toEqual([READY, READY]);
-    expect(codeMount()?.subPath).toBe("agents/proj-a");
+    expect(manifestReads()).toEqual([MANIFEST, MANIFEST]);
+    expect(dirMount()).toEqual(DIR_MOUNT);
   });
 
-  it("the agent directory is sanitized exactly like the user-data subPath", async () => {
-    // The supplier writes these directory names from its own side of the wire;
-    // the two must agree character for character or the mount silently points
-    // at a directory nobody fills.
-    g.__fakeExistingPaths.add("/app/.siclaw/code-root/agents/proj_a_b/.ready");
-    const s = new K8sSpawner({
-      codeVolume: { claimName: "agent-code" },
-      persistence: { enabled: true, claimName: "siclaw-data" },
-    });
-    s.setCertManager(new FakeCertManager() as any);
-
-    await s.spawn({ agentId: "proj/a b" });
-
-    const userData = mounts().find((m) => m.name === "user-data");
-    expect(codeMount().subPath).toBe("agents/proj_a_b");
-    expect(codeMount().subPath).toBe(userData.subPath);
-  });
-
-  it("the code volume is independent of persistence — either can be on without the other", async () => {
-    g.__fakeExistingPaths.add(READY);
-    const s = new K8sSpawner({ codeVolume: { claimName: "agent-code" } });
-    s.setCertManager(new FakeCertManager() as any);
-
-    await s.spawn({ agentId: "proj-a" });
-
-    const userData = (podBody().spec.volumes as any[]).find((v) => v.name === "user-data");
-    expect(userData.emptyDir).toEqual({});
-    expect(userData.persistentVolumeClaim).toBeUndefined();
-    expect(codeMount()).toBeTruthy();
-  });
-});
-
-describe("K8sSpawner — git mirrors from the code-view manifest", () => {
-  // Contract: docs/design/agentbox-code-volume.md ("Git layer").
-  const ROOT = "/app/.siclaw/code-root";
-  const READY = `${ROOT}/agents/proj-a/.ready`;
-  const MANIFEST = `${ROOT}/agents/proj-a/.gitrepos.json`;
-  const RULES = { exclude_dirs: ["node_modules"], max_file_bytes: 5242880 };
-
-  function readReturnsRunningAfter404() {
-    let r = 0;
-    readPodImpl.fn = async () => {
-      r++;
-      if (r === 1) throw Object.assign(new Error("nf"), { code: 404 });
-      return {
-        status: { phase: "Running", podIP: "10.9.9.9", conditions: [{ type: "Ready", status: "True" }] },
-        metadata: { name: "agentbox-proj-a", labels: {} },
-      };
-    };
-  }
-  function podBody() {
-    return calls.createNamespacedPod[0].body;
-  }
-  function codeMounts(): any[] {
-    return (podBody().spec.containers[0].volumeMounts as any[]).filter((m) => m.name === "code");
-  }
-  function gitMounts(): any[] {
-    return codeMounts().filter((m) => m.mountPath.startsWith("/app/.siclaw/gitrepos/"));
-  }
-  /** A bare mirror that exists: realpath is itself and HEAD is present. */
-  function mirror(bare: string) {
-    g.__fakeRealpaths.set(`${ROOT}/${bare}`, `${ROOT}/${bare}`);
-    g.__fakeExistingPaths.add(`${ROOT}/${bare}/HEAD`);
-  }
-  function manifest(repos: unknown[], extra: Record<string, unknown> = {}) {
-    g.__fakeFiles.set(MANIFEST, JSON.stringify({ version: 1, updated_at: "t", repos, rules: RULES, ...extra }));
-  }
-  async function spawnWithCode(claim = true) {
-    const s = new K8sSpawner(claim ? { codeVolume: { claimName: "agent-code" } } : {});
-    s.setCertManager(new FakeCertManager() as any);
-    await s.spawn({ agentId: "proj-a" });
-  }
-
-  let errors: string[];
-  beforeEach(() => {
-    g.__fakeExistingPaths.clear();
-    g.__fsExistsCalls.length = 0;
-    g.__fakeFiles.clear();
-    g.__fsReadCalls.length = 0;
-    g.__fakeRealpaths.clear();
-    g.__onExistsSync = undefined;
-    g.__fakeRealpaths.set(`${ROOT}/mirrors`, `${ROOT}/mirrors`);
-    readReturnsRunningAfter404();
-    errors = [];
-    vi.spyOn(console, "error").mockImplementation((...a: unknown[]) => { errors.push(a.map(String).join(" ")); });
-  });
-  afterEach(() => {
-    vi.restoreAllMocks();
-  });
-
-  it("ready marker + manifest → one read-only subPath mount per repository, after the tree mount", async () => {
-    g.__fakeExistingPaths.add(READY);
+  it("valid manifest → the agent directory, then one read-only subPath mount per mirror, from ONE volume", async () => {
     mirror("mirrors/gitlab.x/grp/app.git");
     mirror("mirrors/gitlab.x/grp/sub/lib.git");
     manifest([
@@ -1434,35 +1365,24 @@ describe("K8sSpawner — git mirrors from the code-view manifest", () => {
     await spawnWithCode();
 
     expect(codeMounts()).toEqual([
-      { name: "code", mountPath: "/app/.siclaw/repos", subPath: "agents/proj-a", readOnly: true },
+      DIR_MOUNT,
       { name: "code", mountPath: "/app/.siclaw/gitrepos/app.git", subPath: "mirrors/gitlab.x/grp/app.git", readOnly: true },
       { name: "code", mountPath: "/app/.siclaw/gitrepos/lib.git", subPath: "mirrors/gitlab.x/grp/sub/lib.git", readOnly: true },
     ]);
-    // Still ONE volume, and still no readOnly on its source (the CSI staging trap).
+    // 🔴 readOnly on the volume SOURCE stages the CSI volume read-only and hangs
+    // the pod in ContainerCreating until the spawn deadline. It belongs on the
+    // mounts, and only on the mounts.
     const vols = (podBody().spec.volumes as any[]).filter((v) => v.name === "code");
     expect(vols).toEqual([{ name: "code", persistentVolumeClaim: { claimName: "agent-code" } }]);
+    // Found on the first look: no retry.
+    expect(manifestReads()).toEqual([MANIFEST]);
     expect(errors).toEqual([]);
   });
 
-  it("no claim, or no ready marker → the manifest is never even read", async () => {
-    manifest([{ name: "app", host: "h", path: "p", bare: "mirrors/h/p.git" }]);
-    mirror("mirrors/h/p.git");
-    await spawnWithCode(false);
-    expect(g.__fsReadCalls.filter((p: string) => p.startsWith(ROOT))).toEqual([]);
-    expect(gitMounts()).toEqual([]);
-
-    calls.createNamespacedPod.length = 0;
-    readReturnsRunningAfter404();
-    await spawnWithCode(true); // claim, but no .ready
-    expect(g.__fsReadCalls.filter((p: string) => p.startsWith(ROOT))).toEqual([]);
-    expect(gitMounts()).toEqual([]);
-  });
-
-  it("no manifest → trees only, and it is not an error (a supplier without the git layer)", async () => {
-    g.__fakeExistingPaths.add(READY);
-    g.__fakeFiles.set(MANIFEST, Object.assign(new Error("ENOENT: no such file"), { code: "ENOENT" }));
+  it("a valid manifest granting nothing → the agent directory alone, and it is not an error", async () => {
+    manifest([]);
     await spawnWithCode();
-    expect(codeMounts().map((m) => m.mountPath)).toEqual(["/app/.siclaw/repos"]);
+    expect(codeMounts()).toEqual([DIR_MOUNT]);
     expect(errors).toEqual([]);
   });
 
@@ -1471,24 +1391,61 @@ describe("K8sSpawner — git mirrors from the code-view manifest", () => {
     ["an unknown version", JSON.stringify({ version: 2, repos: [], rules: RULES })],
     ["repos not an array", JSON.stringify({ version: 1, repos: {}, rules: RULES })],
     ["malformed rules", JSON.stringify({ version: 1, repos: [], rules: { exclude_dirs: "x", max_file_bytes: 1 } })],
-  ])("a manifest with %s → logged, no git mounts, and the box still gets its trees", async (_label, text) => {
-    g.__fakeExistingPaths.add(READY);
+  ])("a manifest with %s → the agent directory without mirrors, and logged (the box reports it)", async (_label, text) => {
     g.__fakeFiles.set(MANIFEST, text);
     await spawnWithCode();
-    expect(codeMounts().map((m) => m.mountPath)).toEqual(["/app/.siclaw/repos"]);
+    // The directory stays: it is how the box reads the same manifest and tells
+    // the agent it is invalid, instead of looking like an agent with no code.
+    expect(codeMounts()).toEqual([DIR_MOUNT]);
     expect(errors.some((e) => e.includes("is invalid"))).toBe(true);
   });
 
-  it("an unreadable manifest (not ENOENT) is logged, not thrown", async () => {
-    g.__fakeExistingPaths.add(READY);
+  it("a manifest that exists but cannot be read (not ENOENT) → the agent directory without mirrors, logged, not thrown", async () => {
     g.__fakeFiles.set(MANIFEST, Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" }));
     await spawnWithCode();
-    expect(gitMounts()).toEqual([]);
+    expect(codeMounts()).toEqual([DIR_MOUNT]);
     expect(errors.some((e) => e.includes("cannot read"))).toBe(true);
+    // Present is present: not retried as if it were absent.
+    expect(manifestReads()).toEqual([MANIFEST]);
   });
 
+  it("a manifest whose every entry is rejected → the agent directory without mirrors, each rejection logged", async () => {
+    mirror("mirrors/h/a.git");
+    manifest([
+      { name: "a/b", host: "h", path: "a", bare: "mirrors/h/a.git" },
+      { name: "x", host: "h", path: "x", bare: "agents/proj-b/x.git" },
+    ]);
+    await spawnWithCode();
+    expect(codeMounts()).toEqual([DIR_MOUNT]);
+    expect(errors.filter((e) => e.includes("not mounted"))).toHaveLength(2);
+  });
+
+  it("the agent directory is sanitized exactly like the user-data subPath", async () => {
+    // The supplier writes these directory names from its own side of the wire;
+    // the two must agree character for character or the gate looks at a
+    // directory nobody fills.
+    g.__fakeFiles.set(`${ROOT}/agents/proj_a_b/.gitrepos.json`, JSON.stringify({ version: 1, repos: [], rules: RULES }));
+
+    await spawnWithCode({ agentId: "proj/a b", persistence: true });
+
+    const userData = mounts().find((m) => m.name === "user-data");
+    expect(dirMount().subPath).toBe("agents/proj_a_b");
+    expect(dirMount().subPath).toBe(userData.subPath);
+  });
+
+  it("the code volume is independent of persistence — either can be on without the other", async () => {
+    manifest([]);
+    await spawnWithCode();
+
+    const userData = (podBody().spec.volumes as any[]).find((v) => v.name === "user-data");
+    expect(userData.emptyDir).toEqual({});
+    expect(userData.persistentVolumeClaim).toBeUndefined();
+    expect(dirMount()).toEqual(DIR_MOUNT);
+  });
+
+  // ── Per-entry mirror checks (the manifest is present and usable) ──────────
+
   it("a duplicated name or bare mounts NEITHER party (the API server rejects a duplicate mountPath)", async () => {
-    g.__fakeExistingPaths.add(READY);
     for (const b of ["mirrors/h/a.git", "mirrors/h/b.git", "mirrors/h/c.git", "mirrors/h/ok.git"]) mirror(b);
     manifest([
       { name: "dup", host: "h", path: "a", bare: "mirrors/h/a.git" },
@@ -1509,7 +1466,6 @@ describe("K8sSpawner — git mirrors from the code-view manifest", () => {
     ["an invalid name", { name: "a/b", bare: "mirrors/h/p.git" }],
     ["a name that is too long", { name: "a".repeat(64), bare: "mirrors/h/p.git" }],
   ])("an entry with %s is skipped and logged; the others still mount", async (_label, bad) => {
-    g.__fakeExistingPaths.add(READY);
     mirror("mirrors/h/good.git");
     manifest([
       { host: "h", path: "p", ...bad },
@@ -1521,17 +1477,16 @@ describe("K8sSpawner — git mirrors from the code-view manifest", () => {
   });
 
   it("a bare that realpaths outside mirrors/ (a planted symlink) is refused", async () => {
-    g.__fakeExistingPaths.add(READY);
     g.__fakeRealpaths.set(`${ROOT}/mirrors/h/evil.git`, `${ROOT}/agents/proj-b`);
     g.__fakeExistingPaths.add(`${ROOT}/agents/proj-b/HEAD`);
     manifest([{ name: "evil", host: "h", path: "evil", bare: "mirrors/h/evil.git" }]);
     await spawnWithCode();
     expect(gitMounts()).toEqual([]);
+    expect(dirMount()).toEqual(DIR_MOUNT);
     expect(errors.some((e) => e.includes("outside mirrors/"))).toBe(true);
   });
 
   it("a bare without HEAD is refused — kubelet would mount an empty directory in its place", async () => {
-    g.__fakeExistingPaths.add(READY);
     g.__fakeRealpaths.set(`${ROOT}/mirrors/h/gone.git`, `${ROOT}/mirrors/h/gone.git`);
     manifest([{ name: "gone", host: "h", path: "gone", bare: "mirrors/h/gone.git" }]);
     await spawnWithCode();
@@ -1540,12 +1495,20 @@ describe("K8sSpawner — git mirrors from the code-view manifest", () => {
   });
 
   it("a bare that does not resolve at all is refused", async () => {
-    g.__fakeExistingPaths.add(READY);
     g.__fakeRealpaths.set(`${ROOT}/mirrors/h/none.git`, Object.assign(new Error("ENOENT"), { code: "ENOENT" }));
     manifest([{ name: "none", host: "h", path: "none", bare: "mirrors/h/none.git" }]);
     await spawnWithCode();
     expect(gitMounts()).toEqual([]);
     expect(errors.some((e) => e.includes("cannot resolve"))).toBe(true);
+  });
+
+  it("a mirror pool that cannot be resolved → no mirrors, but the agent directory stays", async () => {
+    g.__fakeRealpaths.set(`${ROOT}/mirrors`, Object.assign(new Error("ENOENT"), { code: "ENOENT" }));
+    mirror("mirrors/h/p.git");
+    manifest([{ name: "p", host: "h", path: "p", bare: "mirrors/h/p.git" }]);
+    await spawnWithCode();
+    expect(codeMounts()).toEqual([DIR_MOUNT]);
+    expect(errors.some((e) => e.includes("cannot be resolved"))).toBe(true);
   });
 });
 

@@ -3,17 +3,21 @@
  * mirror instead of the disk. See docs/design/agentbox-code-volume.md
  * ("Git layer").
  *
- * The four file tools (read / ls / find / grep) consult `classify()` for every
- * path. It answers `null` — "not mine, use the filesystem" — for everything
- * except a path whose first segment under `reposDir`:
+ * On the code volume `reposDir` is the agent's own directory, which holds only
+ * the manifest: every repository is read through these virtual paths. The four
+ * file tools (read / ls / find / grep) consult `classify()` for every path. It
+ * answers `null` — "not mine, use the filesystem" — for everything except a
+ * path whose first segment under `reposDir`:
  *
- *   1. does NOT exist on disk (a physical `<repo>@<view>` tree always wins), and
- *   2. splits at its LAST `@` into a repository name and 7–40 lowercase hex.
+ *   1. does NOT exist on disk (a real directory always wins — that is what
+ *      keeps a local-mode `repos/` checkout, whatever its names, on the
+ *      filesystem), and
+ *   2. splits at its LAST `@` into a repository name and 7–40 hex.
  *
- * 🔴 Only SHAs, never branch or tag names. A physical view is `<repo>@<env>`;
- * accepting symbolic refs here would put two meanings on one spelling, and a
- * branch moves, so a conclusion drawn from `app@main` could not be reproduced an
- * hour later. Symbolic refs are turned into SHAs by `git_query refs`.
+ * 🔴 Only SHAs, never branch or tag names. A branch moves, so a conclusion
+ * drawn from `app@main` could not be reproduced an hour later; and a symbolic
+ * name would give a directory name that happens to contain `@` a second
+ * meaning. Symbolic refs are turned into SHAs by `git_query refs`.
  *
  * A path that passes 1 and 2 is either served or REFUSED with a reason — it is
  * never handed back to the filesystem, where it would come out as a bare "not
@@ -38,7 +42,7 @@ import { GitCommandError, runGit } from "./git.js";
 
 /** `<name>@<sha>`: the name half is validated separately against the repo-name rule. */
 // Either case: a SHA copied from a UI or a log may be upper-case, and refusing it
-// would fall through to the physical layer and surface as a reasonless "not found".
+// would fall through to the filesystem and surface as a reasonless "not found".
 const VIRTUAL_SEGMENT_RE = /^(.+)@([0-9a-fA-F]{7,40})$/;
 
 /**
@@ -177,7 +181,7 @@ function isInside(child: string, dir: string): boolean {
 /**
  * Parse `git ls-tree -z [-l] [-r -t]` output. With `-l` the size column is
  * present (`-` for trees / submodules). Names are raw bytes decoded as UTF-8,
- * which is what the physical trees' file names are as well.
+ * which is how a checkout on disk would name the same files.
  */
 export function parseLsTree(out: Buffer, withSize: boolean): Array<Omit<TreeEntry, "name"> & { name: string }> {
   const entries: Array<Omit<TreeEntry, "name"> & { name: string }> = [];
@@ -223,8 +227,9 @@ export class CodeView {
   /**
    * Manifest ∩ mounts, re-read at most every `authorityTtlMs`.
    *
-   * A missing manifest is the normal state of a box whose supplier has not
-   * adopted the git layer: nothing readable, nothing wrong. An UNUSABLE manifest
+   * A missing manifest is the normal state of a box that got no code volume
+   * (and what a box sees if the supplier withdraws its agent's manifest while
+   * it runs): nothing readable, nothing wrong. An UNUSABLE manifest
    * is different — it is recorded as `manifestError` (and logged once per
    * distinct reason) so a request for a virtual path can say why nothing is
    * readable instead of pretending the repository is unknown.
@@ -319,7 +324,8 @@ export class CodeView {
       throw new CodeViewError(
         "manifest_invalid",
         `No commit can be read: the code-view manifest is invalid (${auth.manifestError}). ` +
-        `The physical views under ${this.reposDir} are unaffected.`,
+        `This is a fault in how the code is supplied, not in any repository, and no repository is readable ` +
+        `until the manifest is rewritten.`,
       );
     }
     const repo = auth.repos.get(name);
@@ -365,7 +371,10 @@ export class CodeView {
     if (!isInside(resolved, this.reposDir)) return null;
     const [segment, ...rest] = path.relative(this.reposDir, resolved).split(path.sep);
     const root = path.join(this.reposDir, segment);
-    // A physical tree always wins, whatever its name looks like.
+    // Anything that exists on disk wins, whatever its name looks like. On the
+    // code volume nothing under reposDir but the manifest does; the rule exists
+    // for a local-mode `repos/` directory, where an operator's checkout named
+    // `app@deadbeef` must stay the files it is rather than become a commit.
     if (fs.existsSync(root)) return null;
     const m = VIRTUAL_SEGMENT_RE.exec(segment);
     if (!m || !CODE_VIEW_REPO_NAME_RE.test(m[1])) return null;
@@ -405,15 +414,10 @@ export class CodeView {
       }
       // Only "no such object" means the commit is absent. Anything else — a repository
       // git refuses to open (ownership, corruption, permissions) — must not be dressed
-      // up as a missing commit: that would send the agent to code-mcp on every read
-      // and hide the real fault.
+      // up as a missing commit: that would tell the agent to wait for a fetch that
+      // cannot help, on every read, and hide the real fault.
       if (!isMissingRevision(err.stderr)) throw gitFailed(loc.repo.name, err);
-      throw new CodeViewError(
-        "ref_unreachable",
-        `Commit ${loc.sha} is not in the local mirror of "${loc.repo.name}" (it may be newer than the mirror's last ` +
-        `fetch, or not on any branch, tag or merge request of this repository). Read the file at that SHA through ` +
-        `code-mcp instead, or list known commits with git_query.`,
-      );
+      throw new CodeViewError("ref_unreachable", unreachableCommitMessage(loc.sha, loc.repo.name));
     }
   }
 
@@ -588,6 +592,26 @@ export function codeViewFor(opts: { reposDir: string; gitReposDir: string }): Co
  */
 export function isMissingRevision(stderr: string): boolean {
   return /Needed a single revision|unknown revision|bad revision|not a valid object name|bad object/i.test(stderr);
+}
+
+/**
+ * The refusal for a SHA the local mirror does not have — one text for the file
+ * tools and `git_query`, so the agent gets the same next step from either.
+ *
+ * The usual cause is a commit pushed after the mirror's last fetch: a push
+ * triggers a fetch within seconds, and a full round catches anything missed,
+ * so waiting is a real remedy. Nothing here fetches on demand (see "Virtual
+ * paths accept SHAs only" in docs/design/agentbox-code-volume.md). The other
+ * causes — a mistyped SHA, a commit on no branch, tag or merge request — are
+ * what listing the mirror's refs tells apart.
+ */
+export function unreachableCommitMessage(sha: string, repo: string): string {
+  return (
+    `Commit ${sha} is not in the local mirror of "${repo}". The mirror may not have fetched it yet — a push is ` +
+    `usually synced within seconds, at the latest by the next full sync round — so retry later; or list the ` +
+    `branches, tags and merge requests the mirror has, with the commit each points to, with git_query op "refs". ` +
+    `A commit that is on none of them cannot be read.`
+  );
 }
 
 /** A git failure that is not a missing object: surface git's own words, first line only. */

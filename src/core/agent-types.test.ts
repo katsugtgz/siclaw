@@ -9,6 +9,7 @@ import {
   PREVIOUS_KNOWLEDGE_QA_DEFAULT_PROMPT,
   PRODUCT_SUPPORT_DEFAULT_PROMPT,
   CODING_DEFAULT_PROMPT,
+  FLAT_TREE_CODING_DEFAULT_PROMPT,
   normalizeAgentType,
   requireAgentType,
   effectiveAgentPrompt,
@@ -162,6 +163,35 @@ describe("agent-types", () => {
     });
     expect(effectiveAgentPrompt("knowledge_qa", `${LEGACY_KNOWLEDGE_QA_DEFAULT_PROMPT} Edited`))
       .toBe(`${LEGACY_KNOWLEDGE_QA_DEFAULT_PROMPT} Edited`);
+  });
+
+  it("the coding contract names the virtual paths and the manifest, not the flat-tree layout", () => {
+    // The flat trees (<repo>@<view> directories, .revision.json) are gone from
+    // the code volume; a contract that still named them would send the agent
+    // to a file and directories that do not exist.
+    expect(CODING_DEFAULT_PROMPT).toContain(".siclaw/repos/<repo>@<sha>/<path>");
+    expect(CODING_DEFAULT_PROMPT).toContain("git_query");
+    expect(CODING_DEFAULT_PROMPT).toContain(".siclaw/repos/.gitrepos.json");
+    expect(CODING_DEFAULT_PROMPT).toContain('"Git history"');
+    expect(CODING_DEFAULT_PROMPT).not.toContain(".revision.json");
+    expect(CODING_DEFAULT_PROMPT).not.toContain("repository-and-view");
+  });
+
+  it("recognises the flat-tree coding default as materialized, not as an addendum", () => {
+    // A row persisted while that text was the default must not be re-injected
+    // on top of the new contract: it would reintroduce .revision.json.
+    expect(resolveAgentPromptLayers("coding", FLAT_TREE_CODING_DEFAULT_PROMPT)).toEqual({
+      typeContract: CODING_DEFAULT_PROMPT,
+      addendum: undefined,
+    });
+    expect(resolveAgentPromptLayers("coding", `  ${CODING_DEFAULT_PROMPT}  `)).toEqual({
+      typeContract: CODING_DEFAULT_PROMPT,
+      addendum: undefined,
+    });
+    expect(effectiveAgentPrompt("coding", FLAT_TREE_CODING_DEFAULT_PROMPT)).toBe(CODING_DEFAULT_PROMPT);
+    // Only the EXACT old text: an edited copy is the operator's and is kept.
+    expect(effectiveAgentPrompt("coding", `${FLAT_TREE_CODING_DEFAULT_PROMPT} Edited`))
+      .toBe(`${FLAT_TREE_CODING_DEFAULT_PROMPT} Edited`);
   });
 });
 

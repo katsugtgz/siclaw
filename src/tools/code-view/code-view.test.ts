@@ -1,8 +1,9 @@
 /**
  * The code-view layer against REAL git: a bare repository built in a temp dir,
- * mounted where the box would see it, plus the physical `<repo>@<view>` tree the
- * supplier would have exported from the same commit. Contract:
- * docs/design/agentbox-code-volume.md ("Git layer").
+ * mounted where the box would see it, plus the same commit written out as a
+ * plain directory with the manifest's rules applied. That directory is the
+ * REFERENCE: pi's own tools read it from disk, and every virtual answer must
+ * equal theirs. Contract: docs/design/agentbox-code-volume.md ("Git layer").
  */
 import { vi } from "vitest";
 // pi resolves rg from its own agent dir BEFORE PATH, and freezes that dir at
@@ -32,7 +33,7 @@ import { compileRgGlob, withCodeViewGrep } from "./grep.js";
 const MAX_FILE_BYTES = 4096;
 const RULES = { exclude_dirs: ["node_modules", "dist"], max_file_bytes: MAX_FILE_BYTES };
 
-/** Files of the fixture commit; NOT_EXPORTED lists the ones the supplier would leave out of a physical view. */
+/** Files of the fixture commit; NOT_EXPORTED lists the ones the rules keep out of the on-disk reference copy. */
 const FILES: Record<string, string> = {
   "README.md": "# app\nthe needle is documented here\n",
   ".hidden.ts": "export const needle = 1;\n",
@@ -110,8 +111,8 @@ beforeAll(() => {
   git(work, "commit", "-qam", "later");
   git(bare, "fetch", "-q", work, "+refs/heads/*:refs/heads/*");
 
-  // The physical view the supplier would have exported from `sha`.
-  physical = path.join(reposDir, "app@latest");
+  // The on-disk reference: `sha` as a plain directory, minus what the rules exclude.
+  physical = path.join(reposDir, "app-checkout");
   for (const [rel, content] of Object.entries(FILES)) {
     if (NOT_EXPORTED.includes(rel)) continue;
     fs.mkdirSync(path.join(physical, path.dirname(rel)), { recursive: true });
@@ -287,10 +288,17 @@ describe("CodeView commits", () => {
     expect(await view.commit(loc)).toBe(sha);
   });
 
-  it("a commit the mirror does not have is 'unreachable', pointing at code-mcp", async () => {
+  it("a commit the mirror does not have is 'unreachable': not fetched yet, retry, or list refs", async () => {
     const view = newView();
     const loc = view.classify(path.join(reposDir, `app@${"1".repeat(40)}`, "README.md"))!;
-    await expect(view.commit(loc)).rejects.toMatchObject({ kind: "ref_unreachable", message: expect.stringMatching(/code-mcp/) });
+    const err = await view.commit(loc).catch((e) => e);
+    expect(err).toMatchObject({ kind: "ref_unreachable" });
+    const message = (err as Error).message;
+    expect(message).toContain("may not have fetched it yet");
+    expect(message).toContain("retry later");
+    expect(message).toContain('git_query op "refs"');
+    // The retired code MCP is not a next step any more.
+    expect(message).not.toMatch(/code-mcp/i);
   });
 
   it("a repository git refuses to open is 'git_failed' with git's reason — never dressed up as a missing commit", async () => {
@@ -306,7 +314,8 @@ describe("CodeView commits", () => {
       const err = await view.commit(loc).catch((e) => e);
       expect(err).toBeInstanceOf(CodeViewError);
       expect((err as CodeViewError).kind).toBe("git_failed");
-      expect((err as Error).message).not.toMatch(/code-mcp/);
+      // Waiting for a fetch cannot fix a repository git refuses to open.
+      expect((err as Error).message).not.toMatch(/retry later/);
     } finally {
       fs.rmSync(broken, { recursive: true });
       writeManifest([{ name: "app" }]);
@@ -323,7 +332,7 @@ describe("read on a virtual path", () => {
     expect(text(r)).not.toContain("changed after");
   });
 
-  it("output is identical to reading the physical view of the same commit", async () => {
+  it("output is identical to reading the same commit from disk", async () => {
     const t = tools();
     for (const rel of ["src/main.ts", "crlf.txt", "long.txt", "many.txt"]) {
       const a = await run(t.read, { path: path.join(physical, rel), offset: 2, limit: 3 });
@@ -345,12 +354,13 @@ describe("read on a virtual path", () => {
 });
 
 describe("ls on a virtual path", () => {
-  it("lists like the physical view (sorted, / for directories, excluded names hidden)", async () => {
+  it("lists like the same commit on disk (sorted, / for directories, excluded names hidden)", async () => {
     const t = tools();
     for (const rel of ["", "src", "src/[id]"]) {
       const a = await run(t.ls, { path: rel ? path.join(physical, rel) : physical });
       const b = await run(t.ls, { path: rel ? path.join(virtual, rel) : virtual });
-      // The only difference the supplier's export introduces: big.txt is not exported.
+      // The one intended difference: big.txt is left out of the reference copy but
+      // listed virtually (max_file_bytes is enforced by read only).
       expect(text(b).split("\n").filter((l) => l !== "big.txt")).toEqual(text(a).split("\n"));
     }
     expect(text(await run(t.ls, { path: virtual }))).not.toMatch(/node_modules/);

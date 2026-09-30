@@ -14,9 +14,10 @@
  *                       prompt and bound MCP define the intake/result contract;
  *                       built-in filesystem access stays read-only.
  *   - coding      — managed project coding agent driven by the control plane.
- *                   Same hands-on capability set as `sre`, plus an optional
- *                   read-only mount of the project's source trees under
- *                   `.siclaw/repos` (see docs/design/agentbox-code-volume.md).
+ *                   Host-configured capability set (like `ticket`), plus
+ *                   optional read-only access to any commit of the project's
+ *                   repositories as `.siclaw/repos/<repo>@<sha>` paths (see
+ *                   docs/design/agentbox-code-volume.md).
  *   - custom      — the legacy free-form agent. Standalone Portal may persist
  *                   an operator's tool_capabilities selection; integrations
  *                   that omit it intentionally retain unrestricted built-ins.
@@ -177,28 +178,13 @@ export const PRODUCT_SUPPORT_DEFAULT_PROMPT =
   "Do not claim that downstream actions such as ticket creation or human handoff succeeded unless the caller confirms them.";
 
 /**
- * Public runtime invariant for a managed coding agent. The control plane owns
- * the released business prompt (what a project's environments mean, how to read
- * the deployment ledger); this layer only states the three facts that belong to
- * THIS runtime and that the agent cannot discover on its own:
- *
- *   1. The source trees under `.siclaw/repos` are a read-only snapshot, one
- *      top-level directory per `<repo>@<view>` — not a working copy and not a
- *      git repository (history is read through `git_query`, which needs read_code).
- *   2. They are reachable ONLY through the file tools. `restricted_bash` runs a
- *      command whitelist that contains no `ls`/`cat`/`find` and refuses text
- *      operands containing `/`, so a shell attempt returns a refusal rather
- *      than an empty result.
- *   3. `.siclaw/repos/.revision.json` is the authoritative manifest of the
- *      snapshot. The "Code Repositories" table injected by the knowledge
- *      overview has a character budget and truncates, so it is a hint, not a
- *      listing — an agent that trusts it will report a mounted repository as
- *      absent. The manifest is written by whoever prepares the volume and names
- *      every directory with the commit it holds.
- *
- * See docs/design/agentbox-code-volume.md ("What the agent sees").
+ * Exact default from the flat-tree layout (one `<repo>@<view>` directory per
+ * repository-and-view, listed in `.revision.json`), kept for materialized-row
+ * migration: a stored row holding it is the old default, not an addendum, and
+ * re-injecting it would point the agent at directories and a file that no
+ * longer exist.
  */
-export const CODING_DEFAULT_PROMPT =
+export const FLAT_TREE_CODING_DEFAULT_PROMPT =
   "You are a coding agent. You work hands-on within the clusters and environments of the one " +
   "project you are bound to: inspect, diagnose, and (only when explicitly asked) remediate. " +
   "When a read-only snapshot of the project's source is mounted, it appears as top-level directories under " +
@@ -209,12 +195,49 @@ export const CODING_DEFAULT_PROMPT =
   "Ground every conclusion in the code and the live state you actually read, and say so when the snapshot " +
   "does not cover what you were asked about.";
 
+/**
+ * Public runtime invariant for a managed coding agent. The control plane owns
+ * the released business prompt (what a project's environments mean, how to find
+ * the commit an environment runs); this layer only states the three facts that
+ * belong to THIS runtime and that the agent cannot discover on its own:
+ *
+ *   1. The source is read ONLY through the file tools, at virtual paths
+ *      `.siclaw/repos/<repo>@<sha>/<path>` served from bare mirrors. No `ls`
+ *      shows them, so without this sentence the agent cannot know they exist;
+ *      there is no checkout, and `restricted_bash` runs a command whitelist
+ *      with no `ls`/`cat`/`find` that refuses text operands containing `/`, so
+ *      a shell attempt returns a refusal rather than an empty result.
+ *   2. Those paths take a SHA only; `git_query` op `refs` (read_code) is how a
+ *      branch, tag or merge request becomes one.
+ *   3. The "Git history" section of the knowledge overview has a character
+ *      budget and truncates, so it is a hint, not a listing — an agent that
+ *      trusts it will report a readable repository as absent. The supplier's
+ *      manifest `.siclaw/repos/.gitrepos.json` names every repository.
+ *
+ * See docs/design/agentbox-code-volume.md ("The `coding` type").
+ */
+export const CODING_DEFAULT_PROMPT =
+  "You are a coding agent. You work hands-on within the clusters and environments of the one " +
+  "project you are bound to: inspect, diagnose, and (only when explicitly asked) remediate. " +
+  "The project's source is read-only and reachable only through the `read`, `ls`, `find` and `grep` tools, at " +
+  "`.siclaw/repos/<repo>@<sha>/<path>` where `<sha>` is a 7-40 hex commit SHA — such paths are not listed by " +
+  "`ls`, there is no git checkout, and the shell cannot reach them. A branch, tag or merge request becomes a SHA " +
+  "with `git_query` op `refs`. The readable repositories are listed in the \"Git history\" section of the " +
+  "knowledge overview, which may be truncated; the full list is `.siclaw/repos/.gitrepos.json`. " +
+  "Ground every conclusion in the code and the live state you actually read, and say so when a commit or " +
+  "repository you were asked about is not available.";
+
+const REPLACED_CODING_DEFAULT_PROMPTS = new Set([
+  CODING_DEFAULT_PROMPT,
+  FLAT_TREE_CODING_DEFAULT_PROMPT,
+]);
+
 const MATERIALIZED_TYPE_PROMPTS: Record<Exclude<AgentType, "custom">, ReadonlySet<string>> = {
   sre: new Set([SRE_DEFAULT_PROMPT]),
   knowledge_qa: REPLACED_KNOWLEDGE_QA_DEFAULT_PROMPTS,
   product_support: new Set([PRODUCT_SUPPORT_DEFAULT_PROMPT]),
   ticket: new Set(),
-  "coding": new Set([CODING_DEFAULT_PROMPT]),
+  "coding": REPLACED_CODING_DEFAULT_PROMPTS,
 };
 
 export interface AgentPromptLayers {

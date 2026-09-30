@@ -5,12 +5,13 @@
  * real filesystem itself and only asks the operations whether the path is a
  * directory and, for context lines, what a file contains. So — following the
  * `withGrepPathReason` precedent in agent-factory — the tool's `execute` is
- * wrapped: a physical path goes to pi untouched, a virtual one is answered here
+ * wrapped: a path on disk goes to pi untouched, a virtual one is answered here
  * with `git grep` against the commit.
  *
  * 🔴 The output contract is pi's, reproduced step by step (see pi 0.85.1
  * `dist/core/tools/grep.js`), because the agent must be able to use one tool
- * the same way on `app@latest` and on `app@<sha>`:
+ * the same way on `app@<sha>` as on any directory it greps — a skill, a
+ * knowledge page, a local checkout:
  *
  *   rg flag / behaviour                    here
  *   ─────────────────────────────────────  ─────────────────────────────────────
@@ -33,9 +34,10 @@
  *   stop the child at `limit` matches      stop `git grep` at `limit` matches
  *   notices + details                      identical text and fields
  *
- * The contract test (`grep.test.ts`) runs the same queries over a physical tree
- * (real ripgrep through pi's tool) and the equivalent commit, and requires
- * byte-identical output. It is what fails first when pi is upgraded.
+ * The contract test (`code-view.test.ts`) runs the same queries over the commit
+ * written out to disk (real ripgrep through pi's tool) and over the commit
+ * itself, and requires byte-identical output. It is what fails first when pi is
+ * upgraded.
  *
  * Known, documented differences: PCRE is not Rust regex at the edges (lookaround
  * works here and not in rg; Unicode classes differ under `LC_ALL=C`); `.ignore`
@@ -74,7 +76,7 @@ const UNICODE_SPACES = /[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g;
 /**
  * pi's `resolveToCwd` (not exported): unicode spaces → " ", a leading `@`
  * dropped, `~` expanded, `file://` URLs converted, then resolved against cwd.
- * Must agree with pi exactly — the wrapper decides physical-vs-virtual on the
+ * Must agree with pi exactly — the wrapper decides disk-vs-virtual on the
  * path pi WOULD search.
  */
 export function resolveToolPath(input: string, cwd: string): string {

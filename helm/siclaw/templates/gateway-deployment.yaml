@@ -191,9 +191,9 @@ spec:
               value: {{ include "siclaw.dataPvcName" . | quote }}
             {{- end }}
             {{- if eq (include "siclaw.codeVolume.available" .) "true" }}
-            # Read-only per-agent source trees (docs/design/agentbox-code-volume.md).
-            # A PVC written by an external supplier; unset ⇒ AgentBox pods get no
-            # code volume and no code mount at all.
+            # Read-only code mirrors and per-agent manifests
+            # (docs/design/agentbox-code-volume.md). A PVC written by an external
+            # supplier; unset ⇒ AgentBox pods get no code volume and no code mount at all.
             - name: SICLAW_CODE_CLAIM_NAME
               value: {{ .Values.agentbox.codeVolume.claimName | quote }}
             {{- end }}
@@ -301,11 +301,13 @@ spec:
             {{- end }}
             {{- if eq (include "siclaw.codeVolume.available" .) "true" }}
             # The Runtime needs its OWN view of the code volume to read each
-            # agent's ready marker before it decides what to give a pod. Read-only
+            # agent's manifest and check the mirrors it names before it decides
+            # what to give a pod. Read-only
             # on the MOUNT, never on the volume source below: a read-only PVC
             # source is staged read-only by the CSI driver and leaves pods stuck in
             # ContainerCreating. This path is never handed to an AgentBox — each
-            # box gets a subPath-scoped mount of its own agents/<id>/ subtree.
+            # box gets subPath-scoped mounts of its own agents/<id>/ directory
+            # and of the mirrors its manifest grants.
             - name: code-root
               mountPath: /app/.siclaw/code-root
               readOnly: true

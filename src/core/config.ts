@@ -116,9 +116,9 @@ export interface SiclawConfig {
      * repository at `<gitReposDir>/<name>.git`. The K8s spawner hard-codes the
      * same path (`/app/.siclaw/gitrepos`) for the mounts it emits, exactly as it
      * does for `reposDir` — see docs/design/agentbox-code-volume.md ("Git layer").
-     * Deliberately NOT under `reposDir`: that directory is the supplier's
-     * subPath mount (read-only, owned by another system) and is scanned into the
-     * prompt as the repository table, so nothing of ours may live inside it.
+     * Deliberately NOT under `reposDir`: on the code volume that directory is
+     * the agent's own `agents/<agentId>/` subPath mount (read-only, owned by the
+     * supplier, holding its manifest), so nothing of ours may live inside it.
      */
     gitReposDir: string;
   };

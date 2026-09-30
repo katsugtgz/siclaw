@@ -31,7 +31,16 @@ import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { ToolEntry } from "../../core/tool-registry.js";
 import { isExcludedPath } from "../../shared/code-view-manifest.js";
 import { GitCommandError, GitGateBusyError, GitTimeoutError, runGit } from "./git.js";
-import { CodeViewError, excludePathspecs, gitFailed, isMissingRevision, type CodeView, type CodeViewRepo, type VirtualLocation } from "./view.js";
+import {
+  CodeViewError,
+  excludePathspecs,
+  gitFailed,
+  isMissingRevision,
+  unreachableCommitMessage,
+  type CodeView,
+  type CodeViewRepo,
+  type VirtualLocation,
+} from "./view.js";
 import type { CodeViewRules } from "../../shared/code-view-manifest.js";
 
 /**
@@ -182,8 +191,7 @@ async function resolveCommit(repo: CodeViewRepo, ref: string, signal?: AbortSign
     throw new CodeViewError(
       "ref_unreachable",
       HEX_RE.test(bare)
-        ? `Commit ${ref} is not in the local mirror of "${repo.name}" (it may be newer than the mirror's last fetch, ` +
-          `or not on any branch, tag or merge request). Read files at that SHA through code-mcp instead.`
+        ? unreachableCommitMessage(ref, repo.name)
         : `"${ref}" does not name a commit in "${repo.name}". List branches, tags and merge requests with op "refs".`,
     );
   }

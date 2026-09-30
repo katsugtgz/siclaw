@@ -299,14 +299,17 @@ agentbox:
   # Optional read-only source-code volume for AgentBox pods.
   # Full contract: docs/design/agentbox-code-volume.md.
   #
-  # A SEPARATE, pre-existing RWX PVC laid out as agents/<agentId>/<repo>@<view>/
-  # by an external supplier. The chart never provisions it and nothing in Siclaw
-  # ever writes to it: the Runtime mounts it read-only to read each agent's
-  # `.ready` marker, and each AgentBox gets a read-only, subPath-scoped mount of
-  # its own agents/<agentId>/ subtree at /app/.siclaw/repos.
+  # A SEPARATE, pre-existing RWX PVC on which an external supplier keeps bare
+  # mirrors (mirrors/<host>/<path>.git) and one manifest per agent
+  # (agents/<agentId>/.gitrepos.json). The chart never provisions it and nothing
+  # in Siclaw ever writes to it: the Runtime mounts it read-only to read each
+  # agent's manifest, and each AgentBox whose agent has one gets read-only,
+  # subPath-scoped mounts of its own agents/<agentId>/ directory at
+  # /app/.siclaw/repos and of each mirror the manifest grants at
+  # /app/.siclaw/gitrepos/<name>.git.
   #
   # There is deliberately no `enabled` flag beside the name. Whether a given
-  # agent gets the mount is decided by that ready marker on the volume itself —
+  # agent gets the mounts is decided by that manifest on the volume itself —
   # a chart-level policy flag could only disagree with the filesystem.
   #
   # 🔴 Do NOT add fsGroup to make this readable. kubelet chowns the volume

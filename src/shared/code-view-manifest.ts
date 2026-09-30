@@ -32,8 +32,8 @@ const SEGMENT_RE = /^[A-Za-z0-9._-]+$/;
 /**
  * A repository name is one path segment: it becomes the mount directory
  * `<name>.git` AND the first half of a virtual path `<name>@<sha>`. Same charset
- * and 63-char cap as the physical view names the supplier writes, so the two
- * address spaces spell a repository identically.
+ * and 63-char cap as the agent directory names on the volume (the Runtime's
+ * subPath rule), so one name is valid in every place it is spelled.
  */
 export const CODE_VIEW_REPO_NAME_RE = /^[A-Za-z0-9._-]{1,63}$/;
 
@@ -54,11 +54,11 @@ export interface CodeViewManifestRepo {
 export interface CodeViewRules {
   /**
    * Directory names hidden at ANY depth. A path is excluded when any of its
-   * segments equals one of these — the writer's own `is_excluded` rule, which
-   * is also what shaped the physical `<repo>@<view>` trees.
+   * segments equals one of these — the writer's own `is_excluded` rule,
+   * serialised rather than re-typed here so the two cannot drift.
    */
   excludeDirs: string[];
-  /** Blobs larger than this are refused by `read`, matching the physical trees. */
+  /** Blobs larger than this are refused by `read` (a hygiene limit, not an authorisation boundary). */
   maxFileBytes: number;
 }
 
