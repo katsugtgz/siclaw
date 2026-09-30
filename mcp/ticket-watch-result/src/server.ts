@@ -23,7 +23,7 @@ const inputSchema = {
       minimum: LIMITS.minCheckAfterSeconds,
       maximum: LIMITS.maxCheckAfterSeconds,
       description:
-        "How long until you should be woken again. Required unless state is \"done\", where it must be omitted. This is a floor, not a promise: a message from a person or a finished investigation wakes you sooner. Choose it by how fast this ticket is actually moving — a long wait costs nothing when a real signal will pull you forward.",
+        "How long until you should be woken again. Required unless state is \"done\"; leave it out then, and it is ignored if sent. This is a floor, not a promise: a message from a person or a finished investigation wakes you sooner. Choose it by how fast this ticket is actually moving — a long wait costs nothing when a real signal will pull you forward.",
     },
     last_seen_message_id: {
       type: "string",
@@ -133,7 +133,7 @@ const inputSchema = {
 
 export function createTicketWatchResultServer(): Server {
   const server = new Server(
-    { name: "mcp-ticket-watch-result", version: "0.3.1" },
+    { name: "mcp-ticket-watch-result", version: "0.3.2" },
     { capabilities: { tools: {} } },
   );
 

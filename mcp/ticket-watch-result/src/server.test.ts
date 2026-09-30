@@ -135,7 +135,6 @@ describe("ticket watch result MCP", () => {
         {},
         { state: "stalled", next_check_after_seconds: 300 },
         { state: "watching" },
-        { state: "done", next_check_after_seconds: 300, note: "已结单" },
         { state: "done" },
         { state: "watching", next_check_after_seconds: 30 },
         {
@@ -149,6 +148,17 @@ describe("ticket watch result MCP", () => {
         expect(response.isError).toBe(true);
         expect(response.structuredContent).toBeUndefined();
       }
+    });
+  });
+
+  it("accepts a finished follow that still names a next check, and drops it", async () => {
+    await withClient(async (client) => {
+      const response = await client.callTool(
+        { name: TOOL_NAME, arguments: { state: "done", next_check_after_seconds: 300, note: "已结单" } },
+        CallToolResultSchema,
+      );
+      expect(response.isError).toBeFalsy();
+      expect(response.structuredContent).toEqual({ state: "done", note: "已结单" });
     });
   });
 
