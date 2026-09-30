@@ -143,6 +143,7 @@ interface PromptRequestBody {
   turnId?: string;
   /** Trusted control-plane contract for one required structured result tool. */
   requiredResultToolName?: string;
+  toolPolicy?: "ticket_fill_once";
 }
 
 /**
@@ -950,6 +951,11 @@ export function createHttpServer(
       return;
     }
     const requiredResultToolName = body.requiredResultToolName?.trim() || undefined;
+    if (body.toolPolicy !== undefined && (body.toolPolicy !== "ticket_fill_once" || !requiredResultToolName)) {
+      logPromptResponse(400, "rejected", "Invalid tool policy");
+      sendJson(res, 400, { error: "toolPolicy requires ticket_fill_once and a result tool" });
+      return;
+    }
 
     const promptMediaValidation = validatePromptMedia(body.images, body.files);
     if (promptMediaValidation.error) {
@@ -1471,7 +1477,7 @@ export function createHttpServer(
       },
       media,
       requiredResultToolName
-        ? { requiredResultToolName }
+        ? { requiredResultToolName, toolPolicy: body.toolPolicy }
         : undefined,
     );
 

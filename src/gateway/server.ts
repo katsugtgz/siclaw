@@ -829,6 +829,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       sessionId,
       turnId,
       requiredResultToolName,
+      toolPolicy: params.toolPolicy === "ticket_fill_once" ? "ticket_fill_once" : undefined,
       userId,
       text: promptText,
       handoffTrace: handoff ? normalizeHandoffTrace(handoffParam?.traceContext) : undefined,

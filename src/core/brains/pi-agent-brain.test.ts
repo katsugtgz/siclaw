@@ -54,6 +54,31 @@ describe("PiAgentBrain", () => {
     vi.restoreAllMocks();
   });
 
+  it.each([false, true])("restricts final fill tools and restores them after failure=%s", async (fails) => {
+    const required = "mcp__result__submit";
+    const session = makeFakeSession();
+    const original = ["read", "bash", "investigate", "knowledge_search", required];
+    session.setActiveToolsByName(original);
+    session.prompt = vi.fn(async () => {
+      expect(session.getActiveToolNames()).toEqual(["read", required]);
+      if (fails) throw new Error("provider down");
+      session.__emit({type: "tool_execution_end", toolName: required, isError: false, result: {details: {structuredContent: {state: "done"}}}});
+      session.__emit({type: "message_end", message: {role: "assistant", content: [{type: "text", text: "done"}], stopReason: "stop"}});
+    });
+    const call = new PiAgentBrain(session).prompt("final fill", undefined, {requiredResultToolName: required, toolPolicy: "ticket_fill_once"});
+    if (fails) await expect(call).rejects.toThrow("provider down");
+    else await call;
+    expect(session.getActiveToolNames()).toEqual(original);
+  });
+
+  it("refuses final fill when its required result tool is unavailable", async () => {
+    const session = makeFakeSession();
+    session.setActiveToolsByName(["read", "bash"]);
+    await expect(new PiAgentBrain(session).prompt("fill", undefined, {requiredResultToolName: "missing", toolPolicy: "ticket_fill_once"})).rejects.toThrow("active result tool");
+    expect(session.prompt).not.toHaveBeenCalled();
+    expect(session.getActiveToolNames()).toEqual(["read", "bash"]);
+  });
+
   it("brainType is pi-agent", () => {
     const brain = new PiAgentBrain(makeFakeSession());
     expect(brain.brainType).toBe("pi-agent");

@@ -39,6 +39,8 @@ export interface PromptMedia {
 
 /** Runtime-only completion requirements supplied by a trusted control plane. */
 export interface PromptRequirements {
+  /** Narrows this turn to file reads and its required result, never grants tools. */
+  toolPolicy?: "ticket_fill_once";
   /**
    * Exact MCP result tool that must succeed before this prompt may finish.
    * The normal agent run remains unrestricted. If it omits the result, the
