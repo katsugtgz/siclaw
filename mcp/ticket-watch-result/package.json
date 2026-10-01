@@ -1,6 +1,6 @@
 {
   "name": "mcp-ticket-watch-result",
-  "version": "0.3.0",
+  "version": "0.3.2",
   "description": "Stateless MCP validator for the per-turn result of an L1 ticket follow",
   "type": "module",
   "bin": {

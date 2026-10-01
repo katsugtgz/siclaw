@@ -89,10 +89,11 @@ describe("the schedule", () => {
 
   // A finished follow that also asks to be woken is a contradiction the worker
   // would have to resolve by guessing which half to believe.
-  it("is refused once the follow is done", () => {
-    expect(() =>
-      parseTicketWatchResult({ state: "done", note: "已结单", next_check_after_seconds: 300 }),
-    ).toThrow("must be omitted");
+  it("is dropped once the follow is done, not refused", () => {
+    expect(parseTicketWatchResult({ state: "done", note: "已结单", next_check_after_seconds: 300 })).toEqual({
+      state: "done",
+      note: "已结单",
+    });
   });
 
   it("is what a done result carries instead — a reason", () => {

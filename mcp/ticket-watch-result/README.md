@@ -6,7 +6,7 @@ JSON object in MCP text and `structuredContent`. It reads and writes nothing:
 no ticket system, no messages, no scheduling. The harness that dispatched the
 run stores the result and acts on it.
 
-This is the in-flight follow only. The other result contracts in this directory
+This contract also carries bounded final fills requested by the host. The other result contracts in this directory
 belong to different moments of a ticket's life: pre-ticket intake keeps
 [product-support-result](../product-support-result/README.md), the pre-handoff
 closure keeps [ticket-closure-result](../ticket-closure-result/README.md), and
@@ -128,13 +128,19 @@ could not explain the problem to it often can once an engineer is talking to
 them, and the follow folds what that conversation established into the same
 text rather than appending to it.
 
-The tool writes nothing. The harness writes all four fields to the ticket after
-the turn is stored, and it is the harness that can see what this tool cannot:
-it reads the ticket first, replaces the pre-ticket `description` and `modules`
-it found at the claim, never overwrites a field a person has changed (that
-field is theirs from then on), and stops writing once the ticket leaves the
-handling states. The engineer's resolve form shows the current values as
-defaults, so the person confirming is always the last writer.
+The tool writes nothing. The harness writes the four fields after a successful
+check. People and the assistant may both update them. A new explicit proposal
+may replace a person's edit, including while the ticket awaits acceptance;
+without new facts the assistant omits the field. The harness consumes each
+proposal after applying it, so an idle check or a retry does not replay a value
+that was already written. Entering awaiting acceptance requests a summary, and
+late investigation results can still supplement it. Continuous follows end
+when the ticket closes, is voided or is converted.
+
+A platform-requested single fill after the customer ends AI reception uses the
+same four-field result. It submits `state=done`, closure fields and a note, with
+no next-check time or investigation list. The harness completes the writes and
+any write retries before declaring that task complete.
 
 ## What is deliberately absent
 
@@ -147,8 +153,8 @@ defaults, so the person confirming is always the last writer.
 - **No write the agent makes itself.** `closure` is a proposal; the harness
   decides whether it reaches the ticket, as described above. Nothing is ever
   written to the group.
-- **Nothing reaches the customer without a person.** `closure.result` becomes
-  customer-visible only when the engineer submits the resolve form, with the
+- **Closure text is suitable for the customer.** `closure.result` may be
+  visible during handling and acceptance, with the
   proposal as its default. `note` stays internal to the team.
 
 ## Assistant and API setup

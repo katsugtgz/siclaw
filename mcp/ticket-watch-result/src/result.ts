@@ -365,15 +365,13 @@ export function parseTicketWatchResult(input: unknown): TicketWatchResult {
 
   const result: TicketWatchResult = { state };
 
-  // `done` ends the follow, so a next check would be a contradiction rather
-  // than a harmless extra: the worker would have to decide which of the two to
-  // believe. Everywhere else the schedule is what the run is FOR.
+  // `done` ends the follow, so it is never scheduled again, and a next check
+  // sent with it is dropped rather than refused. Refusing taught nothing: on
+  // 2026-09-30 a single fill sent one 26 times in a row, each time saying it
+  // had removed it, and spent four and a half minutes of its lease before it
+  // landed a result the worker treats the same either way. Everywhere else
+  // the schedule is what the run is FOR.
   if (state === "done") {
-    if ("next_check_after_seconds" in record) {
-      throw new Error(
-        'input.next_check_after_seconds must be omitted when state is "done" — a finished follow is not scheduled again',
-      );
-    }
     // The one transition a person reading the trail will want explained.
     if (!("note" in record)) {
       throw new Error('input.note is required when state is "done" — say why the follow ended');

@@ -231,9 +231,25 @@ export class PiAgentBrain implements BrainSession {
 
   async prompt(text: string, media?: PromptMedia, requirements?: PromptRequirements): Promise<void> {
     this.aborted = false;
-    // Implicit prompt boundary for callers that bypass the agentbox HTTP layer
-    // (child sub-agents, synthetic notifies). A no-op when the HTTP layer already
-    // opened the prompt explicitly — routing calls prompt() once per attempt.
+    const toolSession = this.session as AgentSession & {
+      getActiveToolNames?: () => string[];
+      setActiveToolsByName?: (names: string[]) => void;
+    };
+    let restoreTools: string[] | undefined;
+    let restrictedTools: string[] | undefined;
+    if (requirements?.toolPolicy === "ticket_fill_once") {
+      if (!toolSession.getActiveToolNames || !toolSession.setActiveToolsByName) {
+        throw new Error("ticket_fill_once tool policy is unsupported by this session");
+      }
+      const active = toolSession.getActiveToolNames();
+      if (!requirements.requiredResultToolName || !active.includes(requirements.requiredResultToolName)) {
+        throw new Error("ticket_fill_once requires an active result tool");
+      }
+      restoreTools = active;
+      const reads = new Set(["read", "read_file", "read_files", "list_files", "ls"]);
+      restrictedTools = active.filter(name => reads.has(name) || name === requirements.requiredResultToolName);
+    }
+    // Validate admission before opening the implicit prompt boundary.
     this.llmCalls?.beginPrompt(Date.now());
     this.handedOff = false;
     this.handoffReserved = false;
@@ -278,6 +294,7 @@ export class PiAgentBrain implements BrainSession {
     });
 
     try {
+      if (restrictedTools) toolSession.setActiveToolsByName!(restrictedTools);
       await this.session.prompt(text, promptOptions);
       if (this.handedOff) return;
 
@@ -360,9 +377,13 @@ export class PiAgentBrain implements BrainSession {
         await this.repairMissingRequiredResult(requiredResultToolName, successfulTools);
       }
     } finally {
-      unsub();
-      releaseMailbox?.();
-      this.llmCalls?.endPrompt();
+      try {
+        unsub();
+        if (restoreTools) toolSession.setActiveToolsByName!(restoreTools);
+      } finally {
+        releaseMailbox?.();
+        this.llmCalls?.endPrompt();
+      }
     }
   }
 
