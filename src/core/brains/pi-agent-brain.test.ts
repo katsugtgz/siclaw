@@ -197,6 +197,78 @@ describe("PiAgentBrain", () => {
     expect(session.setActiveToolsByName).not.toHaveBeenCalled();
   });
 
+  it("asks only for the reply, with no tools, when a recorded result ends on an empty message", async () => {
+    // The shape measured 2026-10-01: the closing line written alongside the
+    // result call, then an empty message. Re-sending the prompt ran the task
+    // again and the turn failed on its second result.
+    const requiredTool = "mcp__result__submit";
+    const session = makeFakeSession();
+    (PiAgentBrain as any).RETRY_DELAY_MS = 1;
+    const prompts: string[] = [];
+    session.prompt = vi.fn(async (text: string) => {
+      prompts.push(text);
+      if (prompts.length === 1) {
+        session.__emit({ type: "message_start", message: { role: "assistant" } });
+        session.__emit({
+          type: "message_end",
+          message: { role: "assistant", content: [{ type: "text", text: "proposed" }, { type: "toolCall", name: requiredTool }], stopReason: "toolUse" },
+        });
+        session.__emit({
+          type: "tool_execution_end",
+          toolName: requiredTool,
+          isError: false,
+          result: { details: { structuredContent: { state: "done" } } },
+        });
+        session.__emit({ type: "message_start", message: { role: "assistant" } });
+        session.__emit({ type: "message_end", message: { role: "assistant", content: [], stopReason: "stop" } });
+        return;
+      }
+      expect(session.getActiveToolNames()).toEqual([]);
+      session.__emit({ type: "message_start", message: { role: "assistant" } });
+      session.__emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "proposed" }], stopReason: "stop" } });
+    });
+
+    const brain = new PiAgentBrain(session);
+    const events: any[] = [];
+    brain.subscribe((event) => events.push(event));
+    await brain.prompt("fill", undefined, { requiredResultToolName: requiredTool });
+
+    expect(prompts).toHaveLength(2);
+    expect(prompts[1]).toContain("[System: final-reply repair]");
+    expect(session.getActiveToolNames()).toEqual(["read", requiredTool]);
+    expect(events.some((e) => e.type === "auto_retry_start")).toBe(false);
+    expect(events).toContainEqual({ type: "final_reply_repair_end", success: true });
+  });
+
+  it("asks for a missing reply once and leaves a still-empty turn as it is", async () => {
+    const requiredTool = "mcp__result__submit";
+    const session = makeFakeSession();
+    (PiAgentBrain as any).RETRY_DELAY_MS = 1;
+    let calls = 0;
+    session.prompt = vi.fn(async () => {
+      calls++;
+      if (calls === 1) {
+        session.__emit({
+          type: "tool_execution_end",
+          toolName: requiredTool,
+          isError: false,
+          result: { details: { structuredContent: { state: "done" } } },
+        });
+      }
+      session.__emit({ type: "message_start", message: { role: "assistant" } });
+      session.__emit({ type: "message_end", message: { role: "assistant", content: [], stopReason: "stop" } });
+    });
+
+    const brain = new PiAgentBrain(session);
+    const events: any[] = [];
+    brain.subscribe((event) => events.push(event));
+    await brain.prompt("fill", undefined, { requiredResultToolName: requiredTool });
+
+    expect(session.prompt).toHaveBeenCalledTimes(2);
+    expect(events).toContainEqual({ type: "final_reply_repair_end", success: false });
+    expect(session.getActiveToolNames()).toEqual(["read", requiredTool]);
+  });
+
   it("repairs a result-tool call that succeeded at transport level without structuredContent", async () => {
     const requiredTool = "mcp__result__submit";
     const session = makeFakeSession();
