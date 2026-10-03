@@ -94,6 +94,14 @@ Memory DB: node:sqlite + FTS5 + sqlite-vec
   a `chore/...` branch from GitLab `main`, review and test, then merge through
   a merge request. Never rebase or force push protected `main`, and never add
   Siclaw commits to `upstream/main`.
+- The target Codex integration uses its native instructions, tools, execution
+  environments, and agent lifecycle. Implement Siclaw-specific policy and
+  services at native extension boundaries; do not wrap Pi tool definitions or
+  require a Pi AgentSession as the Codex implementation. The current
+  `CodexToolBridge` is a transitional prototype. See
+  `docs/design/codex-native-runtime.md` for the replacement direction.
+- Validate the Codex runtime with SiCore as the UI first. Portal UI acceptance
+  follows only after that runtime path is complete.
 - `Dockerfile.agentbox` fetches GitLab `main` and verifies the exact
   `CODEX_COMMIT` before building. Advance the pin after reviewing the source
   diff and passing Codex Rust tests/build, the Siclaw app-server smoke test,

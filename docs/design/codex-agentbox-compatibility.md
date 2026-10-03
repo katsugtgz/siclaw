@@ -1,5 +1,10 @@
 # Codex AgentBox compatibility
 
+Status: transitional prototype. The user selected a native Codex runtime on
+2026-10-03; the target is documented in `codex-native-runtime.md`. The tool
+bridge below describes the existing prototype and is not the intended final
+architecture. SiCore is the first UI acceptance target; Portal UI is deferred.
+
 Siclaw selects Pi or the source-built official Codex CLI inside the same
 AgentBox. This integration preserves the existing Runtime API and session event
 stream. It is not yet a complete replacement of Pi.
@@ -64,7 +69,7 @@ the root `AGENTS.md` and `CLAUDE.md`.
    Mount only the smoke script read-only at `/app/scripts/test`; the binary and
    production modules must come from the image.
 5. Before rollout, validate real provider requests and an isolated Runtime +
-   AgentBox deployment: frontend events, stop/restart/resume, model fallback,
+   AgentBox deployment with SiCore as the UI: events, stop/restart/resume, model fallback,
    domain tools, background jobs, subtasks, and the Pi fallback cases above.
 
 The fake provider and standalone container checks do not establish real-model

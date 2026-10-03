@@ -13,6 +13,13 @@ Its protected `main` contains the minimal Siclaw patch series. Prefer native
 Codex features first; use merge requests for normal patches. Periodically
 sync upstream, merge it into a `chore/...` work branch, and use a merge
 request to update protected `main`. Never rebase or force push `main`.
+
+The target integration retains Codex native instructions, tools, execution
+environments, and agent lifecycle. Siclaw-specific policy and services belong
+at Codex extension boundaries. Do not implement Codex by wrapping Pi tool
+definitions or requiring a Pi AgentSession. `CodexToolBridge` is a transitional
+prototype, superseded by the direction in `docs/design/codex-native-runtime.md`.
+SiCore is the first UI acceptance target; Portal UI acceptance comes last.
 `Dockerfile.agentbox` fetches
 GitLab `main` over SSH and verifies a pinned
 `CODEX_COMMIT`. Advance the pin only after Codex Rust tests/build, the Siclaw
