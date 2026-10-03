@@ -60,6 +60,9 @@ RUN --mount=type=ssh,required=true git init /src/codex \
     && test "$(git -C /src/codex rev-parse HEAD)" = "${CODEX_COMMIT}"
 RUN cd /src/codex/codex-rs && cargo build --release --locked -p codex-cli --bin codex \
     && target/release/codex --version
+RUN cd /src/codex/codex-rs \
+    && cargo build --release --locked -p codex-code-mode-host --bin codex-code-mode-host \
+    && target/release/codex-code-mode-host --help >/dev/null
 
 # ── Production stage ─────────────────────────────────────────────
 FROM node:22.19-slim
@@ -86,7 +89,7 @@ ARG YQ_SHA256=fa52a4e758c63d38299163fbdd1edfb4c4963247918bf9c1c5d31d84789eded4
 # NoSuchKey XML. Every cluster read in the box then died before reaching an API server.
 ARG KUBECTL_VERSION=v1.36.4
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl jq python3 ca-certificates sudo fonts-noto-cjk chromium bsdextrautils ripgrep libcap2 \
+    curl jq python3 ca-certificates sudo fonts-noto-cjk chromium bsdextrautils ripgrep libcap2 bubblewrap \
     && curl -fsSL --retry 3 -o /usr/local/bin/kubectl \
        "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" \
     && chmod +x /usr/local/bin/kubectl \
@@ -131,7 +134,8 @@ RUN npm ci --omit=dev
 
 # Copy only the binary from the official source build, never an npm wrapper.
 COPY --from=codex-builder /src/codex/codex-rs/target/release/codex /usr/local/bin/codex
-RUN codex --version
+COPY --from=codex-builder /src/codex/codex-rs/target/release/codex-code-mode-host /usr/local/bin/codex-code-mode-host
+RUN codex --version && codex-code-mode-host --help >/dev/null && bwrap --version
 
 # Copy compiled JS + skills + entrypoint (knowledge synced at runtime via bundle API)
 COPY --from=builder /app/dist/ ./dist/

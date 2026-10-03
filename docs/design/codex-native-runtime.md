@@ -38,6 +38,12 @@ wrapper is needed. `environment/add` and thread environment selection are
 experimental upstream APIs, so the source pin and protocol integration checks
 are upgrade gates.
 
+The Linux image also needs bubblewrap for upstream sandbox execution and the
+source-built `codex-code-mode-host` for catalogs selecting Code Mode. Copying
+only the CLI binary is insufficient for the native tool path. Installing these
+runtime prerequisites does not justify changing the container's security
+context; execute the native probe under the intended restrictions.
+
 `scripts/test/codex-native-exec-probe.mjs` exercises official app-server +
 exec-server with a fixed fake Responses model and a temporary workspace. It
 checks actual native command output and native `apply_patch` file creation, with
