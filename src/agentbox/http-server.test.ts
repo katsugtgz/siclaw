@@ -277,8 +277,12 @@ function makeFakeSessionManager(ledgerDir = fs.mkdtempSync(path.join(os.tmpdir()
       activeMode?: unknown,
       userId?: string,
       allowInputRequest?: boolean,
+      _handoffSupported?: boolean,
+      _handoffPolicy?: unknown,
+      _structuredResultRequired?: boolean,
+      agentEngine?: string,
     ) => {
-      getOrCreateCalls.push({ id, activeMode, userId, allowInputRequest });
+      getOrCreateCalls.push({ id, activeMode, userId, allowInputRequest, agentEngine });
       const key = id ?? "default";
       let s = sessions.get(key);
       if (!s) {
@@ -344,7 +348,8 @@ function modelConfigWithInput(input: string[]) {
 let server: http.Server | https.Server;
 let port: number;
 let sm: ReturnType<typeof makeFakeSessionManager>;
-const origEnv = { SICLAW_GATEWAY_URL: process.env.SICLAW_GATEWAY_URL, SICLAW_CERT_PATH: process.env.SICLAW_CERT_PATH };
+const origEnv = { SICLAW_GATEWAY_URL: process.env.SICLAW_GATEWAY_URL, SICLAW_CERT_PATH: process.env.SICLAW_CERT_PATH,
+  SICLAW_AGENT_ENGINE: process.env.SICLAW_AGENT_ENGINE };
 
 beforeEach(async () => {
   mockConfigState.modelRouting = undefined;
@@ -357,6 +362,7 @@ beforeEach(async () => {
   // Point to a non-existent cert path → plain HTTP.
   process.env.SICLAW_CERT_PATH = "/tmp/nonexistent-cert-path-for-siclaw-tests";
   delete process.env.SICLAW_GATEWAY_URL;
+  delete process.env.SICLAW_AGENT_ENGINE;
 
   sm = makeFakeSessionManager();
   server = createHttpServer(sm as any);
@@ -368,6 +374,8 @@ afterEach(async () => {
   vi.restoreAllMocks();
   process.env.SICLAW_GATEWAY_URL = origEnv.SICLAW_GATEWAY_URL;
   process.env.SICLAW_CERT_PATH = origEnv.SICLAW_CERT_PATH;
+  if (origEnv.SICLAW_AGENT_ENGINE === undefined) delete process.env.SICLAW_AGENT_ENGINE;
+  else process.env.SICLAW_AGENT_ENGINE = origEnv.SICLAW_AGENT_ENGINE;
 });
 
 // ── Basic endpoints ───────────────────────────────────────────────────
@@ -637,6 +645,38 @@ describe("http-server — sub-agent tier turn state", () => {
 });
 
 describe("http-server — prompt + session lifecycle", () => {
+  it("selects Codex only for a Responses binding whose routing candidates are all compatible", async () => {
+    process.env.SICLAW_AGENT_ENGINE = "codex";
+    const responses = { ...modelConfigWithInput(["text"]), api: "openai-responses", authHeader: true };
+    await getJson(port, "/api/prompt", "POST", {
+      text: "inspect", sessionId: "codex-compatible", modelProvider: "openai", modelId: "gpt-4",
+      modelConfig: responses,
+    });
+    expect(sm.getOrCreateCalls.at(-1)?.agentEngine).toBe("codex");
+
+    await getJson(port, "/api/prompt", "POST", {
+      text: "submit result", sessionId: "codex-required-result", modelProvider: "openai", modelId: "gpt-4",
+      modelConfig: responses, requiredResultToolName: "mcp__result__submit",
+    });
+    expect(sm.getOrCreateCalls.at(-1)?.agentEngine).toBe("pi-agent");
+
+    await getJson(port, "/api/prompt", "POST", {
+      text: "inspect", sessionId: "codex-wire-override", modelProvider: "openai", modelId: "gpt-4",
+      modelConfig: { ...responses, models: [{ ...responses.models[0], compat: { supportsTemperature: false } }] },
+    });
+    expect(sm.getOrCreateCalls.at(-1)?.agentEngine).toBe("pi-agent");
+
+    await getJson(port, "/api/prompt", "POST", {
+      text: "inspect", sessionId: "codex-fallback", modelProvider: "openai", modelId: "gpt-4",
+      modelConfig: responses,
+      modelRouting: { enabled: true, strategy: "ordered_fallback", candidates: [
+        { provider: "openai", modelId: "gpt-4", modelConfig: responses },
+        { provider: "legacy", modelId: "gpt-4", modelConfig: modelConfigWithInput(["text"]) },
+      ] },
+    });
+    expect(sm.getOrCreateCalls.at(-1)?.agentEngine).toBe("pi-agent");
+  });
+
   it("sync keeps the original SSE through child completion and root synthesis", async () => {
     const session = await sm.getOrCreate("sync-join");
     const emit = (text: string) => session.brain.emitter.emit("event", { type: "message_end", message: {

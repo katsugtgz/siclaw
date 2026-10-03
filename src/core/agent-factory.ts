@@ -40,6 +40,7 @@ import compactionSafeguardExtension from "./extensions/compaction-safeguard.js";
 import memoryFlushExtension from "./extensions/memory-flush.js";
 import deepInvestigationExtension from "./extensions/deep-investigation.js";
 import { PiAgentBrain } from "./brains/pi-agent-brain.js";
+import { CodexAgentBrain } from "./brains/codex-agent-brain.js";
 import { resolveSessionThinkingLevel } from "./session-thinking.js";
 import type { BrainSession } from "./brain-session.js";
 import { createPiExecutionSession } from "./pi-execution.js";
@@ -70,6 +71,8 @@ import { allowsBackgroundExec } from "./background-execution-policy.js";
 import type { SessionMode, KubeconfigRef, MemoryRef, DpStateRef, MutableDpStateRef } from "./types.js";
 
 export interface CreateSiclawSessionOpts {
+  /** AgentBox selects Codex only for a compatible Responses binding. */
+  agentEngine?: "pi-agent" | "codex";
   scriptExecutor?: import("../script-sandbox/types.js").ScriptExecutor;
   scriptSandboxInfo?: import("../script-sandbox/types.js").ScriptSandboxInfo;
   sessionManager?: SessionManager;
@@ -168,7 +171,7 @@ export interface CreateSiclawSessionOpts {
 export interface SiclawSessionResult {
   brain: BrainSession;
   toolResultArtifactStore: ToolResultArtifactStore;
-  session: AgentSession;  // backward compat — only set for pi-agent brain
+  session: AgentSession;  // Pi-compatible transcript and resource context, also retained by Codex
   /** cwd-bound runtime services (pi 0.73) — needed to build an AgentSessionRuntime for the CLI */
   services: AgentSessionServices;
   /** Loaded extensions result — required when wrapping the session in an AgentSessionRuntime */
@@ -930,7 +933,28 @@ export async function createSiclawSession(
       return toolset ? [[tool.name, toolset] as const] : [];
     }),
   );
-  const brain: BrainSession = new PiAgentBrain(session, toolsetsByName, llmCallRecorder);
+  let brain: BrainSession;
+  // Pi sees an entire model tool-call batch before execution and guards
+  // transfer_to_agent against mixed batches and pending input. MCP receives
+  // individual calls, so keep handoff-capable sessions on Pi until Codex can
+  // enforce the same pre-execution boundary.
+  if (opts?.agentEngine === "codex" && !opts.isSubagent
+      && !customTools.some((tool) => tool.name === "transfer_to_agent")) {
+    const executableTools = session.getAllTools().map((info) => {
+      const tool = session.extensionRunner.getToolDefinition(info.name)
+        ?? customTools.find((candidate) => candidate.name === info.name);
+      if (!tool) throw new Error(`Codex tool bridge cannot resolve ${info.name}`);
+      return tool;
+    });
+    brain = await CodexAgentBrain.create({
+      sessionManager, piSession: session, systemPrompt: session.systemPrompt,
+      tools: executableTools, toolsetsByName, cwd, skillPaths: loadedSkills.map((skill) => ({
+        name: skill.name, filePath: skill.filePath,
+      })),
+    });
+  } else {
+    brain = new PiAgentBrain(session, toolsetsByName, llmCallRecorder);
+  }
   const getSkillSnapshot = () => {
     const currentSkills = loader.getSkills().skills;
     const skillNames = currentSkills.map((skill) => skill.name).sort();
@@ -952,9 +976,9 @@ export async function createSiclawSession(
     return createPromptInspection({
       context: compiledContext,
       mode,
-      effectivePrompt: wire?.systemPrompt ?? session.systemPrompt,
+      effectivePrompt: brain.brainType === "codex" ? session.systemPrompt : (wire?.systemPrompt ?? session.systemPrompt),
       stage: wire ? "provider_wire" : "session_ready",
-      tools: wire ? wire.toolSchemas : customTools,
+      tools: brain.brainType === "codex" ? (brain.getTools?.() ?? customTools) : (wire ? wire.toolSchemas : customTools),
       skillNames: getSkillSnapshot().skillNames,
     });
   };

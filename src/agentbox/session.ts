@@ -1097,10 +1097,11 @@ export class AgentBoxSessionManager {
       if (request.resumeHandle && request.forkTurns !== undefined) throw new Error("Cannot change fork_turns on a resumed child");
       const parent = this.sessions.get(request.parentSessionId);
       if (request.forkTurns !== undefined && request.forkTurns !== "none") {
-        if (!parent || parent.userId !== request.userId || !Array.isArray(parent.session.messages)) {
+        const conversation = parent?.brain.getConversationMessages?.() ?? parent?.session.messages;
+        if (!parent || parent.userId !== request.userId || !Array.isArray(conversation)) {
           throw new Error("Active parent context is unavailable for this session and user");
         }
-        request = { ...request, parentContext: captureSubagentContext(parent.session.messages, request.forkTurns, request.spawnId) };
+        request = { ...request, parentContext: captureSubagentContext(conversation, request.forkTurns, request.spawnId) };
       } else {
         request = { ...request, parentContext: undefined };
       }
@@ -3510,9 +3511,18 @@ export class AgentBoxSessionManager {
     handoffSupported = false,
     handoffPolicy?: import("../shared/agent-handoff.js").HandoffPolicy,
     structuredResultRequired = false,
+    requestedAgentEngine: "pi-agent" | "codex" = "pi-agent",
   ): Promise<ManagedSession> {
     const id = sessionId || this.defaultSessionId;
     const effectiveUserId = requestUserId?.trim() || this.userId;
+    const codexMarker = path.join(this.getSessionDir(id), "codex-thread.json");
+    const residentEngine = this.sessions.get(id)?.brain.brainType;
+    // A pre-existing Pi transcript has no Codex thread to resume. Keep that
+    // session on Pi; newly created Codex sessions carry their own thread marker.
+    const agentEngine = requestedAgentEngine === "codex"
+      && (residentEngine === "pi-agent" || (!residentEngine && !fs.existsSync(codexMarker)
+        && this.hasRestorableSessionContext(id)))
+      ? "pi-agent" : requestedAgentEngine;
 
     const existing = this.sessions.get(id);
     if (existing) {
@@ -3554,7 +3564,8 @@ export class AgentBoxSessionManager {
           && Boolean(existing.handoffSupported) === handoffSupported
           && Boolean(existing.structuredResultRequired) === structuredResultRequired
           && JSON.stringify(existing.handoffPolicy) === JSON.stringify(handoffPolicy)
-          && existing.mode === (mode ?? "web");
+          && existing.mode === (mode ?? "web")
+          && (existing.brain.brainType ?? "pi-agent") === agentEngine;
         if (
           (existing.activeMode === activeMode && sameInputCapability && !needsUserIdentityRebuild) ||
           !existing._promptDone ||
@@ -3571,6 +3582,13 @@ export class AgentBoxSessionManager {
 
     // Ensure shared components are ready
     await this.ensureSharedComponents();
+
+    // An incompatible binding (for example a PDF or a non-Responses model)
+    // switches the session to Pi. Its append-only transcript is the new source
+    // of truth, so a later Codex-compatible request must not revive a stale turn.
+    if (agentEngine === "pi-agent" && requestedAgentEngine === "pi-agent") {
+      fs.rmSync(codexMarker, { force: true });
+    }
 
     const sessionDir = this.getSessionDir(id);
     console.log(`[agentbox-session] Creating session: ${id} in ${sessionDir}`);
@@ -3669,6 +3687,7 @@ export class AgentBoxSessionManager {
     }
     const scriptInfo = effectiveMode === "web" && gc ? await gc.scriptSandboxInfo() : undefined;
     const result = await createSiclawSession({
+      agentEngine,
       scriptExecutor: scriptInfo?.enabled ? (request, _sessionId, signal) => gc!.runScript(request, id, signal) : undefined,
       scriptSandboxInfo: scriptInfo,
       sessionManager: frameworkSessionManager,
@@ -4142,6 +4161,7 @@ export class AgentBoxSessionManager {
     }
 
     console.log(`[agentbox-session] Releasing session: ${sessionId}`);
+    await managed.brain.close?.();
 
     // 1. Auto-save session memory (dedup: only if new messages since last save)
     if (isMemoryEnabled()) {
@@ -4263,6 +4283,7 @@ export class AgentBoxSessionManager {
     const managed = this.sessions.get(sessionId);
     if (managed) {
       console.log(`[agentbox-session] Closing session: ${sessionId}`);
+      await managed.brain.close?.();
       if (managed._releaseTimer) {
         clearTimeout(managed._releaseTimer);
         managed._releaseTimer = null;
@@ -4323,6 +4344,7 @@ export class AgentBoxSessionManager {
     this.sessions.clear();
 
     for (const [id, managed] of snapshot) {
+      await managed.brain.close?.();
       if (managed._releaseTimer) {
         clearTimeout(managed._releaseTimer);
         managed._releaseTimer = null;

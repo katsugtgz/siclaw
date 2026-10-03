@@ -56,7 +56,7 @@ vi.mock("../core/agent-factory.js", async () => {
   const g = globalThis as any;
   g.__createSessionCalls = g.__createSessionCalls ?? [];
   g.__fakeBrainFactories = g.__fakeBrainFactories ?? [];
-  function createFakeBrain() {
+  function createFakeBrain(engine: "pi-agent" | "codex" = "pi-agent") {
     const emitter = new EventEmitter();
     const behaviorFactory = g.__fakeBrainFactories.shift();
     const behavior = behaviorFactory ? behaviorFactory(emitter) : {};
@@ -65,6 +65,7 @@ vi.mock("../core/agent-factory.js", async () => {
       return () => emitter.off("event", cb);
     };
     return {
+      brainType: engine,
       emitter,
       subscribe,
       reload: async () => {},
@@ -91,7 +92,7 @@ vi.mock("../core/agent-factory.js", async () => {
     createSiclawSession: async (opts: any) => {
       g.__createSessionCalls.push(opts);
       return {
-        brain: createFakeBrain(),
+        brain: createFakeBrain(opts.agentEngine),
         session: { sessionId: "fake-session", messages: [], sendCustomMessage: async (message: any, options: any) => {
           (g.__inheritedContextMessages ??= []).push({ message, options });
         } },
@@ -346,6 +347,20 @@ describe("AgentBoxSessionManager — getOrCreate", () => {
     const s2 = await mgr.getOrCreate("sess-1");
     expect(s1).toBe(s2);
     expect(lastCreateSiclawSession.calls).toHaveLength(1);
+  });
+
+  it("starts new compatible sessions on Codex but preserves existing Pi transcripts", async () => {
+    const mgr = new AgentBoxSessionManager();
+    const codex = await mgr.getOrCreate("fresh", undefined, undefined, "normal", undefined,
+      false, false, undefined, false, "codex");
+    expect(codex.brain.brainType).toBe("codex");
+    (globalThis as any).__frameworkEntriesState.entries = [
+      { type: "message", message: { role: "user", content: "previous Pi turn" } },
+    ];
+    const legacy = await mgr.getOrCreate("legacy", undefined, undefined, "normal", undefined,
+      false, false, undefined, false, "codex");
+    expect(legacy.brain.brainType).toBe("pi-agent");
+    expect(lastCreateSiclawSession.calls.map((call: any) => call.agentEngine)).toEqual(["codex", "pi-agent"]);
   });
 
   it("uses defaultSessionId when id is omitted", async () => {

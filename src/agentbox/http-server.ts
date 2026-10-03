@@ -435,6 +435,37 @@ function requestBindingCandidate(body: PromptRequestBody): ModelRouteCandidate |
   };
 }
 
+/** Keep the existing Pi path for bindings Codex cannot issue without changing the wire contract. */
+function codexCompatibleCandidate(candidate: ModelRouteCandidate): boolean {
+  const config = candidate.modelConfig;
+  if (!config || typeof config.baseUrl !== "string" || !config.baseUrl
+      || typeof config.apiKey !== "string" || !config.apiKey
+      || config.authHeader === false || !Array.isArray(config.models)
+      || (config.headers && typeof config.headers === "object"
+        && Object.keys(config.headers).length > 0)) return false;
+  const model = config.models.find((entry): entry is Record<string, unknown> =>
+    !!entry && typeof entry === "object" && !Array.isArray(entry)
+    && (entry as Record<string, unknown>).id === candidate.modelId);
+  return !!model && !model.samplingParams
+    && !(model.compat && typeof model.compat === "object" && Object.keys(model.compat).length > 0)
+    && (model.api || config.api) === "openai-responses";
+}
+
+function promptAgentEngine(body: PromptRequestBody): "pi-agent" | "codex" {
+  // Pi can force a missed required result tool in a bounded repair turn;
+  // Codex's current advisory retry does not provide that contract.
+  if (process.env.SICLAW_AGENT_ENGINE !== "codex" || body.files?.length
+      || body.requiredResultToolName?.trim()) return "pi-agent";
+  const primary = requestBindingCandidate(body);
+  if (!primary || !codexCompatibleCandidate(primary)) return "pi-agent";
+  const policy = normalizeModelRoutePolicy(body.modelRouting !== undefined
+    ? body.modelRouting : loadConfig().modelRouting);
+  if (policy?.enabled && policy.candidates?.some((candidate) => !codexCompatibleCandidate(candidate))) {
+    return "pi-agent";
+  }
+  return "codex";
+}
+
 /**
  * The binding to actually route this turn on.
  *
@@ -1027,6 +1058,7 @@ export function createHttpServer(
       body.handoffSupported === true,
       parseHandoffPolicy(body.handoffPolicy),
       Boolean(requiredResultToolName),
+      promptAgentEngine(body),
     );
     // Still fail closed when a Ticket instance DID declare a contract: a named
     // result tool it cannot call is a misbinding, and letting the turn run would

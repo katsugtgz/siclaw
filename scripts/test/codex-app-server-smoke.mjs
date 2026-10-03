@@ -1,0 +1,98 @@
+// Run after `npm run build` with SICLAW_CODEX_BIN pointing at a Codex binary
+// built from Dockerfile.agentbox's pinned openai/codex source commit.
+import assert from "node:assert/strict";
+import { createServer } from "node:http";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { CodexAgentBrain } from "../../dist/core/brains/codex-agent-brain.js";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
+
+if (!process.env.SICLAW_CODEX_BIN) {
+  throw new Error("Set SICLAW_CODEX_BIN to the Codex binary built from the pinned source commit");
+}
+
+const sessionDir = mkdtempSync(join(tmpdir(), "siclaw-codex-source-smoke-"));
+let calls = 0;
+let toolRuns = 0;
+const model = createServer(async (request, response) => {
+  let raw = "";
+  for await (const part of request) raw += part;
+  const body = JSON.parse(raw);
+  assert.equal(request.url, "/v1/responses");
+  assert.equal(body.model, "smoke-model");
+  assert.equal(body.stream, true);
+  calls++;
+  const id = `response_${calls}`;
+  const toolCall = calls === 1;
+  const item = toolCall
+    ? { id: `function_${calls}`, type: "function_call", namespace: "mcp__siclaw",
+      name: "echo", call_id: `call_${calls}`, arguments: '{"text":"ok"}', status: "completed" }
+    : { id: `message_${calls}`, type: "message", role: "assistant", status: "completed",
+      content: [{ type: "output_text", text: "hello from codex", annotations: [] }] };
+  const envelope = { id, object: "response", created_at: Math.floor(Date.now() / 1000),
+    status: "completed", model: "smoke-model", output: [item],
+    usage: { input_tokens: 12, output_tokens: 4, total_tokens: 16 }, parallel_tool_calls: false, tools: [] };
+  response.writeHead(200, { "content-type": "text/event-stream" });
+  const send = (type, payload) => response.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...payload })}\n\n`);
+  send("response.created", { response: { ...envelope, status: "in_progress", output: [] } });
+  send("response.output_item.added", { output_index: 0,
+    item: toolCall ? { ...item, arguments: "", status: "in_progress" }
+      : { ...item, content: [], status: "in_progress" } });
+  if (toolCall) {
+    send("response.function_call_arguments.delta", { output_index: 0, delta: item.arguments });
+  } else {
+    send("response.content_part.added", { output_index: 0, content_index: 0,
+      part: { type: "output_text", text: "", annotations: [] } });
+    send("response.output_text.delta", { output_index: 0, content_index: 0, delta: "hello from codex" });
+    send("response.output_text.done", { output_index: 0, content_index: 0, text: "hello from codex" });
+    send("response.content_part.done", { output_index: 0, content_index: 0, part: item.content[0] });
+  }
+  send("response.output_item.done", { output_index: 0, item });
+  send("response.completed", { response: envelope });
+  response.end();
+});
+
+await new Promise((resolve) => model.listen(0, "127.0.0.1", resolve));
+const port = model.address().port;
+const extensionRunner = { createContext: () => ({}), emitContext: async (messages) => messages,
+  emitToolCall: async () => undefined, emitToolResult: async () => undefined,
+  emitInput: async () => ({ action: "continue" }), emit: async () => undefined };
+const tool = { name: "echo", label: "Echo", description: "Echo input",
+  parameters: { type: "object", properties: { text: { type: "string" } } },
+  execute: async (_id, args) => { toolRuns++; return { content: [{ type: "text", text: args.text }] }; } };
+const makeBrain = async (sessionManager) => {
+  const brain = await CodexAgentBrain.create({ sessionManager, piSession: { extensionRunner },
+    systemPrompt: "Reply briefly", tools: [tool], toolsetsByName: new Map([["echo", "test"]]),
+    cwd: process.cwd(), skillPaths: [] });
+  brain.registerProvider("fixture", { apiKey: "test", baseUrl: `http://127.0.0.1:${port}/v1`,
+    api: "openai-responses", models: [{ id: "smoke-model", api: "openai-responses",
+      contextWindow: 128_000, maxTokens: 1_000 }] });
+  await brain.setModel(brain.findModel("fixture", "smoke-model"));
+  return brain;
+};
+
+let brain;
+try {
+  brain = await makeBrain(SessionManager.create(process.cwd(), sessionDir));
+  await brain.prompt("Hi");
+  assert.equal(toolRuns, 1);
+  assert.ok(brain.getConversationMessages().some((message) => message.role === "assistant" &&
+    message.content?.some?.((item) => item.text === "hello from codex")));
+  await brain.close();
+
+  brain = await makeBrain(SessionManager.continueRecent(process.cwd(), sessionDir));
+  await brain.prompt("Again");
+  assert.ok(brain.getConversationMessages().length >= 6);
+  const beforeStop = calls;
+  const stopping = brain.prompt("Stop before model call");
+  await brain.abort();
+  await stopping;
+  assert.equal(calls, beforeStop);
+  console.log(`Codex app-server smoke passed: ${calls} model calls, ${toolRuns} Siclaw tool run, resume and early stop`);
+} finally {
+  await brain?.close();
+  model.closeAllConnections();
+  await new Promise((resolve) => model.close(resolve));
+  rmSync(sessionDir, { recursive: true, force: true });
+}

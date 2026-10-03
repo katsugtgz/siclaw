@@ -2,7 +2,7 @@
  * BrainSession — unified interface for the AI agent backend.
  *
  * Consumers (http-server, session.ts, cli-main) program against this interface.
- * Implementation: PiAgentBrain (pi-coding-agent).
+ * Implementations: PiAgentBrain and CodexAgentBrain.
  *
  * Event protocol follows the pi-agent format (frontend already adapted):
  * - agent_start/end, turn_start/end, message_start/end
@@ -14,7 +14,7 @@
 
 import type { LlmCallPromptBoundary } from "./llm-call-recorder.js";
 
-export type BrainType = "pi-agent";
+export type BrainType = "pi-agent" | "codex";
 
 /**
  * An image attachment to send alongside a prompt. `data` is raw base64 (no
@@ -177,6 +177,12 @@ export interface TaskCompletionAssessment {
 
 export interface BrainSession {
   readonly brainType: BrainType;
+
+  /** Release backend-owned processes and sockets when the session leaves memory. */
+  close?(): Promise<void>;
+
+  /** Model-visible conversation used for child context inheritance. */
+  getConversationMessages?(): readonly unknown[];
 
   /**
    * Optional: prompt / routing-attempt boundaries for the LLM call recorder

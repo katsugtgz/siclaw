@@ -45,6 +45,28 @@ COPY src/portal/cli-snapshot-types.ts ./src/portal/
 # Backend build (agentbox-specific tsconfig, excludes gateway server/portal/channel code)
 RUN npx tsc -p tsconfig.agentbox.json
 
+# Build the official open-source Codex CLI from a reviewed upstream commit.
+# Siclaw-specific changes, if needed, live as small patches applied on top of
+# this clean checkout; upgrading means advancing CODEX_COMMIT and rebasing them.
+FROM rust:1.95-bookworm AS codex-builder
+ARG CODEX_COMMIT=8f7a0f7a878199c6886600370e5be6bd37ca38a3
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git ca-certificates pkg-config libcap-dev clang make \
+    && rm -rf /var/lib/apt/lists/*
+RUN git init /src/codex \
+    && git -C /src/codex remote add origin https://github.com/openai/codex.git \
+    && git -C /src/codex fetch --depth 1 origin "${CODEX_COMMIT}" \
+    && git -C /src/codex checkout --detach FETCH_HEAD \
+    && test "$(git -C /src/codex rev-parse HEAD)" = "${CODEX_COMMIT}"
+COPY patches/codex/ /opt/siclaw-codex-patches/
+RUN set -eu; for patch in /opt/siclaw-codex-patches/*.patch; do \
+      [ -f "$patch" ] || continue; \
+      git -C /src/codex apply --check "$patch"; \
+      git -C /src/codex apply "$patch"; \
+    done
+RUN cd /src/codex/codex-rs && cargo build --release --locked -p codex-cli --bin codex \
+    && target/release/codex --version
+
 # ── Production stage ─────────────────────────────────────────────
 FROM node:22.19-slim
 
@@ -70,7 +92,7 @@ ARG YQ_SHA256=fa52a4e758c63d38299163fbdd1edfb4c4963247918bf9c1c5d31d84789eded4
 # NoSuchKey XML. Every cluster read in the box then died before reaching an API server.
 ARG KUBECTL_VERSION=v1.36.4
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl jq python3 ca-certificates sudo fonts-noto-cjk chromium bsdextrautils ripgrep \
+    curl jq python3 ca-certificates sudo fonts-noto-cjk chromium bsdextrautils ripgrep libcap2 \
     && curl -fsSL --retry 3 -o /usr/local/bin/kubectl \
        "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" \
     && chmod +x /usr/local/bin/kubectl \
@@ -112,6 +134,10 @@ COPY package*.json ./
 COPY patches/ ./patches/
 COPY scripts/install/ ./scripts/install/
 RUN npm ci --omit=dev
+
+# Copy only the binary from the official source build, never an npm wrapper.
+COPY --from=codex-builder /src/codex/codex-rs/target/release/codex /usr/local/bin/codex
+RUN codex --version
 
 # Copy compiled JS + skills + entrypoint (knowledge synced at runtime via bundle API)
 COPY --from=builder /app/dist/ ./dist/

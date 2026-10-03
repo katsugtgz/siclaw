@@ -642,6 +642,10 @@ export class K8sSpawner implements BoxSpawner {
         // existing session only when its pod is recycled or idles out.
         "SICLAW_SUBAGENT_MODEL_TIER",
         "SICLAW_SUBAGENT_GROUP_ENABLED",
+        // Opt-in engine selection is evaluated inside normal AgentBoxes. Keep
+        // capability pods on their fixed, lean runtime profile.
+        "SICLAW_AGENT_ENGINE",
+        "SICLAW_CODEX_BIN",
         // Embedding endpoint for the memory indexer. The agentbox reads these via
         // loadConfig() env overrides (config.ts); set on the runtime deployment to
         // configure every normal AgentBox it spawns.

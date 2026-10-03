@@ -2,9 +2,6 @@
 
 > Historical design note: terminal UI references describe the implementation at the time. Siclaw removed the interactive TUI on 2026-09-10; see [ADR-020](decisions.md#adr-020-use-web-ui-for-interactive-work-retain-headless-cli-execution) for the current entry points.
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended)
-> or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax.
-
 **Goal:** Implement the v2 design (`docs/design/2026-05-29-subagents-background-task-ledger.md`):
 a Tasks-v2 task ledger (= plan), `spawn_subagent` delegation, a background Job runtime, full sub-agent
 transcript persistence, refresh recovery, and the Portal Web UI.
