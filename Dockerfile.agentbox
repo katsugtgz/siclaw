@@ -60,9 +60,10 @@ RUN --mount=type=ssh,required=true git init /src/codex \
     && test "$(git -C /src/codex rev-parse HEAD)" = "${CODEX_COMMIT}"
 RUN cd /src/codex/codex-rs && cargo build --release --locked -p codex-cli --bin codex \
     && target/release/codex --version
-RUN cd /src/codex/codex-rs \
-    && cargo build --release --locked -p codex-code-mode-host --bin codex-code-mode-host \
-    && target/release/codex-code-mode-host --help >/dev/null
+RUN apt-get update && apt-get install -y --no-install-recommends curl python3 \
+    && rm -rf /var/lib/apt/lists/*
+COPY docker/build-codex-code-mode-host.sh /usr/local/bin/build-codex-code-mode-host.sh
+RUN bash /usr/local/bin/build-codex-code-mode-host.sh /src/codex
 
 # ── Production stage ─────────────────────────────────────────────
 FROM node:22.19-slim

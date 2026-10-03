@@ -43,6 +43,10 @@ source-built `codex-code-mode-host` for catalogs selecting Code Mode. Copying
 only the CLI binary is insufficient for the native tool path. Installing these
 runtime prerequisites does not justify changing the container's security
 context; execute the native probe under the intended restrictions.
+The Code Mode build follows upstream's V8 setup action: use its sandbox-enabled
+archive/binding pair and verify the release manifest against the digest in the
+pinned source checkout. Do not substitute a different V8 build or disable its
+sandbox to make Cargo succeed.
 
 `scripts/test/codex-native-exec-probe.mjs` exercises official app-server +
 exec-server with a fixed fake Responses model and a temporary workspace. It
@@ -56,8 +60,14 @@ The first request-policy component is implemented in
 `src/core/brains/codex-executor-policy.ts`, independently of Pi tool/session
 types. It validates command form and whitelist, strips caller environment
 overrides, scopes process continuation, and enforces read/write roots and link
-denials. It is not wired into the production brain. Output policy, the relay,
-native interactive execution, file streaming, and full lifecycle integration
+denials. `codex-executor-output.ts` buffers and sanitizes complete outputs before
+returning them. `codex-executor-relay.ts` pairs these policies with the official
+exec-server protocol. The source-built native probe passes through this relay
+with `SICLAW_CODEX_RELAY_PROBE=1` after `npm run build`.
+
+These components are not wired into the production brain. Native interactive
+execution, stateful output streaming, process reaping across the production UID
+boundary, executor reconnect, file streaming, and full lifecycle integration
 are required before enabling it; currently unsupported RPCs fail closed.
 
 1. Replace the generic Pi tool bridge with an execution policy adapter at the

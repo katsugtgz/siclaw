@@ -12,6 +12,7 @@ import { createInterface } from "node:readline";
 
 const executable = process.env.SICLAW_CODEX_BIN;
 assert.ok(executable, "Set SICLAW_CODEX_BIN to the pinned source-built Codex CLI");
+const useRelay = process.env.SICLAW_CODEX_RELAY_PROBE === "1";
 const root = mkdtempSync(join(tmpdir(), "siclaw-native-codex-"));
 const workspace = join(root, "workspace");
 mkdirSync(workspace, { mode: 0o700 });
@@ -22,6 +23,7 @@ let fixtureError;
 let toolOutputs = [];
 const seenTools = new Set();
 const patch = "*** Begin Patch\n*** Add File: native-probe.txt\n+created by native apply_patch\n*** End Patch\n";
+const expectedOutput = useRelay ? /v\d+\.\d+\.\d+/ : /native-command-ok/;
 const model = createServer(async (request, response) => {
   try {
     let raw = "";
@@ -43,10 +45,10 @@ const model = createServer(async (request, response) => {
     assert.ok(seenTools.has("apply_patch"), "upstream native apply_patch must be exposed");
     assert.ok(![...seenTools].some((name) => name.startsWith("mcp__siclaw")));
     calls++;
-    if (calls === 2) assert.match(JSON.stringify(body.input), /native-command-ok/);
+    if (calls === 2) assert.match(JSON.stringify(body.input), expectedOutput);
     const item = calls === 1
       ? { id: "exec-1", type: "function_call", name: "exec_command", call_id: "exec-call-1",
-        arguments: JSON.stringify({ cmd: "printf native-command-ok", workdir: workspace,
+        arguments: JSON.stringify({ cmd: useRelay ? "kubectl version --client" : "printf native-command-ok", workdir: workspace,
           login: false, max_output_tokens: 200 }), status: "completed" }
       : calls === 2
         ? { id: "patch-1", type: "custom_tool_call", name: "apply_patch", call_id: "patch-call-1",
@@ -94,9 +96,22 @@ function child(args, home) {
   process.stderr.resume();
   return process;
 }
-const executor = child(["exec-server", "--listen", `ws://127.0.0.1:${execPort}`,
-  "--ws-auth", "capability-token", "--ws-token-sha256", tokenHash,
-  "--strict-config", "-c", "sandbox_mode=\"workspace-write\""], join(root, "executor-home"));
+let relay;
+let executorUrl = `ws://127.0.0.1:${execPort}`;
+let executorToken = token;
+if (useRelay) {
+  const { CodexExecutorRelay } = await import("../../dist/core/brains/codex-executor-relay.js");
+  relay = new CodexExecutorRelay({ executable, home: join(root, "executor-home"), cwd: workspace,
+    grants: { readRoots: [workspace], writeRoots: [workspace], deniedRoots: [], allowCommands: true,
+      production: false, environment: { PATH: process.env.PATH ?? "/usr/bin:/bin" } } });
+  await relay.start();
+  executorUrl = relay.url;
+  executorToken = relay.bearerToken;
+} else {
+  child(["exec-server", "--listen", executorUrl,
+    "--ws-auth", "capability-token", "--ws-token-sha256", tokenHash,
+    "--strict-config", "-c", "sandbox_mode=\"workspace-write\""], join(root, "executor-home"));
+}
 const app = child(["app-server", "--stdio", "--strict-config",
   "-c", "features.shell_tool=true", "-c", "features.unified_exec=true",
   "-c", "features.code_mode=false", "-c", "features.multi_agent=false"], join(root, "app-home"));
@@ -137,7 +152,7 @@ try {
     capabilities: { experimentalApi: true } });
   app.stdin.write(`${JSON.stringify({ method: "initialized" })}\n`);
   await rpc("environment/add", { environmentId: "siclaw-native-probe",
-    execServerUrl: `ws://127.0.0.1:${execPort}`, authBearerToken: token, connectTimeoutMs: 10_000 });
+    execServerUrl: executorUrl, authBearerToken: executorToken, connectTimeoutMs: 10_000 });
   const info = await rpc("environment/info", { environmentId: "siclaw-native-probe" });
   assert.ok(info.shell.path);
   const started = await rpc("thread/start", { model: "gpt-5.5", modelProvider: "fixture",
@@ -163,12 +178,13 @@ try {
   assert.equal(command?.exitCode, 0, `the native command must execute successfully: ${JSON.stringify({ command,
     outputs: toolOutputs, items: events.filter((event) => event.method === "item/completed")
       .map((event) => ({ type: event.params.item.type, status: event.params.item.status })) }).slice(0, 2500)}`);
-  assert.match(command.aggregatedOutput, /native-command-ok/);
+  assert.match(command.aggregatedOutput, expectedOutput);
   assert.ok(existsSync(join(workspace, "native-probe.txt")),
     `native apply_patch did not create the file: ${JSON.stringify(toolOutputs).slice(0, 2000)}`);
   assert.equal(readFileSync(join(workspace, "native-probe.txt"), "utf8"), "created by native apply_patch\n");
   assert.ok(events.some((event) => event.params?.item?.type === "fileChange"));
   console.log("Native execution probe passed: official app-server + exec-server, exec_command, apply_patch, no Pi or Siclaw MCP tools");
+  if (useRelay) console.log("Native execution passed through Siclaw's independent RPC request and output policies");
 } finally {
   for (const waiter of pending.values()) clearTimeout(waiter.timer);
   for (const process of children) {
@@ -180,6 +196,7 @@ try {
       const timer = setTimeout(() => process.kill("SIGKILL"), 2_000);
       process.once("exit", () => { clearTimeout(timer); resolve(); });
     })));
+  await relay?.close();
   model.closeAllConnections();
   await new Promise((resolve) => model.close(resolve));
   rmSync(root, { recursive: true, force: true });

@@ -114,7 +114,7 @@ export class CodexExecutorPolicy {
         !["-c", "-lc"].includes(argv[1]) || typeof argv[2] !== "string") {
       throw new Error("Native executor command form is not authorized");
     }
-    if (params.tty === true || params.pipeStdin === true || params.shellSnapshot) {
+    if (params.tty === true || params.shellSnapshot) {
       throw new Error("Interactive native execution is not authorized");
     }
     if (params.arg0) throw new Error("Native argv0 override is not authorized");
@@ -130,6 +130,9 @@ export class CodexExecutorPolicy {
     params.env = { ...this.environment };
     params.envPolicy = { inherit: "none", ignoreDefaultExcludes: false,
       exclude: [], set: {}, includeOnly: [] };
+    // Unified exec requests a writable pipe even when the model only polls.
+    // Close it at launch; process/write is independently restricted above.
+    params.pipeStdin = false;
     // Upstream filesystem sandbox intent remains intact. If the production
     // sandbox prevents the UID transition, the relay must reject execution;
     // it must not silently remove sandbox intent or elevate capabilities.
