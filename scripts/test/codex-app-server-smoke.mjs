@@ -2,19 +2,26 @@
 // built from Dockerfile.agentbox's pinned GitLab Codex main commit.
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CodexAgentBrain } from "../../dist/core/brains/codex-agent-brain.js";
 import { projectCodexPlan } from "../../dist/core/brains/codex-plan.js";
 import { getOrCreateLedger } from "../../dist/core/task-ledger.js";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { createRestrictedBashTool } from "../../dist/tools/cmd-exec/restricted-bash.js";
 
 if (!process.env.SICLAW_CODEX_BIN) {
   throw new Error("Set SICLAW_CODEX_BIN to the Codex binary built from the pinned source commit");
 }
 
 const sessionDir = mkdtempSync(join(tmpdir(), "siclaw-codex-source-smoke-"));
+// Enable only inside the production AgentBox image, as its agentbox user.
+const containerSecurity = process.env.SICLAW_CODEX_CONTAINER_SMOKE === "1";
+const credentialFixture = `/app/.siclaw/credentials/clusters/codex-smoke-${process.pid}`;
+const deniedWrite = join(sessionDir, "must-not-exist");
+const commandResults = [];
 let calls = 0;
 let toolRuns = 0;
 const plans = [];
@@ -35,13 +42,22 @@ const model = createServer(async (request, response) => {
   }
   calls++;
   const id = `response_${calls}`;
-  const toolCall = calls <= 2;
+  const command = containerSecurity && calls >= 3 && calls <= 5
+    ? [
+      `touch ${deniedWrite}`,
+      `grep secret ${credentialFixture}`,
+      "kubectl version --client -o json | jq -r .clientVersion.gitVersion",
+    ][calls - 3] : undefined;
+  const toolCall = calls <= 2 || command !== undefined;
   const item = calls === 1
     ? { id: `function_${calls}`, type: "function_call", name: "update_plan",
       call_id: `call_${calls}`, arguments: '{"plan":[{"step":"Inspect","status":"in_progress"}]}', status: "completed" }
     : calls === 2
       ? { id: `function_${calls}`, type: "function_call", namespace: "mcp__siclaw",
         name: "echo", call_id: `call_${calls}`, arguments: '{"text":"ok"}', status: "completed" }
+    : command !== undefined
+      ? { id: `function_${calls}`, type: "function_call", namespace: "mcp__siclaw",
+        name: "bash", call_id: `call_${calls}`, arguments: JSON.stringify({ command }), status: "completed" }
     : { id: `message_${calls}`, type: "message", role: "assistant", status: "completed",
       content: [{ type: "output_text", text: "hello from codex", annotations: [] }] };
   const envelope = { id, object: "response", created_at: Math.floor(Date.now() / 1000),
@@ -75,9 +91,15 @@ const extensionRunner = { createContext: () => ({}), emitContext: async (message
 const tool = { name: "echo", label: "Echo", description: "Echo input",
   parameters: { type: "object", properties: { text: { type: "string" } } },
   execute: async (_id, args) => { toolRuns++; return { content: [{ type: "text", text: args.text }] }; } };
+const bash = createRestrictedBashTool();
+const tools = containerSecurity ? [tool, { ...bash, execute: async (...args) => {
+  const result = await bash.execute(...args);
+  commandResults.push(result);
+  return result;
+} }] : [tool];
 const makeBrain = async (sessionManager) => {
   const brain = await CodexAgentBrain.create({ sessionManager, piSession: { extensionRunner },
-    systemPrompt: "Reply briefly", tools: [tool], toolsetsByName: new Map([["echo", "test"]]),
+    systemPrompt: "Reply briefly", tools, toolsetsByName: new Map([["echo", "test"], ["bash", "cmd-exec"]]),
     cwd: process.cwd(), skillPaths: [], nativePlanEnabled: true,
     onPlanUpdate: (plan) => {
       plans.push(plan);
@@ -92,9 +114,25 @@ const makeBrain = async (sessionManager) => {
 
 let brain;
 try {
+  if (containerSecurity) {
+    assert.equal(process.env.NODE_ENV, "production");
+    assert.equal(process.getuid(), 1000, "Run the container smoke as agentbox, not root");
+    writeFileSync(credentialFixture, "fake-secret-for-isolation-test", { mode: 0o640 });
+    assert.equal(spawnSync("sudo", ["-n", "-u", "sandbox", "--", "test", "-r", credentialFixture]).status,
+      1, "sandbox must not be able to read AgentBox credentials");
+  }
   brain = await makeBrain(SessionManager.create(process.cwd(), sessionDir));
   await brain.prompt("Hi");
   assert.equal(toolRuns, 1);
+  if (containerSecurity) {
+    assert.equal(commandResults.length, 3);
+    assert.equal(commandResults[0].details.blocked, true, "non-whitelisted command must be blocked");
+    assert.equal(commandResults[1].details.blocked, true, "credential path must be blocked");
+    assert.equal(existsSync(deniedWrite), false, "blocked command must not execute");
+    assert.match(commandResults[2].content[0].text, /v\d+\.\d+\.\d+/,
+      "authorized kubectl pipeline must execute through the production sandbox");
+    assert.ok(!commandResults[2].details?.blocked);
+  }
   assert.deepEqual(plans[0], [{ step: "Inspect", status: "inProgress" }]);
   assert.deepEqual(getOrCreateLedger("smoke-plan").snapshot().map(({ subject, status }) =>
     ({ subject, status })), [{ subject: "Inspect", status: "in_progress" }]);
@@ -112,9 +150,11 @@ try {
   await stopping;
   assert.equal(calls, beforeStop);
   console.log(`Codex app-server smoke passed: ${calls} model calls, ${toolRuns} Siclaw tool run, resume and early stop`);
+  if (containerSecurity) console.log("Container security passed: command whitelist, credential path denial, OS user isolation, authorized kubectl pipeline");
 } finally {
   await brain?.close();
   model.closeAllConnections();
   await new Promise((resolve) => model.close(resolve));
   rmSync(sessionDir, { recursive: true, force: true });
+  if (containerSecurity) rmSync(credentialFixture, { force: true });
 }
