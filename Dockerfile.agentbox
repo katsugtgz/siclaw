@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # AgentBox Docker Image — multi-stage build
 # Stage 1: build (tsc)
 # Stage 2: production runtime
@@ -45,25 +46,18 @@ COPY src/portal/cli-snapshot-types.ts ./src/portal/
 # Backend build (agentbox-specific tsconfig, excludes gateway server/portal/channel code)
 RUN npx tsc -p tsconfig.agentbox.json
 
-# Build the official open-source Codex CLI from a reviewed upstream commit.
-# Siclaw-specific changes, if needed, live as small patches applied on top of
-# this clean checkout; upgrading means advancing CODEX_COMMIT and rebasing them.
+# Build Codex from Siclaw's reviewed main branch in the internal upstream mirror.
 FROM rust:1.95-bookworm AS codex-builder
-ARG CODEX_COMMIT=8f7a0f7a878199c6886600370e5be6bd37ca38a3
+ARG CODEX_COMMIT=d4684bba63aba4c941d5a251054609e722b64779
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git ca-certificates pkg-config libcap-dev clang make \
+    git openssh-client ca-certificates pkg-config libcap-dev clang make \
     && rm -rf /var/lib/apt/lists/*
-RUN git init /src/codex \
-    && git -C /src/codex remote add origin https://github.com/openai/codex.git \
-    && git -C /src/codex fetch --depth 1 origin "${CODEX_COMMIT}" \
+COPY docker/gitlab-known-hosts /etc/ssh/ssh_known_hosts
+RUN --mount=type=ssh,required=true git init /src/codex \
+    && git -C /src/codex remote add origin git@gitlab.scitix-inner.ai:aiops/codex.git \
+    && git -C /src/codex fetch --depth 1 origin refs/heads/main \
     && git -C /src/codex checkout --detach FETCH_HEAD \
     && test "$(git -C /src/codex rev-parse HEAD)" = "${CODEX_COMMIT}"
-COPY patches/codex/ /opt/siclaw-codex-patches/
-RUN set -eu; for patch in /opt/siclaw-codex-patches/*.patch; do \
-      [ -f "$patch" ] || continue; \
-      git -C /src/codex apply --check "$patch"; \
-      git -C /src/codex apply "$patch"; \
-    done
 RUN cd /src/codex/codex-rs && cargo build --release --locked -p codex-cli --bin codex \
     && target/release/codex --version
 

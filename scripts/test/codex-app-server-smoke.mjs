@@ -1,5 +1,5 @@
 // Run after `npm run build` with SICLAW_CODEX_BIN pointing at a Codex binary
-// built from Dockerfile.agentbox's pinned openai/codex source commit.
+// built from Dockerfile.agentbox's pinned GitLab Codex main commit.
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { mkdtempSync, rmSync } from "node:fs";

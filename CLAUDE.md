@@ -4,6 +4,24 @@
 
 ---
 
+## Branches And Codex Source
+
+Use ordinary work branch names (`feat/...`, `fix/...`, `docs/...`), without a
+`codex/` prefix. Internal `aiops/codex` keeps official `openai/codex` commits
+unchanged on `upstream/main` (`origin/main` in a clone of the official remote).
+Its protected `main` contains the minimal Siclaw patch series. Prefer native
+Codex features first; use merge requests for normal patches. Periodically
+sync upstream, merge it into a `chore/...` work branch, and use a merge
+request to update protected `main`. Never rebase or force push `main`.
+`Dockerfile.agentbox` fetches
+GitLab `main` over SSH and verifies a pinned
+`CODEX_COMMIT`. Advance the pin only after Codex Rust tests/build, the Siclaw
+app-server smoke test, and Siclaw regression tests pass. AgentBox Docker builds
+need an authorized SSH agent and `--ssh default`; never bake credentials into
+the image. See `AGENTS.md` for the full maintenance contract.
+
+---
+
 ## What This Project Is
 
 **Siclaw** is an AI-powered SRE copilot that runs Kubernetes diagnostics via natural language.

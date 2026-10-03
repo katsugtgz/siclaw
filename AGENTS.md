@@ -81,6 +81,27 @@ Memory DB: node:sqlite + FTS5 + sqlite-vec
   is explicitly requested.
 - Follow `CONTRIBUTING.md` for PR format.
 
+## Branches And Codex Upgrades
+
+- Name work branches by purpose, such as `feat/...`, `fix/...`, or `docs/...`.
+  Do not use a `codex/` prefix.
+- The GitLab `aiops/codex` repository keeps official `openai/codex` unchanged
+  on `upstream/main` (`origin/main` in a clone whose official remote is
+  `origin`). Its protected `main` contains the minimal Siclaw patch series.
+- Prefer Codex's native capabilities and Siclaw adapter configuration before
+  changing Codex source. Use merge requests for normal patch changes.
+  Periodically sync the official main branch to `upstream/main`, merge it into
+  a `chore/...` branch from GitLab `main`, review and test, then merge through
+  a merge request. Never rebase or force push protected `main`, and never add
+  Siclaw commits to `upstream/main`.
+- `Dockerfile.agentbox` fetches GitLab `main` and verifies the exact
+  `CODEX_COMMIT` before building. Advance the pin after reviewing the source
+  diff and passing Codex Rust tests/build, the Siclaw app-server smoke test,
+  and Siclaw regression tests. Keep the Pi path available for compatibility.
+- AgentBox Docker builds need an SSH agent authorized to read `aiops/codex`.
+  The host key is pinned in `docker/gitlab-known-hosts`; pass `--ssh default`
+  when building directly. Never bake an SSH key or access token into an image.
+
 ## Commit Notes
 
 Commit messages should explain why. Add trailers only when they carry useful

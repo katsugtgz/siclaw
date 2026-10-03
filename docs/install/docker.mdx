@@ -19,8 +19,15 @@ For a single-machine setup, use [CLI & Local Server](/install/cli). The reposito
 From the repo root:
 
 ```bash
+ssh-add -l # Verify the build host has a key with read access to aiops/codex.
 make docker REGISTRY=registry.example.com/myteam TAG=latest
 ```
+
+The AgentBox build forwards the SSH agent through BuildKit. Its GitLab host key
+is pinned in `docker/gitlab-known-hosts`; SSH credentials are not copied into
+the image. If `ssh-add -l` shows no identity, load an authorized key with
+`ssh-add /path/to/key`. Direct `docker build` invocations need `--ssh default`
+too. CI builders need equivalent read access to `aiops/codex`.
 
 That builds:
 
@@ -56,9 +63,11 @@ make push-agentbox REGISTRY=registry.example.com/myteam TAG=latest
 - Runtime and AgentBox communicate over mTLS inside the cluster.
 - The AgentBox image is designed to be spawned by the Runtime inside Kubernetes.
 - Core skills are baked into the images; dynamic skills and credentials are synced at runtime.
-- The AgentBox image builds the official open-source Codex CLI from the `openai/codex`
-  commit pinned by `CODEX_COMMIT` in `Dockerfile.agentbox`. The small Siclaw source patch in
-  `patches/codex/` gates native `apply_patch` alongside the disabled native shell; model-authored
+- The AgentBox image builds the open-source Codex CLI from the protected
+  `aiops/codex` `main` branch, verifying the exact `CODEX_COMMIT` in
+  `Dockerfile.agentbox`. Official upstream commits are mirrored unchanged on
+  `upstream/main`; Siclaw's minimal source changes live on `main`. The source change gates
+  native `apply_patch` alongside the disabled native shell; model-authored
   commands and file operations use Siclaw's authorized MCP tools. Set `SICLAW_AGENT_ENGINE=codex` on Runtime
   (`runtime.env` in Helm) to opt new AgentBox sessions into Codex. Runtime forwards the setting
   to normal AgentBox pods. Existing Pi sessions, non-Responses model bindings, PDF turns,
