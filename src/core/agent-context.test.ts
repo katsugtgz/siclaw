@@ -167,6 +167,18 @@ describe("compileAgentContext", () => {
     expect(context.systemPrompt).toContain("spawn_subagent");
     expect(context.harness.includeBundledSkills).toBe(true);
   });
+
+  it("lets Codex own planning while preserving the SRE safety guidance", () => {
+    const input = { agentType: "sre", allowedTools: ["bash", "task_create", "task_update"],
+      memoryConfigured: false, mode: "web" as const };
+    const pi = compileAgentContext(input);
+    const codex = compileAgentContext({ ...input, nativePlanning: true });
+    expect(pi.harness.includePlanningGuidance).toBe(true);
+    expect(codex.harness.includePlanningGuidance).toBe(false);
+    expect(codex.systemPrompt).not.toContain("task_create");
+    expect(codex.harness.includeOperationalSafety).toBe(true);
+    expect(codex.harness.allowedTools).toEqual(pi.harness.allowedTools);
+  });
 });
 
 describe("createAgentContextManifest", () => {

@@ -46,6 +46,8 @@ export interface CompileAgentContextInput {
   /** Child execution role is separate from the Agent's inherited business policy. */
   subagentPrompt?: string;
   isSubagent?: boolean;
+  /** Codex supplies update_plan itself; omit Pi task-tool instructions. */
+  nativePlanning?: boolean;
   interactiveProgress?: boolean;
   /** A conversation owner has a control emitter and an authorized handoff roster. */
   handoffAvailable?: boolean;
@@ -170,6 +172,7 @@ export function resolveAgentHarness(
       (agentType === "knowledge_qa" || hasAnyTool(allowedTools, ["write", "edit", "skill_preview"])),
     includePlanningGuidance:
       !input.isSubagent &&
+      !input.nativePlanning &&
       resolution === "resolved" &&
       hasAnyTool(allowedTools, ["task_create", "task_update", "task_list", "task_get"]),
     includeSubagentGuidance:

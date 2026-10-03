@@ -41,6 +41,7 @@ import memoryFlushExtension from "./extensions/memory-flush.js";
 import deepInvestigationExtension from "./extensions/deep-investigation.js";
 import { PiAgentBrain } from "./brains/pi-agent-brain.js";
 import { CodexAgentBrain } from "./brains/codex-agent-brain.js";
+import { projectCodexPlan } from "./brains/codex-plan.js";
 import { resolveSessionThinkingLevel } from "./session-thinking.js";
 import type { BrainSession } from "./brain-session.js";
 import { createPiExecutionSession } from "./pi-execution.js";
@@ -462,7 +463,7 @@ export async function createSiclawSession(
   // Turn counter for per-attempt tool state; the prompt owner bumps it (see ToolRefs).
   const turnRef: { current: number } = { current: 0 };
   const mode = opts?.mode ?? "web";
-  const compiledContext = compileAgentContext({
+  const contextInput = {
     agentType: opts?.agentType ?? "sre",
     allowedTools: opts?.allowedTools ?? config.allowedTools,
     harnessResolved: opts?.harnessResolved,
@@ -476,7 +477,8 @@ export async function createSiclawSession(
     structuredResultRequired: opts?.structuredResultRequired === true,
     handoffAvailable: Boolean(opts?.handoffPolicy?.remaining !== 0 && opts?.handoffSupported && opts?.searchHandoffTargets && opts?.sessionEventEmitter && opts?.handoffTargets?.length && !opts?.isSubagent),
     interactiveProgress: mode === "web" && !opts?.isSubagent,
-  });
+  };
+  let compiledContext = compileAgentContext(contextInput);
   const allowedTools = compiledContext.harness.allowedTools;
   const memoryEnabled = compiledContext.harness.memoryEnabled;
   // Mutable ref — populated after memoryIndexer is created (below) so memory-
@@ -758,6 +760,14 @@ export async function createSiclawSession(
   // capability whitelist here before exposing them to the model.
   appendAllowedTools(customTools, restrictedFileTools, allowedTools);
 
+  // Codex owns its progress checklist. Keep Pi's task ledger available for Pi
+  // fallback, but do not advertise two competing plan APIs to a Codex turn.
+  const useCodex = opts?.agentEngine === "codex" && !opts.isSubagent
+    && !customTools.some((tool) => tool.name === "transfer_to_agent");
+  const nativePlanEnabled = useCodex && ["task_create", "task_update"].every((name) =>
+    customTools.some((tool) => tool.name === name));
+  if (nativePlanEnabled) compiledContext = compileAgentContext({ ...contextInput, nativePlanning: true });
+
   for (let i = 0; i < customTools.length; i++) {
     const tool = customTools[i];
     if (!tool.name.startsWith("tool_result_") && !mcpTools.includes(tool)) {
@@ -775,6 +785,10 @@ export async function createSiclawSession(
       !customTools.some((tool) => tool.name === citationSupport.tool.name)) {
     customTools.push(citationSupport.tool);
   }
+  const piPlanTools = new Set(["task_create", "task_update", "task_list", "task_get"]);
+  const codexTools = nativePlanEnabled
+    ? customTools.filter((tool) => !piPlanTools.has(tool.name))
+    : customTools;
 
   // Final model-visible tool set (registry-resolved + MCP + file tools, after the
   // whitelist is applied at every chokepoint). Logged by NAME when restricted so a
@@ -894,7 +908,7 @@ export async function createSiclawSession(
   const contextManifest = createAgentContextManifest({
     context: compiledContext,
     mode,
-    tools: customTools,
+    tools: useCodex && nativePlanEnabled ? [...codexTools, { name: "update_plan" }] : customTools,
     skillNames: loadedSkills.map((skill) => skill.name),
     mcpServerNames: Object.keys(mcpServers),
     knowledgeMounted: fs.existsSync(knowledgeDir),
@@ -938,9 +952,9 @@ export async function createSiclawSession(
   // transfer_to_agent against mixed batches and pending input. MCP receives
   // individual calls, so keep handoff-capable sessions on Pi until Codex can
   // enforce the same pre-execution boundary.
-  if (opts?.agentEngine === "codex" && !opts.isSubagent
-      && !customTools.some((tool) => tool.name === "transfer_to_agent")) {
-    const executableTools = session.getAllTools().map((info) => {
+  if (useCodex) {
+    const executableTools = session.getAllTools().filter((info) =>
+      !nativePlanEnabled || !piPlanTools.has(info.name)).map((info) => {
       const tool = session.extensionRunner.getToolDefinition(info.name)
         ?? customTools.find((candidate) => candidate.name === info.name);
       if (!tool) throw new Error(`Codex tool bridge cannot resolve ${info.name}`);
@@ -948,7 +962,10 @@ export async function createSiclawSession(
     });
     brain = await CodexAgentBrain.create({
       sessionManager, piSession: session, systemPrompt: session.systemPrompt,
-      tools: executableTools, toolsetsByName, cwd, skillPaths: loadedSkills.map((skill) => ({
+      tools: executableTools, toolsetsByName, cwd, nativePlanEnabled,
+      onPlanUpdate: opts?.sessionEventEmitter
+        ? (plan) => projectCodexPlan(taskListId, opts.sessionEventEmitter!, plan) : undefined,
+      skillPaths: loadedSkills.map((skill) => ({
         name: skill.name, filePath: skill.filePath,
       })),
     });

@@ -9,6 +9,22 @@ const model = { id: "test", name: "Test", provider: "test", api: "openai-respons
   contextWindow: 8_000, maxTokens: 1_000, reasoning: false };
 
 describe("CodexAgentBrain compatibility", () => {
+  it("enables native update_plan and forwards its app-server notification", () => {
+    const brain = Object.create(CodexAgentBrain.prototype) as any;
+    const onPlanUpdate = vi.fn();
+    brain.threadId = "thread-1";
+    brain.nativePlanEnabled = true;
+    brain.onPlanUpdate = onPlanUpdate;
+    brain.bridge = { url: "http://127.0.0.1:1/mcp" };
+    brain.currentProviderConfig = () => ({ baseUrl: "http://127.0.0.1:2/v1" });
+    expect(brain.codexConfig().tools.update_plan.enabled).toBe(true);
+    brain.handleEvent({ method: "turn/plan/updated", params: { threadId: "other",
+      plan: [{ step: "ignored", status: "pending" }] } });
+    brain.handleEvent({ method: "turn/plan/updated", params: { threadId: "thread-1",
+      plan: [{ step: "verify", status: "inProgress" }] } });
+    expect(onPlanUpdate).toHaveBeenCalledExactlyOnceWith([{ step: "verify", status: "inProgress" }]);
+  });
+
   it("does not reject a long session based on lifetime token usage", () => {
     const brain = Object.create(CodexAgentBrain.prototype) as any;
     brain.totalUsage = { input: 80_000, output: 20_000, cacheRead: 0, cacheWrite: 0, total: 100_000 };

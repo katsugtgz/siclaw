@@ -122,6 +122,8 @@ export class CodexAgentBrain implements BrainSession {
     private readonly toolsetsByName: ReadonlyMap<string, string>,
     private readonly cwd: string,
     private readonly skillPaths: Array<{ name: string; filePath: string }>,
+    private readonly nativePlanEnabled = false,
+    private readonly onPlanUpdate?: (plan: unknown) => void,
   ) {
     const sessionDir = sessionManager.getSessionDir();
     this.home = path.join(sessionDir, "codex-home");
@@ -160,9 +162,11 @@ export class CodexAgentBrain implements BrainSession {
     sessionManager: SessionManager; piSession: AgentSession; systemPrompt: string; tools: ToolDefinition[];
     toolsetsByName: ReadonlyMap<string, string>;
     cwd: string; skillPaths: Array<{ name: string; filePath: string }>;
+    nativePlanEnabled?: boolean; onPlanUpdate?: (plan: unknown) => void;
   }): Promise<CodexAgentBrain> {
     const brain = new CodexAgentBrain(options.sessionManager, options.piSession, options.systemPrompt,
-      options.tools, options.toolsetsByName, options.cwd, options.skillPaths);
+      options.tools, options.toolsetsByName, options.cwd, options.skillPaths,
+      options.nativePlanEnabled, options.onPlanUpdate);
     fs.mkdirSync(brain.home, { recursive: true, mode: 0o700 });
     brain.syncSkills();
     await brain.bridge.start();
@@ -176,7 +180,14 @@ export class CodexAgentBrain implements BrainSession {
 
   getConversationMessages(): readonly unknown[] { return this.messages; }
   getTools(): BrainToolDefinition[] {
-    return this.tools.map((tool) => ({ name: tool.name, description: tool.description, parameters: tool.parameters }));
+    const tools = this.tools.map((tool) => ({ name: tool.name, description: tool.description,
+      parameters: tool.parameters }));
+    if (this.nativePlanEnabled) tools.push({ name: "update_plan", description: "Update the task plan",
+      parameters: { type: "object", required: ["plan"], properties: { plan: { type: "array",
+        items: { type: "object", required: ["step", "status"], properties: {
+          step: { type: "string" }, status: { type: "string", enum: ["pending", "in_progress", "completed"] },
+        } } } } } });
+    return tools;
   }
   getModel(): BrainModelInfo | undefined { return this.model; }
   getSessionStats(): BrainSessionStats { return { tokens: { ...this.totalUsage }, cost: this.totalCost }; }
@@ -496,7 +507,7 @@ export class CodexAgentBrain implements BrainSession {
       // prepend an ambient AGENTS.md from the AgentBox working directory.
       project_doc_max_bytes: 0,
       tools: { experimental_request_user_input: { enabled: false },
-        update_plan: { enabled: false } },
+        update_plan: { enabled: this.nativePlanEnabled } },
       model_providers: { siclaw_model: {
         name: "Siclaw model", base_url: string(provider.baseUrl),
         env_key: "SICLAW_CODEX_MODEL_TOKEN", wire_api: "responses",
@@ -507,7 +518,9 @@ export class CodexAgentBrain implements BrainSession {
         // authorization. Codex must not add a second interactive approval UI.
         default_tools_approval_mode: "approve",
       } },
-      features: { shell_tool: false, apps: false, plugins: false, browser_use: false,
+      features: { shell_tool: false, code_mode: false, code_mode_only: false,
+        code_mode_host: false, request_permissions_tool: false,
+        send_message_to_user_async: false, apps: false, plugins: false, browser_use: false,
         computer_use: false, image_generation: false, multi_agent: false,
         view_image: false, goals: false },
     };
@@ -641,6 +654,10 @@ export class CodexAgentBrain implements BrainSession {
   private handleEvent(event: CodexEvent): void {
     const params = event.params;
     if (string(params.threadId) !== this.threadId) return;
+    if (event.method === "turn/plan/updated") {
+      this.onPlanUpdate?.(params.plan);
+      return;
+    }
     const turn = record(params.turn) ? params.turn : undefined;
     const item = record(params.item) ? params.item : undefined;
     const active = this.active;

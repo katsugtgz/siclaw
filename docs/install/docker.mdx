@@ -57,8 +57,9 @@ make push-agentbox REGISTRY=registry.example.com/myteam TAG=latest
 - The AgentBox image is designed to be spawned by the Runtime inside Kubernetes.
 - Core skills are baked into the images; dynamic skills and credentials are synced at runtime.
 - The AgentBox image builds the official open-source Codex CLI from the `openai/codex`
-  commit pinned by `CODEX_COMMIT` in `Dockerfile.agentbox`. Optional Siclaw source patches
-  live in `patches/codex/`; the current build applies none. Set `SICLAW_AGENT_ENGINE=codex` on Runtime
+  commit pinned by `CODEX_COMMIT` in `Dockerfile.agentbox`. The small Siclaw source patch in
+  `patches/codex/` gates native `apply_patch` alongside the disabled native shell; model-authored
+  commands and file operations use Siclaw's authorized MCP tools. Set `SICLAW_AGENT_ENGINE=codex` on Runtime
   (`runtime.env` in Helm) to opt new AgentBox sessions into Codex. Runtime forwards the setting
   to normal AgentBox pods. Existing Pi sessions, non-Responses model bindings, PDF turns,
   required-result requests, and sessions exposing `transfer_to_agent` continue on Pi.

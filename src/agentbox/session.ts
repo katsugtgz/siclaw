@@ -3757,7 +3757,9 @@ export class AgentBoxSessionManager {
       userId: effectiveUserId,
       brain: result.brain,
       session: result.session,
-      toolNames: (result.customTools ?? []).map((tool) => tool.name).sort(),
+      toolNames: (result.brain.brainType === "codex"
+        ? result.brain.getTools?.() ?? result.customTools ?? []
+        : result.customTools ?? []).map((tool) => tool.name).sort(),
       skillNames: [...(result.skillNames ?? [])].sort(),
       skillDigests: { ...(result.skillDigests ?? {}) },
       getSkillSnapshot: result.getSkillSnapshot,

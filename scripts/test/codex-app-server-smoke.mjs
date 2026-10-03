@@ -6,6 +6,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CodexAgentBrain } from "../../dist/core/brains/codex-agent-brain.js";
+import { projectCodexPlan } from "../../dist/core/brains/codex-plan.js";
+import { getOrCreateLedger } from "../../dist/core/task-ledger.js";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 
 if (!process.env.SICLAW_CODEX_BIN) {
@@ -15,6 +17,8 @@ if (!process.env.SICLAW_CODEX_BIN) {
 const sessionDir = mkdtempSync(join(tmpdir(), "siclaw-codex-source-smoke-"));
 let calls = 0;
 let toolRuns = 0;
+const plans = [];
+const planEvents = [];
 const model = createServer(async (request, response) => {
   let raw = "";
   for await (const part of request) raw += part;
@@ -22,12 +26,22 @@ const model = createServer(async (request, response) => {
   assert.equal(request.url, "/v1/responses");
   assert.equal(body.model, "smoke-model");
   assert.equal(body.stream, true);
+  const toolNames = body.tools.map((tool) => tool.name);
+  assert.ok(toolNames.includes("update_plan"));
+  assert.ok(toolNames.includes("mcp__siclaw") || toolNames.some((name) => name.endsWith("echo")));
+  for (const forbidden of ["exec_command", "write_stdin", "apply_patch", "view_image",
+    "code_mode_execute", "request_permissions"]) {
+    assert.ok(!toolNames.includes(forbidden), `${forbidden} bypasses Siclaw's tool policy`);
+  }
   calls++;
   const id = `response_${calls}`;
-  const toolCall = calls === 1;
-  const item = toolCall
-    ? { id: `function_${calls}`, type: "function_call", namespace: "mcp__siclaw",
-      name: "echo", call_id: `call_${calls}`, arguments: '{"text":"ok"}', status: "completed" }
+  const toolCall = calls <= 2;
+  const item = calls === 1
+    ? { id: `function_${calls}`, type: "function_call", name: "update_plan",
+      call_id: `call_${calls}`, arguments: '{"plan":[{"step":"Inspect","status":"in_progress"}]}', status: "completed" }
+    : calls === 2
+      ? { id: `function_${calls}`, type: "function_call", namespace: "mcp__siclaw",
+        name: "echo", call_id: `call_${calls}`, arguments: '{"text":"ok"}', status: "completed" }
     : { id: `message_${calls}`, type: "message", role: "assistant", status: "completed",
       content: [{ type: "output_text", text: "hello from codex", annotations: [] }] };
   const envelope = { id, object: "response", created_at: Math.floor(Date.now() / 1000),
@@ -64,7 +78,11 @@ const tool = { name: "echo", label: "Echo", description: "Echo input",
 const makeBrain = async (sessionManager) => {
   const brain = await CodexAgentBrain.create({ sessionManager, piSession: { extensionRunner },
     systemPrompt: "Reply briefly", tools: [tool], toolsetsByName: new Map([["echo", "test"]]),
-    cwd: process.cwd(), skillPaths: [] });
+    cwd: process.cwd(), skillPaths: [], nativePlanEnabled: true,
+    onPlanUpdate: (plan) => {
+      plans.push(plan);
+      projectCodexPlan("smoke-plan", (event) => planEvents.push(event), plan);
+    } });
   brain.registerProvider("fixture", { apiKey: "test", baseUrl: `http://127.0.0.1:${port}/v1`,
     api: "openai-responses", models: [{ id: "smoke-model", api: "openai-responses",
       contextWindow: 128_000, maxTokens: 1_000 }] });
@@ -77,6 +95,10 @@ try {
   brain = await makeBrain(SessionManager.create(process.cwd(), sessionDir));
   await brain.prompt("Hi");
   assert.equal(toolRuns, 1);
+  assert.deepEqual(plans[0], [{ step: "Inspect", status: "inProgress" }]);
+  assert.deepEqual(getOrCreateLedger("smoke-plan").snapshot().map(({ subject, status }) =>
+    ({ subject, status })), [{ subject: "Inspect", status: "in_progress" }]);
+  assert.deepEqual(planEvents.map((event) => event.action), ["reset", "upsert"]);
   assert.ok(brain.getConversationMessages().some((message) => message.role === "assistant" &&
     message.content?.some?.((item) => item.text === "hello from codex")));
   await brain.close();

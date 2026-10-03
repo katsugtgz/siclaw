@@ -1,0 +1,69 @@
+diff --git a/codex-rs/core/src/tools/spec_plan.rs b/codex-rs/core/src/tools/spec_plan.rs
+index 66f841d..4dfb2db 100644
+--- a/codex-rs/core/src/tools/spec_plan.rs
++++ b/codex-rs/core/src/tools/spec_plan.rs
+@@ -1249,7 +1249,12 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, registry: &mut Tool
+         ));
+     }
+ 
+-    if environment_mode.has_environment() && context.model_info.apply_patch_tool_type.is_some() {
++    // Siclaw disables model-authored process and file execution together. Its
++    // own scoped MCP file tools remain available when shell_tool is disabled.
++    if environment_mode.has_environment()
++        && features.enabled(Feature::ShellTool)
++        && context.model_info.apply_patch_tool_type.is_some()
++    {
+         let include_environment_id = matches!(environment_mode, ToolEnvironmentMode::Multiple);
+         registry.add(ApplyPatchHandler::new(include_environment_id));
+     }
+diff --git a/codex-rs/core/src/tools/spec_plan_tests.rs b/codex-rs/core/src/tools/spec_plan_tests.rs
+index 1518558..e971a4b 100644
+--- a/codex-rs/core/src/tools/spec_plan_tests.rs
++++ b/codex-rs/core/src/tools/spec_plan_tests.rs
+@@ -1101,7 +1101,9 @@ async fn disabling_shell_tools_disables_command_tools_for_all_environments() {
+     let remote_environment = probe(|turn| {
+         set_feature(turn, Feature::ShellTool, /*enabled*/ false);
+         update_turn_settings_for_test(turn, |settings| {
+-            Arc::make_mut(&mut settings.model_info).shell_type = ConfigShellToolType::UnifiedExec;
++            let model = Arc::make_mut(&mut settings.model_info);
++            model.shell_type = ConfigShellToolType::UnifiedExec;
++            model.apply_patch_tool_type = Some(ApplyPatchToolType::Freeform);
+         });
+ 
+         let TurnEnvironmentState::Ready(environment) = turn
+@@ -1121,20 +1123,30 @@ async fn disabling_shell_tools_disables_command_tools_for_all_environments() {
+         );
+     })
+     .await;
+-    remote_environment.assert_visible_lacks(&["exec_command", "write_stdin"]);
+-    remote_environment.assert_registered_lacks(&["exec_command", "write_stdin"]);
++    remote_environment.assert_visible_lacks(&["exec_command", "write_stdin", "apply_patch"]);
++    remote_environment.assert_registered_lacks(&["exec_command", "write_stdin", "apply_patch"]);
+     assert!(!remote_environment.has_terminal_controls);
+ 
+     let multiple_local_environments = probe(|turn| {
+         set_feature(turn, Feature::ShellTool, /*enabled*/ false);
+         update_turn_settings_for_test(turn, |settings| {
+-            Arc::make_mut(&mut settings.model_info).shell_type = ConfigShellToolType::UnifiedExec;
++            let model = Arc::make_mut(&mut settings.model_info);
++            model.shell_type = ConfigShellToolType::UnifiedExec;
++            model.apply_patch_tool_type = Some(ApplyPatchToolType::Freeform);
+         });
+         duplicate_primary_environment(turn);
+     })
+     .await;
+-    multiple_local_environments.assert_visible_lacks(&["exec_command", "write_stdin"]);
+-    multiple_local_environments.assert_registered_lacks(&["exec_command", "write_stdin"]);
++    multiple_local_environments.assert_visible_lacks(&[
++        "exec_command",
++        "write_stdin",
++        "apply_patch",
++    ]);
++    multiple_local_environments.assert_registered_lacks(&[
++        "exec_command",
++        "write_stdin",
++        "apply_patch",
++    ]);
+ }
+ 
+ #[tokio::test]

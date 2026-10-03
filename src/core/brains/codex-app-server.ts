@@ -28,6 +28,11 @@ export class CodexAppServer {
     this.closing = false;
     const child = spawn(this.executable, ["app-server", "--stdio", "--strict-config",
       "-c", "features.shell_tool=false",
+      "-c", "features.code_mode=false",
+      "-c", "features.code_mode_only=false",
+      "-c", "features.code_mode_host=false",
+      "-c", "features.request_permissions_tool=false",
+      "-c", "features.send_message_to_user_async=false",
       "-c", "features.apps=false",
       "-c", "features.plugins=false",
       "-c", "features.browser_use=false",
