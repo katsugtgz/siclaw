@@ -19,6 +19,7 @@ stream. It is not yet a complete replacement of Pi.
 | Cluster, node, pod, host and skill-script operations | Existing Siclaw domain tools through MCP | Codex does not supply equivalent resource binding or remote execution contracts. |
 | Memory, knowledge, reporting and schedules | Existing Siclaw domain tools through MCP | These use Siclaw persistence and Runtime APIs. |
 | Human clarification | Existing `request_input` through MCP | Siclaw ends the machine-driven turn and resumes on the next answer. Native user input needs request/answer lifecycle adaptation before it can preserve this contract. |
+| Image input | Native Responses image input | Native `view_image` is disabled because arbitrary local paths need Siclaw's file authorization. File attachments continue on Pi. |
 | Subtasks | Existing Siclaw orchestration with Pi child brains | Native Codex multi-agent tools are disabled. Child permissions, model tiers, persisted reports, map/reduce, mailbox delivery, and cancellation need a compatible adapter. |
 | Cross-Agent handoff | Pi | A whole model tool-call batch must be validated before any handoff executes; individual MCP calls do not provide that boundary. |
 
@@ -52,7 +53,8 @@ the root `AGENTS.md` and `CLAUDE.md`.
    pinned internal GitLab Codex source and runs the image capability checks.
 3. Run `scripts/test/codex-app-server-smoke.mjs` with `SICLAW_CODEX_BIN` pointing
    to that source-built binary. Its fake Responses provider exercises native
-   planning, MCP execution, transcript resume, and early Stop, and checks that
+   planning, MCP execution, transcript resume, early and active Stop, and
+   continuation after interruption. It also checks that
    native execution tools are absent from the model's tool list.
 4. Run the same script inside the AgentBox image with
    `SICLAW_CODEX_CONTAINER_SMOKE=1`. Use the normal entrypoint so it runs as

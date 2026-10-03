@@ -26,6 +26,16 @@ let calls = 0;
 let toolRuns = 0;
 const plans = [];
 const planEvents = [];
+let holdNextResponse = false;
+let streamingRequestSeen;
+const withTimeout = async (promise, label) => {
+  let timer;
+  try {
+    return await Promise.race([promise, new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`${label} timed out`)), 10_000);
+    })]);
+  } finally { clearTimeout(timer); }
+};
 const model = createServer(async (request, response) => {
   let raw = "";
   for await (const part of request) raw += part;
@@ -66,6 +76,11 @@ const model = createServer(async (request, response) => {
   response.writeHead(200, { "content-type": "text/event-stream" });
   const send = (type, payload) => response.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...payload })}\n\n`);
   send("response.created", { response: { ...envelope, status: "in_progress", output: [] } });
+  if (holdNextResponse) {
+    holdNextResponse = false;
+    streamingRequestSeen?.();
+    return; // Keep the real model request open until Codex interrupts it.
+  }
   send("response.output_item.added", { output_index: 0,
     item: toolCall ? { ...item, arguments: "", status: "in_progress" }
       : { ...item, content: [], status: "in_progress" } });
@@ -149,7 +164,17 @@ try {
   await brain.abort();
   await stopping;
   assert.equal(calls, beforeStop);
-  console.log(`Codex app-server smoke passed: ${calls} model calls, ${toolRuns} Siclaw tool run, resume and early stop`);
+  holdNextResponse = true;
+  const streamingRequest = new Promise((resolve) => { streamingRequestSeen = resolve; });
+  const streaming = brain.prompt("Stop during a model stream");
+  streaming.catch(() => {}); // Cleanup may reject this promise after an assertion failure.
+  await withTimeout(streamingRequest, "streaming model request");
+  await withTimeout(brain.abort(), "active Stop");
+  await withTimeout(streaming, "interrupted turn completion");
+  const afterInterrupt = calls;
+  await brain.prompt("Continue after Stop");
+  assert.equal(calls, afterInterrupt + 1);
+  console.log(`Codex app-server smoke passed: ${calls} model calls, ${toolRuns} Siclaw tool run, resume, early/active Stop, and continuation`);
   if (containerSecurity) console.log("Container security passed: command whitelist, credential path denial, OS user isolation, authorized kubectl pipeline");
 } finally {
   await brain?.close();
