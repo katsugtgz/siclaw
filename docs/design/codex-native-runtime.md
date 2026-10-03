@@ -128,3 +128,25 @@ including any required source-built runtime helpers.
   successful Pi-backed fallback does not count as native Codex acceptance.
 
 No test account secrets belong in source, image layers or recorded evidence.
+
+## Current verification evidence
+
+- Development build directory: `/tmp/siclaw-codex-validation.qRPCgN` on Shanghai.
+- Source-built image `siclaw-agentbox:codex-native-5b414588`:
+  `sha256:0bd065787b6c0d6cc6a481f0ee9ac6e24c27d1b297a4aadb24e9429a72aba4dd`.
+  It contains the pinned Codex CLI, matching Code Mode host, and bubblewrap.
+- The standalone upstream workspace sandbox cannot create its user namespace
+  under the default Docker restrictions. Preserve those restrictions.
+- The fixed native probe passes under the normal AgentBox entrypoint and
+  default Docker permissions with `SICLAW_CODEX_RELAY_PROBE=1` and
+  `SICLAW_CODEX_EXTERNAL_SANDBOX_PROBE=1`. It uses the upstream
+  `thread/settings/update` `externalSandbox` contract. Siclaw's immutable
+  request grants, sandbox UID transition, and output policy remain enforced at
+  the relay. Native `exec_command` and `apply_patch` complete without Pi tools.
+- Current full regression: 407 files / 8045 tests passed. The 9 added policy,
+  output, and authentication cases cover the new components; typecheck/build
+  and the source-built macOS relay probe also pass.
+- These are component/container checks. The production brain still uses the
+  transitional bridge; native business services, lifecycle compatibility and
+  SiCore end-to-end acceptance have not passed yet. No cluster deployment was
+  changed by this verification phase.
