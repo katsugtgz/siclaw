@@ -160,7 +160,9 @@ try {
   assert.equal(calls, 3);
   const command = events.find((event) => event.method === "item/completed"
     && event.params?.item?.type === "commandExecution")?.params.item;
-  assert.equal(command?.exitCode, 0, `the native command must execute successfully: ${JSON.stringify(command)}`);
+  assert.equal(command?.exitCode, 0, `the native command must execute successfully: ${JSON.stringify({ command,
+    outputs: toolOutputs, items: events.filter((event) => event.method === "item/completed")
+      .map((event) => ({ type: event.params.item.type, status: event.params.item.status })) }).slice(0, 2500)}`);
   assert.match(command.aggregatedOutput, /native-command-ok/);
   assert.ok(existsSync(join(workspace, "native-probe.txt")),
     `native apply_patch did not create the file: ${JSON.stringify(toolOutputs).slice(0, 2000)}`);
