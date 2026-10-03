@@ -46,6 +46,14 @@ enable production native execution or establish Siclaw security parity.
 
 ## Implementation direction
 
+The first request-policy component is implemented in
+`src/core/brains/codex-executor-policy.ts`, independently of Pi tool/session
+types. It validates command form and whitelist, strips caller environment
+overrides, scopes process continuation, and enforces read/write roots and link
+denials. It is not wired into the production brain. Output policy, the relay,
+native interactive execution, file streaming, and full lifecycle integration
+are required before enabling it; currently unsupported RPCs fail closed.
+
 1. Replace the generic Pi tool bridge with an execution policy adapter at the
    native executor boundary. Delegate process and filesystem mechanics to the
    upstream exec-server. Validate every permitted RPC before execution; unknown

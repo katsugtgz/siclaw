@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { createServer } from "node:http";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
@@ -19,6 +19,7 @@ const token = randomBytes(32).toString("hex");
 const tokenHash = createHash("sha256").update(token).digest("hex");
 let calls = 0;
 let fixtureError;
+let toolOutputs = [];
 const seenTools = new Set();
 const patch = "*** Begin Patch\n*** Add File: native-probe.txt\n+created by native apply_patch\n*** End Patch\n";
 const model = createServer(async (request, response) => {
@@ -26,6 +27,7 @@ const model = createServer(async (request, response) => {
     let raw = "";
     for await (const chunk of request) raw += chunk;
     const body = JSON.parse(raw);
+    toolOutputs = body.input.filter((item) => item.type === "function_call_output" || item.type === "custom_tool_call_output");
     assert.equal(request.url, "/v1/responses");
     const tools = body.tools ?? body.input.find((item) => item.type === "additional_tools")?.tools;
     assert.ok(Array.isArray(tools), "native tool schemas must be present in Responses or Responses Lite");
@@ -156,11 +158,13 @@ try {
   assert.equal(completed.params.turn.status, "completed", fixtureError?.message
     ?? JSON.stringify(completed.params.turn.error));
   assert.equal(calls, 3);
-  assert.equal(readFileSync(join(workspace, "native-probe.txt"), "utf8"), "created by native apply_patch\n");
   const command = events.find((event) => event.method === "item/completed"
     && event.params?.item?.type === "commandExecution")?.params.item;
-  assert.equal(command?.exitCode, 0, "the native command must execute successfully");
+  assert.equal(command?.exitCode, 0, `the native command must execute successfully: ${JSON.stringify(command)}`);
   assert.match(command.aggregatedOutput, /native-command-ok/);
+  assert.ok(existsSync(join(workspace, "native-probe.txt")),
+    `native apply_patch did not create the file: ${JSON.stringify(toolOutputs).slice(0, 2000)}`);
+  assert.equal(readFileSync(join(workspace, "native-probe.txt"), "utf8"), "created by native apply_patch\n");
   assert.ok(events.some((event) => event.params?.item?.type === "fileChange"));
   console.log("Native execution probe passed: official app-server + exec-server, exec_command, apply_patch, no Pi or Siclaw MCP tools");
 } finally {
