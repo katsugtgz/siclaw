@@ -2,7 +2,7 @@
 // against an upstream exec-server in a temporary workspace. This does not enable
 // native tools in the production integration or replace Siclaw's security gate.
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { createServer } from "node:http";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync } from "node:fs";
@@ -13,6 +13,13 @@ import { createInterface } from "node:readline";
 const executable = process.env.SICLAW_CODEX_BIN;
 assert.ok(executable, "Set SICLAW_CODEX_BIN to the pinned source-built Codex CLI");
 const useRelay = process.env.SICLAW_CODEX_RELAY_PROBE === "1";
+const externalSandbox = process.env.SICLAW_CODEX_EXTERNAL_SANDBOX_PROBE === "1";
+if (externalSandbox) {
+  assert.ok(useRelay, "External sandbox probe requires the independent policy relay");
+  assert.equal(process.env.NODE_ENV, "production");
+  assert.equal(process.getuid(), 1000, "External sandbox probe must use the normal AgentBox entrypoint");
+  assert.equal(spawnSync("sudo", ["-n", "-u", "sandbox", "--", "id", "-u"]).stdout.toString().trim(), "1001");
+}
 const root = mkdtempSync(join(tmpdir(), "siclaw-native-codex-"));
 const workspace = join(root, "workspace");
 mkdirSync(workspace, { mode: 0o700 });
@@ -103,7 +110,7 @@ if (useRelay) {
   const { CodexExecutorRelay } = await import("../../dist/core/brains/codex-executor-relay.js");
   relay = new CodexExecutorRelay({ executable, home: join(root, "executor-home"), cwd: workspace,
     grants: { readRoots: [workspace], writeRoots: [workspace], deniedRoots: [], allowCommands: true,
-      production: false, environment: { PATH: process.env.PATH ?? "/usr/bin:/bin" } } });
+      production: externalSandbox, environment: { PATH: process.env.PATH ?? "/usr/bin:/bin" } } });
   await relay.start();
   executorUrl = relay.url;
   executorToken = relay.bearerToken;
@@ -162,6 +169,8 @@ try {
       model_providers: { fixture: { name: "Native probe", base_url: `http://127.0.0.1:${modelPort}/v1`,
         env_key: "SICLAW_NATIVE_PROBE_MODEL_TOKEN", wire_api: "responses", request_max_retries: 0,
         stream_max_retries: 0 } } } });
+  if (externalSandbox) await rpc("thread/settings/update", { threadId: started.thread.id,
+    sandboxPolicy: { type: "externalSandbox", networkAccess: "enabled" } });
   await rpc("turn/start", { threadId: started.thread.id,
     input: [{ type: "text", text: "Run the fixed architecture probe." }] });
   const deadline = Date.now() + 30_000;
