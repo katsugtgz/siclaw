@@ -156,17 +156,18 @@ No test account secrets belong in source, image layers or recorded evidence.
   resume, early/active Stop and continuation. No Pi AgentSession or tools run.
 - `codex-code-mode-smoke.mjs`: native gpt-6.1-sol catalog, Responses Lite,
   `functions.exec`, source-built Code Mode host and authorized native command
-  execution pass. Native V2 spawn/mailbox/reporting verification is in progress;
-  the latest remote result has not been read because permission review timed out.
-  V2 controls are direct `collaboration` tools by upstream default, and
+  execution pass. Native V2 spawn, child command execution, send_message and
+  mailbox/wait delivery also pass in the namespace. V2 controls are direct `collaboration` tools by upstream default, and
   model-originated messages use opaque `agent_message.encrypted_content`.
 - `codex-executor-smoke.mjs`: UID 1001, complete process-tree cancellation,
   cross-session handle denial, stdin rejection, complete-document Secret
   redaction and broker failure rejection pass.
-- Both isolated namespace Jobs completed successfully using the final image:
-  `siclaw-native-brain-20261005` and `siclaw-native-executor-20261005` in
+- All three isolated namespace Jobs completed successfully using the final image:
+  `siclaw-native-brain-20261005`, `siclaw-native-executor-20261005` and
+  `siclaw-native-v2-20261005` in
   `roce-test` / `sicore-test`. Their spec matches the normal AgentBox's read-only
-  root filesystem, RuntimeDefault seccomp and existing capability set.
+  root filesystem, RuntimeDefault seccomp and existing capability set. Test
+  resources were cleaned up after saving their logs.
 - Local source-built native parent and child both select `cluster:roce-test`
   and perform a real read-only `sicore-test` Pod query. The fixture broker
   refreshes the credential binding once per launch. This verifies execution
@@ -181,9 +182,9 @@ not established by the component/namespace results.
 
 ## Remaining acceptance work
 
-- Read/confirm the latest native V2 spawn/send_message/wait result, then exercise
-  that path in the namespace. Provider acceptance must include the catalog's
-  native Responses Lite and opaque agent-message contract when applicable.
+- Real provider acceptance must include the catalog's native Responses Lite
+  and opaque agent-message contract when applicable; fake Responses checks
+  do not establish those provider capabilities.
 - Test-namespace Runtime/AgentBox with SiCore: streaming/reasoning, tool/plan and
   child views, Stop/steer, restart/resume, model routing and usage accounting.
   The login page requires an account email; the test password was provided in
