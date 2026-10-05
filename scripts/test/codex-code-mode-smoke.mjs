@@ -21,7 +21,8 @@ const model = createServer(async (request, response) => {
     assert.equal(body.model, "gpt-6.1-sol");
     assert.equal(request.url, "/v1/responses");
     const tools = body.input.find((item) => item.type === "additional_tools")?.tools;
-    assert.ok(tools?.some((tool) => tool.name === "exec"), "preserve the catalog's native Code Mode tools");
+    assert.ok(tools?.some((tool) => tool.name === "exec"), "preserve the catalog's native Code Mode tools: " +
+      JSON.stringify((tools ?? body.tools ?? []).map((tool) => ({name:tool.name,type:tool.type}))));
     assert.equal(body.tools, undefined, "preserve native Responses Lite presentation");
     calls++;
     if (calls === 2) {
@@ -57,7 +58,8 @@ try {
   brain.registerProvider("fixture", {apiKey:"test",baseUrl:`http://127.0.0.1:${model.address().port}/v1`,
     api:"openai-responses",models:[{id:"gpt-6.1-sol",api:"openai-responses",contextWindow:128000,maxTokens:1000}]});
   await brain.setModel(brain.findModel("fixture","gpt-6.1-sol"));
-  await brain.prompt("Inspect the kubectl client with native tools");
+  try { await brain.prompt("Inspect the kubectl client with native tools"); }
+  catch (error) { throw fixtureError ?? error; }
   if (fixtureError) throw fixtureError;
   assert.equal(calls,2);
   assert.ok(brain.getConversationMessages().some((message) => message.role==="assistant" &&
