@@ -11,6 +11,8 @@ import { CodexAgentBrain } from "../../dist/core/brains/codex-agent-brain.js";
 const root = mkdtempSync(join(tmpdir(), "siclaw-code-mode-"));
 chmodSync(root, 0o755);
 let calls = 0;
+let rootCalls = 0, childCalls = 0;
+const nativeChildren = process.env.SICLAW_CODEX_CODE_MODE_CHILDREN === "1";
 let fixtureError;
 const code = 'text(JSON.stringify(await tools.exec_command({cmd:"kubectl version --client",login:false})));';
 const model = createServer(async (request, response) => {
@@ -25,21 +27,34 @@ const model = createServer(async (request, response) => {
       JSON.stringify((tools ?? body.tools ?? []).map((tool) => ({name:tool.name,type:tool.type}))));
     assert.equal(body.tools, undefined, "preserve native Responses Lite presentation");
     calls++;
-    if (calls === 2) {
-      const output = body.input.find((item) => item.type === "custom_tool_call_output" && item.call_id === "code");
+    const child = body.input.filter((item) => item.type === "message" && item.role === "user").at(-1)
+      ?.content?.some((item) => item.text?.includes("CODE_MODE_NATIVE_CHILD"));
+    const turn = child ? ++childCalls : ++rootCalls;
+    const side = child ? "child" : "root";
+    if (turn === 2) {
+      const output = body.input.find((item) => item.type === "custom_tool_call_output" && item.call_id === `${side}-1`);
       assert.match(JSON.stringify(output), /Client Version/);
       assert.ok(!JSON.stringify(output).includes("host unavailable"));
     }
-    const item = calls === 1 ? { id: "code-1", type: "custom_tool_call", namespace: "functions", name: "exec", call_id: "code", input: code }
-      : { id: "answer", type: "message", role: "assistant", content: [{type:"output_text",text:"Code Mode complete",annotations:[]}] };
+    let source = turn === 1 ? code : undefined;
+    if (nativeChildren && !child) {
+      if (turn === 2) source = 'text(await tools.spawn_agent({message:"CODE_MODE_NATIVE_CHILD",task_name:"native_child",fork_turns:"none"}));';
+      else if (turn >= 3 && !JSON.stringify(body.input).includes("Code Mode child complete")) {
+        assert.ok(turn < 8, "native wait must deliver the child result");
+        source = 'text(await tools.wait_agent({timeout_ms:10000}));';
+      }
+    }
+    const answer = child ? "Code Mode child complete" : "Code Mode complete";
+    const item = source ? { id:`${side}-${turn}`, type:"custom_tool_call",namespace:"functions",name:"exec",call_id:`${side}-${turn}`,input:source }
+      : { id:`answer-${calls}`, type:"message",role:"assistant",content:[{type:"output_text",text:answer,annotations:[]}] };
     response.writeHead(200, { "content-type": "text/event-stream" });
     const send = (type, payload) => response.write(`event: ${type}\ndata: ${JSON.stringify({type,...payload})}\n\n`);
     const envelope = { id:`resp-${calls}`, object:"response", model:body.model, output:[item], status:"completed",
       usage:{input_tokens:20,output_tokens:5,total_tokens:25} };
     send("response.created", {response:{...envelope,status:"in_progress",output:[]}});
-    send("response.output_item.added", {output_index:0,item:{...item,...(calls===1?{input:""}:{content:[]}),status:"in_progress"}});
-    if (calls === 1) send("response.custom_tool_call_input.delta", {output_index:0,delta:code});
-    else send("response.output_text.delta", {output_index:0,content_index:0,delta:"Code Mode complete"});
+    send("response.output_item.added", {output_index:0,item:{...item,...(source?{input:""}:{content:[]}),status:"in_progress"}});
+    if (source) send("response.custom_tool_call_input.delta", {output_index:0,delta:source});
+    else send("response.output_text.delta", {output_index:0,content_index:0,delta:answer});
     send("response.output_item.done", {output_index:0,item:{...item,status:"completed"}});
     send("response.completed", {response:envelope});
     response.end();
@@ -54,17 +69,17 @@ try {
   brain = await CodexAgentBrain.create({sessionManager:SessionManager.create(root,join(root,"transcripts")),
     systemPrompt:"Reply briefly",grants:{readRoots:[root],writeRoots:[],deniedRoots:[join(root,"transcripts")],
       allowCommands:true,production:process.env.NODE_ENV==="production",environment:{PATH:process.env.PATH}},
-    cwd:root,skillPaths:[],toolsetsByName:new Map()});
+    cwd:root,skillPaths:[],toolsetsByName:new Map(),allowSubagents:nativeChildren});
   brain.registerProvider("fixture", {apiKey:"test",baseUrl:`http://127.0.0.1:${model.address().port}/v1`,
     api:"openai-responses",models:[{id:"gpt-6.1-sol",api:"openai-responses",contextWindow:128000,maxTokens:1000}]});
   await brain.setModel(brain.findModel("fixture","gpt-6.1-sol"));
   try { await brain.prompt("Inspect the kubectl client with native tools"); }
   catch (error) { throw fixtureError ?? error; }
   if (fixtureError) throw fixtureError;
-  assert.equal(calls,2);
+  if (nativeChildren) assert.equal(childCalls,2); else assert.equal(calls,2);
   assert.ok(brain.getConversationMessages().some((message) => message.role==="assistant" &&
     message.content?.some?.((item) => item.text==="Code Mode complete")));
-  console.log("Native Code Mode smoke passed: gpt-6.1-sol, Responses Lite, source-built host, native exec_command");
+  console.log(`Native Code Mode smoke passed: gpt-6.1-sol, Responses Lite, source-built host, native exec_command${nativeChildren ? ", native V2 spawn/wait and child execution" : ""}`);
 } finally {
   await brain?.close();
   model.closeAllConnections();
