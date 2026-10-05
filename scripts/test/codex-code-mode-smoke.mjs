@@ -39,12 +39,14 @@ const model = createServer(async (request, response) => {
     }
     let source = turn === 1 ? code : undefined;
     let nativeCall;
+    if (nativeChildren && child && turn === 2) nativeCall = {name:"send_message",arguments:JSON.stringify({
+      target:"/root",message:"CODE_MODE_V2_CHILD_RESULT"})};
     if (nativeChildren && !child) {
       // Upstream's V2 default is non_code_mode_only: child controls are direct
       // Responses tools alongside Code Mode, rather than tools.* JS functions.
       if (turn === 2) nativeCall = { name:"spawn_agent",arguments:JSON.stringify({
         message:"CODE_MODE_NATIVE_CHILD",task_name:"native_child",fork_turns:"none"}) };
-      else if (turn >= 3 && !JSON.stringify(body.input).includes("Code Mode child complete")) {
+      else if (turn >= 3 && !JSON.stringify(body.input).includes("CODE_MODE_V2_CHILD_RESULT")) {
         if (turn === 3) assert.match(JSON.stringify(body.input.filter((item) => item.type === "function_call_output")), /task_name/,
           "native spawn failed: " + JSON.stringify(body.input.filter((item) => item.type === "function_call_output")).slice(0,3000));
         assert.ok(turn < 8, "native wait must deliver the child result: " + JSON.stringify({childCalls,
@@ -86,7 +88,11 @@ try {
   try { await brain.prompt("Inspect the kubectl client with native tools"); }
   catch (error) { throw fixtureError ?? error; }
   if (fixtureError) throw fixtureError;
-  if (nativeChildren) assert.equal(childCalls,2); else assert.equal(calls,2);
+  if (nativeChildren) {
+    const deadline=Date.now()+5000;
+    while (childCalls<3 && Date.now()<deadline) await new Promise((resolve) => setTimeout(resolve,50));
+    assert.equal(childCalls,3);
+  } else assert.equal(calls,2);
   assert.ok(brain.getConversationMessages().some((message) => message.role==="assistant" &&
     message.content?.some?.((item) => item.text==="Code Mode complete")));
   console.log(`Native Code Mode smoke passed: gpt-6.1-sol, Responses Lite, source-built host, native exec_command${nativeChildren ? ", native V2 spawn/wait and child execution" : ""}`);
