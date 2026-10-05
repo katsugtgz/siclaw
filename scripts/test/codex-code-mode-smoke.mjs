@@ -37,24 +37,30 @@ const model = createServer(async (request, response) => {
       assert.ok(!JSON.stringify(output).includes("host unavailable"));
     }
     let source = turn === 1 ? code : undefined;
+    let nativeCall;
     if (nativeChildren && !child) {
-      if (turn === 2) source = 'text(await tools.collaboration__spawn_agent({message:"CODE_MODE_NATIVE_CHILD",task_name:"native_child",fork_turns:"none"}));';
+      // Upstream's V2 default is non_code_mode_only: child controls are direct
+      // Responses tools alongside Code Mode, rather than tools.* JS functions.
+      if (turn === 2) nativeCall = { name:"spawn_agent",arguments:JSON.stringify({
+        message:"CODE_MODE_NATIVE_CHILD",task_name:"native_child",fork_turns:"none"}) };
       else if (turn >= 3 && !JSON.stringify(body.input).includes("Code Mode child complete")) {
         assert.ok(turn < 8, "native wait must deliver the child result: " + JSON.stringify({childCalls,
-          outputs:body.input.filter((item) => item.type === "custom_tool_call_output").slice(-3)}).slice(0,5000));
-        source = 'text(await tools.collaboration__wait_agent({timeout_ms:10000}));';
+          outputs:body.input.filter((item) => item.type === "function_call_output").slice(-3)}).slice(0,5000));
+        nativeCall = {name:"wait_agent",arguments:'{"timeout_ms":10000}'};
       }
     }
     const answer = child ? "Code Mode child complete" : "Code Mode complete";
-    const item = source ? { id:`${side}-${turn}`, type:"custom_tool_call",namespace:"functions",name:"exec",call_id:`${side}-${turn}`,input:source }
+    const item = nativeCall ? {id:`${side}-${turn}`,type:"function_call",namespace:"collaboration",call_id:`${side}-${turn}`,...nativeCall}
+      : source ? { id:`${side}-${turn}`, type:"custom_tool_call",namespace:"functions",name:"exec",call_id:`${side}-${turn}`,input:source }
       : { id:`answer-${calls}`, type:"message",role:"assistant",content:[{type:"output_text",text:answer,annotations:[]}] };
     response.writeHead(200, { "content-type": "text/event-stream" });
     const send = (type, payload) => response.write(`event: ${type}\ndata: ${JSON.stringify({type,...payload})}\n\n`);
     const envelope = { id:`resp-${calls}`, object:"response", model:body.model, output:[item], status:"completed",
       usage:{input_tokens:20,output_tokens:5,total_tokens:25} };
     send("response.created", {response:{...envelope,status:"in_progress",output:[]}});
-    send("response.output_item.added", {output_index:0,item:{...item,...(source?{input:""}:{content:[]}),status:"in_progress"}});
-    if (source) send("response.custom_tool_call_input.delta", {output_index:0,delta:source});
+    send("response.output_item.added", {output_index:0,item:{...item,...(nativeCall?{arguments:""}:source?{input:""}:{content:[]}),status:"in_progress"}});
+    if (nativeCall) send("response.function_call_arguments.delta", {output_index:0,delta:nativeCall.arguments});
+    else if (source) send("response.custom_tool_call_input.delta", {output_index:0,delta:source});
     else send("response.output_text.delta", {output_index:0,content_index:0,delta:answer});
     send("response.output_item.done", {output_index:0,item:{...item,status:"completed"}});
     send("response.completed", {response:envelope});
