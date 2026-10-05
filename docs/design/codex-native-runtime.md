@@ -137,37 +137,65 @@ including any required source-built runtime helpers.
 
 No test account secrets belong in source, image layers or recorded evidence.
 
-## Current verification evidence
+## Current verification evidence (2026-10-05)
 
-- Development build directory: `/tmp/siclaw-codex-validation.qRPCgN` on Shanghai.
-- Source-built image `siclaw-agentbox:codex-native-5b414588`:
-  `sha256:0bd065787b6c0d6cc6a481f0ee9ac6e24c27d1b297a4aadb24e9429a72aba4dd`.
-  It contains the pinned Codex CLI, matching Code Mode host, and bubblewrap.
-- The standalone upstream workspace sandbox cannot create its user namespace
-  under the default Docker restrictions. Preserve those restrictions.
-- The fixed native probe passes under the normal AgentBox entrypoint and
-  default Docker permissions with `SICLAW_CODEX_RELAY_PROBE=1` and
-  `SICLAW_CODEX_EXTERNAL_SANDBOX_PROBE=1`. It uses the upstream
-  `thread/settings/update` `externalSandbox` contract. Siclaw's immutable
-  request grants, sandbox UID transition, and output policy remain enforced at
-  the relay. Native `exec_command` and `apply_patch` complete without Pi tools.
-- Native session-factory source smoke: 15 fake Responses model calls, one native
-  child that executes a command through the inherited policy relay, plan events,
-  kubectl client output, apply_patch, file read/redaction, rejected command/path,
-  transcript resume, early/active Stop and continuation. Custom provider headers
-  reach the native Responses request. No Pi AgentSession or Pi tools are used.
-- Current regression/typecheck/build evidence is recorded in the task; rerun
-  after changes before advancing the tested image.
+- Runtime source at `755cfd84`; subsequent commits update validation scripts.
+  Codex source remains pinned to GitLab main `d4684bba63aba4c941d5a251054609e722b64779`.
+- Typecheck and build pass. Full regression: **406 files / 8045 tests**.
+- Source-built AgentBox test image:
+  `registry-cn-shanghai.siflow.cn/k8s/siclaw-agentbox:codex-native-755cfd84`,
+  registry digest `sha256:17f8c8335e754dfeb58b3cb1ade78332f405eea7bf3fa5218c291dc1e29b5ab1`.
+  It contains the official CLI, matching source-built Code Mode host and upstream
+  sandbox-enabled V8, plus bubblewrap.
+- The upstream workspace sandbox cannot create a user namespace under default
+  Docker restrictions. Siclaw uses the native `externalSandbox` contract and
+  enforces grants, OS identity and sanitization at its executor boundary.
+- `codex-native-brain-smoke.mjs`: 16 fake Responses calls, native V1 child command
+  execution and denial, plan events, kubectl output, apply_patch, file read and
+  redaction, command/path rejection, old Pi tool-evidence restoration, native
+  resume, early/active Stop and continuation. No Pi AgentSession or tools run.
+- `codex-code-mode-smoke.mjs`: native gpt-6.1-sol catalog, Responses Lite,
+  `functions.exec`, source-built Code Mode host and authorized native command
+  execution pass. Native V2 spawn/mailbox/reporting verification is in progress;
+  the latest remote result has not been read because permission review timed out.
+  V2 controls are direct `collaboration` tools by upstream default, and
+  model-originated messages use opaque `agent_message.encrypted_content`.
+- `codex-executor-smoke.mjs`: UID 1001, complete process-tree cancellation,
+  cross-session handle denial, stdin rejection, complete-document Secret
+  redaction and broker failure rejection pass.
+- Both isolated namespace Jobs completed successfully using the final image:
+  `siclaw-native-brain-20261005` and `siclaw-native-executor-20261005` in
+  `roce-test` / `sicore-test`. Their spec matches the normal AgentBox's read-only
+  root filesystem, RuntimeDefault seccomp and existing capability set.
+- Local source-built native parent and child both select `cluster:roce-test`
+  and perform a real read-only `sicore-test` Pod query. The fixture broker
+  refreshes the credential binding once per launch. This verifies execution
+  environment selection; it does not verify SiCore-issued credential RPCs.
+- Runtime test image is built and published at
+  `registry-cn-shanghai.siflow.cn/k8s/siclaw-runtime:codex-native-074538b9`.
+  A Runtime has not been registered/deployed for SiCore UI acceptance yet.
+
+The model is a deterministic fake Responses server in these checks. Real model
+quality, production provider protocol compatibility and SiCore UI acceptance are
+not established by the component/namespace results.
 
 ## Remaining acceptance work
 
-- Source-built Linux Code Mode/Responses Lite and cross-UID cancellation tests.
-- Test-namespace Runtime/AgentBox and SiCore streaming/tool/plan/subtask UI.
-- Native product services: knowledge labels/citations, memory query/checkpoints,
-  reports, schedules, host/node/pod diagnostic bindings and script execution.
-  The removed Pi tools are not claimed as implementations of these services.
-- Clarification, file attachments and structured-result contracts; external MCP
-  output/artifact policy; child detail persistence and resource/tier policy.
-- Interactive/background execution, stateful streaming and executor reconnect.
+- Read/confirm the latest native V2 spawn/send_message/wait result, then exercise
+  that path in the namespace. Provider acceptance must include the catalog's
+  native Responses Lite and opaque agent-message contract when applicable.
+- Test-namespace Runtime/AgentBox with SiCore: streaming/reasoning, tool/plan and
+  child views, Stop/steer, restart/resume, model routing and usage accounting.
+  The login page requires an account email; the test password was provided in
+  the task but the email is still pending. No Portal UI acceptance is attempted.
+- Native product services: knowledge labels/citations, memory queries and
+  investigation lifecycle/checkpoints, reports, schedules, host/node/pod
+  diagnostic bindings and script execution. The removed Pi tools are not claimed
+  as implementations of these services.
+- Native clarification, file attachments and structured-result contracts;
+  external MCP output/artifact policy; child detail persistence and resource/model
+  policy. Explicit unsupported requests must never silently run Pi.
+- Interactive/background execution, stateful streaming, bounded finished-process
+  output retention and executor reconnect.
 
 Full Pi replacement and complete end-to-end acceptance are not yet established.
