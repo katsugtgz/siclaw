@@ -84,7 +84,7 @@ export class CodexExecutorRelay {
     child.stderr.resume();
     child.once("error", () => socket.close(1011, "Native executor failed to start"));
     child.once("exit", () => socket.close(1011, "Native executor exited"));
-    socket.on("message", (raw) => {
+    socket.on("message", async (raw) => {
       let message: JsonObject;
       try { message = JSON.parse(raw.toString()); }
       catch { socket.close(1008, "Invalid native executor message"); return; }
@@ -107,6 +107,17 @@ export class CodexExecutorRelay {
           return;
         }
         if (message.method === "process/start") {
+          if (this.options.grants.resolveKubeconfig) {
+            try {
+              const kubeconfig = await this.options.grants.resolveKubeconfig();
+              if (!kubeconfig) throw new Error("Missing cluster credential");
+              (authorized.params.env as Record<string, string>).KUBECONFIG = kubeconfig;
+            } catch {
+              connection.policy.releaseProcess(processId!);
+              throw new Error("Authorized cluster credentials are unavailable");
+            }
+          }
+          if (socket.readyState !== WebSocket.OPEN) { connection.policy.releaseProcess(processId!); return; }
           connection.output.register(processId!, authorized.command!.security);
         }
         if (message.id !== undefined) {
@@ -120,6 +131,7 @@ export class CodexExecutorRelay {
       }
     });
     socket.once("close", () => {
+      connection.policy.stopAll();
       lines.close();
       child.stdin.end();
       child.kill("SIGTERM");
@@ -181,6 +193,7 @@ export class CodexExecutorRelay {
     const connections = [...this.connections];
     for (const connection of connections) connection.socket.close(1000);
     for (const connection of connections) {
+      connection.policy.stopAll();
       connection.child.stdin.end();
       connection.child.kill("SIGTERM");
     }

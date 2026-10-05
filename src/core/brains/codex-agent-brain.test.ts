@@ -15,7 +15,6 @@ describe("CodexAgentBrain compatibility", () => {
     brain.threadId = "thread-1";
     brain.nativePlanEnabled = true;
     brain.onPlanUpdate = onPlanUpdate;
-    brain.bridge = { url: "http://127.0.0.1:1/mcp" };
     brain.currentProviderConfig = () => ({ baseUrl: "http://127.0.0.1:2/v1" });
     expect(brain.codexConfig().tools.update_plan.enabled).toBe(true);
     brain.handleEvent({ method: "turn/plan/updated", params: { threadId: "other",
@@ -91,7 +90,6 @@ describe("CodexAgentBrain compatibility", () => {
     brain.steeringFlush = false;
     brain.messages = [];
     brain.sessionManager = { appendMessage };
-    brain.piSession = { extensionRunner: { emitInput: vi.fn().mockResolvedValue({ action: "continue" }) } };
     const accepted = brain.steer("add this evidence");
     await Promise.resolve();
     expect(request).not.toHaveBeenCalled();
@@ -110,7 +108,7 @@ describe("CodexAgentBrain compatibility", () => {
     try {
       const brain = new (CodexAgentBrain as any)(
         { getSessionDir: () => dir, getEntries: () => [] },
-        { extensionRunner: { createContext: () => ({}) } }, "", [], new Map(), dir, [],
+        { grants: { readRoots: [], writeRoots: [], deniedRoots: [], allowCommands: false, production: false } }, "", new Map(), dir, [],
       ) as any;
       const record = vi.fn();
       brain.registerProvider("test", { baseUrl: "https://example.test/v1", apiKey: "redacted",

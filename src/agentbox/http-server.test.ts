@@ -645,7 +645,7 @@ describe("http-server — sub-agent tier turn state", () => {
 });
 
 describe("http-server — prompt + session lifecycle", () => {
-  it("selects Codex only for a Responses binding whose routing candidates are all compatible", async () => {
+  it("keeps an explicitly selected Codex engine instead of silently falling back to Pi", async () => {
     process.env.SICLAW_AGENT_ENGINE = "codex";
     const responses = { ...modelConfigWithInput(["text"]), api: "openai-responses", authHeader: true };
     await getJson(port, "/api/prompt", "POST", {
@@ -658,13 +658,13 @@ describe("http-server — prompt + session lifecycle", () => {
       text: "submit result", sessionId: "codex-required-result", modelProvider: "openai", modelId: "gpt-4",
       modelConfig: responses, requiredResultToolName: "mcp__result__submit",
     });
-    expect(sm.getOrCreateCalls.at(-1)?.agentEngine).toBe("pi-agent");
+    expect(sm.getOrCreateCalls.at(-1)?.agentEngine).toBe("codex");
 
     await getJson(port, "/api/prompt", "POST", {
       text: "inspect", sessionId: "codex-wire-override", modelProvider: "openai", modelId: "gpt-4",
       modelConfig: { ...responses, models: [{ ...responses.models[0], compat: { supportsTemperature: false } }] },
     });
-    expect(sm.getOrCreateCalls.at(-1)?.agentEngine).toBe("pi-agent");
+    expect(sm.getOrCreateCalls.at(-1)?.agentEngine).toBe("codex");
 
     await getJson(port, "/api/prompt", "POST", {
       text: "inspect", sessionId: "codex-fallback", modelProvider: "openai", modelId: "gpt-4",
@@ -674,7 +674,7 @@ describe("http-server — prompt + session lifecycle", () => {
         { provider: "legacy", modelId: "gpt-4", modelConfig: modelConfigWithInput(["text"]) },
       ] },
     });
-    expect(sm.getOrCreateCalls.at(-1)?.agentEngine).toBe("pi-agent");
+    expect(sm.getOrCreateCalls.at(-1)?.agentEngine).toBe("codex");
   });
 
   it("sync keeps the original SSE through child completion and root synthesis", async () => {

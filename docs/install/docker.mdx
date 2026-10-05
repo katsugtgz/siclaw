@@ -66,17 +66,22 @@ make push-agentbox REGISTRY=registry.example.com/myteam TAG=latest
 - The AgentBox image builds the open-source Codex CLI from the protected
   `aiops/codex` `main` branch, verifying the exact `CODEX_COMMIT` in
   `Dockerfile.agentbox`. Official upstream commits are mirrored unchanged on
-  `upstream/main`; Siclaw's minimal source changes live on `main`. The source change gates
-  native `apply_patch` alongside the disabled native shell; model-authored
-  commands and file operations use Siclaw's authorized MCP tools. Set `SICLAW_AGENT_ENGINE=codex` on Runtime
-  (`runtime.env` in Helm) to opt new AgentBox sessions into Codex. Runtime forwards the setting
-  to normal AgentBox pods. Existing Pi sessions, non-Responses model bindings, PDF turns,
-  required-result requests, and sessions exposing `transfer_to_agent` continue on Pi.
-  The same chat API and event stream are used in both cases.
+  `upstream/main`; Siclaw's minimal source changes live on `main`.
+  Set `SICLAW_AGENT_ENGINE=codex` on Runtime (`runtime.env` in Helm) to select
+  Codex for AgentBox sessions. Codex owns its native execution, file tools,
+  planning, compaction and subtasks. Siclaw enforces grants, whitelist execution,
+  credential brokering and sanitization at its native executor boundary.
+  Codex currently requires Responses models and does not support cross-Agent
+  handoff. Unsupported requests fail explicitly; they do not silently run Pi.
+  The same chat API and event stream are used by both engines. See
+  `docs/design/codex-native-runtime.md` for remaining acceptance gates.
 - `SICLAW_CODEX_BIN` can point to a separately built Codex executable for local testing.
   After building Siclaw, run `SICLAW_CODEX_BIN=/path/to/codex-rs/target/release/codex
-  node scripts/test/codex-app-server-smoke.mjs` to check a source-built CLI against a
-  local fake Responses provider, including Siclaw tool calls, resume, and early Stop.
+  node scripts/test/codex-native-brain-smoke.mjs` to check the real session factory
+  against a fake Responses provider, including native child execution, file
+  operations, security denials, resume and Stop. Run
+  `scripts/test/codex-code-mode-smoke.mjs` inside the image to validate the
+  catalog's Code Mode/Responses Lite path and matching source-built helper.
 
 ## Next Step
 

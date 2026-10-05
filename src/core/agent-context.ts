@@ -48,6 +48,8 @@ export interface CompileAgentContextInput {
   isSubagent?: boolean;
   /** Codex supplies update_plan itself; omit Pi task-tool instructions. */
   nativePlanning?: boolean;
+  /** Codex owns its child-agent schema and instructions. */
+  nativeSubagents?: boolean;
   interactiveProgress?: boolean;
   /** A conversation owner has a control emitter and an authorized handoff roster. */
   handoffAvailable?: boolean;
@@ -176,6 +178,7 @@ export function resolveAgentHarness(
       resolution === "resolved" &&
       hasAnyTool(allowedTools, ["task_create", "task_update", "task_list", "task_get"]),
     includeSubagentGuidance:
+      !input.nativeSubagents &&
       !input.isSubagent &&
       resolution === "resolved" &&
       (input.mode === undefined || input.mode === "web" || input.mode === "channel") &&

@@ -4,7 +4,10 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { preExecSecurity, type PreExecResult } from "../../tools/infra/security-pipeline.js";
 import { sanitizeEnv } from "../../tools/infra/sanitize-env.js";
 import { validateKubectlInPipeline } from "../../tools/infra/kubectl-readonly-policy.js";
-import { buildSandboxCommand } from "../../tools/infra/sandbox-exec.js";
+import { buildSandboxCommand, reapSandboxSession } from "../../tools/infra/sandbox-exec.js";
+import { backgroundPgidFile } from "../../tools/infra/bg-session.js";
+import { randomUUID } from "node:crypto";
+import { authorizeCodexFileCommand } from "./codex-file-command.js";
 
 type JsonObject = Record<string, unknown>;
 
@@ -13,8 +16,12 @@ export interface CodexExecutorGrants {
   writeRoots: readonly string[];
   deniedRoots: readonly string[];
   allowCommands: boolean;
+  /** Scoped native file reads/searches may be allowed without shell diagnostics. */
+  allowFileCommands?: boolean;
   /** Trusted binding supplied by the credential broker, never by model argv. */
   kubeconfigPath?: string;
+  /** Broker-owned refresh at each process launch, including native children. */
+  resolveKubeconfig?: () => Promise<string>;
   environment?: Readonly<Record<string, string>>;
   production: boolean;
 }
@@ -25,8 +32,7 @@ export interface AuthorizedCodexRequest {
 }
 
 /** Authorizes the upstream exec-server RPC contract, independently of Pi tools.
- * This component must be paired with an output policy in the execution relay;
- * it is intentionally not wired into the production brain yet. */
+ * This component is paired with the relay's complete-document output policy. */
 export class CodexExecutorPolicy {
   private readonly readRoots: string[];
   private readonly writeRoots: string[];
@@ -34,8 +40,10 @@ export class CodexExecutorPolicy {
   private readonly declaredReadRoots: string[];
   private readonly declaredWriteRoots: string[];
   private readonly processes = new Set<string>();
+  private readonly sandboxSessions = new Map<string, string>();
   private readonly environment: Record<string, string>;
   private readonly allowCommands: boolean;
+  private readonly allowFileCommands: boolean;
   private readonly production: boolean;
 
   constructor(grants: CodexExecutorGrants) {
@@ -45,6 +53,7 @@ export class CodexExecutorPolicy {
     this.declaredReadRoots = grants.readRoots.map((root) => path.resolve(root));
     this.declaredWriteRoots = grants.writeRoots.map((root) => path.resolve(root));
     this.allowCommands = grants.allowCommands;
+    this.allowFileCommands = grants.allowFileCommands ?? grants.allowCommands;
     this.production = grants.production;
     this.environment = { ...sanitizeEnv({ ...grants.environment }),
       KUBECONFIG: grants.kubeconfigPath ?? "/dev/null" };
@@ -62,9 +71,12 @@ export class CodexExecutorPolicy {
       case "process/start":
         return this.authorizeStart(params);
       case "process/read":
+        this.assertProcess(params.processId);
+        return { params };
       case "process/signal":
       case "process/terminate":
         this.assertProcess(params.processId);
+        this.reap(String(params.processId));
         return { params };
       case "process/write":
         this.assertProcess(params.processId);
@@ -100,10 +112,19 @@ export class CodexExecutorPolicy {
     }
   }
 
-  releaseProcess(processId: string): void { this.processes.delete(processId); }
+  releaseProcess(processId: string): void {
+    this.processes.delete(processId);
+    this.sandboxSessions.delete(processId);
+  }
+
+  stopAll(): void { for (const id of this.processes) this.reap(id); }
+
+  private reap(id: string): void {
+    const file = this.sandboxSessions.get(id);
+    if (file) reapSandboxSession(file);
+  }
 
   private authorizeStart(params: JsonObject): AuthorizedCodexRequest {
-    if (!this.allowCommands) throw new Error("Native commands are not authorized");
     const id = params.processId;
     if (typeof id !== "string" || !id || this.processes.has(id)) {
       throw new Error("Invalid native process identity");
@@ -119,14 +140,24 @@ export class CodexExecutorPolicy {
     }
     if (params.arg0) throw new Error("Native argv0 override is not authorized");
     params.cwd = this.authorizePath(params.cwd, false);
-    const command = argv[2];
-    const security = preExecSecurity(command, { context: "local", extraAllowed: new Set(["kubectl"]),
+    const fileCommand = authorizeCodexFileCommand(argv[2], fileURLToPath(String(params.cwd)), (uri, directory) => {
+      const authorized = this.authorizePath(uri, false);
+      if (directory && this.deniedRoots.some((root) => within(root, fileURLToPath(authorized)))) {
+        throw new Error("Native directory search overlaps a denied path");
+      }
+      return authorized;
+    });
+    const command = fileCommand ?? argv[2];
+    if (fileCommand ? !this.allowFileCommands : !this.allowCommands) throw new Error("Native commands are not authorized");
+    const security: PreExecResult = fileCommand ? { error: null, action: null, hasSensitiveKubectl: true }
+      : preExecSecurity(command, { context: "local", extraAllowed: new Set(["kubectl"]),
       pipelineValidators: [validateKubectlInPipeline], analyzeTarget: "auto" });
     if (security.error) throw new Error(security.error);
     // The executor owns process mechanics. Siclaw supplies immutable policy,
     // the sanitized environment and its existing OS identity boundary.
+    const pgidFile = this.production ? backgroundPgidFile(randomUUID()) : undefined;
     params.argv = ["/bin/bash", "-c", this.production
-      ? buildSandboxCommand(command, { timeoutS: 60 }) : command];
+      ? buildSandboxCommand(command, { timeoutS: 60, pgidFile }) : command];
     params.env = { ...this.environment };
     params.envPolicy = { inherit: "none", ignoreDefaultExcludes: false,
       exclude: [], set: {}, includeOnly: [] };
@@ -137,6 +168,7 @@ export class CodexExecutorPolicy {
     // sandbox prevents the UID transition, the relay must reject execution;
     // it must not silently remove sandbox intent or elevate capabilities.
     this.processes.add(id);
+    if (pgidFile) this.sandboxSessions.set(id, pgidFile);
     return { params, command: { text: command, security } };
   }
 

@@ -27,10 +27,8 @@ export class CodexAppServer {
     if (this.child) return;
     this.closing = false;
     const child = spawn(this.executable, ["app-server", "--stdio", "--strict-config",
-      "-c", "features.shell_tool=false",
-      "-c", "features.code_mode=false",
-      "-c", "features.code_mode_only=false",
-      "-c", "features.code_mode_host=false",
+      "-c", "features.shell_tool=true",
+      "-c", "features.code_mode_host=true",
       "-c", "features.request_permissions_tool=false",
       "-c", "features.send_message_to_user_async=false",
       "-c", "features.apps=false",
@@ -38,7 +36,7 @@ export class CodexAppServer {
       "-c", "features.browser_use=false",
       "-c", "features.computer_use=false",
       "-c", "features.image_generation=false",
-      "-c", "features.multi_agent=false",
+      "-c", "features.multi_agent=true",
     ], {
       // The child needs only its private model/MCP tokens. Do not inherit
       // AgentBox's kubeconfig, gateway, broker, or other user credentials.
@@ -66,7 +64,7 @@ export class CodexAppServer {
     try {
       await this.request("initialize", {
         clientInfo: { name: "siclaw", title: "Siclaw AgentBox", version: "1" },
-        capabilities: { experimentalApi: false },
+        capabilities: { experimentalApi: true },
       }, 15_000);
       this.notify("initialized", {});
     } catch (error) {
@@ -141,8 +139,8 @@ export class CodexAppServer {
     }
     if (typeof message.method !== "string") return;
     if (typeof id === "number") {
-      // The Siclaw MCP bridge owns tool calls. Unexpected server requests must
-      // fail closed, including command/file approvals and credential prompts.
+      // Native tools own execution. Unexpected server requests fail closed,
+      // including command/file approvals and credential prompts.
       this.child?.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id,
         error: { code: -32601, message: "Siclaw does not authorize this request" } })}\n`);
       return;

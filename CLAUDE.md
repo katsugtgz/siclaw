@@ -17,8 +17,7 @@ request to update protected `main`. Never rebase or force push `main`.
 The target integration retains Codex native instructions, tools, execution
 environments, and agent lifecycle. Siclaw-specific policy and services belong
 at Codex extension boundaries. Do not implement Codex by wrapping Pi tool
-definitions or requiring a Pi AgentSession. `CodexToolBridge` is a transitional
-prototype, superseded by the direction in `docs/design/codex-native-runtime.md`.
+definitions or requiring a Pi AgentSession. The implementation is described in `docs/design/codex-native-runtime.md`.
 SiCore is the first UI acceptance target; Portal UI acceptance comes last.
 `Dockerfile.agentbox` fetches
 GitLab `main` over SSH and verifies a pinned

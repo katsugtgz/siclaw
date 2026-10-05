@@ -349,7 +349,7 @@ describe("AgentBoxSessionManager — getOrCreate", () => {
     expect(lastCreateSiclawSession.calls).toHaveLength(1);
   });
 
-  it("starts new compatible sessions on Codex but preserves existing Pi transcripts", async () => {
+  it("uses the explicitly selected Codex engine for new and restored transcripts", async () => {
     const mgr = new AgentBoxSessionManager();
     const codex = await mgr.getOrCreate("fresh", undefined, undefined, "normal", undefined,
       false, false, undefined, false, "codex");
@@ -359,8 +359,8 @@ describe("AgentBoxSessionManager — getOrCreate", () => {
     ];
     const legacy = await mgr.getOrCreate("legacy", undefined, undefined, "normal", undefined,
       false, false, undefined, false, "codex");
-    expect(legacy.brain.brainType).toBe("pi-agent");
-    expect(lastCreateSiclawSession.calls.map((call: any) => call.agentEngine)).toEqual(["codex", "pi-agent"]);
+    expect(legacy.brain.brainType).toBe("codex");
+    expect(lastCreateSiclawSession.calls.map((call: any) => call.agentEngine)).toEqual(["codex", "codex"]);
   });
 
   it("uses defaultSessionId when id is omitted", async () => {

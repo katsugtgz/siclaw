@@ -65,10 +65,17 @@ returning them. `codex-executor-relay.ts` pairs these policies with the official
 exec-server protocol. The source-built native probe passes through this relay
 with `SICLAW_CODEX_RELAY_PROBE=1` after `npm run build`.
 
-These components are not wired into the production brain. Native interactive
-execution, stateful output streaming, process reaping across the production UID
-boundary, executor reconnect, file streaming, and full lifecycle integration
-are required before enabling it; currently unsupported RPCs fail closed.
+The selected Codex brain now uses these components directly, without a Pi
+AgentSession or ToolDefinition bridge. It preserves upstream base instructions,
+supplies Siclaw business policy as developer instructions, and registers
+session-scoped native environments. Cluster environments refresh broker
+credentials at each process launch, including native children. Native file
+commands use a literal read-only argv grammar and authorized paths. Native
+process stop/connection close invoke the existing sandbox session reaper.
+
+Interactive stdin/PTY, reconnect and file streaming remain disabled and fail
+closed. Output is sanitized as a complete document; it is not streamed before
+process completion. Long-running/background task parity still requires work.
 
 1. Replace the generic Pi tool bridge with an execution policy adapter at the
    native executor boundary. Delegate process and filesystem mechanics to the
@@ -84,12 +91,13 @@ are required before enabling it; currently unsupported RPCs fail closed.
    and product services. Implement memory, reports, scheduling and other product
    capabilities through Codex-native extension contracts, independently of Pi
    ToolDefinition/ExtensionRunner APIs.
-4. Use Codex-native multi-agent and user-input contracts, translating their
-   lifecycle into existing SiCore events. Keep Codex children on Codex and retain
-   current business grants, tier selection, map/reduce, resume and cancellation.
-5. Test provider compatibility, attachments, required result contracts and
-   cross-Agent handoff explicitly. A Pi fallback must remain visible as a
-   separate compatibility limitation until the Codex implementation passes.
+4. Use native Codex child-agent creation, waiting, coordination and lifecycle.
+   Preserve executor grants in children and project native lifecycle events to
+   SiCore. Do not reproduce Pi's spawn_subagent/map-reduce tool contract.
+5. Responses is the only model protocol in scope. Cross-Agent handoff is deferred
+   and not exposed. Explicit Codex selection must fail for unsupported bindings,
+   rather than silently choosing Pi. Validate native clarification, attachments
+   and structured-result contracts before claiming full compatibility.
 
 ## Security findings that constrain the adapter
 
@@ -120,7 +128,7 @@ including any required source-built runtime helpers.
   source-built native executor security tests.
 - Deploy the reviewed native path in the test namespace and validate SiCore
   streaming, tools, plan, Stop, steer, restart/resume, model routing, attachments,
-  memory, reports, jobs, subtasks, scheduling and handoff.
+  memory, reports, jobs, native subtasks and scheduling. Handoff is deferred.
 - Test denial paths independently: unauthorized commands/resources/files,
   leaked environment variables, raw output secrets, cross-session handles,
   policy failure, executor failure and canceled process groups.
@@ -143,10 +151,23 @@ No test account secrets belong in source, image layers or recorded evidence.
   `thread/settings/update` `externalSandbox` contract. Siclaw's immutable
   request grants, sandbox UID transition, and output policy remain enforced at
   the relay. Native `exec_command` and `apply_patch` complete without Pi tools.
-- Current full regression: 407 files / 8045 tests passed. The 9 added policy,
-  output, and authentication cases cover the new components; typecheck/build
-  and the source-built macOS relay probe also pass.
-- These are component/container checks. The production brain still uses the
-  transitional bridge; native business services, lifecycle compatibility and
-  SiCore end-to-end acceptance have not passed yet. No cluster deployment was
-  changed by this verification phase.
+- Native session-factory source smoke: 15 fake Responses model calls, one native
+  child that executes a command through the inherited policy relay, plan events,
+  kubectl client output, apply_patch, file read/redaction, rejected command/path,
+  transcript resume, early/active Stop and continuation. Custom provider headers
+  reach the native Responses request. No Pi AgentSession or Pi tools are used.
+- Current regression/typecheck/build evidence is recorded in the task; rerun
+  after changes before advancing the tested image.
+
+## Remaining acceptance work
+
+- Source-built Linux Code Mode/Responses Lite and cross-UID cancellation tests.
+- Test-namespace Runtime/AgentBox and SiCore streaming/tool/plan/subtask UI.
+- Native product services: knowledge labels/citations, memory query/checkpoints,
+  reports, schedules, host/node/pod diagnostic bindings and script execution.
+  The removed Pi tools are not claimed as implementations of these services.
+- Clarification, file attachments and structured-result contracts; external MCP
+  output/artifact policy; child detail persistence and resource/tier policy.
+- Interactive/background execution, stateful streaming and executor reconnect.
+
+Full Pi replacement and complete end-to-end acceptance are not yet established.

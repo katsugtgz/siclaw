@@ -1,13 +1,14 @@
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import type { AgentSession, SessionManager, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { SessionManager } from "@earendil-works/pi-coding-agent";
 import type {
   BrainSession, BrainModelInfo, BrainModelParams, BrainContextUsage, BrainSessionStats,
   BrainContextPreflightResult, PromptMedia, PromptRequirements, BrainToolDefinition,
 } from "../brain-session.js";
 import { CodexAppServer } from "./codex-app-server.js";
-import { CodexToolBridge } from "./codex-tool-bridge.js";
+import { CodexExecutorRelay } from "./codex-executor-relay.js";
+import type { CodexExecutorGrants } from "./codex-executor-policy.js";
 import type { AgentMailbox } from "../agent-mailbox.js";
 import type { LlmCallPromptBoundary } from "../llm-call-recorder.js";
 import type { UsageIdentity, UsageSink } from "../../shared/model-usage.js";
@@ -87,7 +88,8 @@ export class CodexAgentBrain implements BrainSession {
   readonly llmCalls = new CodexUsageBoundary();
   private readonly listeners = new Set<(event: unknown) => void>();
   private readonly providers = new Map<string, JsonObject>();
-  private readonly bridge: CodexToolBridge;
+  private readonly executor: CodexExecutorRelay;
+  private readonly clusterExecutors = new Map<string, CodexExecutorRelay>();
   private readonly home: string;
   private readonly marker: string;
   private readonly messages: unknown[];
@@ -116,9 +118,9 @@ export class CodexAgentBrain implements BrainSession {
 
   private constructor(
     private readonly sessionManager: SessionManager,
-    private readonly piSession: AgentSession,
+    private readonly native: { grants: CodexExecutorGrants; mcpServers?: JsonObject; allowSubagents?: boolean;
+      environments?: Array<{ id: string; grants: CodexExecutorGrants }> },
     private readonly systemPrompt: string,
-    private readonly tools: ToolDefinition[],
     private readonly toolsetsByName: ReadonlyMap<string, string>,
     private readonly cwd: string,
     private readonly skillPaths: Array<{ name: string; filePath: string }>,
@@ -128,21 +130,14 @@ export class CodexAgentBrain implements BrainSession {
     const sessionDir = sessionManager.getSessionDir();
     this.home = path.join(sessionDir, "codex-home");
     this.marker = path.join(sessionDir, "codex-thread.json");
-    this.bridge = new CodexToolBridge(tools, () => piSession.extensionRunner.createContext(), {
-      before: async (id, name, args) => {
-        // Pi's context hook drives extension state such as the Deep
-        // Investigation tool-use checkpoint. Rebuild it from the same cached
-        // messages that a later Pi fallback can resume.
-        await piSession.extensionRunner.emitContext(this.messages as Parameters<typeof piSession.extensionRunner.emitContext>[0]);
-        return piSession.extensionRunner.emitToolCall({
-          type: "tool_call", toolName: name, toolCallId: id, input: args as Record<string, unknown>,
-        });
-      },
-      after: async (id, name, args, result, isError) => piSession.extensionRunner.emitToolResult({
-        type: "tool_result", toolName: name, toolCallId: id, input: args as Record<string, unknown>,
-        content: result.content, details: result.details, isError, usage: result.usage,
-      }),
-    });
+    this.executor = new CodexExecutorRelay({ executable: process.env.SICLAW_CODEX_BIN || "codex",
+      home: path.join(this.home, "executor"), cwd, grants: native.grants ?? {
+        readRoots: [], writeRoots: [], deniedRoots: [], allowCommands: false, production: false,
+      } });
+    for (const [index, environment] of (native.environments ?? []).entries()) {
+      this.clusterExecutors.set(environment.id, new CodexExecutorRelay({ executable: process.env.SICLAW_CODEX_BIN || "codex",
+        home: path.join(this.home, `executor-${index}`), cwd, grants: environment.grants }));
+    }
     this.messages = sessionManager.getEntries()
       .filter((entry) => entry.type === "message")
       .map((entry) => entry.message);
@@ -159,17 +154,22 @@ export class CodexAgentBrain implements BrainSession {
   }
 
   static async create(options: {
-    sessionManager: SessionManager; piSession: AgentSession; systemPrompt: string; tools: ToolDefinition[];
+    sessionManager: SessionManager; systemPrompt: string; grants: CodexExecutorGrants;
+    mcpServers?: JsonObject; allowSubagents?: boolean;
+    environments?: Array<{ id: string; grants: CodexExecutorGrants }>;
     toolsetsByName: ReadonlyMap<string, string>;
     cwd: string; skillPaths: Array<{ name: string; filePath: string }>;
     nativePlanEnabled?: boolean; onPlanUpdate?: (plan: unknown) => void;
   }): Promise<CodexAgentBrain> {
-    const brain = new CodexAgentBrain(options.sessionManager, options.piSession, options.systemPrompt,
-      options.tools, options.toolsetsByName, options.cwd, options.skillPaths,
+    const brain = new CodexAgentBrain(options.sessionManager,
+      { grants: options.grants, mcpServers: options.mcpServers, allowSubagents: options.allowSubagents,
+        environments: options.environments }, options.systemPrompt,
+      options.toolsetsByName, options.cwd, options.skillPaths,
       options.nativePlanEnabled, options.onPlanUpdate);
     fs.mkdirSync(brain.home, { recursive: true, mode: 0o700 });
     brain.syncSkills();
-    await brain.bridge.start();
+    await brain.executor.start();
+    for (const executor of brain.clusterExecutors.values()) await executor.start();
     return brain;
   }
 
@@ -180,8 +180,11 @@ export class CodexAgentBrain implements BrainSession {
 
   getConversationMessages(): readonly unknown[] { return this.messages; }
   getTools(): BrainToolDefinition[] {
-    const tools = this.tools.map((tool) => ({ name: tool.name, description: tool.description,
-      parameters: tool.parameters }));
+    const tools: BrainToolDefinition[] = [];
+    if (this.native?.grants.allowCommands || this.native?.grants.allowFileCommands) tools.push({ name: "exec_command" }, { name: "write_stdin" });
+    if (this.native?.grants.writeRoots.length) tools.push({ name: "apply_patch" });
+    if (this.native?.allowSubagents) tools.push({ name: "spawn_agent" }, { name: "wait_agent" },
+      { name: "send_input" }, { name: "close_agent" });
     if (this.nativePlanEnabled) tools.push({ name: "update_plan", description: "Update the task plan",
       parameters: { type: "object", required: ["plan"], properties: { plan: { type: "array",
         items: { type: "object", required: ["step", "status"], properties: {
@@ -219,7 +222,7 @@ export class CodexAgentBrain implements BrainSession {
 
   async setModel(model: BrainModelInfo): Promise<void> {
     if (model.api !== "openai-responses") {
-      throw new Error(`Codex requires a Responses-compatible provider; ${model.api || "unknown"} remains on Pi`);
+      throw new Error(`Codex mode requires a Responses-compatible provider; received ${model.api || "unknown"}`);
     }
     const changed = this.model && (this.model.provider !== model.provider || this.model.id !== model.id);
     this.model = model;
@@ -284,6 +287,8 @@ export class CodexAgentBrain implements BrainSession {
     if (!record(thread) || !string(thread.id)) throw new Error("Codex did not return a forked thread");
     this.threadId = string(thread.id);
     this.loadedThreadId = this.threadId;
+    await client.request("thread/settings/update", { threadId: this.threadId,
+      sandboxPolicy: { type: "externalSandbox", networkAccess: "enabled" } });
     this.lastTurnId = lastTurnId || undefined;
     this.persistThread();
   }
@@ -439,27 +444,13 @@ export class CodexAgentBrain implements BrainSession {
     await this.client?.close();
     this.client = undefined;
     this.loadedThreadId = undefined;
-    try {
-      await this.piSession.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
-    } catch (error) {
-      console.warn("[codex-agent] session_shutdown extension failed:", error);
-    } finally {
-      await this.bridge.close();
-    }
+    await this.executor.close();
+    for (const executor of this.clusterExecutors.values()) await executor.close();
   }
 
-  private async transformInput(text: string, media: PromptMedia | undefined, source: "interactive" | "rpc",
-    streamingBehavior?: "steer"):
-    Promise<{ text: string; media: PromptMedia | undefined } | undefined> {
-    const images = media?.images?.map((image) => ({ type: "image" as const,
-      data: image.data, mimeType: image.mimeType }));
-    const result = await this.piSession.extensionRunner.emitInput(text, images, source, streamingBehavior);
-    if (result.action === "handled") return undefined;
-    if (result.action !== "transform") return { text, media };
-    return { text: result.text, media: { ...media,
-      images: result.images?.filter((image) => image.type === "image").map((image) => ({
-        data: image.data, mimeType: image.mimeType,
-      })) ?? media?.images } };
+  private async transformInput(text: string, media: PromptMedia | undefined, _source: "interactive" | "rpc",
+    _streamingBehavior?: "steer"): Promise<{ text: string; media: PromptMedia | undefined }> {
+    return { text, media };
   }
 
   private async ensureClient(): Promise<CodexAppServer> {
@@ -469,7 +460,7 @@ export class CodexAgentBrain implements BrainSession {
     if (!apiKey) throw new Error("Codex model API key is missing");
     const client = new CodexAppServer(this.home, {
       SICLAW_CODEX_MODEL_TOKEN: apiKey,
-      SICLAW_CODEX_MCP_TOKEN: this.bridge.bearerToken,
+
     });
     let failure: Error | undefined;
     client.subscribe((event) => this.handleEvent(event));
@@ -483,6 +474,10 @@ export class CodexAgentBrain implements BrainSession {
     this.client = client;
     try {
       await client.start();
+      await client.request("environment/add", { environmentId: "siclaw", execServerUrl: this.executor.url,
+        authBearerToken: this.executor.bearerToken });
+      for (const [id, executor] of this.clusterExecutors) await client.request("environment/add", {
+        environmentId: id, execServerUrl: executor.url, authBearerToken: executor.bearerToken });
       if (failure) throw failure;
       return client;
     } catch (error) {
@@ -506,23 +501,19 @@ export class CodexAgentBrain implements BrainSession {
       // Siclaw supplies its own compiled prompt and scoped skills. Do not
       // prepend an ambient AGENTS.md from the AgentBox working directory.
       project_doc_max_bytes: 0,
+      agents: { enabled: this.native?.allowSubagents ?? false },
       tools: { experimental_request_user_input: { enabled: false },
         update_plan: { enabled: this.nativePlanEnabled } },
       model_providers: { siclaw_model: {
         name: "Siclaw model", base_url: string(provider.baseUrl),
-        env_key: "SICLAW_CODEX_MODEL_TOKEN", wire_api: "responses",
+        ...(provider.authHeader === false ? {} : { env_key: "SICLAW_CODEX_MODEL_TOKEN" }),
+        ...(record(provider.headers) ? { http_headers: provider.headers } : {}), wire_api: "responses",
       } },
-      mcp_servers: { siclaw: {
-        url: this.bridge.url, bearer_token_env_var: "SICLAW_CODEX_MCP_TOKEN", required: true,
-        // Siclaw's existing per-session tool filter and execution guards own
-        // authorization. Codex must not add a second interactive approval UI.
-        default_tools_approval_mode: "approve",
-      } },
-      features: { shell_tool: false, code_mode: false, code_mode_only: false,
-        code_mode_host: false, request_permissions_tool: false,
-        send_message_to_user_async: false, apps: false, plugins: false, browser_use: false,
-        computer_use: false, image_generation: false, multi_agent: false,
-        view_image: false, goals: false },
+      mcp_servers: this.native?.mcpServers ?? {},
+      features: { shell_tool: Boolean(this.native?.grants?.allowCommands || this.native?.grants?.allowFileCommands || this.native?.grants?.writeRoots.length),
+        code_mode_host: true, request_permissions_tool: false, send_message_to_user_async: false,
+        apps: false, plugins: false, browser_use: false, computer_use: false, image_generation: false,
+        multi_agent: this.native?.allowSubagents ?? false, view_image: true, goals: false },
     };
   }
 
@@ -534,11 +525,15 @@ export class CodexAgentBrain implements BrainSession {
       ...(existing ? { threadId: existing } : {}),
       model: this.model?.id, modelProvider: "siclaw_model", config: this.codexConfig(),
       cwd: this.cwd, sandbox: "read-only", approvalPolicy: "never",
-      baseInstructions: this.systemPrompt,
+      developerInstructions: this.systemPrompt,
+      environments: ["siclaw", ...this.clusterExecutors.keys()].map((environmentId) =>
+        ({ environmentId, cwd: this.cwd, runtimeWorkspaceRoots: [this.cwd] })),
     });
     const thread = result.thread;
     if (!record(thread) || !string(thread.id)) throw new Error("Codex did not return a thread id");
     this.threadId = string(thread.id);
+    await client.request("thread/settings/update", { threadId: this.threadId,
+      sandboxPolicy: { type: "externalSandbox", networkAccess: "enabled" } });
     try {
       if (!existing && this.messages.length) {
         const items: JsonObject[] = [];
@@ -601,13 +596,6 @@ export class CodexAgentBrain implements BrainSession {
     } finally {
       active.mailboxStop?.abort();
       if (this.active === active) this.active = undefined;
-      if (active.started) {
-        try {
-          await this.piSession.extensionRunner.emit({ type: "agent_end", messages: this.messages as any });
-        } catch (error) {
-          console.warn("[codex-agent] agent_end extension failed:", error);
-        }
-      }
     }
   }
 
@@ -682,13 +670,19 @@ export class CodexAgentBrain implements BrainSession {
         if (active) active.assistantHadContent = false;
         this.assistantTexts.set(string(item.id), "");
         this.emit({ type: "message_start", message: this.assistantMessage("", "stop", undefined, item.phase) });
-      } else if (item.type === "mcpToolCall" && item.server === "siclaw") {
+      } else if (item.type === "mcpToolCall") {
         this.mailbox?.steer();
         if (active) this.watchMailbox(active);
         const name = string(item.tool);
         this.toolItems.set(string(item.id), { name, args: item.arguments ?? {} });
         this.emit({ type: "tool_execution_start", toolCallId: string(item.id), toolName: name,
           args: item.arguments ?? {}, toolset: this.toolsetsByName.get(name), startedAt: Date.now() });
+      } else if (["commandExecution", "fileChange", "collabAgentToolCall"].includes(string(item.type))) {
+        const name = item.type === "commandExecution" ? "exec_command"
+          : item.type === "fileChange" ? "apply_patch" : string(item.tool);
+        this.toolItems.set(string(item.id), { name, args: item });
+        this.emit({ type: "tool_execution_start", toolCallId: string(item.id), toolName: name,
+          args: item, startedAt: Date.now(), toolset: item.type === "collabAgentToolCall" ? "workflow" : "cmd-exec" });
       }
     } else if (event.method === "item/agentMessage/delta") {
       const id = string(params.itemId);
@@ -705,7 +699,7 @@ export class CodexAgentBrain implements BrainSession {
         const message = this.assistantMessage(output, "stop", undefined, item.phase);
         this.emit({ type: "message_end", message });
         if (output) this.appendCache(message);
-      } else if (item.type === "mcpToolCall" && item.server === "siclaw") {
+      } else if (item.type === "mcpToolCall") {
         const id = string(item.id);
         if (active) active.assistantHadContent = true;
         const started = this.toolItems.get(id);
@@ -727,6 +721,22 @@ export class CodexAgentBrain implements BrainSession {
         this.appendCache(toolResult);
         this.emit({ type: "message_start", message: toolResult });
         this.emit({ type: "message_end", message: toolResult });
+      } else if (["commandExecution", "fileChange", "collabAgentToolCall"].includes(string(item.type))) {
+        const id = string(item.id);
+        const started = this.toolItems.get(id);
+        this.toolItems.delete(id);
+        const name = started?.name ?? (item.type === "commandExecution" ? "exec_command"
+          : item.type === "fileChange" ? "apply_patch" : string(item.tool));
+        const isError = item.status === "failed" || item.status === "declined" ||
+          (typeof item.exitCode === "number" && item.exitCode !== 0);
+        const result = { content: [{ type: "text", text: string(item.aggregatedOutput) || JSON.stringify(item) }],
+          details: item };
+        if (active) { active.assistantHadContent = true; if (!isError) active.toolNames.add(name); }
+        this.emit({ type: "tool_execution_end", toolCallId: id, toolName: name, args: started?.args ?? item,
+          result, isError, endedAt: Date.now(), toolset: item.type === "collabAgentToolCall" ? "workflow" : "cmd-exec" });
+        this.appendCache({ ...this.assistantMessage("", "toolUse"), content: [{ type: "toolCall", id, name,
+          arguments: started?.args ?? item }] });
+        this.appendCache({ role: "toolResult", toolCallId: id, toolName: name, ...result, isError, timestamp: Date.now() });
       }
     } else if (event.method === "thread/tokenUsage/updated") {
       const usage = record(params.tokenUsage) ? params.tokenUsage : {};

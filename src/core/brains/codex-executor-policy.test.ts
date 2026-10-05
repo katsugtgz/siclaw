@@ -65,6 +65,22 @@ describe("Codex native executor policy", () => {
     expect(() => policy.authorize("process/signal", { processId: "process-1", signal: "interrupt" })).toThrow(/session/);
   });
 
+  it("authorizes native file argv by scope and refuses shell injection, links and unsafe search options", () => {
+    const { policy, read, denied } = fixture();
+    const file = path.join(read, "notes.md");
+    fs.writeFileSync(file, "safe");
+    const allowed = policy.authorize("process/start", start(read, "cat notes.md"));
+    expect(allowed.params.argv).toEqual(["/bin/bash", "-c", `'cat' '${fs.realpathSync(file)}'`]);
+    expect(allowed.command?.security.hasSensitiveKubectl).toBe(true);
+    fs.symlinkSync(denied, path.join(read, "alias"));
+    for (const command of ["cat /etc/passwd", "cat alias/key", "cat notes.md; touch owned", "cat $(id)",
+      "rg --pre sh pattern notes.md", "rg -L pattern .", "rg --files .", "head -n nope notes.md"]) {
+      expect(() => policy.authorize("process/start", start(read, command, command))).toThrow();
+    }
+    expect(policy.authorize("process/start", start(read, "rg -n '$(touch owned)' notes.md", "search"))
+      .params.argv).toEqual(["/bin/bash", "-c", `'rg' '-n' '$(touch owned)' '${fs.realpathSync(file)}'`]);
+  });
+
   it("fails closed for unsupported methods, file handles, authority changes and execution forms", () => {
     const { policy, read } = fixture();
     for (const method of ["fs/open", "fs/readBlock", "http/request", "process/unknown"]) {

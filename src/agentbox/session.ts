@@ -130,7 +130,7 @@ export interface ManagedSession {
   /** User identity bound to this conversation's tools and child-session persistence. */
   userId?: string;
   brain: BrainSession;
-  session: AgentSession;  // backward compat — only guaranteed for pi-agent brain
+  session?: AgentSession;  // Only the Pi path creates a Pi AgentSession.
   /** Exact function-schema names exposed when this in-memory brain was built. */
   toolNames: string[];
   /** Exact Skill names exposed after personal overlay and Built-in masks. */
@@ -1097,7 +1097,7 @@ export class AgentBoxSessionManager {
       if (request.resumeHandle && request.forkTurns !== undefined) throw new Error("Cannot change fork_turns on a resumed child");
       const parent = this.sessions.get(request.parentSessionId);
       if (request.forkTurns !== undefined && request.forkTurns !== "none") {
-        const conversation = parent?.brain.getConversationMessages?.() ?? parent?.session.messages;
+        const conversation = parent?.brain.getConversationMessages?.() ?? parent?.session?.messages;
         if (!parent || parent.userId !== request.userId || !Array.isArray(conversation)) {
           throw new Error("Active parent context is unavailable for this session and user");
         }
@@ -3223,7 +3223,7 @@ export class AgentBoxSessionManager {
           const content = await materializeSubagentContext(request.parentContext, source, child.toolResultArtifactStore,
             text => redactText(text, redactionConfig), () => stopRequested || deadlineReached);
           if (stopRequested || deadlineReached) throw new Error("stopped before context inheritance completed");
-          await child.session.sendCustomMessage({ customType: "subagent-parent-context", content, display: false }, { triggerTurn: false });
+          await child.session!.sendCustomMessage({ customType: "subagent-parent-context", content, display: false }, { triggerTurn: false });
         }
         const promptRequest = request.inputReports ? {
           ...request,
@@ -3516,13 +3516,7 @@ export class AgentBoxSessionManager {
     const id = sessionId || this.defaultSessionId;
     const effectiveUserId = requestUserId?.trim() || this.userId;
     const codexMarker = path.join(this.getSessionDir(id), "codex-thread.json");
-    const residentEngine = this.sessions.get(id)?.brain.brainType;
-    // A pre-existing Pi transcript has no Codex thread to resume. Keep that
-    // session on Pi; newly created Codex sessions carry their own thread marker.
-    const agentEngine = requestedAgentEngine === "codex"
-      && (residentEngine === "pi-agent" || (!residentEngine && !fs.existsSync(codexMarker)
-        && this.hasRestorableSessionContext(id)))
-      ? "pi-agent" : requestedAgentEngine;
+    const agentEngine = requestedAgentEngine;
 
     const existing = this.sessions.get(id);
     if (existing) {

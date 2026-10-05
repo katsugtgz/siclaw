@@ -1,4 +1,5 @@
 import { scheduleToolOutputCleanup } from "./tool-output-cleanup.js";
+import type { CodexExecutorGrants } from "./brains/codex-executor-policy.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -172,7 +173,7 @@ export interface CreateSiclawSessionOpts {
 export interface SiclawSessionResult {
   brain: BrainSession;
   toolResultArtifactStore: ToolResultArtifactStore;
-  session: AgentSession;  // Pi-compatible transcript and resource context, also retained by Codex
+  session?: AgentSession;  // Present only for the Pi runtime; Codex owns its native session.
   /** cwd-bound runtime services (pi 0.73) — needed to build an AgentSessionRuntime for the CLI */
   services: AgentSessionServices;
   /** Loaded extensions result — required when wrapping the session in an AgentSessionRuntime */
@@ -654,7 +655,7 @@ export async function createSiclawSession(
     );
   }
   const { mcpManager, mcpTools: discoveredMcpTools } = await resolveSessionMcpTools({
-    enabled: exposeConfiguredMcp, allowedTools,
+    enabled: opts?.agentEngine !== "codex" && exposeConfiguredMcp, allowedTools,
     mcpServers,
     mcpManager: opts?.mcpManager, mcpTools: opts?.mcpTools,
   });
@@ -762,11 +763,11 @@ export async function createSiclawSession(
 
   // Codex owns its progress checklist. Keep Pi's task ledger available for Pi
   // fallback, but do not advertise two competing plan APIs to a Codex turn.
-  const useCodex = opts?.agentEngine === "codex" && !opts.isSubagent
-    && !customTools.some((tool) => tool.name === "transfer_to_agent");
+  const useCodex = opts?.agentEngine === "codex";
   const nativePlanEnabled = useCodex && ["task_create", "task_update"].every((name) =>
     customTools.some((tool) => tool.name === name));
-  if (nativePlanEnabled) compiledContext = compileAgentContext({ ...contextInput, nativePlanning: true });
+  if (useCodex) compiledContext = compileAgentContext({ ...contextInput,
+    nativePlanning: true, nativeSubagents: true, handoffAvailable: false });
 
   for (let i = 0; i < customTools.length; i++) {
     const tool = customTools[i];
@@ -785,10 +786,15 @@ export async function createSiclawSession(
       !customTools.some((tool) => tool.name === citationSupport.tool.name)) {
     customTools.push(citationSupport.tool);
   }
-  const piPlanTools = new Set(["task_create", "task_update", "task_list", "task_get"]);
-  const codexTools = nativePlanEnabled
-    ? customTools.filter((tool) => !piPlanTools.has(tool.name))
-    : customTools;
+  const nativeAllowSubagents = useCodex && !opts?.isSubagent &&
+    (allowedTools == null || allowedTools.includes("spawn_subagent"));
+  const nativeToolManifest = [
+    ...(customTools.some((tool) => ["bash", "read", "grep", "find", "ls"].includes(tool.name))
+      ? [{ name: "exec_command" }, { name: "write_stdin" }] : []),
+    ...(customTools.some((tool) => ["write", "edit"].includes(tool.name)) ? [{ name: "apply_patch" }] : []),
+    ...(nativePlanEnabled ? [{ name: "update_plan" }] : []),
+    ...(nativeAllowSubagents ? [{ name: "spawn_agent" }, { name: "wait_agent" }, { name: "send_input" }, { name: "close_agent" }] : []),
+  ];
 
   // Final model-visible tool set (registry-resolved + MCP + file tools, after the
   // whitelist is applied at every chokepoint). Logged by NAME when restricted so a
@@ -799,7 +805,7 @@ export async function createSiclawSession(
   // stale names even though they are no longer in this list and cannot be invoked.
   if (Array.isArray(allowedTools)) {
     console.log(
-      `[agent-factory] Restricted tools visible to model (${customTools.length}): ` +
+      `[agent-factory] ${useCodex ? "Resolved capability permissions" : "Restricted tools visible to model"} (${customTools.length}): ` +
       `${customTools.map((t) => t.name).join(", ") || "(none)"}`,
     );
   }
@@ -908,7 +914,7 @@ export async function createSiclawSession(
   const contextManifest = createAgentContextManifest({
     context: compiledContext,
     mode,
-    tools: useCodex && nativePlanEnabled ? [...codexTools, { name: "update_plan" }] : customTools,
+    tools: useCodex ? nativeToolManifest : customTools,
     skillNames: loadedSkills.map((skill) => skill.name),
     mcpServerNames: Object.keys(mcpServers),
     knowledgeMounted: fs.existsSync(knowledgeDir),
@@ -926,7 +932,9 @@ export async function createSiclawSession(
   const {
     session, extensionsResult, modelFallbackMessage, llmCallRecorder,
     modelEnvelopeManifestRef, modelEnvelopeInspectionRef,
-  } = await createPiExecutionSession({
+  } = useCodex ? { session: undefined, extensionsResult: loader.getExtensions(),
+    modelFallbackMessage: undefined, llmCallRecorder: undefined,
+    modelEnvelopeManifestRef: {}, modelEnvelopeInspectionRef: {} } : await createPiExecutionSession({
     services,
     sessionManager,
     model: configuredModel,
@@ -948,21 +956,49 @@ export async function createSiclawSession(
     }),
   );
   let brain: BrainSession;
-  // Pi sees an entire model tool-call batch before execution and guards
-  // transfer_to_agent against mixed batches and pending input. MCP receives
-  // individual calls, so keep handoff-capable sessions on Pi until Codex can
-  // enforce the same pre-execution boundary.
+  // Codex owns its native tools and children. Cross-Agent handoff is not exposed
+  // by this engine; the separately selectable Pi runtime keeps its own contract.
   if (useCodex) {
-    const executableTools = session.getAllTools().filter((info) =>
-      !nativePlanEnabled || !piPlanTools.has(info.name)).map((info) => {
-      const tool = session.extensionRunner.getToolDefinition(info.name)
-        ?? customTools.find((candidate) => candidate.name === info.name);
-      if (!tool) throw new Error(`Codex tool bridge cannot resolve ${info.name}`);
-      return tool;
-    });
+    fs.mkdirSync(userDataDir, { recursive: true });
+    const nativeGrants: CodexExecutorGrants = { readRoots: readAllowedDirs, writeRoots: customTools.some((tool) =>
+          tool.name === "write" || tool.name === "edit") ? writeAllowedDirs : [],
+        deniedRoots: [...blockedFileDirs.map((item) => item.dir), sessionManager.getSessionDir(),
+          path.dirname(getConfigPath()),
+          path.resolve(cwd, ".siclaw", "credentials"), path.resolve(cwd, ".siclaw", "config")],
+        allowCommands: customTools.some((tool) => tool.name === "bash"),
+        allowFileCommands: customTools.some((tool) => ["read", "grep", "find", "ls"].includes(tool.name)),
+        production: process.env.NODE_ENV === "production", environment: { PATH: process.env.PATH ?? "/usr/bin:/bin" } };
+    const environments: Array<{ id: string; grants: typeof nativeGrants }> = [];
+    if (kubeconfigRef.credentialBroker && nativeGrants.allowCommands) {
+      const clusters = await kubeconfigRef.credentialBroker.refreshClusters();
+      const broker = kubeconfigRef.credentialBroker;
+      for (const cluster of clusters) {
+        environments.push({ id: `cluster:${cluster.name}`, grants: { ...nativeGrants, resolveKubeconfig: async () => {
+          const acquired = await broker.ensureCluster(cluster.name, "native-executor");
+          if (!acquired.path) throw new Error("Missing native cluster credential");
+          return acquired.path;
+        } } });
+      }
+    }
+    const nativeMcpServers: Record<string, unknown> = {};
+    for (const [name, value] of Object.entries(mcpServers)) {
+      if (!value || typeof value !== "object") continue;
+      const server = value as Record<string, unknown>;
+      if (server.transport === "stdio") nativeMcpServers[name] = { command: server.command,
+        args: server.args ?? [], env: server.env ?? {}, required: true, default_tools_approval_mode: "approve" };
+      else if (server.transport === "streamable-http") nativeMcpServers[name] = { url: server.url,
+        http_headers: server.headers ?? {}, required: true, default_tools_approval_mode: "approve" };
+      else throw new Error(`Codex mode requires a native stdio or streamable-http MCP transport: ${name}`);
+    }
     brain = await CodexAgentBrain.create({
-      sessionManager, piSession: session, systemPrompt: session.systemPrompt,
-      tools: executableTools, toolsetsByName, cwd, nativePlanEnabled,
+      sessionManager, systemPrompt: [compiledContext.systemPrompt,
+        ...buildAppendSystemPrompt(memoryEnabled ? memoryDir : null, knowledgeDir,
+          Boolean(citationSupport), compiledContext.harness.includeOperationalSafety),
+        environments.length ? "Authorized Kubernetes clusters are native execution environments: " +
+          environments.map((entry) => entry.id).join(", ") +
+          ". Select environment_id in exec_command for cluster queries. Credentials are injected by the executor." : ""].join("\n\n"),
+      toolsetsByName, cwd: userDataDir, nativePlanEnabled, grants: nativeGrants, environments, mcpServers: nativeMcpServers,
+      allowSubagents: nativeAllowSubagents,
       onPlanUpdate: opts?.sessionEventEmitter
         ? (plan) => projectCodexPlan(taskListId, opts.sessionEventEmitter!, plan) : undefined,
       skillPaths: loadedSkills.map((skill) => ({
@@ -970,7 +1006,7 @@ export async function createSiclawSession(
       })),
     });
   } else {
-    brain = new PiAgentBrain(session, toolsetsByName, llmCallRecorder);
+    brain = new PiAgentBrain(session!, toolsetsByName, llmCallRecorder);
   }
   const getSkillSnapshot = () => {
     const currentSkills = loader.getSkills().skills;
@@ -993,14 +1029,14 @@ export async function createSiclawSession(
     return createPromptInspection({
       context: compiledContext,
       mode,
-      effectivePrompt: brain.brainType === "codex" ? session.systemPrompt : (wire?.systemPrompt ?? session.systemPrompt),
+      effectivePrompt: brain.brainType === "codex" ? compiledContext.systemPrompt : (wire?.systemPrompt ?? session!.systemPrompt),
       stage: wire ? "provider_wire" : "session_ready",
       tools: brain.brainType === "codex" ? (brain.getTools?.() ?? customTools) : (wire ? wire.toolSchemas : customTools),
       skillNames: getSkillSnapshot().skillNames,
     });
   };
   return {
-    brain, session, services, extensionsResult, modelFallbackMessage, customTools, toolResultArtifactStore,
+    brain, session, services, extensionsResult, modelFallbackMessage, customTools: useCodex ? [] : customTools, toolResultArtifactStore,
     skillNames, skillDigests, getSkillSnapshot,
     kubeconfigRef, skillsDirs, mode, mcpManager, memoryIndexer, knowledgeIndexer,
     sessionIdRef, turnRef, dpStateRef, contextManifest, modelEnvelopeManifestRef,

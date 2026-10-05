@@ -97,8 +97,7 @@ Memory DB: node:sqlite + FTS5 + sqlite-vec
 - The target Codex integration uses its native instructions, tools, execution
   environments, and agent lifecycle. Implement Siclaw-specific policy and
   services at native extension boundaries; do not wrap Pi tool definitions or
-  require a Pi AgentSession as the Codex implementation. The current
-  `CodexToolBridge` is a transitional prototype. See
+  require a Pi AgentSession as the Codex implementation. See
   `docs/design/codex-native-runtime.md` for the replacement direction.
 - Validate the Codex runtime with SiCore as the UI first. Portal UI acceptance
   follows only after that runtime path is complete.
