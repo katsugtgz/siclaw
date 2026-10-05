@@ -960,13 +960,15 @@ export async function createSiclawSession(
   // by this engine; the separately selectable Pi runtime keeps its own contract.
   if (useCodex) {
     fs.mkdirSync(userDataDir, { recursive: true });
-    const nativeGrants: CodexExecutorGrants = { readRoots: readAllowedDirs, writeRoots: customTools.some((tool) =>
+    const allowNativeFileRead = customTools.some((tool) => ["read", "grep", "find", "ls"].includes(tool.name));
+    const nativeGrants: CodexExecutorGrants = { readRoots: allowNativeFileRead ? readAllowedDirs : [],
+        executionRoots: [userDataDir], writeRoots: customTools.some((tool) =>
           tool.name === "write" || tool.name === "edit") ? writeAllowedDirs : [],
         deniedRoots: [...blockedFileDirs.map((item) => item.dir), sessionManager.getSessionDir(),
           path.dirname(getConfigPath()),
           path.resolve(cwd, config.paths.credentialsDir), path.resolve(cwd, ".siclaw", "config")],
         allowCommands: customTools.some((tool) => tool.name === "bash"),
-        allowFileCommands: customTools.some((tool) => ["read", "grep", "find", "ls"].includes(tool.name)),
+        allowFileCommands: allowNativeFileRead,
         production: process.env.NODE_ENV === "production", environment: { PATH: process.env.PATH ?? "/usr/bin:/bin" } };
     const environments: Array<{ id: string; grants: typeof nativeGrants }> = [];
     if (kubeconfigRef.credentialBroker && nativeGrants.allowCommands) {

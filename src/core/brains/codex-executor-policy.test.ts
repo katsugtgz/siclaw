@@ -90,4 +90,13 @@ describe("Codex native executor policy", () => {
     expect(() => policy.authorize("process/start", { ...start(read, "kubectl version --client"), argv: ["/bin/bash"] })).toThrow(/form/);
     expect(() => policy.authorize("fs/readFile", { path: "https://example.test/key" })).toThrow(/local/);
   });
+
+  it("does not turn shell permission or a command cwd into a file-read grant", () => {
+    const { read } = fixture();
+    const policy = new CodexExecutorPolicy({readRoots:[],writeRoots:[],deniedRoots:[],executionRoots:[read],
+      allowCommands:true,allowFileCommands:false,production:false});
+    expect(policy.authorize("process/start",start(read,"kubectl version --client")).params.cwd).toBe(uri(fs.realpathSync(read)));
+    expect(() => policy.authorize("fs/readFile",{path:uri(path.join(read,"notes.md"))})).toThrow(/grant/);
+    expect(() => policy.authorize("process/start",start(read,"cat notes.md","read"))).toThrow();
+  });
 });

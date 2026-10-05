@@ -15,6 +15,8 @@ export interface CodexExecutorGrants {
   readRoots: readonly string[];
   writeRoots: readonly string[];
   deniedRoots: readonly string[];
+  /** A command's cwd does not grant permission to read files there. */
+  executionRoots?: readonly string[];
   allowCommands: boolean;
   /** Scoped native file reads/searches may be allowed without shell diagnostics. */
   allowFileCommands?: boolean;
@@ -39,6 +41,8 @@ export class CodexExecutorPolicy {
   private readonly deniedRoots: string[];
   private readonly declaredReadRoots: string[];
   private readonly declaredWriteRoots: string[];
+  private readonly executionRoots: string[];
+  private readonly declaredExecutionRoots: string[];
   private readonly processes = new Set<string>();
   private readonly sandboxSessions = new Map<string, string>();
   private readonly environment: Record<string, string>;
@@ -52,6 +56,9 @@ export class CodexExecutorPolicy {
     this.deniedRoots = grants.deniedRoots.map(canonicalPath);
     this.declaredReadRoots = grants.readRoots.map((root) => path.resolve(root));
     this.declaredWriteRoots = grants.writeRoots.map((root) => path.resolve(root));
+    const executionRoots = grants.executionRoots ?? [...grants.readRoots, ...grants.writeRoots];
+    this.executionRoots = executionRoots.map(canonicalPath);
+    this.declaredExecutionRoots = executionRoots.map((root) => path.resolve(root));
     this.allowCommands = grants.allowCommands;
     this.allowFileCommands = grants.allowFileCommands ?? grants.allowCommands;
     this.production = grants.production;
@@ -139,7 +146,7 @@ export class CodexExecutorPolicy {
       throw new Error("Interactive native execution is not authorized");
     }
     if (params.arg0) throw new Error("Native argv0 override is not authorized");
-    params.cwd = this.authorizePath(params.cwd, false);
+    params.cwd = this.authorizePath(params.cwd, false, true);
     const fileCommand = authorizeCodexFileCommand(argv[2], fileURLToPath(String(params.cwd)), (uri, directory) => {
       const authorized = this.authorizePath(uri, false);
       if (directory && this.deniedRoots.some((root) => within(root, fileURLToPath(authorized)))) {
@@ -178,7 +185,7 @@ export class CodexExecutorPolicy {
     }
   }
 
-  private authorizePath(value: unknown, write: boolean): string {
+  private authorizePath(value: unknown, write: boolean, execution = false): string {
     if (typeof value !== "string") throw new Error("Invalid native filesystem path");
     const uri = new URL(value);
     if (uri.protocol !== "file:" || (uri.hostname && uri.hostname !== "localhost")) {
@@ -186,8 +193,8 @@ export class CodexExecutorPolicy {
     }
     const requested = path.resolve(fileURLToPath(uri));
     const canonical = canonicalPath(requested);
-    const roots = write ? this.writeRoots : [...this.readRoots, ...this.writeRoots];
-    const declared = write ? this.declaredWriteRoots
+    const roots = execution ? this.executionRoots : write ? this.writeRoots : [...this.readRoots, ...this.writeRoots];
+    const declared = execution ? this.declaredExecutionRoots : write ? this.declaredWriteRoots
       : [...this.declaredReadRoots, ...this.declaredWriteRoots];
     const requestedRoot = [...declared, ...roots].find((root) => within(requested, root));
     if (!requestedRoot || !roots.some((root) => within(canonical, root)) ||

@@ -513,7 +513,8 @@ export class CodexAgentBrain implements BrainSession {
       features: { shell_tool: Boolean(this.native?.grants?.allowCommands || this.native?.grants?.allowFileCommands || this.native?.grants?.writeRoots.length),
         code_mode_host: true, request_permissions_tool: false, send_message_to_user_async: false,
         apps: false, plugins: false, browser_use: false, computer_use: false, image_generation: false,
-        multi_agent: this.native?.allowSubagents ?? false, view_image: true, goals: false },
+        multi_agent: this.native?.allowSubagents ?? false,
+        view_image: Boolean(this.native?.grants.allowFileCommands || this.native?.grants.writeRoots.length), goals: false },
     };
   }
 
