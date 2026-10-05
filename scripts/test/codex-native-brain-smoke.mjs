@@ -31,6 +31,17 @@ process.env.SICLAW_MEMORY_ENABLED = "false";
 mkdirSync(process.env.SICLAW_CONFIG_DIR);
 writeFileSync(join(process.env.SICLAW_CONFIG_DIR, "settings.json"), JSON.stringify({ providers: {} }));
 let resources;
+const realCluster = process.env.SICLAW_CODEX_REAL_CLUSTER_CONFIG;
+const realCredential = join(workspace,".siclaw","credentials","clusters","native-real-kubeconfig");
+if (realCluster) {
+  assert.ok(!containerSecurity, "the real-cluster probe uses the local authorized kubectl context");
+  mkdirSync(join(workspace,".siclaw","credentials","clusters"),{recursive:true,mode:0o700});
+  writeFileSync(realCredential,readFileSync(realCluster),{mode:0o600});
+}
+let brokerRefreshes=0;
+const clusterCommand = realCluster ? {cmd:"kubectl -n sicore-test get pods -o json",login:false,environment_id:"cluster:roce-test"}
+  : {cmd:"kubectl version --client",login:false};
+const assertCommandOutput = (output) => assert.match(output,realCluster ? /sicore-apiserver/ : /Client Version/);
 let calls = 0;
 let rootCalls = 0;
 let childCalls = 0;
@@ -71,10 +82,10 @@ const model = createServer(async (request, response) => {
   const id = `response_${calls}`;
   let item;
   if (childTurn && childCalls === 1) item = { id: `child_cmd_${calls}`, type: "function_call", name: "exec_command",
-    call_id: "child-command", arguments: '{"cmd":"kubectl version --client","login":false}', status: "completed" };
+    call_id: "child-command", arguments: JSON.stringify(clusterCommand), status: "completed" };
   else if (childTurn && childCalls === 2) {
     const output = body.input.find((entry) => entry.type === "function_call_output" && entry.call_id === "child-command");
-    assert.match(output.output, /Client Version/, "native child must inherit the authorized executor");
+    assertCommandOutput(output.output);
     item = { id: `child_deny_${calls}`, type: "function_call", name: "exec_command", call_id: "child-denied",
       arguments: JSON.stringify({cmd:`touch ${childDeniedFile}`,login:false}), status: "completed" };
   } else if (childTurn) {
@@ -86,10 +97,10 @@ const model = createServer(async (request, response) => {
   } else if (rootCalls === 1) item = { id: `function_${calls}`, type: "function_call", name: "update_plan",
     call_id: "plan", arguments: '{"plan":[{"step":"Inspect","status":"in_progress"}]}', status: "completed" };
   else if (rootCalls === 2) item = { id: `function_${calls}`, type: "function_call", name: "exec_command",
-    call_id: "command", arguments: '{"cmd":"kubectl version --client","login":false}', status: "completed" };
+    call_id: "command", arguments: JSON.stringify(clusterCommand), status: "completed" };
   else if (rootCalls === 3) {
     const output = body.input.find((entry) => entry.type === "function_call_output" && entry.call_id === "command");
-    assert.match(output.output, /Client Version/);
+    assertCommandOutput(output.output);
     item = { id: `search_${calls}`, type: "tool_search_call", call_id: "discover",
       execution: "client", arguments: { query: "spawn_agent wait_agent", limit: 5 }, status: "completed" };
   }
@@ -167,6 +178,8 @@ await new Promise((resolve) => model.listen(0, "127.0.0.1", resolve));
 const port = model.address().port;
 const makeBrain = async (sessionManager) => {
   resources = await createSiclawSession({ sessionManager, agentEngine: "codex", agentType: "custom",
+    ...(realCluster ? {kubeconfigRef:{credentialBroker:{refreshClusters:async () => [{name:"roce-test"}],
+      ensureCluster:async (name) => {assert.equal(name,"roce-test");brokerRefreshes++;return {path:realCredential};}}}} : {}),
     harnessResolved: true, allowedTools: ["bash", "read", "write", "edit", "task_create", "task_update", "spawn_subagent"],
     sessionEventEmitter: (event) => planEvents.push(event), userId: "native-smoke", agentId: "native-smoke" });
   assert.equal(resources.session, undefined, "Codex must not instantiate a Pi AgentSession");
@@ -204,6 +217,7 @@ try {
   await brain.prompt("Hi");
   assert.equal(childCalls, 3);
   assert.ok(childId);
+  if (realCluster) assert.equal(brokerRefreshes,2,"parent and native child must refresh the selected cluster credential");
   const planUpdates = planEvents.filter((event) => event.kind === "task_event");
   assert.deepEqual(planUpdates.map((event) => event.action), ["reset", "upsert"]);
   assert.ok(brain.getConversationMessages().some((message) => message.role === "assistant" &&
@@ -229,7 +243,7 @@ try {
   const afterInterrupt = calls;
   await brain.prompt("Continue after Stop");
   assert.equal(calls, afterInterrupt + 1);
-  console.log(`Native Codex brain smoke passed: ${calls} model calls, 1 native child (${childCalls} calls), plan, command, patch, read/redaction, denied command/path, resume, early/active Stop, continuation`);
+  console.log(`Native Codex brain smoke passed: ${calls} model calls, 1 native child (${childCalls} calls), plan, command, patch, read/redaction, denied command/path, resume, early/active Stop, continuation${realCluster ? ", real roce-test environment, parent/child broker refresh" : ""}`);
 
 } finally {
   await brain?.close();

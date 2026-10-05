@@ -44,6 +44,8 @@ const model = createServer(async (request, response) => {
       if (turn === 2) nativeCall = { name:"spawn_agent",arguments:JSON.stringify({
         message:"CODE_MODE_NATIVE_CHILD",task_name:"native_child",fork_turns:"none"}) };
       else if (turn >= 3 && !JSON.stringify(body.input).includes("Code Mode child complete")) {
+        if (turn === 3) assert.match(JSON.stringify(body.input.filter((item) => item.type === "function_call_output")), /task_name/,
+          "native spawn failed: " + JSON.stringify(body.input.filter((item) => item.type === "function_call_output")).slice(0,3000));
         assert.ok(turn < 8, "native wait must deliver the child result: " + JSON.stringify({childCalls,
           outputs:body.input.filter((item) => item.type === "function_call_output").slice(-3)}).slice(0,5000));
         nativeCall = {name:"wait_agent",arguments:'{"timeout_ms":10000}'};
@@ -66,7 +68,7 @@ const model = createServer(async (request, response) => {
     send("response.completed", {response:envelope});
     response.end();
   } catch (error) {
-    fixtureError = error;
+    fixtureError ??= error;
     response.writeHead(500).end(JSON.stringify({error:{message:error.message}}));
   }
 });
