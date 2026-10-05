@@ -38,11 +38,11 @@ const model = createServer(async (request, response) => {
     }
     let source = turn === 1 ? code : undefined;
     if (nativeChildren && !child) {
-      if (turn === 2) source = 'text(await tools.spawn_agent({message:"CODE_MODE_NATIVE_CHILD",task_name:"native_child",fork_turns:"none"}));';
+      if (turn === 2) source = 'text(await tools.collaboration__spawn_agent({message:"CODE_MODE_NATIVE_CHILD",task_name:"native_child",fork_turns:"none"}));';
       else if (turn >= 3 && !JSON.stringify(body.input).includes("Code Mode child complete")) {
         assert.ok(turn < 8, "native wait must deliver the child result: " + JSON.stringify({childCalls,
           outputs:body.input.filter((item) => item.type === "custom_tool_call_output").slice(-3)}).slice(0,5000));
-        source = 'text(await tools.wait_agent({timeout_ms:10000}));';
+        source = 'text(await tools.collaboration__wait_agent({timeout_ms:10000}));';
       }
     }
     const answer = child ? "Code Mode child complete" : "Code Mode complete";
