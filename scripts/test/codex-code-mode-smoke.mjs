@@ -21,7 +21,7 @@ const model = createServer(async (request, response) => {
     assert.equal(body.model, "gpt-6.1-sol");
     assert.equal(request.url, "/v1/responses");
     const tools = body.input.find((item) => item.type === "additional_tools")?.tools;
-    assert.ok(tools?.some((tool) => tool.name === "exec"), "preserve the catalog's native Code Mode tools: " +
+    assert.ok(tools?.flatMap((tool) => [tool,...(tool.tools ?? [])]).some((tool) => tool.name === "exec"), "preserve the catalog's native Code Mode tools: " +
       JSON.stringify((tools ?? body.tools ?? []).map((tool) => ({name:tool.name,type:tool.type}))));
     assert.equal(body.tools, undefined, "preserve native Responses Lite presentation");
     calls++;
@@ -30,7 +30,7 @@ const model = createServer(async (request, response) => {
       assert.match(JSON.stringify(output), /Client Version/);
       assert.ok(!JSON.stringify(output).includes("host unavailable"));
     }
-    const item = calls === 1 ? { id: "code-1", type: "custom_tool_call", name: "exec", call_id: "code", input: code }
+    const item = calls === 1 ? { id: "code-1", type: "custom_tool_call", namespace: "functions", name: "exec", call_id: "code", input: code }
       : { id: "answer", type: "message", role: "assistant", content: [{type:"output_text",text:"Code Mode complete",annotations:[]}] };
     response.writeHead(200, { "content-type": "text/event-stream" });
     const send = (type, payload) => response.write(`event: ${type}\ndata: ${JSON.stringify({type,...payload})}\n\n`);
