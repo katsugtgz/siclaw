@@ -17,6 +17,11 @@ direction supersedes wrapping Siclaw's Pi tool definitions in an MCP bridge.
 - Preserve whitelist-only execution, credential brokering, OS user isolation,
   path authorization, output sanitization, and cancellation guarantees.
 - Validate SiCore as the UI first. Defer Portal UI work until runtime acceptance.
+- Scope parity to currently enabled Pi product capabilities. Long-term memory
+  is disabled by default and is not a required migration feature. Keep it
+  disabled for this acceptance scope; evaluate native Codex memory separately
+  if the product explicitly enables it later. Conversation history, resume and
+  compaction remain in scope and use Codex natively.
 
 ## Extension boundaries verified in the pinned source
 
@@ -30,7 +35,7 @@ The source pin is `aiops/codex` main at
 | Native `exec-server` protocol | Process launch, reads/writes, signals, termination, filesystem and PTY operations | Enforce command/resource/path grants and sanitize data before returning it to Codex |
 | Native shell, `apply_patch`, image reading | Model-facing tool schemas and orchestration | Authoritative execution policy at the executor boundary |
 | Native MCP and dynamic tools | Tool discovery, invocation and native orchestration | Product-specific services and external server authorization |
-| Native hooks | Lifecycle integration and supplementary policy feedback | Investigation checkpoints, memory work and audit integration |
+| Native hooks | Lifecycle integration and supplementary policy feedback | Enabled investigation workflow and audit integration; optional memory work |
 | Native multi-agent | Child creation, coordination, context and termination | Role/tier grants, resource inheritance, reports and existing SiCore task events |
 
 `codex exec-server` ships as a subcommand of the source-built CLI. No npm Codex
@@ -88,7 +93,7 @@ process completion. Long-running/background task parity still requires work.
    prompt with Pi's assembled system prompt. Preserve the model catalog's native
    tool presentation, including Responses Lite and Code Mode where supported.
 3. Reimplement cluster/node/pod/host bindings as authorized native environments
-   and product services. Implement memory, reports, scheduling and other product
+   and product services. Implement reports, scheduling and other enabled product
    capabilities through Codex-native extension contracts, independently of Pi
    ToolDefinition/ExtensionRunner APIs.
 4. Use native Codex child-agent creation, waiting, coordination and lifecycle.
@@ -128,7 +133,8 @@ including any required source-built runtime helpers.
   source-built native executor security tests.
 - Deploy the reviewed native path in the test namespace and validate SiCore
   streaming, tools, plan, Stop, steer, restart/resume, model routing, attachments,
-  memory, reports, jobs, native subtasks and scheduling. Handoff is deferred.
+  reports, jobs, native subtasks and scheduling. Long-term memory and handoff are
+  outside the current acceptance scope.
 - Test denial paths independently: unauthorized commands/resources/files,
   leaked environment variables, raw output secrets, cross-session handles,
   policy failure, executor failure and canceled process groups.
@@ -189,10 +195,12 @@ not established by the component/namespace results.
   child views, Stop/steer, restart/resume, model routing and usage accounting.
   The login page requires an account email; the test password was provided in
   the task but the email is still pending. No Portal UI acceptance is attempted.
-- Native product services: knowledge labels/citations, memory queries and
-  investigation lifecycle/checkpoints, reports, schedules, host/node/pod
+- Native product services: knowledge labels/citations, enabled investigation
+  workflow state, reports, schedules, host/node/pod
   diagnostic bindings and script execution. The removed Pi tools are not claimed
   as implementations of these services.
+- Long-term memory search, generation and publication are optional future
+  capabilities, not blockers for the current disabled-memory Pi replacement.
 - Native clarification, file attachments and structured-result contracts;
   external MCP output/artifact policy; child detail persistence and resource/model
   policy. Explicit unsupported requests must never silently run Pi.
