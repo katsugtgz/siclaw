@@ -63,6 +63,8 @@ async function connect() {
 let pids=[];
 try {
   if (production) assert.equal(process.getuid(),1000,"run as agentbox using the normal entrypoint");
+  if (production) assert.equal(process.env.SICLAW_CODEX_EXECUTOR_FIXTURE,"1",
+    "mount scripts/test/fixtures/native-executor-kubectl.sh at /usr/local/bin/kubectl for this test only");
   await relay.start();
   const first=await connect();
   const second=await connect();
