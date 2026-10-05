@@ -27,7 +27,7 @@ const model = createServer(async (request, response) => {
       JSON.stringify((tools ?? body.tools ?? []).map((tool) => ({name:tool.name,type:tool.type}))));
     assert.equal(body.tools, undefined, "preserve native Responses Lite presentation");
     calls++;
-    const child = body.input.filter((item) => item.type === "message")
+    const child = body.input.filter((item) => ["message","agent_message"].includes(item.type))
       .some((message) => message.content?.some((item) => item.text?.includes("CODE_MODE_NATIVE_CHILD")));
     const turn = child ? ++childCalls : ++rootCalls;
     const side = child ? "child" : "root";
