@@ -2,7 +2,7 @@
 // built from Dockerfile.agentbox's pinned GitLab Codex main commit.
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, chownSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -17,6 +17,7 @@ const sessionDir = mkdtempSync(join(tmpdir(), "siclaw-codex-source-smoke-"));
 // Enable only inside the production AgentBox image, as its agentbox user.
 const containerSecurity = process.env.SICLAW_CODEX_CONTAINER_SMOKE === "1";
 const credentialFixture = `/app/.siclaw/credentials/clusters/codex-smoke-${process.pid}`;
+const childDeniedFile = join(sessionDir, "child-must-not-exist");
 const workspace = join(sessionDir, "workspace");
 const transcriptDir = join(sessionDir, "transcripts");
 const outputFile = join(workspace, ".siclaw", "user-data", "native.txt");
@@ -65,13 +66,21 @@ const model = createServer(async (request, response) => {
   const childTurn = body.input.filter((entry) => entry.type === "message" && entry.role === "user")
     .at(-1)?.content?.some((entry) => entry.text?.includes("CHILD_ONLY_NATIVE"));
   if (childTurn) childCalls++; else rootCalls++;
+  if (rootCalls === 1 && !childTurn) assert.ok(JSON.stringify(body.input).includes("legacy-kubectl-evidence"),
+    "restoring a Pi transcript into Codex must preserve its historical tool evidence");
   const id = `response_${calls}`;
   let item;
   if (childTurn && childCalls === 1) item = { id: `child_cmd_${calls}`, type: "function_call", name: "exec_command",
     call_id: "child-command", arguments: '{"cmd":"kubectl version --client","login":false}', status: "completed" };
-  else if (childTurn) {
+  else if (childTurn && childCalls === 2) {
     const output = body.input.find((entry) => entry.type === "function_call_output" && entry.call_id === "child-command");
     assert.match(output.output, /Client Version/, "native child must inherit the authorized executor");
+    item = { id: `child_deny_${calls}`, type: "function_call", name: "exec_command", call_id: "child-denied",
+      arguments: JSON.stringify({cmd:`touch ${childDeniedFile}`,login:false}), status: "completed" };
+  } else if (childTurn) {
+    const output = body.input.find((entry) => entry.type === "function_call_output" && entry.call_id === "child-denied");
+    assert.match(output.output, /not.*(allowed|authorized)|blocked|denied/i, "native child must not bypass the policy relay");
+    assert.ok(!existsSync(childDeniedFile));
     item = { id: `child_${calls}`, type: "message", role: "assistant", status: "completed",
     content: [{ type: "output_text", text: "native child completed", annotations: [] }] };
   } else if (rootCalls === 1) item = { id: `function_${calls}`, type: "function_call", name: "update_plan",
@@ -175,13 +184,25 @@ try {
   if (containerSecurity) {
     assert.equal(process.env.NODE_ENV, "production");
     assert.equal(process.getuid(), 1000, "Run the container smoke as agentbox, not root");
+    // A fresh K8s credential emptyDir hides the image's pre-created directories.
+    const clusterDir = "/app/.siclaw/credentials/clusters";
+    mkdirSync(clusterDir, {recursive:true});
+    chownSync(clusterDir, 1000, 1002);
+    chmodSync(clusterDir, 0o2750);
     writeFileSync(credentialFixture, "fake-secret-for-isolation-test", { mode: 0o640 });
     assert.equal(spawnSync("sudo", ["-n", "-u", "sandbox", "--", "test", "-r", credentialFixture]).status,
       1, "sandbox must not be able to read AgentBox credentials");
   }
-  brain = await makeBrain(SessionManager.create(process.cwd(), transcriptDir));
+  const legacy = SessionManager.create(process.cwd(), transcriptDir);
+  legacy.appendMessage({role:"user",content:"Inspect the old node",timestamp:Date.now()});
+  legacy.appendMessage({role:"assistant",content:[{type:"toolCall",id:"legacy",name:"node_exec",arguments:{node:"prior-node"}}],
+    stopReason:"toolUse",api:"openai-responses",provider:"fixture",model:"gpt-5.5",timestamp:Date.now(),
+    usage:{input:0,output:0,cacheRead:0,cacheWrite:0,totalTokens:0,cost:{input:0,output:0,cacheRead:0,cacheWrite:0,total:0}}});
+  legacy.appendMessage({role:"toolResult",toolCallId:"legacy",toolName:"node_exec",
+    content:[{type:"text",text:"legacy-kubectl-evidence"}],isError:false,timestamp:Date.now()});
+  brain = await makeBrain(legacy);
   await brain.prompt("Hi");
-  assert.equal(childCalls, 2);
+  assert.equal(childCalls, 3);
   assert.ok(childId);
   const planUpdates = planEvents.filter((event) => event.kind === "task_event");
   assert.deepEqual(planUpdates.map((event) => event.action), ["reset", "upsert"]);

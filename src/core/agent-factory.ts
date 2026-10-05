@@ -964,7 +964,7 @@ export async function createSiclawSession(
           tool.name === "write" || tool.name === "edit") ? writeAllowedDirs : [],
         deniedRoots: [...blockedFileDirs.map((item) => item.dir), sessionManager.getSessionDir(),
           path.dirname(getConfigPath()),
-          path.resolve(cwd, ".siclaw", "credentials"), path.resolve(cwd, ".siclaw", "config")],
+          path.resolve(cwd, config.paths.credentialsDir), path.resolve(cwd, ".siclaw", "config")],
         allowCommands: customTools.some((tool) => tool.name === "bash"),
         allowFileCommands: customTools.some((tool) => ["read", "grep", "find", "ls"].includes(tool.name)),
         production: process.env.NODE_ENV === "production", environment: { PATH: process.env.PATH ?? "/usr/bin:/bin" } };
