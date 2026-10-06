@@ -23,7 +23,7 @@ const server = new ssh2.Server({ hostKeys: [key] }, client => {
   client.on("ready", () => client.on("session", accept => {
     const session = accept();
     session.on("exec", (accept, _reject, info) => {
-      assert.match(info.command, /'timeout'.*(?:uname|curl|sichek|printenv|mmlscluster)/);
+      assert.match(info.command, /(?:uname|curl|sichek|printenv|mmlscluster)/);
       executions++;
       const stream = accept();
       stream.write("NATIVE_SSH_READ_OK\npassword: private-runtime-fixture\nOPENAI_API_KEY=private-env-fixture\n");

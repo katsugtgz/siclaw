@@ -167,17 +167,18 @@ export class CodexAgentBrain implements BrainSession {
       ...[...this.providers.values()].flatMap(provider => [string(provider.apiKey),
         ...(record(provider.headers) ? Object.values(provider.headers).filter((value): value is string => typeof value === "string") : [])]),
     ], () => native.grants.deniedRoots);
-    const redact = createModelOutputRedactor(() => [
+    const sensitiveValues: SensitiveValueSource = () => [
       ...mcpSensitiveValues(native.mcpServers ?? {}), ...(native.sensitiveValues?.() ?? []),
       ...[...this.providers.values()].flatMap(provider => [string(provider.apiKey),
         ...(record(provider.headers) ? Object.values(provider.headers).flatMap(value => typeof value === "string"
           ? [value, value.replace(/^(?:Bearer|Basic)\s+/i, "")] : []) : [])]),
-    ]);
+    ];
+    const redact = createModelOutputRedactor(sensitiveValues);
     const inheritedOutputGate = native.grants.redactOutput;
     const outputGate = (text: string) => redact(inheritedOutputGate?.(text) ?? text);
-    native.grants = { ...native.grants, redactOutput: outputGate };
+    native.grants = { ...native.grants, redactOutput: outputGate, sensitiveValues };
     native.environments = native.environments?.map(environment => ({ ...environment,
-      grants: { ...environment.grants, redactOutput: outputGate } }));
+      grants: { ...environment.grants, redactOutput: outputGate, sensitiveValues } }));
     const legacyHome = path.join(sessionDir, "codex-home");
     this.home = native.codexHome ?? legacyHome;
     this.marker = path.join(sessionDir, "codex-thread.json");

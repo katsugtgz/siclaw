@@ -7,9 +7,9 @@ import path from "node:path";
 import { createInterface } from "node:readline";
 import { WebSocket, WebSocketServer } from "ws";
 import { CodexExecutorPolicy, type CodexExecutorGrants } from "./codex-executor-policy.js";
-import { CodexExecutorOutput } from "./codex-executor-output.js";
 import { executeInfrastructureOperation, type InfrastructureOperation } from "./codex-infrastructure.js";
 import { fileURLToPath } from "node:url";
+import { once } from "node:events";
 import { shellEscape } from "../../tools/infra/command-sets.js";
 import { redactModelJson } from "../../shared/model-output-redactor.js";
 import { redactDataDocument } from "../../tools/infra/kubectl-sanitize.js";
@@ -19,7 +19,6 @@ interface Connection {
   socket: WebSocket;
   child: ChildProcessWithoutNullStreams;
   policy: CodexExecutorPolicy;
-  output: CodexExecutorOutput;
   pending: Map<string | number, { method: string; processId?: string }>;
 }
 
@@ -64,14 +63,33 @@ export class CodexExecutorRelay {
       const running = this.infrastructureRuns.get(entry.connection) ?? new Set<AbortController>();
       this.infrastructureRuns.set(entry.connection, running); running.add(abort);
       response.once("close", () => { if (!response.writableEnded) abort.abort(); });
-      const deadline = setTimeout(() => abort.abort(), entry.operation.script
-        ? (entry.operation.script.timeoutSeconds + 60) * 1000 : 70_000);
+      let keepAlive: NodeJS.Timeout | undefined;
       try {
+        response.writeHead(200, { "Content-Type": "application/x-ndjson" });
+        response.flushHeaders();
+        const send = async (frame: object) => {
+          abort.signal.throwIfAborted();
+          if (!response.write(`${JSON.stringify(frame)}\n`)) await once(response, "drain", { signal: abort.signal });
+        };
+        // Fetch transports impose an idle body deadline. Keep silent native
+        // processes alive without fabricating model-visible process output.
+        keepAlive = setInterval(() => {
+          if (!response.writableNeedDrain && !abort.signal.aborted) void send({ keepAlive: true }).catch(() => abort.abort());
+        }, 15_000);
+        keepAlive.unref();
         const result = await executeInfrastructureOperation(this.options.grants.infrastructure, entry.operation, abort.signal,
-          this.options.grants.skillScripts, this.options.grants.environment, this.options.grants.resolveKubeconfig, this.options.grants.redactOutput);
-        response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(result));
-      } catch { response.writeHead(502).end(); }
-      finally { clearTimeout(deadline); running.delete(abort); }
+          this.options.grants.skillScripts, this.options.grants.environment, this.options.grants.resolveKubeconfig, this.options.grants.redactOutput,
+          { sensitiveValues: this.options.grants.sensitiveValues, output: async (stream, text) => {
+            // A frame stays below both HTTP client and native protocol budgets.
+            const bytes = Buffer.from(text);
+            for (let offset = 0; offset < bytes.length; offset += 32 * 1024) {
+              await send({ stream, chunk: bytes.subarray(offset, offset + 32 * 1024).toString("base64") });
+            }
+          } });
+        await send({ exitCode: result.exitCode });
+        response.end();
+      } catch { response.destroy(); }
+      finally { if (keepAlive) clearInterval(keepAlive); running.delete(abort); }
     });
     const websocket = new WebSocketServer({ noServer: true, maxPayload: 2 * 1024 * 1024 });
     http.on("upgrade", (request, socket, head) => {
@@ -100,7 +118,7 @@ export class CodexExecutorRelay {
       stdio: ["pipe", "pipe", "pipe"],
     });
     const connection: Connection = { socket, child, policy: new CodexExecutorPolicy(this.options.grants),
-      output: new CodexExecutorOutput(undefined, this.options.grants.redactOutput), pending: new Map() };
+      pending: new Map() };
     this.connections.add(connection);
     const lines = createInterface({ input: child.stdout });
     lines.on("line", (line) => {
@@ -128,34 +146,23 @@ export class CodexExecutorRelay {
         }
         const authorized = connection.policy.authorize(message.method, message.params ?? {});
         const processId = typeof authorized.params.processId === "string" ? authorized.params.processId : undefined;
-        if (message.method === "process/read") {
-          this.send(connection, { id: message.id,
-            result: connection.output.read(processId!, Number(authorized.params.afterSeq ?? 0)) });
-          return;
-        }
         if (message.method === "process/start") {
-          if (authorized.infrastructure) {
-            for (const [ticket, entry] of this.tickets) if (entry.expiresAt < Date.now()) this.tickets.delete(ticket);
-            if (this.tickets.size >= 64) throw new Error("Native infrastructure launch capacity exceeded");
-            const ticket = randomBytes(32).toString("hex");
-            this.tickets.set(ticket, { operation: authorized.infrastructure, connection, expiresAt: Date.now() + 15_000 });
-            const helper = fileURLToPath(new URL("./codex-infrastructure-client.js", import.meta.url));
-            const endpoint = this.address!.replace(/^ws:/, "http:").replace(/\/executor$/, "/infrastructure");
-            connection.policy.setTransportCommand(authorized.params,
-              [process.execPath, helper, endpoint, ticket].map(shellEscape).join(" "), authorized.infrastructure.script
-                ? authorized.infrastructure.script.timeoutSeconds + 60 : 70);
-          } else if (this.options.grants.resolveKubeconfig) {
-            try {
-              const kubeconfig = await this.options.grants.resolveKubeconfig();
-              if (!kubeconfig) throw new Error("Missing cluster credential");
-              (authorized.params.env as Record<string, string>).KUBECONFIG = kubeconfig;
-            } catch {
-              connection.policy.releaseProcess(processId!);
-              throw new Error("Authorized cluster credentials are unavailable");
-            }
+          for (const [ticket, entry] of this.tickets) if (entry.expiresAt < Date.now()) this.tickets.delete(ticket);
+          if (this.tickets.size >= 64) throw new Error("Native execution launch capacity exceeded");
+          const ticket = randomBytes(32).toString("hex");
+          const operation: InfrastructureOperation = authorized.infrastructure ?? {
+            kind: "local-command", command: authorized.command!.text, security: authorized.command!.security,
+            cwd: String(authorized.params.cwd), environment: authorized.params.env as Record<string, string>,
+            production: this.options.grants.production,
+          };
+          this.tickets.set(ticket, { operation, connection, expiresAt: Date.now() + 15_000 });
+          const helper = fileURLToPath(new URL("./codex-infrastructure-client.js", import.meta.url));
+          const endpoint = this.address!.replace(/^ws:/, "http:").replace(/\/executor$/, "/infrastructure");
+          connection.policy.setTransportCommand(authorized.params,
+            [process.execPath, helper, endpoint, ticket].map(shellEscape).join(" "));
+          if (socket.readyState !== WebSocket.OPEN) {
+            this.tickets.delete(ticket); connection.policy.releaseProcess(processId!); return;
           }
-          if (socket.readyState !== WebSocket.OPEN) { connection.policy.releaseProcess(processId!); return; }
-          connection.output.register(processId!, authorized.command!.security);
         }
         if (message.id !== undefined) {
           connection.pending.set(message.id, { method: message.method, processId });
@@ -184,24 +191,10 @@ export class CodexExecutorRelay {
 
   private backendMessage(connection: Connection, message: JsonObject): void {
     if (!object(message)) throw new Error("Invalid native executor response");
-    const params = message.params ?? {};
-    if (message.method === "process/output") {
-      connection.output.capture(params.processId, params.seq, params.stream, params.chunk);
-      return;
-    }
-    if (message.method === "process/exited") {
-      const chunks = connection.output.finish(params.processId, params.exitCode);
-      for (const chunk of chunks) this.send(connection, { method: "process/output",
-        params: { processId: params.processId, ...chunk } });
-      this.send(connection, { method: "process/exited", params: {
-        processId: params.processId, seq: chunks.length + 1, exitCode: params.exitCode,
-        sandboxDenied: params.sandboxDenied ?? false } });
-      return;
-    }
-    if (message.method === "process/closed") {
-      connection.output.close(params.processId);
-      this.send(connection, { method: "process/closed", params: { processId: params.processId,
-        seq: connection.output.read(params.processId).nextSeq } });
+    if (["process/output", "process/exited", "process/closed"].includes(message.method)) {
+      // The fixed transport client's stdout/stderr already passed the security
+      // gate. Preserve upstream sequence numbers and lifecycle unchanged.
+      this.send(connection, message);
       return;
     }
     if (message.method !== undefined) throw new Error("Unsupported native executor notification");
@@ -210,7 +203,6 @@ export class CodexExecutorRelay {
     connection.pending.delete(message.id);
     if (message.error && pending.method === "process/start" && pending.processId) {
       connection.policy.releaseProcess(pending.processId);
-      connection.output.release(pending.processId);
     }
     if (!message.error && ["initialize", "environment/info"].includes(pending.method)) {
       const info = pending.method === "initialize" ? message.result?.environmentInfo : message.result;
@@ -232,7 +224,7 @@ export class CodexExecutorRelay {
       const bytes = Buffer.from(content, "base64");
       const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
       message.result = { dataBase64: Buffer.from(redact(redactDataDocument(text).text)).toString("base64") };
-    } else if (redact && message.result !== undefined) {
+    } else if (redact && message.result !== undefined && !pending.method.startsWith("process/")) {
       message.result = redactModelJson(message.result, redact);
     }
     this.send(connection, message);

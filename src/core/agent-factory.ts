@@ -1087,8 +1087,8 @@ export async function createSiclawSession(
             "kubectl -n <namespace> exec <pod> [-c <container>] -- bash/python3 <local Skill script path> <args>, " +
             "or kubectl debug node/<node> -- bash/python3 <local Skill script path> <args>. " +
             "The platform sends the approved asset bytes to remote stdin; do not upload, edit or copy scripts yourself. " +
-            "Use one literal call, no pipeline, redirection, inline code or interpreter options. Optional timeout <1-300 seconds> may precede the interpreter. " +
-            "The default is 180 seconds. Poll through native write_stdin; session/turn Stop cancels execution. Interactive input is unavailable. " +
+            "Use one literal call, no pipeline, redirection, inline code or interpreter options. An optional timeout <positive integer seconds> may precede the interpreter. " +
+            "There is no adapter runtime deadline. Poll through native write_stdin; session/turn Stop cancels execution. Interactive input is unavailable. " +
             "Execution requires its separate local/pod/node/host script capability. Only the selected, unchanged Skill assets are executable."
           : ""].join("\n\n"),
       toolsetsByName, cwd: userDataDir, nativePlanEnabled, grants: nativeGrants, environments,

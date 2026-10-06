@@ -11,6 +11,7 @@ import { authorizeCodexFileCommand } from "./codex-file-command.js";
 import { authorizeInfrastructureCommand, type CodexInfrastructureTarget, type InfrastructureOperation } from "./codex-infrastructure.js";
 import { extractCommands } from "../../tools/infra/command-validator.js";
 import { authorizeSkillScriptCommand, SCRIPT_SECURITY, type NativeSkillScriptGrants } from "./codex-skill-scripts.js";
+import type { SensitiveValueSource } from "../../shared/model-output-redactor.js";
 
 type JsonObject = Record<string, unknown>;
 
@@ -31,8 +32,9 @@ export interface CodexExecutorGrants {
   production: boolean;
   infrastructure?: CodexInfrastructureTarget;
   skillScripts?: NativeSkillScriptGrants;
-  /** Owner-scoped complete-output gate, including credentials acquired later. */
+  /** Owner-scoped output gate, including credentials acquired later. */
   redactOutput?: (text: string) => string;
+  sensitiveValues?: SensitiveValueSource;
 }
 
 export interface AuthorizedCodexRequest {
@@ -42,7 +44,7 @@ export interface AuthorizedCodexRequest {
 }
 
 /** Authorizes the upstream exec-server RPC contract, independently of Pi tools.
- * This component is paired with the relay's complete-document output policy. */
+ * The relay delivers sanitized bytes to the native process manager. */
 export class CodexExecutorPolicy {
   private readonly readRoots: string[];
   private readonly writeRoots: string[];
@@ -186,7 +188,7 @@ export class CodexExecutorPolicy {
     // the sanitized environment and its existing OS identity boundary.
     const pgidFile = this.production ? backgroundPgidFile(randomUUID()) : undefined;
     params.argv = ["/bin/bash", "-c", this.production
-      ? buildSandboxCommand(command, { timeoutS: 60, pgidFile }) : command];
+      ? buildSandboxCommand(command, { pgidFile }) : command];
     params.env = { ...this.environment };
     params.envPolicy = { inherit: "none", ignoreDefaultExcludes: false,
       exclude: [], set: {}, includeOnly: [] };
@@ -203,10 +205,10 @@ export class CodexExecutorPolicy {
 
   /** Trusted transport rewrite after native command authorization. Reuses the
    * same sandbox identity and process-group cleanup as ordinary native exec. */
-  setTransportCommand(params: JsonObject, command: string, timeoutS = 70): void {
+  setTransportCommand(params: JsonObject, command: string): void {
     this.assertProcess(params.processId);
     const pgidFile = this.sandboxSessions.get(String(params.processId));
-    params.argv = ["/bin/bash", "-c", this.production ? buildSandboxCommand(command, { timeoutS, pgidFile }) : command];
+    params.argv = ["/bin/bash", "-c", this.production ? buildSandboxCommand(command, { pgidFile }) : command];
   }
 
   private assertProcess(id: unknown): void {

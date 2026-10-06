@@ -1,15 +1,11 @@
 import type { CredentialBroker } from "../../agentbox/credential-broker.js";
 import { parseArgs, shellEscape, CONTAINER_SENSITIVE_PATHS, isTrustedCommandExecutable } from "../../tools/infra/command-sets.js";
-import { preExecSecurity, postExecSecurity, type PreExecResult } from "../../tools/infra/security-pipeline.js";
-import { acquireSshTarget, sshExec } from "../../tools/infra/ssh-client.js";
+import { preExecSecurity, type PreExecResult } from "../../tools/infra/security-pipeline.js";
+import { acquireSshTarget, sshExecStream } from "../../tools/infra/ssh-client.js";
 import { prepareExecEnv, spawnAsync, validateNodeName, validatePodName } from "../../tools/infra/exec-utils.js";
-import { runInDebugPod } from "../../tools/infra/debug-pod.js";
 import { loadConfig } from "../config.js";
-import type { ToolOutputData } from "../../tools/infra/security-pipeline.js";
 import { extractCommands, validateShellOperators } from "../../tools/infra/command-validator.js";
 import { getCommandBinary } from "../../tools/infra/command-sets.js";
-import { redactText, buildRedactionConfig } from "../../shared/output-redactor.js";
-import { redactDataDocument } from "../../tools/infra/kubectl-sanitize.js";
 import { kubectlSubcommand, kubectlConnectionOverride } from "../../tools/infra/kubectl-sanitize.js";
 import { authorizeSkillScriptCommand, executeLocalSkillScript, revalidateSkillScript, SCRIPT_SECURITY,
   type AuthorizedSkillScript, type NativeSkillScriptGrants } from "./codex-skill-scripts.js";
@@ -17,6 +13,11 @@ import { backgroundPgidFile, wrapBackgroundSession, killRemoteSessionViaSsh, kil
 import { ensureDebugPodReady, acquireDebugPod, releaseDebugPod } from "../../tools/infra/debug-pod.js";
 import { stdinExecCmd } from "../../tools/infra/exec-utils.js";
 import { sanitizeEnv } from "../../tools/infra/sanitize-env.js";
+import { fileURLToPath } from "node:url";
+import { buildSandboxCommand, reapSandboxSession } from "../../tools/infra/sandbox-exec.js";
+import { CodexOutputStream } from "./codex-output-stream.js";
+import { consumeNativeOutput, spawnNativeStream, type NativeOutputConsumer } from "./codex-process-stream.js";
+import type { SensitiveValueSource } from "../../shared/model-output-redactor.js";
 
 export type CodexInfrastructureTarget =
   | { kind: "ssh"; broker: CredentialBroker; allowCommands?: boolean }
@@ -28,6 +29,8 @@ export type InfrastructureOperation = (
   | { kind: "pod"; namespace?: string; pod: string; container?: string; command: string; security: PreExecResult }
   | { kind: "node"; node: string; command: string; security: PreExecResult }
   | { kind: "local-script"; command: string; security: PreExecResult }
+  | { kind: "local-command"; command: string; security: PreExecResult;
+      cwd: string; environment: Record<string, string>; production: boolean }
 ) & { script?: AuthorizedSkillScript };
 
 /** Parses native command syntax. Transport/identity options are never supplied
@@ -149,104 +152,89 @@ function authorizeRemoteCommand(command: string, context: "host" | "node" | "pod
 }
 
 /** Credential acquisition and platform transport, independent of Pi tools.
- * Re-authorize against the current broker inventory before every launch. */
+ * Re-authorize current resource bindings before each launch. With an output
+ * consumer (the production relay), no process output is retained here. */
 export async function executeInfrastructureOperation(target: CodexInfrastructureTarget | undefined, operation: InfrastructureOperation,
   signal: AbortSignal, scripts?: NativeSkillScriptGrants, environment?: NodeJS.ProcessEnv,
-  resolveKubeconfig?: () => Promise<string>, redactOutput?: (text: string) => string): Promise<{ stdout: string; stderr: string; exitCode: number }> {
-  if (signal.aborted) throw new Error("Native infrastructure execution aborted");
-  let result: { stdout: string; stderr: string; exitCode: number | null; truncated?: boolean };
+  resolveKubeconfig?: () => Promise<string>, redactOutput?: (text: string) => string,
+  stream?: { output: (channel: "stdout" | "stderr", text: string) => Promise<void>; sensitiveValues?: SensitiveValueSource },
+): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+  signal.throwIfAborted();
+  const stdout = new CodexOutputStream(operation.security.action, redactOutput, stream?.sensitiveValues);
+  const stderr = new CodexOutputStream(null, redactOutput, stream?.sensitiveValues);
+  const result = { stdout: "", stderr: "", exitCode: 1 };
+  const emit = async (channel: "stdout" | "stderr", text: string) => {
+    if (!text) return;
+    if (stream) await stream.output(channel, text);
+    else result[channel] += text; // Convenience for focused executor tests only.
+  };
+  const output: NativeOutputConsumer = async (channel, bytes) => emit(channel, (channel === "stdout" ? stdout : stderr).push(bytes));
   const content = operation.script ? revalidateSkillScript(operation.script, scripts) : undefined;
-  if (operation.kind === "local-script") {
+  if (operation.kind === "local-command") {
+    const env = { ...operation.environment };
+    if (resolveKubeconfig) {
+      const path = await resolveKubeconfig();
+      if (!path) throw new Error("Authorized cluster credentials are unavailable");
+      env.KUBECONFIG = path;
+    }
+    const pgidFile = operation.production ? backgroundPgidFile("native-command") : undefined;
+    const reap = () => { if (pgidFile) reapSandboxSession(pgidFile); };
+    signal.addEventListener("abort", reap, { once: true });
+    try {
+      result.exitCode = await spawnNativeStream("/bin/bash", ["-c", operation.production
+        ? buildSandboxCommand(operation.command, { pgidFile }) : operation.command], {
+        cwd: fileURLToPath(operation.cwd), env, signal, output,
+      });
+    } finally { signal.removeEventListener("abort", reap); }
+  } else if (operation.kind === "local-script") {
     if (!operation.script || content === undefined || !scripts?.allowed.local) throw new Error("Local Skill script is not authorized");
     const kubeconfig = resolveKubeconfig ? await resolveKubeconfig() : "/dev/null";
-    result = await executeLocalSkillScript(operation.script, content,
-      { ...sanitizeEnv((environment ?? {}) as Record<string, string>), KUBECONFIG: kubeconfig, SICLAW_DEBUG_IMAGE: loadConfig().debugImage }, signal);
-  } else if (operation.script) {
-    if (!target || !scripts?.allowed[operation.kind] || content === undefined) throw new Error("Remote Skill script is not authorized");
-    result = await executeRemoteSkillScript(target, operation, content, signal);
+    result.exitCode = await executeLocalSkillScript(operation.script, content,
+      { ...sanitizeEnv((environment ?? {}) as Record<string, string>), KUBECONFIG: kubeconfig, SICLAW_DEBUG_IMAGE: loadConfig().debugImage }, signal, output);
   } else {
-    if (!target) throw new Error("Infrastructure target is unavailable");
-    const bounded = ["timeout", "-s", "TERM", "-k", "5", "60", "/bin/sh", "-c", operation.command];
-    if ((target.kind === "host" || target.kind === "ssh") && operation.kind === "host") {
-      const hosts = await target.broker.refreshHosts();
-      const name = target.kind === "host" ? target.name : operation.host;
-      const selected = hosts.find(host => host.name === name || host.id === name);
-      if (!selected) throw new Error("SSH host binding is no longer authorized");
-      // Force a credential request instead of trusting an old credential cache.
-      await target.broker.acquireHost(selected.name, "native-readonly-ssh");
-      const host = await acquireSshTarget(target.broker, selected.name, "native-readonly-ssh");
-      result = await sshExec(host, bounded.map(shellEscape).join(" "), { timeoutMs: 65_000, signal });
-    } else if (target.kind === "cluster" && operation.kind !== "host") {
-      const clusters = await target.broker.refreshClusters();
-      if (!clusters.some(cluster => cluster.name === target.name)) throw new Error("Cluster binding is no longer authorized");
-      await target.broker.acquireCluster(target.name, "native-readonly-infrastructure", { bypassCache: true });
-      const acquired = await target.broker.ensureCluster(target.name, "native-readonly-infrastructure");
-      if (!acquired.path) throw new Error("Authorized cluster credential is unavailable");
-      const env = prepareExecEnv(undefined, acquired.path);
-      const defaultNamespace = acquired.meta.contexts?.find(context => context.name === acquired.meta.current_context)?.namespace || "default";
-      if (operation.kind === "pod") {
-        const namespace = operation.namespace || defaultNamespace;
-        // GET authorizes the exact selected target; no selector/default workload
-        // can silently resolve to a different Pod.
-        await spawnAsync("kubectl", [...env.kubeconfigArgs, "-n", namespace, "get", "pod", operation.pod, "-o", "name"],
-          10_000, env.childEnv, signal);
-        const args = [...env.kubeconfigArgs, "-n", namespace, "exec", operation.pod,
-          ...(operation.container ? ["-c", operation.container] : []), "--", ...bounded];
-        try { result = { ...await spawnAsync("kubectl", args, 65_000, env.childEnv, signal), exitCode: 0 }; }
-        catch (error) {
-          const e = error as { stdout?: string; stderr?: string; code?: number; truncated?: boolean };
-          result = { stdout: e.stdout ?? "", stderr: e.stderr ?? "Remote execution failed", exitCode: typeof e.code === "number" ? e.code : 1, truncated: e.truncated };
-        }
-      } else {
-        await spawnAsync("kubectl", [...env.kubeconfigArgs, "get", "node", operation.node, "-o", "name"], 10_000, env.childEnv, signal);
-        const config = loadConfig();
-        result = await runInDebugPod({ nodeName: operation.node, userId: target.userId,
-          clusterKey: `${target.name}:${acquired.path}`, image: process.env.SICLAW_DEBUG_IMAGE || acquired.meta.debug_image || config.debugImage,
-          namespace: config.debugNamespace,
-          requireExistingNamespace: true,
-          command: ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--root", "--wd", "--", ...bounded] },
-        env, { timeoutMs: 65_000, signal });
-      }
-    } else throw new Error("Native infrastructure target mismatch");
+    if (!target || operation.script && (!scripts?.allowed[operation.kind] || content === undefined)) throw new Error("Remote execution is not authorized");
+    result.exitCode = await executeRemoteOperation(target, operation, content, signal, output);
   }
-  if (result.truncated) return { stdout: "Output suppressed: infrastructure output exceeded its safety limit.", stderr: "", exitCode: 1 };
-  // Sanitize before private IPC as well as at the native executor output gate.
-  let data: ToolOutputData | undefined;
-  postExecSecurity(result.stdout, operation.security.action, { stderr: result.stderr,
-    hasSensitiveKubectl: operation.security.hasSensitiveKubectl, outputMode: "data", onOutputData: value => { data = value; } });
-  if (!data) throw new Error("Native infrastructure output sanitization failed");
-  const redaction = buildRedactionConfig();
-  const safe = (text: string) => {
-    const sanitized = redactText(redactDataDocument(text).text, redaction);
-    return redactOutput ? redactOutput(sanitized) : sanitized;
-  };
-  return { stdout: safe(data.text), stderr: safe(data.stderr ?? ""), exitCode: result.exitCode ?? 1 };
+  await emit("stdout", stdout.finish());
+  await emit("stderr", stderr.finish());
+  return result;
 }
 
-async function executeRemoteSkillScript(target: CodexInfrastructureTarget,
-  operation: InfrastructureOperation & { script?: AuthorizedSkillScript }, content: string, signal: AbortSignal) {
-  const script = operation.script!;
-  const pgidFile = backgroundPgidFile("native-skill");
-  const inner = stdinExecCmd(script.interpreter, script.args.map(shellEscape).join(" "));
-  const wrapped = wrapBackgroundSession(`timeout -s TERM -k 5 ${script.timeoutSeconds} ${inner}`, pgidFile);
-  const timeoutMs = (script.timeoutSeconds + 10) * 1000;
+async function executeRemoteOperation(target: CodexInfrastructureTarget,
+  operation: Exclude<InfrastructureOperation, { kind: "local-command" | "local-script" }>, content: string | undefined,
+  signal: AbortSignal, output: NativeOutputConsumer): Promise<number> {
+  const script = operation.script;
+  const pgidFile = backgroundPgidFile("native-remote");
+  let inner = script ? stdinExecCmd(script.interpreter, script.args.map(shellEscape).join(" "))
+    : ["/bin/sh", "-c", operation.command].map(shellEscape).join(" ");
+  if (script?.timeoutSeconds !== undefined) inner = `timeout -s TERM -k 5 ${script.timeoutSeconds} ${inner}`;
+  const wrapped = wrapBackgroundSession(inner, pgidFile);
   if (operation.kind === "host" && (target.kind === "ssh" || target.kind === "host")) {
     const name = target.kind === "host" ? target.name : operation.host;
     const hosts = await target.broker.refreshHosts();
     const host = hosts.find(value => value.name === name || value.id === name);
     if (!host) throw new Error("SSH host binding is no longer authorized");
-    await target.broker.acquireHost(host.name, "native-skill-script");
-    const ssh = await acquireSshTarget(target.broker, host.name, "native-skill-script");
+    const reason = script ? "native-skill-script" : "native-readonly-ssh";
+    await target.broker.acquireHost(host.name, reason);
+    const ssh = await acquireSshTarget(target.broker, host.name, reason);
     const kill = () => killRemoteSessionViaSsh({ target: ssh, pgidFile });
     signal.addEventListener("abort", kill, { once: true });
-    try { return await sshExec(ssh, wrapped, { timeoutMs, signal, stdin: content }); }
-    finally { signal.removeEventListener("abort", kill); }
+    try {
+      signal.throwIfAborted();
+      const handle = await sshExecStream(ssh, wrapped, { signal, stdin: content });
+      try {
+        const [done] = await Promise.all([handle.done, consumeNativeOutput(handle.stdout, handle.stderr, output)]);
+        if (typeof done.exitCode !== "number" || done.signal) kill();
+        return done.exitCode ?? 1;
+      } catch (error) { kill(); handle.abort(); throw error; }
+    } finally { signal.removeEventListener("abort", kill); }
   }
-  if (target.kind !== "cluster" || !["pod", "node"].includes(operation.kind)) throw new Error("Native script target mismatch");
+  if (target.kind !== "cluster" || !["pod", "node"].includes(operation.kind)) throw new Error("Native execution target mismatch");
   const clusters = await target.broker.refreshClusters();
   if (!clusters.some(value => value.name === target.name)) throw new Error("Cluster binding is no longer authorized");
-  await target.broker.acquireCluster(target.name, "native-skill-script", { bypassCache: true });
-  const acquired = await target.broker.ensureCluster(target.name, "native-skill-script");
+  const reason = script ? "native-skill-script" : "native-readonly-infrastructure";
+  await target.broker.acquireCluster(target.name, reason, { bypassCache: true });
+  const acquired = await target.broker.ensureCluster(target.name, reason);
   if (!acquired.path) throw new Error("Authorized cluster credential is unavailable");
   const env = prepareExecEnv(undefined, acquired.path);
   let namespace: string, pod: string, prefix: string[] = [], release: (() => void) | undefined;
@@ -265,23 +253,24 @@ async function executeRemoteSkillScript(target: CodexInfrastructureTarget,
     const pinned = acquireDebugPod(spec);
     if (pinned !== pod) {
       if (pinned) releaseDebugPod(spec, pinned);
-      throw new Error("Diagnostic helper changed before script execution");
+      throw new Error("Diagnostic helper changed before execution");
     }
     release = () => releaseDebugPod(spec, pod);
     prefix = ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--root", "--wd", "--"];
-  } else throw new Error("Native script target mismatch");
+  } else throw new Error("Native execution target mismatch");
   const kill = () => killRemoteSessionViaKubectl({ kubeconfigArgs: env.kubeconfigArgs,
     childEnv: env.childEnv as Record<string, string>, namespace, podName: pod, pgidFile, nsenterPrefix: prefix,
     ...(operation.kind === "pod" && operation.container ? { container: operation.container } : {}) });
   signal.addEventListener("abort", kill, { once: true });
   try {
-    if (signal.aborted) throw new Error("Native Skill script execution aborted");
-    const args = [...env.kubeconfigArgs, "-n", namespace, "exec", "-i", pod,
-      ...(operation.kind === "pod" && operation.container ? ["-c", operation.container] : []), "--", ...prefix, "sh", "-c", wrapped];
-    try { return { ...await spawnAsync("kubectl", args, timeoutMs, env.childEnv, signal, content), exitCode: 0 }; }
-    catch (error) {
-      const e = error as { stdout?: string; stderr?: string; code?: number; truncated?: boolean };
-      return { stdout: e.stdout ?? "", stderr: e.stderr ?? "Remote script execution failed", exitCode: e.code ?? 1, truncated: e.truncated };
-    }
+    signal.throwIfAborted();
+    const args = [...env.kubeconfigArgs, "-n", namespace, "exec", ...(script ? ["-i"] : []), pod,
+      ...(operation.kind === "pod" && operation.container ? ["-c", operation.container] : []),
+      "--", ...prefix, "sh", "-c", wrapped];
+    const code = await spawnNativeStream("kubectl", args, { env: env.childEnv, signal, stdin: content, output });
+    if (code !== 0) kill(); // A lost kubectl channel must also reap its remote session.
+    return code;
+  } catch (error) {
+    kill(); throw error;
   } finally { signal.removeEventListener("abort", kill); release?.(); }
 }

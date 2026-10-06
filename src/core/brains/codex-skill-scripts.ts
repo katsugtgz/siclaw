@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { createHash } from "node:crypto";
-import { spawn } from "node:child_process";
+import { spawnNativeStream, type NativeOutputConsumer } from "./codex-process-stream.js";
 import { parseArgs } from "../../tools/infra/command-sets.js";
 import { argumentPathSecurityError } from "../../tools/infra/argument-path-security.js";
 import { extractCommands, validateShellOperators } from "../../tools/infra/command-validator.js";
@@ -22,7 +22,7 @@ export interface NativeSkillScriptGrants {
   privateRoots?: readonly string[];
 }
 export interface AuthorizedSkillScript extends ScriptAsset {
-  args: string[]; timeoutSeconds: number;
+  args: string[]; timeoutSeconds?: number;
 }
 const digest = (bytes: string | Buffer) => createHash("sha256").update(bytes).digest("hex");
 export const SCRIPT_SECURITY: PreExecResult = { error: null, action: null, hasSensitiveKubectl: false };
@@ -72,10 +72,10 @@ export function createNativeSkillScriptGrants(skills: readonly { name: string; f
 export function authorizeSkillScriptCommand(command: string, cwd: string, context: ScriptContext,
   grants?: NativeSkillScriptGrants): AuthorizedSkillScript | undefined {
   const args = parseArgs(command);
-  let offset = 0, timeoutSeconds = 180;
+  let offset = 0, timeoutSeconds: number | undefined;
   if (args[0] === "timeout") {
-    if (!/^\d+$/.test(args[1] ?? "") || Number(args[1]) < 1 || Number(args[1]) > 300) {
-      throw new Error("Skill script timeout must be an integer from 1 to 300 seconds");
+    if (!/^\d+$/.test(args[1] ?? "") || !Number.isSafeInteger(Number(args[1])) || Number(args[1]) < 1 || Number(args[1]) > 2_147_483) {
+      throw new Error("Skill script timeout must be a positive integer within the platform timer range");
     }
     timeoutSeconds = Number(args[1]); offset = 2;
   }
@@ -120,7 +120,7 @@ export function revalidateSkillScript(script: AuthorizedSkillScript, grants?: Na
 /** Reviewed local assets have Pi's agentbox identity and scoped cluster env.
  * A private package copy pins the main bytes and retains sibling imports. */
 export async function executeLocalSkillScript(script: AuthorizedSkillScript, content: string,
-  environment: NodeJS.ProcessEnv, signal: AbortSignal): Promise<{ stdout: string; stderr: string; exitCode: number; truncated?: boolean }> {
+  environment: NodeJS.ProcessEnv, signal: AbortSignal, output: NativeOutputConsumer): Promise<number> {
   if (signal.aborted) throw new Error("Skill script execution aborted");
   const snapshot = fs.mkdtempSync(path.join(os.tmpdir(), "native-skill-"));
   fs.chmodSync(snapshot, 0o700);
@@ -138,24 +138,8 @@ export async function executeLocalSkillScript(script: AuthorizedSkillScript, con
     const pinned = path.join(packageRoot, "scripts", script.filename);
     fs.chmodSync(pinned, 0o600);
     fs.writeFileSync(pinned, content, { mode: 0o600 });
-    return await new Promise((resolve, reject) => {
-      const child = spawn(script.interpreter, [pinned, ...script.args], { detached: true,
-        env: sanitizeEnv(environment as Record<string, string>), stdio: ["ignore", "pipe", "pipe"] });
-      let stdout = "", stderr = "", size = 0, truncated = false;
-      const kill = () => { try { process.kill(-child.pid!, "SIGKILL"); } catch { child.kill("SIGKILL"); } };
-      child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8");
-      const capture = (text: string, error: boolean) => {
-        size += Buffer.byteLength(text);
-        if (size > 8 * 1024 * 1024) { truncated = true; stdout = stderr = ""; kill(); }
-        else if (!truncated) { if (error) stderr += text; else stdout += text; }
-      };
-      child.stdout.on("data", text => capture(text, false)); child.stderr.on("data", text => capture(text, true));
-      const timer = setTimeout(kill, script.timeoutSeconds * 1000);
-      signal.addEventListener("abort", kill, { once: true });
-      child.once("error", error => { clearTimeout(timer); signal.removeEventListener("abort", kill); reject(error); });
-      child.once("close", code => { clearTimeout(timer); signal.removeEventListener("abort", kill);
-        resolve({ stdout, stderr, exitCode: code ?? 1, truncated }); });
-      if (signal.aborted) kill();
+    return await spawnNativeStream(script.interpreter, [pinned, ...script.args], {
+      env: sanitizeEnv(environment as Record<string, string>), signal, output, timeoutSeconds: script.timeoutSeconds,
     });
   } finally { fs.rmSync(snapshot, { recursive: true, force: true }); }
 }

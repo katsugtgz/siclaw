@@ -56,14 +56,17 @@ even when the executed diagnostic command only reads state.
 
 ## Transport and isolation
 
-Validated remote commands become one-use, expiring tickets on a loopback-only
+Validated native commands (local and remote) become one-use, expiring tickets on a loopback-only
 service. The native exec-server launches a fixed transport client under the
 existing sandbox UID. The service owns credentials and executes the sealed
-operation. Ticket holders cannot alter the operation. Output is buffered,
-bounded and sanitized before IPC and again before native model/UI delivery.
+operation. Ticket holders cannot alter the operation. Local diagnostics retain
+the existing sandbox UID and sanitized environment; reviewed scripts retain
+their separate service-identity trust boundary. Only sanitized bytes cross the
+private streaming IPC boundary into the native exec-server.
 
-Target commands have a 60-second remote timeout with a termination grace period;
-transport cancellation is propagated. Node diagnostics use the existing
+Target commands have no adapter runtime deadline; native termination and
+transport disconnect propagate cancellation. Remote channel failures also
+request cleanup of the selected remote session. Node diagnostics use the existing
 platform-owned diagnostic Job lifecycle, image and namespace, with existing
 deadline/cache cleanup. Creating a diagnostic helper is a controlled platform
 operation; it does not grant model-authored Kubernetes mutations or host writes.
@@ -86,6 +89,28 @@ instructions. `src/core/prompt.ts` is unchanged.
 Whitelist command control does not change the remote account's OS privileges.
 Use appropriately scoped SSH accounts and Kubernetes credentials. Unsupported
 native filesystem or interactive contracts must fail closed.
+
+## Native long processes and output
+
+The relay forwards native `process/output`, `process/exited`, `process/closed`
+sequence numbers and `process/read` unchanged. Official exec-server owns replay,
+retention, long polling and stream closure; Codex unified exec owns yield time,
+`write_stdin`, token budgeting and head/tail truncation. No Siclaw output ledger,
+synthetic sequence, whole-process 8 MiB buffer or default 60/180/300-second kill
+exists. Private keepalive frames prevent HTTP transport idle timeouts and never
+become model-visible output. Explicit approved-script `timeout` remains optional.
+
+The owner-scoped stream security gate holds incomplete text records and JSON
+structure, and carries PEM, YAML scalar/mapping and environment state across
+chunks. Known credential literals and encodings are held across byte/line splits.
+Stdout and stderr have separate framing state. A complete safe text line is
+available while the process runs; structured JSON is available after its closing
+boundary. Malformed UTF-8 or a failing secret source suppresses the affected
+stream. A malformed/incomplete or oversized record is suppressed; it neither
+terminates the process nor removes subsequent safe records. The individual
+record redaction budget is 8 MiB. This security framing is independent of native
+whole-process output/token limits. Full-log archiving/search is a separate
+product feature and is not required for native runtime compatibility.
 
 ## Acceptance
 

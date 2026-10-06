@@ -40,8 +40,8 @@ exec_command(environment_id="cluster:<bound-name>", cmd="kubectl debug node/<nod
 exec_command(environment_id="siclaw", cmd="ssh <bound-host> -- bash <local-skill-script-path> <args>")
 ```
 
-The default runtime cap is 180 seconds. An optional `timeout <1-300>` before the
-interpreter lowers or raises that cap within 300 seconds; e.g. remote
+There is no adapter runtime deadline. An optional `timeout <positive integer seconds>`
+before the interpreter sets an explicit caller-selected deadline; e.g. remote
 `ssh <host> -- timeout 240 bash <asset> <args>`. Each call is a literal argv
 invocation: no chained commands, redirection, inline interpreter program or
 interpreter startup option. Script arguments retain their literal values and
@@ -64,12 +64,14 @@ refused. Remote single-file transmission has Pi's existing stdin semantics.
 The native exec-server starts a fixed sandbox-side transport client using an
 expiring one-use ticket. The service re-authorizes the asset and resource, then
 executes the sealed request. The model cannot submit replacement script content
-or write to trusted stdin. Complete stdout/stderr are bounded and sanitized
-before IPC and native delivery. Oversized output is explicitly suppressed.
+or write to trusted stdin. Stdout/stderr are sanitized incrementally before IPC and native delivery. Native
+exec-server owns process output retention and truncation. The security gate
+bounds individual records, not total process output; malformed/oversized records
+are suppressed independently while later safe records continue.
 
 Native process termination/client disconnect aborts the service invocation.
 Local descendants run in a killable process group. Remote scripts use the shared
-setsid/timeout session wrapper and fresh SSH/kubectl cleanup on abort; Pod cleanup
+setsid session wrapper (with timeout only when explicitly requested) and fresh SSH/kubectl cleanup on abort; Pod cleanup
 uses the same selected container. Node helpers are operator-controlled, require
 an existing namespace and remain pinned until the script ends. They enter host
 root/cwd and are released through the existing helper lifecycle.

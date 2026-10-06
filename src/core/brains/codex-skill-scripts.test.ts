@@ -45,7 +45,7 @@ describe("native Skill assets at the execution boundary", () => {
   it("rejects inline interpreters, unbound scripts, chaining and incorrect interpreter types", () => {
     const { file, grants, cwd } = fixture();
     for (const command of [`bash ${file}; touch /tmp/NO`, `bash ${file} > /tmp/NO`, `python3 ${file}`, "bash /tmp/unreviewed.sh",
-      `bash ${file} $(touch /tmp/NO)`, `timeout 301 bash ${file}`]) {
+      `bash ${file} $(touch /tmp/NO)`, `timeout 0 bash ${file}`]) {
       expect(() => authorizeSkillScriptCommand(command, cwd, "local", grants)).toThrow();
     }
     expect(authorizeSkillScriptCommand("bash -c 'touch /tmp/NO'", cwd, "local", grants)).toBeUndefined();
@@ -92,6 +92,8 @@ describe("native Skill assets at the execution boundary", () => {
       allowCommands: false, allowFileCommands: false, production: false, skillScripts: grants });
     const start = (command: string, id: string) => ({ processId: id, argv: ["/bin/bash", "-c", command], cwd: pathToFileURL(cwd).href });
     expect(policy.authorize("process/start", start(`timeout 240 bash ${file}`, "script")).infrastructure?.script?.timeoutSeconds).toBe(240);
+    expect(policy.authorize("process/start", start(`bash ${file}`, "native-lifetime")).infrastructure?.script?.timeoutSeconds).toBeUndefined();
+    expect(policy.authorize("process/start", start(`timeout 600 bash ${file}`, "explicit-timeout")).infrastructure?.script?.timeoutSeconds).toBe(600);
     expect(() => policy.authorize("process/start", start("bash -c id", "inline"))).toThrow();
     expect(() => policy.authorize("process/write", { processId: "script", chunk: "ZXZpbA==" })).toThrow(/input/);
   });

@@ -1,11 +1,13 @@
 import { describe, it, expect, vi } from "vitest";
 import { authorizeInfrastructureCommand, executeInfrastructureOperation, type CodexInfrastructureTarget } from "./codex-infrastructure.js";
-const { sshExec, acquireSshTarget, spawnAsync, runInDebugPod } = vi.hoisted(() => ({
-  sshExec: vi.fn(), acquireSshTarget: vi.fn(), spawnAsync: vi.fn(), runInDebugPod: vi.fn(),
+import { Readable } from "node:stream";
+const { sshExecStream, acquireSshTarget, spawnAsync, ensureDebugPodReady, acquireDebugPod, releaseDebugPod, spawnNativeStream } = vi.hoisted(() => ({
+  sshExecStream: vi.fn(), acquireSshTarget: vi.fn(), spawnAsync: vi.fn(), ensureDebugPodReady: vi.fn(), acquireDebugPod: vi.fn(), releaseDebugPod: vi.fn(), spawnNativeStream: vi.fn(),
 }));
-vi.mock("../../tools/infra/ssh-client.js", () => ({ sshExec, acquireSshTarget }));
-vi.mock("../../tools/infra/debug-pod.js", () => ({ runInDebugPod }));
+vi.mock("../../tools/infra/ssh-client.js", () => ({ sshExecStream, acquireSshTarget }));
+vi.mock("../../tools/infra/debug-pod.js", () => ({ ensureDebugPodReady, acquireDebugPod, releaseDebugPod }));
 vi.mock("../../tools/infra/exec-utils.js", async importOriginal => ({ ...(await importOriginal<object>()), spawnAsync }));
+vi.mock("./codex-process-stream.js", async original => ({ ...await original<object>(), spawnNativeStream }));
 function cluster(overrides = {}): CodexInfrastructureTarget {
   return { kind: "cluster", name: "bound", broker: {} as any, userId: "user", allowApi: true, allowPod: true, allowNode: true, ...overrides };
 }
@@ -66,38 +68,42 @@ describe("native read-only infrastructure grants", () => {
     await expect(executeInfrastructureOperation(target, authorizeInfrastructureCommand("uname", target)!, new AbortController().signal))
       .rejects.toThrow("no longer authorized");
     expect(broker.acquireHost).not.toHaveBeenCalled();
-    expect(sshExec).not.toHaveBeenCalled();
+    expect(sshExecStream).not.toHaveBeenCalled();
   });
   it("refreshes SSH credentials and sanitizes output before private IPC", async () => {
     const broker = { refreshHosts: vi.fn().mockResolvedValue([{ name: "bound-host" }]), acquireHost: vi.fn() };
     acquireSshTarget.mockResolvedValue({ host: "192.0.2.1" });
-    sshExec.mockResolvedValue({ stdout: "password: transport-test-secret\n", stderr: "", exitCode: 0 });
+    sshExecStream.mockResolvedValue({ stdout: Readable.from(["password: transport-test-secret\n"]), stderr: Readable.from([]), done: Promise.resolve({exitCode:0}), abort:vi.fn() });
     const target = { ...host, broker } as unknown as CodexInfrastructureTarget;
     const output = await executeInfrastructureOperation(target, authorizeInfrastructureCommand("uname", target)!, new AbortController().signal);
     expect(output.stdout).not.toContain("transport-test-secret");
     expect(broker.acquireHost).toHaveBeenCalledWith("bound-host", "native-readonly-ssh");
-    expect(sshExec.mock.calls.at(-1)?.[1]).toContain("'timeout'");
+    expect(sshExecStream.mock.calls.at(-1)?.[1]).not.toContain("timeout");
   });
-  it("authorizes the exact Pod and uses a bounded noninteractive transport", async () => {
+  it("authorizes the exact Pod and uses a cancellable noninteractive stream", async () => {
     const broker = { refreshClusters: vi.fn().mockResolvedValue([{ name: "bound" }]), acquireCluster: vi.fn(),
       ensureCluster: vi.fn().mockResolvedValue({ path: "/tmp/authorized-config", meta: {} }) };
     spawnAsync.mockResolvedValue({ stdout: "Linux", stderr: "" });
+    spawnNativeStream.mockResolvedValue(0);
     const target = cluster({ broker });
     const result = await executeInfrastructureOperation(target, authorizeInfrastructureCommand("kubectl -n test exec pod-a -- uname", target)!, new AbortController().signal);
     expect(result.exitCode).toBe(0);
-    const args = spawnAsync.mock.calls.at(-1)?.[1];
+    const args = spawnNativeStream.mock.calls.at(-1)?.[1];
     expect(args).toContain("--kubeconfig=/tmp/authorized-config");
-    expect(args).toContain("timeout"); expect(args).not.toContain("-i"); expect(args).not.toContain("-t");
+    expect(args.join(" ")).not.toContain("timeout"); expect(args).not.toContain("-i"); expect(args).not.toContain("-t");
   });
   it("executes node reads in the host root and only in a prepared operator namespace", async () => {
     const broker = { refreshClusters: vi.fn().mockResolvedValue([{ name: "bound" }]), acquireCluster: vi.fn(),
       ensureCluster: vi.fn().mockResolvedValue({ path: "/tmp/actor-config", meta: { debug_image: "registry.internal/reviewed-debug@sha256:fixed" } }) };
     spawnAsync.mockResolvedValue({ stdout: "node/node-a", stderr: "" });
-    runInDebugPod.mockResolvedValue({ stdout: "node-a", stderr: "", exitCode: 0 });
+    ensureDebugPodReady.mockResolvedValue({ podName: "helper", namespace: "sicore-test" });
+    acquireDebugPod.mockReturnValue("helper"); spawnNativeStream.mockResolvedValue(0);
     const target = cluster({ broker });
     await executeInfrastructureOperation(target, authorizeInfrastructureCommand("kubectl debug node/node-a -- hostname", target)!, new AbortController().signal);
-    const spec = runInDebugPod.mock.calls.at(-1)?.[0];
+    const spec = ensureDebugPodReady.mock.calls.at(-1)?.[0];
     expect(spec).toMatchObject({ nodeName: "node-a", requireExistingNamespace: true, image: "registry.internal/reviewed-debug@sha256:fixed" });
-    expect(spec.command).toContain("--root"); expect(spec.command).toContain("--wd");
+    const args = spawnNativeStream.mock.calls.at(-1)?.[1];
+    expect(args).toContain("--root"); expect(args).toContain("--wd");
+    expect(releaseDebugPod).toHaveBeenCalledWith(expect.objectContaining({nodeName:"node-a"}), "helper");
   });
 });

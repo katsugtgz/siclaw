@@ -327,6 +327,46 @@ export function redactDocument(text: string): { text: string; redacted: boolean 
   return { text: out.join("\n"), redacted };
 }
 
+/** One complete text line at a time, with the same document vocabulary. State
+ * belongs to one stdout/stderr stream, never to a user or process-global cache. */
+export function createDocumentLineRedactor(environmentRecords = false): (line: string) => string {
+  let pem = false, block: number | null = null, mapping: number | null = null;
+  let sensitiveEnvironment = false, podEnvironmentIndent: number | null = null;
+  return line => {
+    const split = splitKeyValue(line);
+    if (environmentRecords) {
+      if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(line)) {
+        sensitiveEnvironment = !!split && (isSensitiveKeyName(split.key) || looksLikeSensitiveValue(split.value));
+      } else if (sensitiveEnvironment) return "";
+    }
+    if (pem) { if (PEM_END_RE.test(line)) pem = false; return ""; }
+    if (block !== null) { if (ownedByBlock(line, block)) return ""; block = null; }
+    if (mapping !== null) {
+      if (!ownedByBlock(line, mapping)) mapping = null;
+      else return split ? `${split.prefix}${REDACTED}` : line.trim() ? REDACTED : line;
+    }
+    // Pod YAML puts the variable name on a different line from its value.
+    if (podEnvironmentIndent !== null) {
+      if (split && split.indent === podEnvironmentIndent && split.key === "value") {
+        podEnvironmentIndent = null;
+        if (BLOCK_SCALAR_RE.test(split.value)) block = split.indent;
+        return `${split.prefix}${REDACTED}`;
+      }
+      if (line.trim() && (!split || split.indent < podEnvironmentIndent || split.key === "name")) podEnvironmentIndent = null;
+    }
+    if (split?.key === "name" && isSensitiveKeyName(split.value)) podEnvironmentIndent = split.indent;
+    if (PEM_BEGIN_RE.test(line)) {
+      pem = !PEM_END_RE.test(line);
+      return split ? `${split.prefix}${REDACTED}` : REDACTED;
+    }
+    if (split && (isSensitiveKeyName(split.key) || looksLikeSensitiveValue(split.value))) {
+      if (BLOCK_SCALAR_RE.test(split.value)) { block = split.indent; return `${split.prefix}${REDACTED}`; }
+      if (!split.value) { mapping = split.indent; return line; }
+    }
+    return redactOneLine(line) ?? line;
+  };
+}
+
 /**
  * Whether a line belongs to a block scalar opened at `keyIndent`. Blank lines
  * inside a block are part of it; anything indented no deeper than the key ends it.
