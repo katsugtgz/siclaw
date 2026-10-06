@@ -58,6 +58,13 @@ const relays=[new CodexExecutorRelay({executable:process.env.SICLAW_CODEX_BIN,ho
  grants:{...grants,infrastructure:{kind:"cluster",name:"cluster",broker,userId:"fixture",allowApi:false,allowPod:false,allowNode:false}}})];
 const sockets=[];
 const linux = process.platform === "linux";
+function alive(pid) {
+ try {
+  process.kill(pid,0);
+  if(linux && /\) Z /.test(fs.readFileSync(`/proc/${pid}/stat`,"utf8")))return false;
+  return true;
+ } catch {return false;}
+}
 async function connect(relay){
  await relay.start();const socket=new WebSocket(relay.url,{headers:{Authorization:`Bearer ${relay.bearerToken}`}});sockets.push(socket);
  const pending=new Map(),events=[];let next=0;
@@ -93,8 +100,8 @@ try {
   assert.ok((await local.rpc("process/terminate",{processId:id})).result);await local.finish(id);
   const pids=fs.readFileSync(pid,"utf8").trim().split(/\s+/).map(Number);
   const until=Date.now()+7000;
-  while(pids.some(pid=>{try{process.kill(pid,0);return true;}catch{return false;}})&&Date.now()<until)await new Promise(r=>setTimeout(r,80));
-  assert.ok(pids.every(pid=>{try{process.kill(pid,0);return false;}catch{return true;}}),"stopped script descendants remain");
+  while(pids.some(alive)&&Date.now()<until)await new Promise(r=>setTimeout(r,80));
+  assert.ok(pids.every(pid=>!alive(pid)),"stopped script descendants remain running");
  }
  bound=false;assert.ok((await local.start("revoked",`ssh fixture -- python3 ${python} revoked`)).result);
  assert.notEqual((await local.finish("revoked")).exitCode,0);
