@@ -374,6 +374,7 @@ export class CredentialBroker {
   ) {
     const dir = credentialsDir || path.resolve(process.cwd(), ".siclaw/credentials");
     fs.mkdirSync(dir, { recursive: true });
+    if (fs.lstatSync(dir).isSymbolicLink()) throw new Error("Credential cache root is an unsafe path");
     this.clusters = new ResourceRegistry<ClusterMeta>("clusters", dir, {
       fileMode: 0o640,
       sharedGroup: "kubecred",
@@ -382,6 +383,24 @@ export class CredentialBroker {
       fileMode: 0o640,
       sharedGroup: "hostcred",
     });
+    // A LocalSpawner/CLI process may restart with this owner's materialized
+    // files still on disk. Register them before any MCP or tool output is
+    // accepted, even before a fresh credential request warms the registry.
+    const existingFiles: CredentialFile[] = [];
+    let existingBytes = 0;
+    for (const kind of ["clusters", "hosts"]) {
+      const directory = path.join(dir, kind);
+      if (fs.lstatSync(directory).isSymbolicLink()) throw new Error("Credential cache directory is an unsafe path");
+      for (const name of fs.readdirSync(directory)) {
+        const file = path.join(directory, name);
+        const stat = fs.lstatSync(file);
+        if (stat.isSymbolicLink() || !stat.isFile()) throw new Error("Credential cache contains an unsafe path");
+        existingBytes += stat.size;
+        if (existingFiles.length >= 1000 || existingBytes > 8 * 1024 * 1024) throw new Error("Credential cache exceeds the redaction budget");
+        existingFiles.push({ name, content: fs.readFileSync(file, "utf8") });
+      }
+    }
+    this.rememberSensitiveValues({ credential: { name: "private-cache", type: "redaction-snapshot", files: existingFiles } });
     this.cleanupTimer = setInterval(() => {
       this.clusters.evictExpired();
       this.hosts.evictExpired();

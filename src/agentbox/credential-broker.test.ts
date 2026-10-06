@@ -63,6 +63,21 @@ afterEach(() => {
 });
 
 describe("CredentialBroker — host pipeline", () => {
+  it("registers private cached values before reacquisition after restart and rejects a linked cache entry", () => {
+    const owner = path.join(dir, "restarted-owner");
+    fs.mkdirSync(path.join(owner, "clusters"), { recursive: true });
+    fs.mkdirSync(path.join(owner, "hosts"), { recursive: true });
+    fs.writeFileSync(path.join(owner, "clusters", "stale.kubeconfig"), 'users:\n- name: reader\n  user:\n    token: cached-cluster-token\n');
+    fs.writeFileSync(path.join(owner, "hosts", "stale.password"), "cached-host-password");
+    const restarted = new CredentialBroker(new FakeTransport(), owner);
+    try {
+      expect(restarted.getSensitiveValues()).toContain("cached-cluster-token");
+      expect(restarted.getSensitiveValues()).toContain("cached-host-password");
+      expect(broker.getSensitiveValues()).toEqual([]);
+    } finally { restarted.dispose(); }
+    fs.symlinkSync(path.join(owner, "hosts", "stale.password"), path.join(owner, "hosts", "linked"));
+    expect(() => new CredentialBroker(new FakeTransport(), owner)).toThrow(/unsafe path/);
+  });
   it("registers token, host and bastion secrets privately, including rotations, without sharing another owner's set", async () => {
     transport.clusterPayloads.set("read", { credential: { name: "read", type: "kubeconfig", files: [{ name: "read.kubeconfig",
       content: 'apiVersion: v1\nusers:\n- name: reader\n  user:\n    token: first-cluster-token\n    exec:\n      env:\n      - name: CUSTOM_AUTH\n        value: tiny\n' }] } });

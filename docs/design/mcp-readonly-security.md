@@ -91,6 +91,9 @@ host and bastion credentials acquired through the shared CredentialBroker.
 Values acquired after session construction participate in the next output gate.
 Rotated values remain registered until that owner is disposed. There is no
 process-global cross-user secret registry.
+An owner process restarted with existing private credential files registers
+them before accepting output. Cache symlinks and excessive cache contents fail
+closed; startup does not scan another user's directories.
 
 Known literals are matched regardless of length or placeholder shape. Matching
 covers raw, JSON-escaped, percent-encoded, base64, base64url and hex forms, including
