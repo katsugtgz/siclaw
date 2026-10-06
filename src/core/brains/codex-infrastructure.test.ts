@@ -84,4 +84,15 @@ describe("native read-only infrastructure grants", () => {
     expect(args).toContain("--kubeconfig=/tmp/authorized-config");
     expect(args).toContain("timeout"); expect(args).not.toContain("-i"); expect(args).not.toContain("-t");
   });
+  it("executes node reads in the host root and only in a prepared operator namespace", async () => {
+    const broker = { refreshClusters: vi.fn().mockResolvedValue([{ name: "bound" }]), acquireCluster: vi.fn(),
+      ensureCluster: vi.fn().mockResolvedValue({ path: "/tmp/actor-config", meta: { debug_image: "registry.internal/reviewed-debug@sha256:fixed" } }) };
+    spawnAsync.mockResolvedValue({ stdout: "node/node-a", stderr: "" });
+    runInDebugPod.mockResolvedValue({ stdout: "node-a", stderr: "", exitCode: 0 });
+    const target = cluster({ broker });
+    await executeInfrastructureOperation(target, authorizeInfrastructureCommand("kubectl debug node/node-a -- hostname", target)!, new AbortController().signal);
+    const spec = runInDebugPod.mock.calls.at(-1)?.[0];
+    expect(spec).toMatchObject({ nodeName: "node-a", requireExistingNamespace: true, image: "registry.internal/reviewed-debug@sha256:fixed" });
+    expect(spec.command).toContain("--root"); expect(spec.command).toContain("--wd");
+  });
 });

@@ -170,10 +170,10 @@ export async function executeInfrastructureOperation(target: CodexInfrastructure
       await spawnAsync("kubectl", [...env.kubeconfigArgs, "get", "node", operation.node, "-o", "name"], 10_000, env.childEnv, signal);
       const config = loadConfig();
       result = await runInDebugPod({ nodeName: operation.node, userId: target.userId,
-        clusterKey: `${target.name}:${acquired.path}`, image: acquired.meta.debug_image || config.debugImage,
+        clusterKey: `${target.name}:${acquired.path}`, image: acquired.meta.debug_image || process.env.SICLAW_DEBUG_IMAGE || config.debugImage,
         namespace: config.debugNamespace,
         requireExistingNamespace: true,
-        command: ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--", ...bounded] },
+        command: ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--root", "--wd", "--", ...bounded] },
       env, { timeoutMs: 65_000, signal });
     }
   } else throw new Error("Native infrastructure target mismatch");
