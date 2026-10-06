@@ -12,6 +12,7 @@ import type { CodexExecutorGrants } from "./codex-executor-policy.js";
 import type { AgentMailbox } from "../agent-mailbox.js";
 import type { LlmCallPromptBoundary } from "../llm-call-recorder.js";
 import type { UsageIdentity, UsageSink } from "../../shared/model-usage.js";
+import { CodexChildProjection, type NativeChildSink } from "./codex-child-projection.js";
 
 type JsonObject = Record<string, unknown>;
 type CodexEvent = { method: string; params: JsonObject };
@@ -38,6 +39,25 @@ class CodexUsageBoundary implements LlmCallPromptBoundary {
   private lastTotalByThread = new Map<string, number>();
 
   setUsageSink(sink: UsageSink): void { this.sink = sink; }
+  captureContext(): ReturnType<UsageSink["context"]> {
+    return this.sink?.context() ?? { sessionId: "", executionRole: "root" };
+  }
+  childUsage(child: { sessionId: string; modelId: string; context: ReturnType<UsageSink["context"]> },
+    provider: string, usage: JsonObject, callId: string): import("../../shared/model-usage.js").UsageObservation | undefined {
+    const last = record(usage.last) ? usage.last : {};
+    if (!child.modelId || !number(last.inputTokens) && !number(last.outputTokens)) return;
+    const at = new Date().toISOString();
+    const identity = this.identities.get(provider) ?? {
+      configId: "", name: provider, sourceKind: "unknown" as const, sourceId: "", sourceName: "",
+    };
+    return { ...child.context, sessionId: child.sessionId, executionRole: "internal_subagent", schemaVersion: 1,
+      callId, phase: "finished", requestAt: at, finishedAt: at, kind: "agent", routingAttempt: 1,
+      outcome: "success", responseModel: child.modelId,
+      model: { ...identity, requestedId: child.modelId, runtimeProvider: provider },
+      usageEvidence: { protocol: "openai_responses", providerUsagePresent: true, finality: "terminal",
+        rawUsage: { input_tokens: number(last.inputTokens), output_tokens: number(last.outputTokens),
+          input_tokens_details: { cached_tokens: number(last.cachedInputTokens) } } } };
+  }
   registerIdentity(provider: string, value: unknown): void {
     if (!record(value)) return;
     const sourceKind = value.sourceKind;
@@ -98,6 +118,7 @@ export class CodexAgentBrain implements BrainSession {
   private readonly clusterExecutors = new Map<string, CodexExecutorRelay>();
   private readonly home: string;
   private readonly marker: string;
+  private readonly children: CodexChildProjection;
   private readonly messages: unknown[];
   private client: CodexAppServer | undefined;
   private loadedThreadId: string | undefined;
@@ -138,6 +159,18 @@ export class CodexAgentBrain implements BrainSession {
     const legacyHome = path.join(sessionDir, "codex-home");
     this.home = native.codexHome ?? legacyHome;
     this.marker = path.join(sessionDir, "codex-thread.json");
+    this.children = new CodexChildProjection(sessionDir, () => this.threadId,
+      () => this.llmCalls.captureContext(), () => ({ id: this.model?.id ?? "", provider: this.model?.provider ?? "" }),
+      (child, usage, id) => this.llmCalls.childUsage(child, child.provider, usage, id),
+      async (id, parentId) => {
+        if (!this.client) throw new Error("Native child metadata is unavailable");
+        const response = await this.client.request("thread/read", { threadId: id, includeTurns: false });
+        const thread = record(response.thread) ? response.thread : {};
+        if (thread.parentThreadId !== parentId || thread.modelProvider !== "siclaw_model" || !string(thread.model)) {
+          throw new Error("Native child ancestry or model identity is unavailable");
+        }
+        return string(thread.model);
+      });
     this.messages = sessionManager.getEntries()
       .filter((entry) => entry.type === "message")
       .map((entry) => entry.message);
@@ -190,6 +223,8 @@ export class CodexAgentBrain implements BrainSession {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
   }
+
+  setNativeChildSink(sink: NativeChildSink): void { this.children.setSink(sink); }
 
   getConversationMessages(): readonly unknown[] { return this.messages; }
   getTools(): BrainToolDefinition[] {
@@ -460,6 +495,9 @@ export class CodexAgentBrain implements BrainSession {
     this.loadedThreadId = undefined;
     await this.executor.close();
     for (const executor of this.clusterExecutors.values()) await executor.close();
+    // A persistence failure must not leak the app-server/executor processes.
+    // The pending journal is retained for the next owner-scoped session load.
+    await this.children.flush();
   }
 
   private async transformInput(text: string, media: PromptMedia | undefined, _source: "interactive" | "rpc",
@@ -620,6 +658,7 @@ export class CodexAgentBrain implements BrainSession {
       if (active.id) this.watchMailbox(active);
       if (active.abortRequested) await this.interruptActive(active);
       await completed;
+      await this.children.flush();
       this.lastToolNames = active.toolNames;
       this.lastTurnHadContent = active.assistantHadContent;
     } finally {
@@ -670,6 +709,7 @@ export class CodexAgentBrain implements BrainSession {
 
   private handleEvent(event: CodexEvent): void {
     const params = event.params;
+    this.children?.handle(event);
     if (string(params.threadId) !== this.threadId) return;
     if (event.method === "turn/plan/updated") {
       this.onPlanUpdate?.(params.plan);
@@ -706,12 +746,14 @@ export class CodexAgentBrain implements BrainSession {
         this.toolItems.set(string(item.id), { name, args: item.arguments ?? {} });
         this.emit({ type: "tool_execution_start", toolCallId: string(item.id), toolName: name,
           args: item.arguments ?? {}, toolset: this.toolsetsByName.get(name), startedAt: Date.now() });
-      } else if (["commandExecution", "fileChange", "collabAgentToolCall"].includes(string(item.type))) {
+      } else if (["commandExecution", "fileChange", "collabAgentToolCall"].includes(string(item.type)) ||
+          item.type === "subAgentActivity" && item.kind === "started") {
         const name = item.type === "commandExecution" ? "exec_command"
-          : item.type === "fileChange" ? "apply_patch" : string(item.tool);
-        this.toolItems.set(string(item.id), { name, args: item });
+          : item.type === "fileChange" ? "apply_patch" : item.type === "subAgentActivity" ? "spawn_agent" : string(item.tool);
+        const args = this.toolItemForUI(item);
+        this.toolItems.set(string(item.id), { name, args });
         this.emit({ type: "tool_execution_start", toolCallId: string(item.id), toolName: name,
-          args: item, startedAt: Date.now(), toolset: item.type === "collabAgentToolCall" ? "workflow" : "cmd-exec" });
+          args, startedAt: Date.now(), toolset: ["collabAgentToolCall", "subAgentActivity"].includes(string(item.type)) ? "workflow" : "cmd-exec" });
       }
     } else if (event.method === "item/agentMessage/delta") {
       const id = string(params.itemId);
@@ -750,21 +792,23 @@ export class CodexAgentBrain implements BrainSession {
         this.appendCache(toolResult);
         this.emit({ type: "message_start", message: toolResult });
         this.emit({ type: "message_end", message: toolResult });
-      } else if (["commandExecution", "fileChange", "collabAgentToolCall"].includes(string(item.type))) {
+      } else if (["commandExecution", "fileChange", "collabAgentToolCall"].includes(string(item.type)) ||
+          item.type === "subAgentActivity" && item.kind === "started") {
         const id = string(item.id);
         const started = this.toolItems.get(id);
         this.toolItems.delete(id);
         const name = started?.name ?? (item.type === "commandExecution" ? "exec_command"
-          : item.type === "fileChange" ? "apply_patch" : string(item.tool));
+          : item.type === "fileChange" ? "apply_patch" : item.type === "subAgentActivity" ? "spawn_agent" : string(item.tool));
         const isError = item.status === "failed" || item.status === "declined" ||
           (typeof item.exitCode === "number" && item.exitCode !== 0);
-        const result = { content: [{ type: "text", text: string(item.aggregatedOutput) || JSON.stringify(item) }],
-          details: item };
+        const publicItem = this.toolItemForUI(item);
+        const result = { content: [{ type: "text", text: string(item.aggregatedOutput) || JSON.stringify(publicItem) }],
+          details: publicItem };
         if (active) { active.assistantHadContent = true; if (!isError) active.toolNames.add(name); }
-        this.emit({ type: "tool_execution_end", toolCallId: id, toolName: name, args: started?.args ?? item,
-          result, isError, endedAt: Date.now(), toolset: item.type === "collabAgentToolCall" ? "workflow" : "cmd-exec" });
+        this.emit({ type: "tool_execution_end", toolCallId: id, toolName: name, args: started?.args ?? publicItem,
+          result, isError, endedAt: Date.now(), toolset: ["collabAgentToolCall", "subAgentActivity"].includes(string(item.type)) ? "workflow" : "cmd-exec" });
         this.appendCache({ ...this.assistantMessage("", "toolUse"), content: [{ type: "toolCall", id, name,
-          arguments: started?.args ?? item }] });
+          arguments: started?.args ?? publicItem }] });
         this.appendCache({ role: "toolResult", toolCallId: id, toolName: name, ...result, isError, timestamp: Date.now() });
       }
     } else if (event.method === "thread/tokenUsage/updated") {
@@ -823,6 +867,12 @@ export class CodexAgentBrain implements BrainSession {
       usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
       stopReason, ...(errorMessage ? { errorMessage } : {}), timestamp: Date.now() };
+  }
+
+  private toolItemForUI(item: JsonObject): JsonObject {
+    if (item.type !== "collabAgentToolCall" && item.type !== "subAgentActivity") return item;
+    return { id: item.id, type: item.type, tool: item.tool, kind: item.kind, prompt: item.prompt,
+      model: item.model, status: item.status, ...this.children.details(item) };
   }
 
   private appendCache(message: JsonObject): void {

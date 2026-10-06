@@ -48,6 +48,7 @@ let childCalls = 0;
 let childId;
 let completedRootResponses = 0;
 const usageObservations = [];
+const childOperations = [];
 const planEvents = [];
 let holdNextResponse = false;
 let streamingRequestSeen;
@@ -213,6 +214,7 @@ const makeBrain = async (sessionManager) => {
   assert.equal(resources.session, undefined, "Codex must not instantiate a Pi AgentSession");
   assert.deepEqual(resources.customTools, [], "Codex must not receive Pi ToolDefinitions");
   const brain = resources.brain;
+  brain.setNativeChildSink({ persist: async operation => childOperations.push(operation), activity: () => {} });
   brain.llmCalls.setUsageSink({context:()=>({sessionId:"native-source-smoke",executionRole:"root"}),
     record:observation=>usageObservations.push(observation)});
   brain.registerProvider("fixture", { apiKey: "test", headers: {"X-Native-Smoke": "fixture"}, baseUrl: `http://127.0.0.1:${port}/v1`,
@@ -246,6 +248,14 @@ try {
   brain = await makeBrain(legacy);
   await brain.prompt("Hi");
   assert.equal(childCalls, 3);
+  assert.equal(childOperations.filter(op => op.type === "ensure").length, 1);
+  const childUsage = childOperations.filter(op => op.type === "usage");
+  assert.equal(childUsage.length, childCalls, "each real native child model call must be projected exactly once");
+  assert.ok(childUsage.every(op => op.observation.executionRole === "internal_subagent"));
+  assert.ok(childOperations.some(op => op.type === "message" && op.content === "native child completed"));
+  assert.ok(childOperations.some(op => op.type === "message" && op.toolName === "exec_command" && op.outcome === "error"));
+  assert.ok(childOperations.some(op => op.type === "status" && op.status === "done"));
+  assert.ok(!JSON.stringify(brain.getConversationMessages()).includes(childId), "native thread IDs stay private");
   assert.ok(childId);
   if (realCluster) assert.equal(brokerRefreshes,2,"parent and native child must refresh the selected cluster credential");
   const planUpdates = planEvents.filter((event) => event.kind === "task_event");

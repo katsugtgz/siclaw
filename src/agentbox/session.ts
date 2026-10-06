@@ -1,4 +1,5 @@
 import { UsageOutbox } from "./usage-outbox.js";
+import { createNativeChildSink } from "./native-child-persistence.js";
 /**
  * AgentBox session manager
  *
@@ -3812,6 +3813,25 @@ export class AgentBoxSessionManager {
     };
 
     this.sessions.set(id, managed);
+    if (result.brain.setNativeChildSink && this.gatewayClient && this.agentId && effectiveUserId) {
+      const nativeRunning = new Set<string>();
+      result.brain.setNativeChildSink(createNativeChildSink({ gateway: this.gatewayClient,
+        rootSessionId: id, agentId: this.agentId, userId: effectiveUserId,
+        redact: text => redactText(text, buildRedactionConfigForModelConfig(this.delegationModelConfig)),
+        recordUsage: observation => {
+          if (!this.usageOutbox) throw new Error("Native child usage collector is unavailable");
+          this.usageOutbox.record(observation);
+        },
+        activity: (childId, running) => {
+          if (this.sessions.get(id) !== managed) return;
+          if (running && !nativeRunning.has(childId)) {
+            nativeRunning.add(childId);
+            managed._backgroundWorkCount++;
+            if (managed._releaseTimer) { clearTimeout(managed._releaseTimer); managed._releaseTimer = null; }
+          } else if (!running && nativeRunning.delete(childId)) this.releaseBackgroundWork(id);
+        },
+      }));
+    }
     emitDiagnostic({ type: "session_created", sessionId: id });
 
     // OpenTelemetry trace recorder. Gated on isTracingEnabled() so that when

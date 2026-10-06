@@ -192,6 +192,9 @@ export interface BrainSession {
    */
   readonly llmCalls?: LlmCallPromptBoundary;
 
+  /** Product persistence observer; native child execution remains owned by Codex. */
+  setNativeChildSink?(sink: import("./brains/codex-child-projection.js").NativeChildSink): void;
+
   /** Send a prompt to the agent. Resolves when the agent finishes responding. */
   prompt(text: string, media?: PromptMedia, requirements?: PromptRequirements): Promise<void>;
 
