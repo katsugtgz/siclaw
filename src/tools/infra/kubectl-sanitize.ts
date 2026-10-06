@@ -1181,6 +1181,11 @@ function redactJsonTree(node: unknown): boolean {
 
   let redacted = false;
   const obj = node as Record<string, unknown>;
+  // Diagnostic scripts/JSON pipelines can wrap Kubernetes objects in arrays
+  // or response envelopes. Kind-based protection follows those objects rather
+  // than relying on the original kubectl command or the root JSON shape.
+  const resource = typeof obj.kind === "string" ? KIND_TO_SENSITIVE_RESOURCE[obj.kind.toLowerCase()] : undefined;
+  if (resource && sanitizeObject(obj, resource)) redacted = true;
   for (const key of Object.keys(obj)) {
     const value = obj[key];
     // A sensitive key protects scalars as well as nested structures.

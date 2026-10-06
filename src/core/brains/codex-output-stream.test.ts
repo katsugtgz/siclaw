@@ -61,6 +61,11 @@ describe("native output security framing", () => {
     const safe = stream.push(bytes("[")) + stream.push(bytes('{"token":"private"}]\n[INFO] healthy\n')) + stream.finish();
     expect(safe).not.toContain("private"); expect(safe).toContain("[INFO] healthy");
   });
+  it("protects arbitrary Secret data keys inside arrays and response envelopes", () => {
+    const stream = new CodexOutputStream();
+    const safe = stream.push(bytes('[{"response":{"data":{"unnamed":"hidden-array"},"kind":"Secret"}}]\n')) + stream.finish();
+    expect(safe).not.toContain("hidden-array"); expect(JSON.parse(safe)[0].response.data.unnamed).toContain("REDACTED");
+  });
   it.each([false, true])("redacts multiline environment values with NUL=%s", nul => {
     const stream = new CodexOutputStream(analyzeOutput("env", nul ? ["-0"] : []));
     const sep = nul ? "\0" : "\n";

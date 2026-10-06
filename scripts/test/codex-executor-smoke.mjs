@@ -77,7 +77,11 @@ try {
   assert.equal(Number(records[0][1]),production?1001:process.getuid());
   assert.ok((await second.rpc("process/terminate",{processId:"long-running"})).error,"cross-session handle must be denied");
   assert.ok((await first.rpc("process/write",{processId:"long-running",chunk:"dG91Y2ggcHduCg=="})).error);
-  assert.equal(first.notifications.filter((event)=>event.method==="process/output").length,0,"raw partial output must be withheld");
+  await waitUntil(() => first.notifications.some(event => event.method === "process/output"), "safe live output");
+  assert.ok(!JSON.stringify(first.notifications).includes(Buffer.from("native-executor-secret").toString("base64")));
+  const liveOutput = first.notifications.filter(event => event.method === "process/output")
+    .map(event => Buffer.from(event.params.chunk,"base64").toString()).join("");
+  assert.ok(!liveOutput.includes("native-executor-secret")); assert.match(liveOutput,/REDACTED/);
   assert.ok((await first.rpc("process/terminate",{processId:"long-running"})).result);
   await waitUntil(() => pids.every((pid)=> {
     const state=spawnSync("ps",["-o","stat=","-p",String(pid)],{encoding:"utf8"}).stdout.trim();
@@ -88,10 +92,12 @@ try {
     .map((event)=>Buffer.from(event.params.chunk,"base64").toString()).join("");
   assert.ok(!output.includes("native-executor-secret"));
   assert.match(output,/native/);
-  assert.ok((await first.rpc("process/start",{...params,processId:"revoked"})).error,"broker failure must reject launch");
+  assert.ok((await first.rpc("process/start",{...params,processId:"revoked"})).result);
+  await waitUntil(() => first.notifications.some(event => event.method === "process/exited" && event.params.processId === "revoked"), "broker refusal");
+  assert.notEqual(first.notifications.find(event => event.method === "process/exited" && event.params.processId === "revoked").params.exitCode,0);
   assert.equal(refreshes,2);
-  assert.ok((await first.rpc("process/read",{processId:"revoked"})).error);
-  console.log(`Native executor smoke passed: UID ${records[0][1]}, process tree cancellation, session isolation, stdin denial, complete-document redaction, broker failure`);
+  assert.equal(readFileSync(pidFile,"utf8").trim().split("\n").length,2,"revoked command did not run");
+  console.log(`Native executor smoke passed: UID ${records[0][1]}, process tree cancellation, session isolation, stdin denial, safe live structural redaction, broker failure`);
 } finally {
   for (const client of clients) client.socket.close();
   await relay.close();

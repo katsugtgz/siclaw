@@ -75,9 +75,9 @@ The first request-policy component is implemented in
 `src/core/brains/codex-executor-policy.ts`, independently of Pi tool/session
 types. It validates command form and whitelist, strips caller environment
 overrides, scopes process continuation, and enforces read/write roots and link
-denials. `codex-executor-output.ts` buffers and sanitizes complete outputs before
-returning them. `codex-executor-relay.ts` pairs these policies with the official
-exec-server protocol. The source-built native probe passes through this relay
+denials. `codex-output-stream.ts` sanitizes bounded security records before
+bytes reach the official exec-server. `codex-executor-relay.ts` forwards native
+process output, sequence, reads and lifecycle without a second retention ledger. The source-built native probe passes through this relay
 with `SICLAW_CODEX_RELAY_PROBE=1` after `npm run build`.
 
 The selected Codex brain now uses these components directly, without a Pi
@@ -89,8 +89,10 @@ commands use a literal read-only argv grammar and authorized paths. Native
 process stop/connection close invoke the existing sandbox session reaper.
 
 Interactive stdin/PTY, reconnect and file streaming remain disabled and fail
-closed. Output is sanitized as a complete document; it is not streamed before
-process completion. Long-running/background task parity still requires work.
+closed. Native long processes, continuation and output budgets remain owned by
+Codex. Safe complete text records flow while a process runs; structural data
+waits for its security boundary. See
+[codex-readonly-infrastructure.md](codex-readonly-infrastructure.md#native-long-processes-and-output).
 
 The pinned native `thread/resume` protocol does not accept `environments`.
 Every `turn/start` must select the authorized environments again. Siclaw also
