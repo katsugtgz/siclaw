@@ -11,6 +11,7 @@ import { getCommandBinary } from "../../tools/infra/command-sets.js";
 import { redactText, buildRedactionConfig } from "../../shared/output-redactor.js";
 import { redactDataDocument } from "../../tools/infra/kubectl-sanitize.js";
 import { kubectlSubcommand, kubectlConnectionOverride } from "../../tools/infra/kubectl-sanitize.js";
+import path from "node:path";
 
 const READONLY_REMOTE_COMMANDS = new Set((
   "cat head tail ls stat file wc find grep egrep fgrep diff md5sum sha256sum sha512sum tree hexdump od strings " +
@@ -118,7 +119,9 @@ function readonlyCommand(command: string, context: "host" | "node" | "pod"): Pre
   // Benchmarks and active state-changing diagnostics are outside this grant,
   // even when the broader SRE whitelist supports them.
   for (const part of extractCommands(command)) {
-    if (/^\s*[a-zA-Z_][a-zA-Z0-9_]*=/.test(part) || !READONLY_REMOTE_COMMANDS.has(getCommandBinary(part))) {
+    const binary = parseArgs(part)[0] ?? "";
+    const trustedBinaryPath = !binary.includes("/") || ["/bin", "/sbin", "/usr/bin", "/usr/sbin"].includes(path.posix.dirname(binary));
+    if (!trustedBinaryPath || /^\s*[a-zA-Z_][a-zA-Z0-9_]*=/.test(part) || !READONLY_REMOTE_COMMANDS.has(getCommandBinary(part))) {
       throw new Error("Command is not authorized by the read-only infrastructure grant");
     }
   }

@@ -49,6 +49,12 @@ describe("native read-only infrastructure grants", () => {
       "ssh bound-host 'PATH=/tmp uname'", "ssh bound-host -- sh -c id"]) expect(() => authorizeInfrastructureCommand(command, target)).toThrow();
     expect(authorizeInfrastructureCommand("ls notes", target)).toBeUndefined();
   });
+  it("does not authorize an arbitrary executable merely because it has a whitelisted basename", () => {
+    for (const command of ["/tmp/cat /etc/os-release", "./uname", "/var/lib/evil/nvidia-smi"]) {
+      expect(() => authorizeInfrastructureCommand(command, host)).toThrow();
+    }
+    expect(authorizeInfrastructureCommand("/usr/bin/uname -a", host)).toMatchObject({ kind: "host" });
+  });
   it("refuses a revoked SSH binding before credential acquisition or execution", async () => {
     const broker = { refreshHosts: vi.fn().mockResolvedValue([]), acquireHost: vi.fn() };
     const target = { ...host, broker } as unknown as CodexInfrastructureTarget;
