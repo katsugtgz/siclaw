@@ -114,6 +114,56 @@ image and cluster evidence below.
 
 ### Actual test-cluster evidence (2026-10-06)
 
+#### Shared-policy rollout and final executor comparison
+
+Source `84cbabef` passes 413 files / 8693 tests, TypeScript, build and the pinned
+official source-built exec-server SSH smoke, including Linux image execution.
+The independent test Runtime now selects
+`codex-whitelist-test-84cbabef`, digest
+`sha256:1f13d64f51fe8d157a25e58178e83a875d92d5de4d9d34a1d08d3ef960428809`.
+The Codex source pin and Runtime binary remain unchanged.
+
+Actual Responses/SiCore/K8sSpawner acceptance on this image persists 14 successful
+native executions and seven policy refusals. Reads include actual node
+`sichek gpu` and `/usr/lpp/mmfs/bin/mmlscluster --noinit`, Pod/SSH `curl` and
+`zgrep`, Pod environment redaction and SSH UID 2001. Both the SSE stream and
+persisted messages exclude the fixture secret. The node has no NVIDIA GPU;
+`sichek` reports the corresponding health check bypass rather than proving GPU
+diagnostic functionality. Refusals include writes, unsafe curl flags, daemon
+startup, an untrusted executable path and Pod pipelines. Removing the SiCore SSH
+binding then denies an actual new native call in the same conversation.
+
+The original Pi executors run as the image's agentbox user against the same
+mTLS/broker/reader and fixtures: six reads succeed and four unsafe calls are
+blocked, with generic stdout already redacted. This is executor-level evidence,
+not a second Pi model conversation. Pi's node call explicitly selects the same
+approved internal diagnostic image; its old default image is not pullable in
+this test environment. The comparison exposed and fixed the generic stdout
+sanitization and prepared-namespace permission gaps in shared services.
+
+Native child, cold continuation and SiCore UI checks on the first shared-policy
+image (`296ca90e`) pass: the owned child has two successful reads and one refusal;
+Pod UID changes while native thread ID stays the same; child output can be
+expanded and reopened after refresh. A separate ordinary UI conversation passes
+Stop HTTP 200, continuation and refresh with no page errors. A later continuation
+in the negative-policy-probe conversation returned provider `content_filter`;
+that refusal is recorded separately from UI/Stop acceptance. The final source
+delta does not change native lifecycle or UI code.
+
+The original Agent bindings and reader Pod get/list/watch Role are restored.
+Temporary node ClusterRole/Binding, SSH Pod/Service/ConfigMap and SiCore
+host/credential are removed; private fixture key/token files are deleted.
+The reader can no longer create Pod exec or Jobs or get the selected node, and
+no diagnostic Job/Pod remains. The independent Runtime, latest AgentBox image
+configuration and existing PVC remain for subsequent acceptance work.
+
+This establishes the scoped infrastructure and lifecycle checks above. Knowledge
+citations, attachments, reports, scheduling and reviewed script execution retain
+their separate business-contract acceptance work; this is not a claim of full
+Pi feature replacement or physical-host/multi-bastion SSH acceptance.
+
+#### Earlier native read-only rollout
+
 Source `473677a5` passes 411 test files / 8089 tests, TypeScript and build. The
 official source-built exec-server with a real SSH protocol fixture verifies
 broker-owned authentication, read-only rejection, removed binding denial and
