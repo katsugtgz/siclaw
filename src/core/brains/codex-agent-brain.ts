@@ -537,8 +537,8 @@ export class CodexAgentBrain implements BrainSession {
       model: this.model?.id, modelProvider: "siclaw_model", config: this.codexConfig(),
       cwd: this.cwd, sandbox: "read-only", approvalPolicy: "never",
       developerInstructions: this.systemPrompt,
-      environments: ["siclaw", ...this.clusterExecutors.keys()].map((environmentId) =>
-        ({ environmentId, cwd: this.cwd, runtimeWorkspaceRoots: [this.cwd] })),
+      // thread/resume has no environments field in the pinned native protocol.
+      ...(!existing ? { environments: this.executionEnvironments() } : {}),
     });
     const thread = result.thread;
     if (!record(thread) || !string(thread.id)) throw new Error("Codex did not return a thread id");
@@ -586,6 +586,11 @@ export class CodexAgentBrain implements BrainSession {
     }
   }
 
+  private executionEnvironments(): JsonObject[] {
+    return ["siclaw", ...this.clusterExecutors.keys()].map((environmentId) =>
+      ({ environmentId, cwd: this.cwd, runtimeWorkspaceRoots: [this.cwd] }));
+  }
+
   private async runTurn(input: JsonObject[], userMessage: JsonObject, internal: boolean): Promise<void> {
     const client = this.client;
     if (!client || !this.threadId) throw new Error("Codex thread is unavailable");
@@ -601,7 +606,8 @@ export class CodexAgentBrain implements BrainSession {
     this.active = active;
     try {
       const response = await client.request("turn/start", { threadId: this.threadId, input,
-        model: this.model?.id, ...(this.reasoningEffort ? { effort: this.reasoningEffort } : {}) });
+        model: this.model?.id, environments: this.executionEnvironments(),
+        ...(this.reasoningEffort ? { effort: this.reasoningEffort } : {}) });
       const turn = response.turn;
       if (record(turn) && string(turn.id)) active.id = string(turn.id);
       void this.flushSteers();

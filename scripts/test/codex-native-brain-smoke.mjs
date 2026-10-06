@@ -66,16 +66,16 @@ const model = createServer(async (request, response) => {
   assert.equal(request.headers.authorization, "Bearer test");
   assert.equal(body.model, "gpt-5.5");
   assert.equal(body.stream, true);
+  const memoryTurn = body.input.filter(x=>x.type==="message"&&x.role==="user").at(-1)
+    ?.content?.some(x=>x.text?.startsWith("## Memory Writing Agent:"));
   const advertised = [...body.tools, ...body.input.filter((entry) => entry.type === "tool_search_output").flatMap((entry) => entry.tools)];
   const toolNames = advertised.flatMap((tool) => [tool.name, ...(tool.tools ?? []).map((entry) => entry.name)]);
   assert.ok(toolNames.includes("update_plan"));
-  assert.ok(toolNames.includes("exec_command"));
+  if (!memoryTurn) assert.ok(toolNames.includes("exec_command"));
 
   assert.ok(!toolNames.includes("spawn_subagent"));
   assert.ok(!toolNames.includes("transfer_to_agent"));
   calls++;
-  const memoryTurn = body.input.filter(x=>x.type==="message"&&x.role==="user").at(-1)
-    ?.content?.some(x=>x.text?.startsWith("## Memory Writing Agent:"));
   const childTurn = body.input.filter((entry) => entry.type === "message" && entry.role === "user")
     .at(-1)?.content?.some((entry) => entry.text?.includes("CHILD_ONLY_NATIVE"));
   if (!memoryTurn) { if (childTurn) childCalls++; else rootCalls++; }
@@ -138,10 +138,31 @@ const model = createServer(async (request, response) => {
     assert.ok(!existsSync(join(workspace, ".siclaw", "user-data", "must-not-exist")));
     item = { id: `deny_path_${calls}`, type: "function_call", name: "exec_command", call_id: "denied-path",
       arguments: JSON.stringify({cmd: `cat ${join(sessionDir, "config", "settings.json")}`, login: false}), status: "completed" };
+  } else if (rootCalls === 11) {
+    item = { id: `resume_deny_${calls}`, type: "function_call", name: "exec_command", call_id: "resume-denied",
+      arguments: '{"cmd":"cat /etc/hosts","login":false}', status: "completed" };
+  } else if (rootCalls === 12) {
+    const output = body.input.find((entry) => entry.type === "function_call_output" && entry.call_id === "resume-denied");
+    assert.ok(/grant|denied|not authorized/i.test(output.output),
+      "resumed default execution must still enforce the native file grant");
+    item = { id: `resume_read_${calls}`, type: "function_call", name: "exec_command", call_id: "resume-read",
+      arguments: '{"cmd":"cat native.txt","login":false}', status: "completed" };
+  } else if (rootCalls === 13) {
+    const output = body.input.find((entry) => entry.type === "function_call_output" && entry.call_id === "resume-read");
+    assert.ok(output.output.includes("native read marker") && !output.output.includes("native-test-secret"),
+      "resumed default execution must sanitize native file output");
+    item = { id: `resume_local_${calls}`, type: "function_call", name: "exec_command", call_id: "resume-local",
+      arguments: '{"cmd":"cat native.txt","login":false,"environment_id":"local"}', status: "completed" };
   } else {
     if (rootCalls === 10) {
       const output = body.input.find((entry) => entry.type === "function_call_output" && entry.call_id === "denied-path");
       assert.match(output.output, /grant|denied|not authorized/i);
+    }
+    if (rootCalls === 14) {
+      const output = body.input.find((entry) => entry.type === "function_call_output" && entry.call_id === "resume-local");
+      assert.ok(!output.output.includes("native-test-secret") &&
+        /environment|grant|denied|not authorized/i.test(output.output),
+        "an explicit local environment must not bypass the native policy relay");
     }
     item = { id: `message_${calls}`, type: "message", role: "assistant", status: "completed",
     content: [{ type: "output_text", text: "hello from codex", annotations: [] }] };

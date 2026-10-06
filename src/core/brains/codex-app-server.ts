@@ -1,8 +1,34 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createInterface } from "node:readline";
+import fs from "node:fs";
+import path from "node:path";
+import { randomUUID } from "node:crypto";
 
 type JsonObject = Record<string, unknown>;
 type Notification = { method: string; params: JsonObject };
+
+const RELAY_ONLY_ENVIRONMENTS = 'include_local = false\ndefault = "none"\nenvironments = []\n';
+
+function ensureRelayOnlyEnvironments(home: string): void {
+  fs.mkdirSync(home, { recursive: true, mode: 0o700 });
+  const target = path.join(home, "environments.toml");
+  let existing: fs.Stats | undefined;
+  try { existing = fs.lstatSync(target); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  if (existing) {
+    if (!existing.isFile() || fs.readFileSync(target, "utf8") !== RELAY_ONLY_ENVIRONMENTS) {
+      throw new Error("Codex environment registry must disable unmanaged local execution");
+    }
+    return;
+  }
+  const temporary = path.join(home, `.environments-${randomUUID()}.tmp`);
+  try {
+    fs.writeFileSync(temporary, RELAY_ONLY_ENVIRONMENTS, { mode: 0o600, flag: "wx" });
+    fs.renameSync(temporary, target);
+  } finally {
+    fs.rmSync(temporary, { force: true });
+  }
+}
 
 /** A private stdio connection to one pinned Codex app-server process. */
 export class CodexAppServer {
@@ -25,6 +51,10 @@ export class CodexAppServer {
 
   async start(): Promise<void> {
     if (this.child) return;
+    // Upstream resume does not restore thread/start's environment selection.
+    // Disable its built-in local executor globally, including internal threads;
+    // only authenticated environments registered by this client can execute.
+    ensureRelayOnlyEnvironments(this.codexHome);
     this.closing = false;
     const child = spawn(this.executable, ["app-server", "--stdio", "--strict-config",
       "-c", "features.shell_tool=true",

@@ -21,7 +21,24 @@ describe("CodexAppServer", () => {
     try {
       const failure = new Promise<Error>((resolve) => client.onFailure(resolve));
       await client.start();
+      expect(fs.readFileSync(path.join(dir, "environments.toml"), "utf8"))
+        .toContain("include_local = false");
       await expect(failure).resolves.toMatchObject({ message: expect.stringContaining("exited (42)") });
+    } finally {
+      await client.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses to launch with an existing unmanaged environment registry", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "siclaw-codex-unmanaged-"));
+    const file = path.join(dir, "environments.toml");
+    const original = 'include_local = true\n';
+    fs.writeFileSync(file, original);
+    const client = new CodexAppServer(dir, {}, "/missing-codex-must-not-be-launched");
+    try {
+      await expect(client.start()).rejects.toThrow("disable unmanaged local execution");
+      expect(fs.readFileSync(file, "utf8")).toBe(original);
     } finally {
       await client.close();
       fs.rmSync(dir, { recursive: true, force: true });
