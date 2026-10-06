@@ -41,9 +41,11 @@ loaded at agent startup and merged into the built-in registry.
    a silent no-op.
 5. **Single merge point.** Extras are stored alongside (never inside) the frozen built-in
    registry; every lookup consults built-in first, then extras. The per-context allowed-set
-   cache is invalidated when extras are (re)registered. All three exec tools
-   (restricted-bash, pod-exec, node-exec) automatically see the same merged view because
-   they all resolve through `validateCommand()` → command-sets.
+   cache is invalidated when extras are (re)registered. Pi's restricted-bash,
+   pod-exec, node-exec and host-exec tools and Codex's native executor automatically
+   see the same merged view because they all resolve through `validateCommand()`
+   → command-sets. An engine adapter must not shadow this registry with a second
+   command-name allow-list.
 6. **All other defense layers unchanged.** Extra commands still run as the `sandbox` OS
    user, still pass shell-operator validation, sensitive-path checks, and output
    sanitization. `category` placement controls context availability via the existing

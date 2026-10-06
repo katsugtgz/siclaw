@@ -1,4 +1,4 @@
-# Codex read-only infrastructure execution
+# Codex controlled infrastructure execution
 
 ## Native boundary
 
@@ -10,9 +10,9 @@ transport infrastructure and remain independent from the agent engine.
 
 - `cluster:<bound name>`: native read-only kubectl API queries.
 - The same environment supports authorized `kubectl -n <ns> exec <pod>
-  [-c <container>] -- <readonly command>` and `kubectl debug node/<node> --
-  <readonly command>` syntax. Namespace/container flag ordering is accepted.
-- `siclaw`: `ssh <bound host name or id> -- <readonly command>`. A shared
+  [-c <container>] -- <approved diagnostic command>` and `kubectl debug node/<node> --
+  <approved diagnostic command>` syntax. Namespace/container flag ordering is accepted.
+- `siclaw`: `ssh <bound host name or id> -- <approved diagnostic command>`. A shared
   transport avoids one native runtime per host. Broker-owned bastions and
   authentication are resolved internally. The model cannot supply SSH options,
   identities, credentials or forwarding.
@@ -23,14 +23,27 @@ Capability booleans come from the current Agent harness. API, node, Pod and SSH
 access are independent grants. Native process requests cannot overwrite broker
 environment, select another kubeconfig/context/identity, provide interactive
 input, choose a diagnostic image or create arbitrary remote filesystem writes.
-Remote commands pass a dedicated read-only command allow-list, shared semantic
-flag validation and sensitive-path checks. Active benchmarks are excluded.
+Remote commands use the same Siclaw command registry, context policy, semantic
+flag validation and sensitive-path checks as Pi. There is no Codex-specific
+command name allow-list. The deployment's additive-only extra-command config
+applies to both engines, including its constraints and built-in collision rules.
+An approved binary still needs to exist on the selected target.
+
+Whitelist compatibility includes existing Pi network probes and controlled
+benchmarks. These operations can consume resources or generate traffic; the
+shared diagnostic policy is not a guarantee that every permitted operation is
+passive. Arbitrary filesystem writes, mutating command flags, Kubernetes API
+mutations and unapproved binaries remain rejected. Pod commands retain Pi's
+single-command restriction; node and SSH commands may use validated pipelines.
+Native transport separately rejects environment/identity overrides, interactive
+input and executable paths outside standard system directories. These execution
+boundary restrictions do not add another command registry.
 
 Each launch refreshes the current bound inventory and acquires current
 credentials. Removed targets fail closed. Pod/node GET authorization selects
 the exact named target before remote execution. Kubernetes RBAC remains
 authoritative; granting Pod exec requires the transport subresource permission,
-even though the executed command is read-only.
+even when the executed diagnostic command only reads state.
 
 ## Transport and isolation
 
@@ -56,7 +69,7 @@ the same SRE capability grants and operational safety. Native environments and
 SSH syntax are supplied as application instructions alongside Codex's own base
 instructions. `src/core/prompt.ts` is unchanged.
 
-Read-only command control does not change the remote account's OS privileges.
+Whitelist command control does not change the remote account's OS privileges.
 Use appropriately scoped SSH accounts and Kubernetes credentials. Unsupported
 native filesystem or interactive contracts must fail closed.
 
@@ -67,6 +80,23 @@ targets, current broker/SiCore bindings, removed-target denial, sensitive output
 redaction and cold child continuation. Separate SSH protocol fixtures from
 actual deployed SSH/Pod/node evidence. Test Kubernetes changes remain in the
 authorized `roce-test` / `sicore-test` environment.
+
+### Shared whitelist compatibility (2026-10-06)
+
+The engine-specific remote command list is removed. Differential checks cover
+all 155 built-in command names across Pod, node and host contexts, representative
+safe and unsafe flags, sensitive paths, output sanitization, pipeline behavior,
+the deployment's actual extra-command config, additive-only collisions and extra
+command removal. Pi execution code is unchanged. The native adapter retains its
+noninteractive transport and executable-path boundaries.
+
+412 test files / 8677 tests, TypeScript and build pass. The pinned source-built
+exec-server plus real SSH protocol fixture admits `curl`, the deployed `sichek`
+extra and `printenv`, refuses mutating flags and removed extras, sanitizes output
+before delivery and rejects a revoked binding. The protocol fixture returns
+fixed output; it does not establish target-side binary availability. This
+whitelist update is source/local verification, separate from the older deployed
+image and cluster evidence below.
 
 ### Actual test-cluster evidence (2026-10-06)
 

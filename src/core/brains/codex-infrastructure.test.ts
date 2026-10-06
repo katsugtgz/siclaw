@@ -33,7 +33,7 @@ describe("native read-only infrastructure grants", () => {
     expect(() => authorizeInfrastructureCommand(command, cluster())).toThrow();
   });
   it.each(["touch /tmp/owned", "rm -rf /", "systemctl restart ssh", "ip link set eth0 down", "nvidia-smi --gpu-reset",
-    "cat /etc/shadow", "env sh -c id", "curl -X POST https://example.test", "ib_write_bw", "tee /tmp/owned",
+    "cat /etc/shadow", "env sh -c id", "curl -X POST https://example.test", "ib_write_bw --output=/tmp/owned", "tee /tmp/owned",
     "dmesg -C", "crictl rm x"])("rejects SSH writes/secrets: %s", command => {
     expect(() => authorizeInfrastructureCommand(command, host)).toThrow();
   });
@@ -54,6 +54,11 @@ describe("native read-only infrastructure grants", () => {
       expect(() => authorizeInfrastructureCommand(command, host)).toThrow();
     }
     expect(authorizeInfrastructureCommand("/usr/bin/uname -a", host)).toMatchObject({ kind: "host" });
+    expect(authorizeInfrastructureCommand("ssh bound-host -- /usr/bin/uname -a", { kind: "ssh", broker: {} as any }))
+      .toMatchObject({ kind: "host" });
+    expect(authorizeInfrastructureCommand("kubectl exec pod-a -- /usr/bin/uname -a", cluster()))
+      .toMatchObject({ kind: "pod" });
+    expect(() => authorizeInfrastructureCommand("kubectl exec pod-a -- /tmp/uname", cluster())).toThrow();
   });
   it("refuses a revoked SSH binding before credential acquisition or execution", async () => {
     const broker = { refreshHosts: vi.fn().mockResolvedValue([]), acquireHost: vi.fn() };

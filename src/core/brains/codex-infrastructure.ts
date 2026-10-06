@@ -13,16 +13,6 @@ import { redactDataDocument } from "../../tools/infra/kubectl-sanitize.js";
 import { kubectlSubcommand, kubectlConnectionOverride } from "../../tools/infra/kubectl-sanitize.js";
 import path from "node:path";
 
-const READONLY_REMOTE_COMMANDS = new Set((
-  "cat head tail ls stat file wc find grep egrep fgrep diff md5sum sha256sum sha512sum tree hexdump od strings " +
-  "sort uniq cut tr column tac nl jq yq " +
-  "ip ifconfig ss netstat route arp ethtool bridge tc conntrack nslookup dig host nstat " +
-  "ibstat ibstatus ibv_devinfo ibv_devices rdma ibaddr iblinkinfo show_gids ibdev2netdev saquery perfquery ibqueryerrors mst mlxlink " +
-  "nvidia-smi gpustat nvtopo dcgmi lspci lsusb lsblk lscpu lsmem lshw dmidecode smartctl nvme sensors " +
-  "uname hostname uptime dmesg sysctl lsmod modinfo getconf ps pgrep top free vmstat iostat mpstat df du mount findmnt nproc pidstat pstree numastat ipcs " +
-  "journalctl systemctl timedatectl hostnamectl crictl ctr iptables ip6tables date whoami id which readlink realpath echo printf pwd test true false sleep"
-).split(" "));
-
 export type CodexInfrastructureTarget =
   | { kind: "ssh"; broker: CredentialBroker }
   | { kind: "host"; name: string; broker: CredentialBroker }
@@ -36,7 +26,7 @@ export type InfrastructureOperation =
 /** Parses native command syntax. Transport/identity options are never supplied
  * by the model. Kubernetes API reads continue through the normal native server. */
 export function authorizeInfrastructureCommand(command: string, target: CodexInfrastructureTarget): InfrastructureOperation | undefined {
-  if (target.kind === "host") return { kind: "host", command, security: readonlyCommand(command, "host") };
+  if (target.kind === "host") return { kind: "host", command, security: authorizeRemoteCommand(command, "host") };
   const args = parseArgs(command);
   if (target.kind === "ssh") {
     if (getCommandBinary(args[0] ?? "") !== "ssh") return;
@@ -47,12 +37,12 @@ export function authorizeInfrastructureCommand(command: string, target: CodexInf
     let inner: string;
     if (remote.length === 1) inner = remote[0];
     else {
-      if (!remote.length || !/^[a-zA-Z0-9_-]+$/.test(remote[0]) || remote.some(arg => /[;|&<>`\n\r]|\$\(/.test(arg))) {
+      if (!remote.length || !validRemoteBinary(remote[0]) || remote.some(arg => /[;|&<>`\n\r]|\$\(/.test(arg))) {
         throw new Error("Invalid noninteractive SSH command");
       }
       inner = [remote[0], ...remote.slice(1).map(shellEscape)].join(" ");
     }
-    return { kind: "host", host, command: inner, security: readonlyCommand(inner, "host") };
+    return { kind: "host", host, command: inner, security: authorizeRemoteCommand(inner, "host") };
   }
   if (getCommandBinary(args[0] ?? "") !== "kubectl") {
     if (!target.allowApi) throw new Error("This environment only authorizes node or Pod diagnostics");
@@ -96,7 +86,7 @@ export function authorizeInfrastructureCommand(command: string, target: CodexInf
   } else {
     if (!remote.length) throw new Error("Missing remote diagnostic command");
     if (remote.some(arg => /[;|&<>`\n\r]|\$\(/.test(arg))) throw new Error("Compound transport commands are not authorized");
-    if (!/^[a-zA-Z0-9_-]+$/.test(remote[0])) throw new Error("Remote command binary must be a whitelisted name");
+    if (!validRemoteBinary(remote[0])) throw new Error("Remote command binary must be a whitelisted name or a system path");
     inner = [remote[0], ...remote.slice(1).map(shellEscape)].join(" ");
   }
   if (verb === "debug") {
@@ -106,26 +96,32 @@ export function authorizeInfrastructureCommand(command: string, target: CodexInf
     const node = selection[0].slice(5);
     const error = validateNodeName(node);
     if (error) throw new Error(error);
-    return { kind: "node", node, command: inner, security: readonlyCommand(inner, "node") };
+    return { kind: "node", node, command: inner, security: authorizeRemoteCommand(inner, "node") };
   }
   if (!target.allowPod || namespaceSeen && (!namespace || !/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(namespace))) throw new Error("Pod namespace is not authorized");
   const pod = selection.shift()?.replace(/^pods?\//, "") ?? "";
   const error = validatePodName(pod);
   if (error) throw new Error(error);
-  return { kind: "pod", namespace, pod, container, command: inner, security: readonlyCommand(inner, "pod") };
+  return { kind: "pod", namespace, pod, container, command: inner, security: authorizeRemoteCommand(inner, "pod") };
 }
 
-function readonlyCommand(command: string, context: "host" | "node" | "pod"): PreExecResult {
-  // Benchmarks and active state-changing diagnostics are outside this grant,
-  // even when the broader SRE whitelist supports them.
+function validRemoteBinary(binary: string): boolean {
+  return /^(?:\/(?:usr\/)?s?bin\/)?[a-zA-Z0-9_][a-zA-Z0-9_.+-]*$/.test(binary);
+}
+
+function authorizeRemoteCommand(command: string, context: "host" | "node" | "pod"): PreExecResult {
+  // Native transport restrictions do not define another command whitelist.
+  // Pi and Codex resolve names, flags, extras and sensitive paths through the
+  // same preExecSecurity/COMMANDS policy below.
   for (const part of extractCommands(command)) {
     const binary = parseArgs(part)[0] ?? "";
     const trustedBinaryPath = !binary.includes("/") || ["/bin", "/sbin", "/usr/bin", "/usr/sbin"].includes(path.posix.dirname(binary));
-    if (!trustedBinaryPath || /^\s*[a-zA-Z_][a-zA-Z0-9_]*=/.test(part) || !READONLY_REMOTE_COMMANDS.has(getCommandBinary(part))) {
-      throw new Error("Command is not authorized by the read-only infrastructure grant");
+    if (!trustedBinaryPath || /^\s*[a-zA-Z_][a-zA-Z0-9_]*=/.test(part)) {
+      throw new Error("Remote executable path or environment override is not authorized");
     }
   }
-  const security = preExecSecurity(command, { context, analyzeTarget: "auto", sensitivePathPatterns: CONTAINER_SENSITIVE_PATHS });
+  const security = preExecSecurity(command, { context, sensitivePathPatterns: CONTAINER_SENSITIVE_PATHS,
+    blockPipeline: context === "pod", analyzeTarget: context === "pod" ? "single" : "last-in-pipeline" });
   if (security.error) throw new Error(security.error);
   return security;
 }
