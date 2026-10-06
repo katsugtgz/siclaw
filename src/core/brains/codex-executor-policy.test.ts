@@ -27,6 +27,12 @@ const start = (cwd: string, command: string, processId = "process-1") => ({
 });
 
 describe("Codex native executor policy", () => {
+  it("refuses shell environment overrides of broker identity before native process execution", () => {
+    const { policy, read } = fixture();
+    for (const cmd of ["KUBECONFIG=/tmp/other kubectl get pods", "PATH=/tmp kubectl get pods", "echo ok; KUBECONFIG=/tmp/x kubectl get pods"]) {
+      expect(() => policy.authorize("process/start", start(read, cmd))).toThrow(/environment overrides/);
+    }
+  });
   it("rejects commands before creating process authority and strips caller environment overrides", () => {
     const { policy, read } = fixture();
     expect(() => policy.authorize("process/start", start(read, "touch must-not-exist"))).toThrow();

@@ -208,6 +208,7 @@ const port = model.address().port;
 const makeBrain = async (sessionManager) => {
   resources = await createSiclawSession({ sessionManager, agentEngine: "codex", agentType: "custom",
     ...(realCluster ? {kubeconfigRef:{credentialBroker:{refreshClusters:async () => [{name:"roce-test"}],
+      acquireCluster:async (name) => {assert.equal(name,"roce-test");},
       ensureCluster:async (name) => {assert.equal(name,"roce-test");brokerRefreshes++;return {path:realCredential};}}}} : {}),
     harnessResolved: true, allowedTools: ["bash", "read", "write", "edit", "task_create", "task_update", "spawn_subagent"],
     sessionEventEmitter: (event) => planEvents.push(event), userId: "native-smoke", agentId: "native-smoke" });

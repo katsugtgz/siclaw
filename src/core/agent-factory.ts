@@ -790,7 +790,7 @@ export async function createSiclawSession(
   const nativeAllowSubagents = useCodex && !opts?.isSubagent &&
     (allowedTools == null || allowedTools.includes("spawn_subagent"));
   const nativeToolManifest = [
-    ...(customTools.some((tool) => ["bash", "read", "grep", "find", "ls"].includes(tool.name))
+    ...(customTools.some((tool) => ["bash", "read", "grep", "find", "ls", "host_exec", "node_exec", "pod_exec"].includes(tool.name))
       ? [{ name: "exec_command" }, { name: "write_stdin" }] : []),
     ...(customTools.some((tool) => ["write", "edit"].includes(tool.name)) ? [{ name: "apply_patch" }] : []),
     ...(nativePlanEnabled ? [{ name: "update_plan" }] : []),
@@ -976,16 +976,34 @@ export async function createSiclawSession(
         allowFileCommands: allowNativeFileRead,
         production: process.env.NODE_ENV === "production", environment: { PATH: process.env.PATH ?? "/usr/bin:/bin" } };
     const environments: Array<{ id: string; grants: typeof nativeGrants }> = [];
-    if (kubeconfigRef.credentialBroker && nativeGrants.allowCommands) {
+    const allowNativePod = customTools.some(tool => tool.name === "pod_exec");
+    const allowNativeNode = customTools.some(tool => tool.name === "node_exec");
+    if (kubeconfigRef.credentialBroker && (nativeGrants.allowCommands || allowNativePod || allowNativeNode)) {
       const clusters = await kubeconfigRef.credentialBroker.refreshClusters();
       const broker = kubeconfigRef.credentialBroker;
       for (const cluster of clusters) {
-        environments.push({ id: `cluster:${cluster.name}`, grants: { ...nativeGrants, resolveKubeconfig: async () => {
+        environments.push({ id: `cluster:${cluster.name}`, grants: { ...nativeGrants,
+          allowCommands: true,
+          infrastructure: { kind: "cluster", name: cluster.name, broker, userId,
+            allowApi: nativeGrants.allowCommands, allowPod: allowNativePod, allowNode: allowNativeNode },
+          resolveKubeconfig: async () => {
+          const current = await broker.refreshClusters();
+          if (!current.some(value => value.name === cluster.name)) throw new Error("Cluster binding is no longer authorized");
+          await broker.acquireCluster(cluster.name, "native-executor", { bypassCache: true });
           const acquired = await broker.ensureCluster(cluster.name, "native-executor");
           if (!acquired.path) throw new Error("Missing native cluster credential");
           return acquired.path;
         } } });
       }
+    }
+    let nativeHostHint = "";
+    if (kubeconfigRef.credentialBroker && customTools.some(tool => tool.name === "host_exec")) {
+      const broker = kubeconfigRef.credentialBroker;
+      const hosts = await broker.refreshHosts();
+      nativeGrants.infrastructure = { kind: "ssh", broker };
+      nativeHostHint = "Use native exec_command in the siclaw environment for SSH: ssh <bound-host-name-or-id> -- <read-only command>. " +
+        "The broker resolves identity, credentials and configured bastions; do not supply SSH options or credentials. " +
+        "Bound SSH host handles (first 50): " + hosts.slice(0, 50).map(host => host.id || host.name).join(", ");
     }
     const nativeMcpServers: Record<string, unknown> = {};
     for (const [name, value] of Object.entries(mcpServers)) {
@@ -1001,9 +1019,13 @@ export async function createSiclawSession(
       sessionManager, systemPrompt: [compiledContext.systemPrompt,
         ...buildAppendSystemPrompt(memoryEnabled ? memoryDir : null, knowledgeDir,
           Boolean(citationSupport), compiledContext.harness.includeOperationalSafety),
-        environments.length ? "Authorized Kubernetes clusters are native execution environments: " +
+        environments.length ? "Authorized read-only infrastructure execution environments: " +
           environments.map((entry) => entry.id).join(", ") +
-          ". Select environment_id in exec_command for cluster queries. Credentials are injected by the executor." : ""].join("\n\n"),
+          ". Select environment_id in native exec_command. cluster: environments support read-only kubectl queries; " +
+          "when authorized, use kubectl -n <namespace> exec <pod> [-c <container>] -- <read-only command> " +
+          "or kubectl debug node/<node> -- <read-only command>. Node helper image/lifecycle are platform-owned. " +
+          "Do not supply credentials, connection overrides, interactive shells or write commands." : "",
+        nativeHostHint].join("\n\n"),
       toolsetsByName, cwd: userDataDir, nativePlanEnabled, grants: nativeGrants, environments, mcpServers: nativeMcpServers, codexHome,
       allowSubagents: nativeAllowSubagents,
       onPlanUpdate: opts?.sessionEventEmitter

@@ -8,6 +8,9 @@ import { createInterface } from "node:readline";
 import { WebSocket, WebSocketServer } from "ws";
 import { CodexExecutorPolicy, type CodexExecutorGrants } from "./codex-executor-policy.js";
 import { CodexExecutorOutput } from "./codex-executor-output.js";
+import { executeInfrastructureOperation, type InfrastructureOperation } from "./codex-infrastructure.js";
+import { fileURLToPath } from "node:url";
+import { shellEscape } from "../../tools/infra/command-sets.js";
 
 type JsonObject = Record<string, any>;
 interface Connection {
@@ -28,6 +31,8 @@ export class CodexExecutorRelay {
   private http?: Server;
   private websocket?: WebSocketServer;
   private address?: string;
+  private readonly tickets = new Map<string, { operation: InfrastructureOperation; connection: Connection; expiresAt: number }>();
+  private readonly infrastructureRuns = new Map<Connection, Set<AbortController>>();
 
   constructor(private readonly options: {
     executable: string;
@@ -45,7 +50,25 @@ export class CodexExecutorRelay {
   async start(): Promise<void> {
     if (this.http) return;
     fs.mkdirSync(this.options.home, { recursive: true, mode: 0o700 });
-    const http = createServer((_request, response) => response.writeHead(403).end());
+    const http = createServer(async (request, response) => {
+      const ticket = request.headers.authorization?.replace(/^Bearer /i, "") ?? "";
+      const entry = this.tickets.get(ticket);
+      if (request.method !== "POST" || request.url !== "/infrastructure" || !entry || entry.expiresAt < Date.now() ||
+          entry.connection.socket.readyState !== WebSocket.OPEN || !this.options.grants.infrastructure) {
+        response.writeHead(403).end(); return;
+      }
+      this.tickets.delete(ticket);
+      const abort = new AbortController();
+      const running = this.infrastructureRuns.get(entry.connection) ?? new Set<AbortController>();
+      this.infrastructureRuns.set(entry.connection, running); running.add(abort);
+      response.once("close", () => { if (!response.writableEnded) abort.abort(); });
+      const deadline = setTimeout(() => abort.abort(), 70_000);
+      try {
+        const result = await executeInfrastructureOperation(this.options.grants.infrastructure, entry.operation, abort.signal);
+        response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(result));
+      } catch { response.writeHead(502).end(); }
+      finally { clearTimeout(deadline); running.delete(abort); }
+    });
     const websocket = new WebSocketServer({ noServer: true, maxPayload: 2 * 1024 * 1024 });
     http.on("upgrade", (request, socket, head) => {
       const supplied = Buffer.from(request.headers.authorization?.replace(/^Bearer /i, "") ?? "");
@@ -107,7 +130,16 @@ export class CodexExecutorRelay {
           return;
         }
         if (message.method === "process/start") {
-          if (this.options.grants.resolveKubeconfig) {
+          if (authorized.infrastructure) {
+            for (const [ticket, entry] of this.tickets) if (entry.expiresAt < Date.now()) this.tickets.delete(ticket);
+            if (this.tickets.size >= 64) throw new Error("Native infrastructure launch capacity exceeded");
+            const ticket = randomBytes(32).toString("hex");
+            this.tickets.set(ticket, { operation: authorized.infrastructure, connection, expiresAt: Date.now() + 15_000 });
+            const helper = fileURLToPath(new URL("./codex-infrastructure-client.js", import.meta.url));
+            const endpoint = this.address!.replace(/^ws:/, "http:").replace(/\/executor$/, "/infrastructure");
+            connection.policy.setTransportCommand(authorized.params,
+              [process.execPath, helper, endpoint, ticket].map(shellEscape).join(" "));
+          } else if (this.options.grants.resolveKubeconfig) {
             try {
               const kubeconfig = await this.options.grants.resolveKubeconfig();
               if (!kubeconfig) throw new Error("Missing cluster credential");
@@ -131,6 +163,9 @@ export class CodexExecutorRelay {
       }
     });
     socket.once("close", () => {
+      for (const [ticket, entry] of this.tickets) if (entry.connection === connection) this.tickets.delete(ticket);
+      for (const abort of this.infrastructureRuns.get(connection) ?? []) abort.abort();
+      this.infrastructureRuns.delete(connection);
       connection.policy.stopAll();
       lines.close();
       child.stdin.end();

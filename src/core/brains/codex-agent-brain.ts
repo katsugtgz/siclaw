@@ -229,7 +229,8 @@ export class CodexAgentBrain implements BrainSession {
   getConversationMessages(): readonly unknown[] { return this.messages; }
   getTools(): BrainToolDefinition[] {
     const tools: BrainToolDefinition[] = [];
-    if (this.native?.grants.allowCommands || this.native?.grants.allowFileCommands) tools.push({ name: "exec_command" }, { name: "write_stdin" });
+    if (this.native?.grants.allowCommands || this.native?.grants.allowFileCommands || this.native?.grants.infrastructure ||
+        this.native?.environments?.some(environment => environment.grants.allowCommands)) tools.push({ name: "exec_command" }, { name: "write_stdin" });
     if (this.native?.grants.writeRoots.length) tools.push({ name: "apply_patch" });
     if (this.native?.allowSubagents) tools.push({ name: "spawn_agent" }, { name: "wait_agent" },
       { name: "send_input" }, { name: "close_agent" });
@@ -564,7 +565,8 @@ export class CodexAgentBrain implements BrainSession {
         ...(record(provider.headers) ? { http_headers: provider.headers } : {}), wire_api: "responses",
       } },
       mcp_servers: this.native?.mcpServers ?? {},
-      features: { shell_tool: Boolean(this.native?.grants?.allowCommands || this.native?.grants?.allowFileCommands || this.native?.grants?.writeRoots.length),
+      features: { shell_tool: Boolean(this.native?.grants?.allowCommands || this.native?.grants?.allowFileCommands || this.native?.grants?.writeRoots.length || this.native?.grants.infrastructure ||
+          this.native?.environments?.some(environment => environment.grants.allowCommands)),
         code_mode_host: true, memories: true, request_permissions_tool: false, send_message_to_user_async: false,
         apps: false, plugins: false, browser_use: false, computer_use: false, image_generation: false,
         multi_agent: this.native?.allowSubagents ?? false,

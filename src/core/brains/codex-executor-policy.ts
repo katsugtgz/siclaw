@@ -8,6 +8,8 @@ import { buildSandboxCommand, reapSandboxSession } from "../../tools/infra/sandb
 import { backgroundPgidFile } from "../../tools/infra/bg-session.js";
 import { randomUUID } from "node:crypto";
 import { authorizeCodexFileCommand } from "./codex-file-command.js";
+import { authorizeInfrastructureCommand, type CodexInfrastructureTarget, type InfrastructureOperation } from "./codex-infrastructure.js";
+import { extractCommands } from "../../tools/infra/command-validator.js";
 
 type JsonObject = Record<string, unknown>;
 
@@ -26,11 +28,13 @@ export interface CodexExecutorGrants {
   resolveKubeconfig?: () => Promise<string>;
   environment?: Readonly<Record<string, string>>;
   production: boolean;
+  infrastructure?: CodexInfrastructureTarget;
 }
 
 export interface AuthorizedCodexRequest {
   params: JsonObject;
   command?: { text: string; security: PreExecResult };
+  infrastructure?: InfrastructureOperation;
 }
 
 /** Authorizes the upstream exec-server RPC contract, independently of Pi tools.
@@ -49,6 +53,7 @@ export class CodexExecutorPolicy {
   private readonly allowCommands: boolean;
   private readonly allowFileCommands: boolean;
   private readonly production: boolean;
+  private readonly infrastructure?: CodexInfrastructureTarget;
 
   constructor(grants: CodexExecutorGrants) {
     this.readRoots = grants.readRoots.map(canonicalPath);
@@ -62,12 +67,14 @@ export class CodexExecutorPolicy {
     this.allowCommands = grants.allowCommands;
     this.allowFileCommands = grants.allowFileCommands ?? grants.allowCommands;
     this.production = grants.production;
+    this.infrastructure = grants.infrastructure;
     this.environment = { ...sanitizeEnv({ ...grants.environment }),
       KUBECONFIG: grants.kubeconfigPath ?? "/dev/null" };
   }
 
   authorize(method: string, input: unknown): AuthorizedCodexRequest {
     if (!isObject(input)) throw new Error("Invalid native executor request");
+    if (this.infrastructure?.kind === "host" && method.startsWith("fs/")) throw new Error("SSH environment filesystem RPCs are not authorized");
     const params = { ...input };
     switch (method) {
       case "initialize":
@@ -146,8 +153,12 @@ export class CodexExecutorPolicy {
       throw new Error("Interactive native execution is not authorized");
     }
     if (params.arg0) throw new Error("Native argv0 override is not authorized");
+    // A shell assignment could otherwise override the broker's immutable
+    // KUBECONFIG/PATH even though the RPC environment is sanitized.
+    if (extractCommands(argv[2]).some(command => /^\s*[a-zA-Z_][a-zA-Z0-9_]*=/.test(command))) throw new Error("Native shell environment overrides are not authorized");
     params.cwd = this.authorizePath(params.cwd, false, true);
-    const fileCommand = authorizeCodexFileCommand(argv[2], fileURLToPath(String(params.cwd)), (uri, directory) => {
+    const infrastructure = this.infrastructure ? authorizeInfrastructureCommand(argv[2], this.infrastructure) : undefined;
+    const fileCommand = infrastructure ? undefined : authorizeCodexFileCommand(argv[2], fileURLToPath(String(params.cwd)), (uri, directory) => {
       const authorized = this.authorizePath(uri, false);
       if (directory && this.deniedRoots.some((root) => within(root, fileURLToPath(authorized)))) {
         throw new Error("Native directory search overlaps a denied path");
@@ -155,8 +166,8 @@ export class CodexExecutorPolicy {
       return authorized;
     });
     const command = fileCommand ?? argv[2];
-    if (fileCommand ? !this.allowFileCommands : !this.allowCommands) throw new Error("Native commands are not authorized");
-    const security: PreExecResult = fileCommand ? { error: null, action: null, hasSensitiveKubectl: true }
+    if (!infrastructure && (fileCommand ? !this.allowFileCommands : !this.allowCommands)) throw new Error("Native commands are not authorized");
+    const security: PreExecResult = infrastructure ? infrastructure.security : fileCommand ? { error: null, action: null, hasSensitiveKubectl: true }
       : preExecSecurity(command, { context: "local", extraAllowed: new Set(["kubectl"]),
       pipelineValidators: [validateKubectlInPipeline], analyzeTarget: "auto" });
     if (security.error) throw new Error(security.error);
@@ -176,7 +187,15 @@ export class CodexExecutorPolicy {
     // it must not silently remove sandbox intent or elevate capabilities.
     this.processes.add(id);
     if (pgidFile) this.sandboxSessions.set(id, pgidFile);
-    return { params, command: { text: command, security } };
+    return { params, command: { text: command, security }, infrastructure };
+  }
+
+  /** Trusted transport rewrite after native command authorization. Reuses the
+   * same sandbox identity and process-group cleanup as ordinary native exec. */
+  setTransportCommand(params: JsonObject, command: string): void {
+    this.assertProcess(params.processId);
+    const pgidFile = this.sandboxSessions.get(String(params.processId));
+    params.argv = ["/bin/bash", "-c", this.production ? buildSandboxCommand(command, { timeoutS: 70, pgidFile }) : command];
   }
 
   private assertProcess(id: unknown): void {
