@@ -339,8 +339,10 @@ not established by the component/namespace results.
   acceptance below pass. Remaining business contracts still need acceptance.
   No Portal UI acceptance is attempted.
 - Native product services: knowledge labels/citations, enabled investigation
-  workflow state, reports, schedules, host/node/pod
-  diagnostic bindings and script execution. The removed Pi tools are not claimed
+  workflow state, reports, schedules and script execution. Read-only cluster,
+  node, Pod and SSH native command bindings are implemented and tested in
+  [Native read-only infrastructure](codex-readonly-infrastructure.md). Other
+  infrastructure contracts remain outside that acceptance. The removed Pi tools are not claimed
   as implementations of these services.
 - Siclaw memory search, generation and publication are not migration targets.
   Native notes/read and history resume have source-built checks. Automatic native
