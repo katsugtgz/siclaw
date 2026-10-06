@@ -146,3 +146,36 @@ artifact tests, and `scripts/test/codex-mcp-security-smoke.mjs`. The smoke uses 
 pinned source-built Codex, records actual Responses request bodies, tests parent
 and native child calls plus resume, and checks that upstream write execution is
 zero. Test credentials and raw private logs must not be included in reports.
+
+### Accepted on 2026-10-06
+
+- Source implementation: `9d76db98b38a458d2b674e6ae6ad81018e897d6c`.
+  Official source-built Codex remains pinned to `d4684bba`; no additional
+  upstream patch or production dependency was introduced.
+- Full regression: **418 files / 8731 tests**; TypeScript check and build pass.
+  Linux production-image tests cover native MCP parent/child/resume model
+  request bodies, native session/plan/command/file/Stop behavior, and selected
+  local/SSH/Pod Skill scripts with immutable grants and process-tree Stop.
+- Deployed only through the independent `siclaw-native-validation-runtime`
+  in `roce-test` / `sicore-test`. AgentBox image is
+  `registry-cn-shanghai.siflow.cn/k8s/siclaw-agentbox:codex-security-9d76db98`,
+  digest `sha256:84c812b35584a6a9d75bbd8aa845283a0726c638b188fe9a3fc915118c6c8a6b`.
+- Real SiCore Responses acceptance session:
+  `0ec98301-2f8d-41af-aba1-267a83115eda`; native child:
+  `f18145bf-1be3-477f-8793-08c575908035`.
+  MCP normal/error results, bound-cluster Pod queries and existing script help
+  work. MCP sensitive-path arguments, Kubernetes deletion, private config
+  reads and sensitive script operands are rejected. An additional disallowed
+  `sed` attempt was also rejected before the model used an allowed file read.
+- Upstream fixture counter: **3 read calls, 0 write calls** (parent normal,
+  parent error and child normal). The sensitive MCP request never reaches its
+  upstream handler. Parent SSE and persisted parent/child messages contain no
+  fixture credential. Reserved policy env values are not forwarded upstream.
+- Original test Agent resource bindings are restored. Temporary MCP registration
+  and counter are removed. Reader permissions remain namespace Pod get/list/watch;
+  no node, Pod-exec or diagnostic-Job permission was added for this acceptance.
+  The independent Runtime keeps the verified AgentBox image for follow-up work.
+
+The live SiCore run verifies real routing, brokering, events and persistence.
+Exact model-request-body checks use the deterministic source-built Codex smoke;
+the live external provider's encrypted HTTP traffic is not captured.
