@@ -332,6 +332,18 @@ export function redactDocument(text: string): { text: string; redacted: boolean 
 export function createDocumentLineRedactor(environmentRecords = false): (line: string) => string {
   let pem = false, block: number | null = null, mapping: number | null = null;
   let sensitiveEnvironment = false, podEnvironmentIndent: number | null = null;
+  let quote: string | null = null, continuation = false;
+  const continued = (value: string) => ((/\\+$/.exec(value.trimEnd())?.[0].length ?? 0) % 2) === 1;
+  const closesQuote = (value: string, delimiter: string) => {
+    const end = value.trimEnd().replace(/,$/, "");
+    return end.endsWith(delimiter) && !continued(end.slice(0, -1));
+  };
+  const protectScalar = (line: string, split: SplitLine) => {
+    block = split.indent;
+    const raw = line.slice(split.prefix.length).trim();
+    if ((raw[0] === '"' || raw[0] === "'") && !closesQuote(raw.slice(1), raw[0])) quote = raw[0];
+    continuation = continued(raw);
+  };
   return line => {
     const split = splitKeyValue(line);
     if (environmentRecords) {
@@ -340,6 +352,8 @@ export function createDocumentLineRedactor(environmentRecords = false): (line: s
       } else if (sensitiveEnvironment) return "";
     }
     if (pem) { if (PEM_END_RE.test(line)) pem = false; return ""; }
+    if (quote) { if (closesQuote(line, quote)) quote = null; return ""; }
+    if (continuation) { continuation = continued(line); return ""; }
     if (block !== null) { if (ownedByBlock(line, block)) return ""; block = null; }
     if (mapping !== null) {
       if (!ownedByBlock(line, mapping)) mapping = null;
@@ -349,7 +363,7 @@ export function createDocumentLineRedactor(environmentRecords = false): (line: s
     if (podEnvironmentIndent !== null) {
       if (split && split.indent === podEnvironmentIndent && split.key === "value") {
         podEnvironmentIndent = null;
-        if (BLOCK_SCALAR_RE.test(split.value)) block = split.indent;
+        protectScalar(line, split);
         return `${split.prefix}${REDACTED}`;
       }
       if (line.trim() && (!split || split.indent < podEnvironmentIndent || split.key === "name")) podEnvironmentIndent = null;
@@ -362,6 +376,7 @@ export function createDocumentLineRedactor(environmentRecords = false): (line: s
     if (split && (isSensitiveKeyName(split.key) || looksLikeSensitiveValue(split.value))) {
       if (BLOCK_SCALAR_RE.test(split.value)) { block = split.indent; return `${split.prefix}${REDACTED}`; }
       if (!split.value) { mapping = split.indent; return line; }
+      protectScalar(line, split);
     }
     return redactOneLine(line) ?? line;
   };

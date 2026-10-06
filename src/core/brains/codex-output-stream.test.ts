@@ -44,6 +44,14 @@ describe("native output security framing", () => {
     const safe = stream.push(bytes("  - name: API_TOKEN\n")) + stream.push(bytes("    value: unknown-secret\n  - name: SAFE\n    value: yes\n")) + stream.finish();
     expect(safe).not.toContain("unknown-secret"); expect(safe).toContain("value: yes");
   });
+  it("protects quoted, folded and backslash-continued credential values", () => {
+    const stream = new CodexOutputStream();
+    let safe = stream.push(bytes('password: "hidden-one\n'));
+    safe += stream.push(bytes('hidden-two"\nsafe: yes\napi_token: hidden-three\n  hidden-four\nvisible: yes\npassword=hidden-five\\\n'));
+    safe += stream.push(bytes('hidden-six\nlast: yes\n  - name: API_TOKEN\n    value: "hidden-seven\n'));
+    safe += stream.push(bytes('hidden-eight"\n  - name: SAFE\n    value: yes\n')) + stream.finish();
+    expect(safe).not.toContain('hidden-'); expect(safe).toContain('safe: yes'); expect(safe).toContain('last: yes'); expect(safe).toContain('value: yes');
+  });
   it("waits for JSON structure even when the Secret kind comes after its data", () => {
     const stream = new CodexOutputStream();
     expect(stream.push(bytes('{"data":{"arbitrary":"private-base64"},'))).toBe("");
