@@ -152,7 +152,12 @@ export async function ensureDebugNamespace(
   namespace: string,
   env: ExecEnv,
   timeoutMs = 10_000,
+  requireExisting = false,
 ): Promise<void> {
+  if (requireExisting) {
+    await spawnAsync("kubectl", [...env.kubeconfigArgs, "get", "namespace", namespace, "-o", "name"], timeoutMs, env.childEnv);
+    return;
+  }
   try {
     await spawnAsync(
       "kubectl",
@@ -575,6 +580,8 @@ export const debugPodCache = new DebugPodCache();
 export interface DebugPodSpec {
   /** Trusted infrastructure overrides; never exposed in tool arguments. */
   namespace?: string;
+  /** Trusted read-only integrations may use only a pre-provisioned namespace. */
+  requireExistingNamespace?: boolean;
   activeDeadlineSeconds?: number;
   expiresAtMs?: number;
   confirmCleanup?: boolean;
@@ -674,7 +681,7 @@ export async function ensureDebugPodReady(
       );
 
       try {
-        await ensureDebugNamespace(debugNamespace, env);
+        await ensureDebugNamespace(debugNamespace, env, 10_000, spec.requireExistingNamespace === true);
 
         opts.signal?.throwIfAborted();
         if (spec.expiresAtMs !== undefined && spec.expiresAtMs <= Date.now()) throw new Error("Diagnostic deadline expired");
@@ -989,7 +996,7 @@ export async function runInDebugPod(
   } catch (err: any) {
     return {
       stdout: err.stdout?.trim() ?? "",
-      stderr: err.stderr?.trim() ?? err.message ?? String(err),
+      stderr: err.stderr?.trim() || err.message || String(err),
       exitCode: typeof err.code === "number" ? err.code : null,
     };
   }

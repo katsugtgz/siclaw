@@ -172,6 +172,7 @@ export async function executeInfrastructureOperation(target: CodexInfrastructure
       result = await runInDebugPod({ nodeName: operation.node, userId: target.userId,
         clusterKey: `${target.name}:${acquired.path}`, image: acquired.meta.debug_image || config.debugImage,
         namespace: config.debugNamespace,
+        requireExistingNamespace: true,
         command: ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--", ...bounded] },
       env, { timeoutMs: 65_000, signal });
     }
