@@ -768,7 +768,7 @@ export async function createSiclawSession(
   const nativePlanEnabled = useCodex && ["task_create", "task_update"].every((name) =>
     customTools.some((tool) => tool.name === name));
   if (useCodex) compiledContext = compileAgentContext({ ...contextInput,
-    nativePlanning: true, nativeSubagents: true, handoffAvailable: false });
+    nativePlanning: true, nativeSubagents: true, nativeInfrastructure: true, handoffAvailable: false });
 
   for (let i = 0; i < customTools.length; i++) {
     const tool = customTools[i];

@@ -7,6 +7,15 @@ import {
 } from "./agent-context.js";
 
 describe("resolveAgentHarness", () => {
+  it("uses native infrastructure guidance without changing SRE execution grants or safety", () => {
+    const input = { agentType: "sre", allowedTools: null, harnessResolved: true, memoryConfigured: false };
+    const pi = resolveAgentHarness(input);
+    const native = resolveAgentHarness({ ...input, nativeInfrastructure: true });
+    expect(pi.includeInfrastructureGuidance).toBe(true);
+    expect(native.includeInfrastructureGuidance).toBe(false);
+    expect(native.allowedTools).toEqual(pi.allowedTools);
+    expect(native.includeOperationalSafety).toBe(true);
+  });
   it.each(["sre", "knowledge_qa"])("fails closed for %s when type/capability resolution did not complete", agentType => {
     const harness = resolveAgentHarness({
       agentType,

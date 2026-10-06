@@ -50,6 +50,8 @@ export interface CompileAgentContextInput {
   nativePlanning?: boolean;
   /** Codex owns its child-agent schema and instructions. */
   nativeSubagents?: boolean;
+  /** Hosting application supplies native environment guidance, not Pi tool names. */
+  nativeInfrastructure?: boolean;
   interactiveProgress?: boolean;
   /** A conversation owner has a control emitter and an authorized handoff roster. */
   handoffAvailable?: boolean;
@@ -184,6 +186,7 @@ export function resolveAgentHarness(
       (input.mode === undefined || input.mode === "web" || input.mode === "channel") &&
       hasAnyTool(allowedTools, ["spawn_subagent"]),
     includeInfrastructureGuidance:
+      !input.nativeInfrastructure &&
       resolution === "resolved" &&
       (agentType === "sre" || agentType === "custom") &&
       hasAnyTool(allowedTools, ["cluster_list", "host_list"]),
