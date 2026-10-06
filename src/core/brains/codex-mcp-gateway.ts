@@ -63,7 +63,7 @@ export class CodexMcpGateway {
         const cursors = new Set<string>();
         let cursor: string | undefined;
         let bytes = 0;
-        for (let page = 0; page < 32; page++) {
+        for (let page = 0; client.getServerCapabilities()?.tools && page < 32; page++) {
           const result = await client.listTools(cursor ? { cursor } : undefined, { signal });
           bytes += Buffer.byteLength(JSON.stringify(result));
           if (bytes > 4 * 1024 * 1024 || names.size + result.tools.length > 1000) throw new Error("MCP discovery budget exceeded");
