@@ -153,6 +153,11 @@ No test account secrets belong in source, image layers or recorded evidence.
 
 ### Native memory update (2026-10-06)
 
+- Runtime source commit `d74db318`; typecheck/build and **407 files / 8047 tests**
+  pass. No additional upstream Codex source patch was needed.
+- Linux test image
+  `registry-cn-shanghai.siflow.cn/k8s/siclaw-agentbox:codex-memory-d74db318`,
+  digest `sha256:5a4bb343f4bbbb0b92e39ef2d930118d4cc82ad86358c81f514a235f81970821`.
 - The real factory uses official `memories` tools for notes and reads, even
   with `SICLAW_MEMORY_ENABLED=true`; no legacy indexer, profile prompt or
   auto-save is initialized for Codex.
@@ -162,6 +167,10 @@ No test account secrets belong in source, image layers or recorded evidence.
 - Fake Responses fixtures distinguish native memory-consolidation sessions
   from user turns. The upstream generation pipeline and prompts are retained;
   summary quality still needs real-provider acceptance.
+- Container memory, full native conversation and Code Mode/V2 child checks pass.
+  `siclaw-native-memory-20261006` completed in `roce-test/sicore-test` under the
+  normal AgentBox filesystem/capability/seccomp restrictions. Its resources
+  were removed after saving logs.
 
 - Runtime source at `755cfd84`; subsequent commits update validation scripts.
   Codex source remains pinned to GitLab main `d4684bba63aba4c941d5a251054609e722b64779`.
