@@ -1,3 +1,4 @@
+import { argumentPathSecurityError } from "../infra/argument-path-security.js";
 import { BACKGROUND_EXEC_DESCRIPTION } from "../cmd-exec/background-launch.js";
 import type { ToolEntry, BackgroundExecWiring } from "../../core/tool-registry.js";
 import { Type } from "@sinclair/typebox";
@@ -113,6 +114,11 @@ Examples (pass the id from host_list; names shown here for readability):
     }),
     async execute(toolCallId, rawParams, signal) {
       const params = rawParams as HostScriptParams;
+      const privateDirectory = kubeconfigRef?.credentialBroker?.getPrivateDirectory?.();
+      const argumentError = argumentPathSecurityError(parseArgs(params.args ?? ""), {
+        privateRoots: privateDirectory ? [privateDirectory] : [],
+      });
+      if (argumentError) return { content: [{ type: "text" as const, text: argumentError }], details: { error: true } };
 
       const hostErr = validateNodeName(params.host);
       if (hostErr) {

@@ -414,7 +414,7 @@ export class McpClientManager {
   private disposed = false;
 
   constructor(config: McpServersConfig, private readonly sensitiveValues: SensitiveValueSource = () => [],
-    private readonly options: { discoveryOnly?: boolean } = {}) {
+    private readonly options: { discoveryOnly?: boolean; privateRoots?: () => readonly string[] } = {}) {
     this.config = config;
   }
 
@@ -460,7 +460,7 @@ export class McpClientManager {
           { name: `siclaw-mcp-${serverName}`, version: "1.0.0" },
         );
         const policy = resolveMcpReadOnlyPolicy({ ...cfg, transport: detectedTransport });
-        const security = new McpModelSecurity(() => [...mcpSensitiveValues(this.config.mcpServers), ...this.sensitiveValues()]);
+        const security = new McpModelSecurity(() => [...mcpSensitiveValues(this.config.mcpServers), ...this.sensitiveValues()], this.options.privateRoots);
         if (!this.options.discoveryOnly && !policy.tools.size && !policy.resources.size && !policy.prompts.size) {
           recordFailure({ kind: "invalid_config", message: "No explicit MCP read-only policy; connection denied" });
           continue;
@@ -711,6 +711,7 @@ export function createMcpToolDefinition(
     execute: async (_toolCallId, args, signal) => {
       try {
         signal?.throwIfAborted();
+        if (!trustedOptions?.allowImages) security.arguments(args ?? {});
         const rawResult = await client.callTool(
           {
             name: mcpTool.name,

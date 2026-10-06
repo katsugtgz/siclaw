@@ -102,7 +102,7 @@ export function globToPathRegExp(glob: string): RegExp | null {
  * `cat /etc/*release*`, which names no secret and is an ordinary diagnostic — hence the compile-and-test
  * approach rather than a prefix rule.
  */
-function globReachesSensitivePath(arg: string, examples: readonly string[]): string | null {
+export function globReachesSensitivePath(arg: string, examples: readonly string[]): string | null {
   if (!GLOB_METACHARS.test(arg)) return null;
   const rx = globToPathRegExp(arg);
   if (!rx) return null;

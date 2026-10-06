@@ -686,6 +686,8 @@ export async function createSiclawSession(
     enabled: opts?.agentEngine !== "codex" && exposeConfiguredMcp, allowedTools,
     mcpServers,
     sensitiveValues,
+    privateRoots: () => [path.dirname(getConfigPath()), ...(kubeconfigRef.credentialBroker?.getPrivateDirectory?.()
+      ? [kubeconfigRef.credentialBroker.getPrivateDirectory()] : [])],
     mcpManager: opts?.mcpManager, mcpTools: opts?.mcpTools,
   });
   const secureTool = (original: ToolDefinition): ToolDefinition => ({ ...original, execute: async (...args) => {
@@ -735,6 +737,7 @@ export async function createSiclawSession(
   ];
   const writeAllowedDirs = [userDataDir];
   const blockedFileDirs = [
+    ...(kubeconfigRef.credentialBroker?.getPrivateDirectory?.() ? [{ dir: kubeconfigRef.credentialBroker.getPrivateDirectory(), reason: "private broker credentials" }] : []),
     ...[path.dirname(getConfigPath()), path.resolve(cwd, config.paths.credentialsDir),
       path.resolve(cwd, ".siclaw", "config"), sessionManager.getSessionDir(), path.join(userDataDir, "agent", "codex")]
       .map(dir => ({ dir, reason: "private credentials, configuration or agent state" })),
@@ -1034,6 +1037,7 @@ export async function createSiclawSession(
         allowFileCommands: allowNativeFileRead,
         production: process.env.NODE_ENV === "production", environment: { PATH: process.env.PATH ?? "/usr/bin:/bin" },
         skillScripts: nativeScriptGrants, redactOutput: redactModelOutput };
+    nativeScriptGrants.privateRoots = nativeGrants.deniedRoots;
     const environments: Array<{ id: string; grants: typeof nativeGrants }> = [];
     const allowNativePod = customTools.some(tool => tool.name === "pod_exec");
     const allowNativeNode = customTools.some(tool => tool.name === "node_exec");

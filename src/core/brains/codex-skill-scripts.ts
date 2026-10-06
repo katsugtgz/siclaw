@@ -4,6 +4,7 @@ import os from "node:os";
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import { parseArgs } from "../../tools/infra/command-sets.js";
+import { argumentPathSecurityError } from "../../tools/infra/argument-path-security.js";
 import { extractCommands, validateShellOperators } from "../../tools/infra/command-validator.js";
 import type { SkillScriptResolver } from "../../tools/infra/script-resolver.js";
 import { sanitizeEnv } from "../../tools/infra/sanitize-env.js";
@@ -18,6 +19,7 @@ export interface NativeSkillScriptGrants {
   resolver: SkillScriptResolver;
   assets: readonly ScriptAsset[];
   allowed: Readonly<Record<ScriptContext, boolean>>;
+  privateRoots?: readonly string[];
 }
 export interface AuthorizedSkillScript extends ScriptAsset {
   args: string[]; timeoutSeconds: number;
@@ -97,6 +99,8 @@ export function authorizeSkillScriptCommand(command: string, cwd: string, contex
   if (asset.interpreter === "python3" ? !["python3", "/usr/bin/python3"].includes(interpreter)
     : !["bash", "sh", "/bin/bash", "/bin/sh"].includes(interpreter)) throw new Error("Skill script interpreter does not match its asset type");
   const authorized = { ...asset, args: args.slice(offset + 2), timeoutSeconds };
+  const argumentError = argumentPathSecurityError(authorized.args, { cwd, privateRoots: grants.privateRoots });
+  if (argumentError) throw new Error(argumentError);
   revalidateSkillScript(authorized, grants);
   return authorized;
 }

@@ -11,6 +11,7 @@ export async function resolveSessionMcpTools(options: {
   mcpManager?: McpClientManager;
   mcpTools?: ToolDefinition[];
   sensitiveValues?: SensitiveValueSource;
+  privateRoots?: () => readonly string[];
 }): Promise<{ mcpManager?: McpClientManager; mcpTools: ToolDefinition[] }> {
   const { allowedTools, mcpServers } = options;
   if (options.enabled === false || (allowedTools?.length && allowedTools.every(name => name === "run_script"))) {
@@ -29,7 +30,7 @@ export async function resolveSessionMcpTools(options: {
   if (options.mcpManager) return { mcpManager: options.mcpManager,
     mcpTools: filter(options.mcpTools ?? options.mcpManager.getTools()) };
   if (!mcpServers || !Object.keys(mcpServers).length) return { mcpTools: [] };
-  const mcpManager = new McpClientManager({ mcpServers } as McpServersConfig, options.sensitiveValues);
+  const mcpManager = new McpClientManager({ mcpServers } as McpServersConfig, options.sensitiveValues, { privateRoots: options.privateRoots });
   try {
     await mcpManager.initialize();
     return { mcpManager, mcpTools: filter(mcpManager.getTools()) };

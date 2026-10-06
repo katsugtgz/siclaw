@@ -166,7 +166,7 @@ export class CodexAgentBrain implements BrainSession {
       ...mcpSensitiveValues(native.mcpServers ?? {}), ...(native.sensitiveValues?.() ?? []),
       ...[...this.providers.values()].flatMap(provider => [string(provider.apiKey),
         ...(record(provider.headers) ? Object.values(provider.headers).filter((value): value is string => typeof value === "string") : [])]),
-    ]);
+    ], () => native.grants.deniedRoots);
     const redact = createModelOutputRedactor(() => [
       ...mcpSensitiveValues(native.mcpServers ?? {}), ...(native.sensitiveValues?.() ?? []),
       ...[...this.providers.values()].flatMap(provider => [string(provider.apiKey),

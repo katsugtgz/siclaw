@@ -73,7 +73,8 @@ export class CodexExecutorPolicy {
     this.allowFileCommands = grants.allowFileCommands ?? grants.allowCommands;
     this.production = grants.production;
     this.infrastructure = grants.infrastructure;
-    this.skillScripts = grants.skillScripts;
+    this.skillScripts = grants.skillScripts ? { ...grants.skillScripts,
+      privateRoots: [...new Set([...grants.deniedRoots, ...(grants.skillScripts.privateRoots ?? [])])] } : undefined;
     this.environment = { ...sanitizeEnv({ ...grants.environment }),
       KUBECONFIG: grants.kubeconfigPath ?? "/dev/null" };
   }

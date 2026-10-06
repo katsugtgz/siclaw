@@ -1,3 +1,4 @@
+import { argumentPathSecurityError } from "../infra/argument-path-security.js";
 import { BACKGROUND_EXEC_DESCRIPTION } from "../cmd-exec/background-launch.js";
 import type { ToolEntry, BackgroundExecWiring } from "../../core/tool-registry.js";
 import { Type } from "@sinclair/typebox";
@@ -134,6 +135,11 @@ Examples:
     }),
     async execute(toolCallId, rawParams, signal) {
       const params = rawParams as NodeScriptParams;
+      const privateDirectory = kubeconfigRef?.credentialBroker?.getPrivateDirectory?.();
+      const argumentError = argumentPathSecurityError(parseArgs(params.args ?? ""), {
+        privateRoots: privateDirectory ? [privateDirectory] : [],
+      });
+      if (argumentError) return { content: [{ type: "text" as const, text: argumentError }], details: { error: true } };
 
       try {
         await ensureClusterForTool(kubeconfigRef?.credentialBroker, params.cluster, "node_script");

@@ -95,4 +95,14 @@ describe("native Skill assets at the execution boundary", () => {
     expect(() => policy.authorize("process/start", start("bash -c id", "inline"))).toThrow();
     expect(() => policy.authorize("process/write", { processId: "script", chunk: "ZXZpbA==" })).toThrow(/input/);
   });
+  it("applies native executor private roots to reviewed script operands before launch", () => {
+    const { file, grants, cwd } = fixture();
+    const privateRoot = path.join(cwd, "private");fs.mkdirSync(privateRoot);
+    const policy = new CodexExecutorPolicy({ readRoots: [], executionRoots: [cwd], writeRoots: [], deniedRoots: [privateRoot],
+      allowCommands: false, production: false, skillScripts: grants });
+    for (const operand of [path.join(privateRoot, "password"), "/etc/shadow", "%2Fetc%2Fshadow"]) {
+      expect(() => policy.authorize("process/start", { processId: "denied", argv: ["/bin/bash", "-c", `bash ${file} --file ${operand}`],
+        cwd: pathToFileURL(cwd).href })).toThrow(/not authorized/);
+    }
+  });
 });

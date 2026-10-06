@@ -348,6 +348,7 @@ class ResourceRegistry<TMeta extends { name: string }> {
 // ---------------------------------------------------------------------------
 
 export class CredentialBroker {
+  private readonly directory: string;
   // Keep rotated/revoked values until this owner is disposed: older tool
   // artifacts and upstream error messages can still echo those credentials.
   private readonly sensitiveValues = new Set<string>();
@@ -373,6 +374,7 @@ export class CredentialBroker {
     credentialsDir?: string,
   ) {
     const dir = credentialsDir || path.resolve(process.cwd(), ".siclaw/credentials");
+    this.directory = path.resolve(dir);
     fs.mkdirSync(dir, { recursive: true });
     if (fs.lstatSync(dir).isSymbolicLink()) throw new Error("Credential cache root is an unsafe path");
     this.clusters = new ResourceRegistry<ClusterMeta>("clusters", dir, {
@@ -726,6 +728,8 @@ export class CredentialBroker {
 
   /** Private backend redaction source, never a tool response or sync payload. */
   getSensitiveValues(): readonly string[] { return [...this.sensitiveValues]; }
+  /** Backend policy metadata only; never expose this through a model tool. */
+  getPrivateDirectory(): string { return this.directory; }
 
   private rememberSensitiveValues(response: CredentialResponse): void {
     const files = [...response.credential.files, ...(response.credential.jump_chain ?? []).flatMap(hop => hop.files)];

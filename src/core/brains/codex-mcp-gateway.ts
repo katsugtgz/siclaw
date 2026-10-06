@@ -33,7 +33,8 @@ export class CodexMcpGateway {
   private address?: string;
   private closed = false;
 
-  constructor(private readonly configs: Record<string, McpServerConfig>, private readonly secrets: SensitiveValueSource = () => []) {}
+  constructor(private readonly configs: Record<string, McpServerConfig>, private readonly secrets: SensitiveValueSource = () => [],
+    private readonly privateRoots: () => readonly string[] = () => []) {}
 
   async start(): Promise<Record<string, unknown>> {
     if (!Object.keys(this.configs).length) return {};
@@ -43,7 +44,7 @@ export class CodexMcpGateway {
         // No authorized operation means no connection, process launch or auth.
         if (!policy.tools.size && !policy.resources.size && !policy.prompts.size) continue;
         const client = new Client({ name: "siclaw-mcp-security", version: "1.0.0" }, { capabilities: {} });
-        const security = new McpModelSecurity(() => [...mcpSensitiveValues(this.configs), ...this.secrets()]);
+        const security = new McpModelSecurity(() => [...mcpSensitiveValues(this.configs), ...this.secrets()], this.privateRoots);
         if ([...policy.resources, ...policy.prompts].some(value => security.redact(value) !== value)) {
           throw new Error("MCP resource/prompt handles must not contain credentials");
         }
@@ -152,8 +153,9 @@ export class CodexMcpGateway {
       if (!upstream.tools.some(tool => tool.name === name) || !upstream.policy.tools.has(name) || this.closed) {
         throw new McpError(ErrorCode.InvalidParams, "MCP tool is not authorized by the read-only policy");
       }
+      const args = request.params.arguments ?? {};
+      if (!upstream.policy.trustedRenderer) upstream.security.arguments(args);
       try {
-        const args = request.params.arguments ?? {};
         const safeArgs = upstream.policy.trustedRenderer ? JSON.parse(upstream.security.text(JSON.stringify(args))) : args;
         const result = await upstream.client.callTool({ name, arguments: safeArgs }, undefined,
           { signal: extra.signal, timeout: 65_000 });
@@ -169,6 +171,7 @@ export class CodexMcpGateway {
       server.setRequestHandler(ListResourcesRequestSchema, async () => ({ resources: [...upstream.policy.resources].map(uri => ({ uri, name: "Authorized resource" })) }));
       server.setRequestHandler(ReadResourceRequestSchema, async (request, extra) => {
         if (!upstream.policy.resources.has(request.params.uri)) throw new McpError(ErrorCode.InvalidParams, "MCP resource is not authorized");
+        upstream.security.arguments({ uri: request.params.uri });
         try {
           const result = await upstream.client.readResource({ uri: request.params.uri }, { signal: extra.signal, timeout: 30_000 });
           const safe = upstream.security.result({ content: result.contents.map(resource => ({ type: "resource", resource })) });
@@ -181,6 +184,7 @@ export class CodexMcpGateway {
       server.setRequestHandler(ListPromptsRequestSchema, async () => ({ prompts: [...upstream.policy.prompts].map(name => ({ name })) }));
       server.setRequestHandler(GetPromptRequestSchema, async (request, extra) => {
         if (!upstream.policy.prompts.has(request.params.name)) throw new McpError(ErrorCode.InvalidParams, "MCP prompt is not authorized");
+        upstream.security.arguments(request.params.arguments ?? {});
         try {
           const result = await upstream.client.getPrompt({ name: request.params.name, arguments: request.params.arguments }, { signal: extra.signal, timeout: 30_000 });
           if (JSON.stringify(result).length > 8 * 1024 * 1024 || result.messages.length > 1000) throw new Error("Oversized prompt");

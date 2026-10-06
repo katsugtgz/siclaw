@@ -1,9 +1,11 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { CallToolResult, Tool } from "@modelcontextprotocol/sdk/types.js";
+import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
 import type { McpServerConfig } from "./mcp-client.js";
 import { createModelOutputRedactor, redactModelJson, type SensitiveValueSource } from "../shared/model-output-redactor.js";
 import { redactDataDocument } from "../tools/infra/kubectl-sanitize.js";
+import { argumentPathSecurityError } from "../tools/infra/argument-path-security.js";
 
 const POLICY_ENV = "SICLAW_MCP_READ_ONLY_TOOLS";
 const RESOURCE_ENV = "SICLAW_MCP_READ_ONLY_RESOURCES";
@@ -96,8 +98,23 @@ export function mcpSensitiveValues(servers: Record<string, unknown>): string[] {
 
 export class McpModelSecurity {
   readonly redact: (text: string) => string;
-  constructor(private readonly secrets: SensitiveValueSource = () => []) {
+  constructor(private readonly secrets: SensitiveValueSource = () => [], private readonly privateRoots: () => readonly string[] = () => []) {
     this.redact = createModelOutputRedactor(secrets);
+  }
+
+  arguments(value: unknown): void {
+    const strings: string[] = [];
+    let nodes = 0;
+    const collect = (item: unknown, depth: number, key = ""): void => {
+      if (++nodes > 100_000 || depth > 48) throw new Error("MCP arguments exceed the safety budget");
+      if (typeof item === "string" && (item.includes("/") || /%25|%2f|%5c/i.test(item)
+          || /path|file|directory|folder|root/i.test(key))) strings.push(item);
+      else if (Array.isArray(item)) for (const entry of item) collect(entry, depth + 1, key);
+      else if (item && typeof item === "object") for (const [name, entry] of Object.entries(item)) collect(entry, depth + 1, name);
+    };
+    collect(value, 0);
+    const error = argumentPathSecurityError(strings, { privateRoots: this.privateRoots() });
+    if (error) throw new McpError(ErrorCode.InvalidParams, error);
   }
 
   text(value: string): string {

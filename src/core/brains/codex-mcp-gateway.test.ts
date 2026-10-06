@@ -30,6 +30,10 @@ describe("native MCP pre-model security boundary", () => {
       expect(list.tools[0].annotations?.readOnlyHint).toBe(true);
       await expect(client.callTool({ name: "write_fixture", arguments: {} })).rejects.toThrow(/not authorized/);
       expect(fs.existsSync(counter)).toBe(false);
+      for (const mode of ["/etc/shadow", "%2Fetc%2Fshadow", "file:///root/.ssh/id_rsa"]) {
+        await expect(client.callTool({ name: "read_fixture", arguments: { mode } })).rejects.toThrow(/not authorized/);
+      }
+      expect(fs.existsSync(counter)).toBe(false);
       const result = await client.callTool({ name: "read_fixture", arguments: {} });
       const wire = JSON.stringify(result);
       expect(wire).not.toContain(secret); expect(wire).not.toContain(Buffer.from(secret).toString("base64"));

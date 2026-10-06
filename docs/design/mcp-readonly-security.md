@@ -117,6 +117,14 @@ the artifact store applies it again before hashing or persistence. Native
 executor stdout/stderr and text filesystem responses have equivalent gates,
 including private infrastructure IPC and native child execution.
 
+Pi scripts, native Codex scripts and dynamic MCP arguments also reuse the
+existing command policy's sensitive paths and glob matcher. Private broker
+directories, normalized paths, file URIs, encoded paths and local symlink
+operands are checked before invocation. An approved script asset is not a
+permission to pass it `/etc/shadow`, service-account tokens or private config.
+The reviewed renderer treats its input as display data and retains its separate
+sanitized-input contract.
+
 ## Trust limits and acceptance
 
 Reviewed Skill scripts retain the existing Pi trust boundary: immutable selected
