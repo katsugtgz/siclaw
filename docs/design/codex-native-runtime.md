@@ -88,6 +88,15 @@ Interactive stdin/PTY, reconnect and file streaming remain disabled and fail
 closed. Output is sanitized as a complete document; it is not streamed before
 process completion. Long-running/background task parity still requires work.
 
+The pinned native `thread/resume` protocol does not accept `environments`.
+Every `turn/start` must select the authorized environments again. Siclaw also
+sets `include_local = false` and `default = "none"` in the native environment
+registry, so an omitted selection or internal worker cannot fall back to an
+unmanaged local executor. A conflicting existing registry fails closed rather
+than being overwritten. Native background memory consolidation that needs file
+execution still requires an authorized environment; notes/read tools continue
+to use Codex's own memory implementation.
+
 1. Replace the generic Pi tool bridge with an execution policy adapter at the
    native executor boundary. Delegate process and filesystem mechanics to the
    upstream exec-server. Validate every permitted RPC before execution; unknown
@@ -149,7 +158,60 @@ including any required source-built runtime helpers.
 
 No test account secrets belong in source, image layers or recorded evidence.
 
-## Current verification evidence (2026-10-05)
+## Current verification evidence
+
+### Live Responses and SiCore update (2026-10-06)
+
+- Independent Runtime registration and two private test Agents are used in
+  `sicore-test`. The validation Pod uses ProcessSpawner with separate Runtime
+  and AgentBox processes, private emptyDir volumes, no ServiceAccount token,
+  and the normal AgentBox capability/seccomp restrictions. It does not establish
+  K8sSpawner, mTLS callback or shared-PVC acceptance. Automatic approval rejected
+  the standard shared-namespace RBAC/PVC deployment; explicit approval is pending.
+- Real `api.scitix.ai/model-api` Responses calls through SiCore pass for
+  `gpt-5.6-luna`: greeting, native apply_patch/read, live Plan projection,
+  native V1 child creation/read/wait/close, and steer from the UI.
+- A fresh conversation passes UI Stop and continuation. An earlier conversation
+  returned provider `content_filter` after Stop; this remains an unresolved
+  provider/history case, not a successful continuation result.
+- Real `gpt-6-astra` passes Code Mode file creation/read and V2 text/file children
+  explicitly created without inherited history. A child launched after parent
+  tool history failed with `Encrypted function output content could not be
+  decrypted or decoded` before the executor fix. Post-fix checks pass for a child
+  inheriting full parent tool history and, after normal release/resume, a child
+  reading the parent's file with full inherited history. The earlier provider
+  error's cause is not established; it is not silently rewritten or downgraded.
+  V2 uses its native lifecycle; a V1 close operation is not required of V2.
+- Plan is visible while the turn runs, but disappears after reload in this
+  ProcessSpawner setup. AgentBox reports rejected task-event persistence
+  callbacks. Native V2 spawn/message events and child details also need complete
+  SiCore projection and persistence.
+- Live denied-root testing exposed an execution-policy bypass after session
+  release/resume: `cat /etc/hostname` executed through the native local fallback.
+  The test Pod was stopped. Fix `b7c3642d` disables unmanaged local environments
+  and selects authorized environments on every turn; Codex source is unchanged.
+- The official source-built regression fails before that fix and passes after
+  it, checking resumed denied reads, sanitized allowed reads and rejection of
+  explicit local execution. Typecheck/build pass; full regression is
+  **407 files / 8048 tests**. Native notes/read and legacy-home resume smoke also
+  pass.
+- Fixed AgentBox image:
+  `registry-cn-shanghai.siflow.cn/k8s/siclaw-agentbox:codex-executor-b7c3642d`.
+  The independent `siclaw-native-policy-20261006` Job completes under the normal
+  restrictions: restored executor authorization/redaction, native memories and
+  source-built Code Mode checks pass. Logs are saved before resource cleanup.
+- Post-fix SiCore UI passes allowed apply_patch/read, waits through the normal
+  30-second brain release, then rejects `cat /etc/hostname` on the restored
+  conversation with `Native filesystem path is outside the session grant`.
+  The test-only ProcessSpawner image is
+  `registry-cn-shanghai.siflow.cn/k8s/siclaw-native-validation:b7c3642d`, digest
+  `sha256:131a97d4c5ea49d9c705644a490e7eabb7e9b9fc0a66132b806b2c859d373f19`.
+
+Opaque Responses state remains owned by Codex. Preserve replayable output items
+and program callers as specified by the
+[official programmatic tool calling guide](https://developers.openai.com/api/docs/guides/tools-programmatic-tool-calling).
+Do not strip encrypted items or replace native delegation with Pi tools to make
+the provider accept a test.
 
 ### Native memory update (2026-10-06)
 
@@ -220,15 +282,16 @@ not established by the component/namespace results.
   do not establish those provider capabilities.
 - Test-namespace Runtime/AgentBox with SiCore: streaming/reasoning, tool/plan and
   child views, Stop/steer, restart/resume, model routing and usage accounting.
-  The login page requires an account email; the test password was provided in
-  the task but the email is still pending. No Portal UI acceptance is attempted.
+  Test login is available. K8sSpawner deployment approval, authoritative callbacks
+  and persistence remain pending. No Portal UI acceptance is attempted.
 - Native product services: knowledge labels/citations, enabled investigation
   workflow state, reports, schedules, host/node/pod
   diagnostic bindings and script execution. The removed Pi tools are not claimed
   as implementations of these services.
 - Siclaw memory search, generation and publication are not migration targets.
-  Native Codex memory needs its own source-built read/write, restart and owner
-  isolation checks; retaining old Pi memory code does not establish support.
+  Native notes/read and history resume have source-built checks. Automatic native
+  consolidation needs authorized execution and real-provider acceptance. Further
+  memory isolation work is deferred by the user.
 - Native clarification, file attachments and structured-result contracts;
   external MCP output/artifact policy; child detail persistence and resource/model
   policy. Explicit unsupported requests must never silently run Pi.
