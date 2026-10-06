@@ -15,6 +15,12 @@ Missing, disabled, replaced and unbound assets fail closed. A changed Skill must
 be reloaded into a new approved session snapshot. An approved name is not
 permission to execute a different filesystem path or a symlinked script.
 
+The shared Skill loader includes harness-authorized image roots even when a
+materialized bundle directory exists: bundles intentionally omit core Skills.
+Scoped bundle selection remains authoritative for non-image resources; the
+existing inheritance switch, disabled list and bundle-name precedence still
+filter image assets before native execution grants are built.
+
 Local, Pod, node and SSH script capabilities are independent from ordinary
 command capabilities. A script-only Agent does not acquire arbitrary shell,
 Kubernetes API or ordinary remote-command access. Native children inherit the

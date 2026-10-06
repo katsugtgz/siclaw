@@ -30,7 +30,12 @@ export function resolveSkillDirectories(input: ResolveSkillDirectoriesInput): st
     }
   } else if (fs.existsSync(resolvedSkillsDir)) {
     skillsDirs.push(resolvedSkillsDir);
-  } else if (input.includeBundledSkills) {
+  }
+
+  // Bundles deliberately omit image Skills. A materialized (even empty)
+  // resolved directory must not hide the harness-authorized baked assets.
+  // The overlay filter still applies inherit/disable and same-name precedence.
+  if (input.includeBundledSkills) {
     for (const bundledDir of [builtinPath, extensionPath]) {
       if (fs.existsSync(bundledDir)) skillsDirs.push(bundledDir);
     }
