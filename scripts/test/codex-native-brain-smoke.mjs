@@ -74,7 +74,7 @@ const model = createServer(async (request, response) => {
   const advertised = [...body.tools, ...body.input.filter((entry) => entry.type === "tool_search_output").flatMap((entry) => entry.tools)];
   const toolNames = advertised.flatMap((tool) => [tool.name, ...(tool.tools ?? []).map((entry) => entry.name)]);
   assert.ok(toolNames.includes("update_plan"));
-  if (!memoryTurn) assert.ok(toolNames.includes("exec_command"));
+  if (!memoryTurn) assert.ok(toolNames.includes("exec_command"), `native catalog (${calls} requests, ${rootCalls} root, ${childCalls} child): ${JSON.stringify(toolNames)}`);
 
   assert.ok(!toolNames.includes("spawn_subagent"));
   assert.ok(!toolNames.includes("transfer_to_agent"));

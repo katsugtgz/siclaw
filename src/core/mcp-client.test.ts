@@ -316,12 +316,12 @@ describe("normalizeMcpInputSchema", () => {
   });
 });
 
-it("shares MCP cancellation and preserves raw structured data only for trusted SDK consumers", async () => {
+it("shares MCP cancellation and returns only sanitized structured data to trusted SDK consumers", async () => {
   const controller = new AbortController();
   const response = { content: [{ type: "resource_link", uri: "https://example.test/report", name: "report" }], structuredContent: { rows: [1, 2] } };
   const client = { callTool: vi.fn(async () => response) };
   const tool = createMcpToolDefinition("metrics", undefined, { name: "query" }, client, 15000, { includeRawResult: true });
-  expect((await tool.execute("1", {}, controller.signal, undefined, {} as any)).details).toMatchObject({ rawResult: response });
+  expect((await tool.execute("1", {}, controller.signal, undefined, {} as any)).details).toMatchObject({ rawResult: { content: [{ type: "text", text: "MCP opaque content suppressed by the output security policy." }], structuredContent: response.structuredContent } });
   expect(client.callTool).toHaveBeenCalledWith({ name: "query", arguments: {} }, undefined, { timeout: 15000, signal: controller.signal });
   controller.abort();
   const stopped = await tool.execute("2", {}, controller.signal, undefined, {} as any);

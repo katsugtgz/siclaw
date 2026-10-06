@@ -152,7 +152,7 @@ function authorizeRemoteCommand(command: string, context: "host" | "node" | "pod
  * Re-authorize against the current broker inventory before every launch. */
 export async function executeInfrastructureOperation(target: CodexInfrastructureTarget | undefined, operation: InfrastructureOperation,
   signal: AbortSignal, scripts?: NativeSkillScriptGrants, environment?: NodeJS.ProcessEnv,
-  resolveKubeconfig?: () => Promise<string>): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+  resolveKubeconfig?: () => Promise<string>, redactOutput?: (text: string) => string): Promise<{ stdout: string; stderr: string; exitCode: number }> {
   if (signal.aborted) throw new Error("Native infrastructure execution aborted");
   let result: { stdout: string; stderr: string; exitCode: number | null; truncated?: boolean };
   const content = operation.script ? revalidateSkillScript(operation.script, scripts) : undefined;
@@ -216,8 +216,11 @@ export async function executeInfrastructureOperation(target: CodexInfrastructure
     hasSensitiveKubectl: operation.security.hasSensitiveKubectl, outputMode: "data", onOutputData: value => { data = value; } });
   if (!data) throw new Error("Native infrastructure output sanitization failed");
   const redaction = buildRedactionConfig();
-  return { stdout: redactText(redactDataDocument(data.text).text, redaction),
-    stderr: redactText(redactDataDocument(data.stderr ?? "").text, redaction), exitCode: result.exitCode ?? 1 };
+  const safe = (text: string) => {
+    const sanitized = redactText(redactDataDocument(text).text, redaction);
+    return redactOutput ? redactOutput(sanitized) : sanitized;
+  };
+  return { stdout: safe(data.text), stderr: safe(data.stderr ?? ""), exitCode: result.exitCode ?? 1 };
 }
 
 async function executeRemoteSkillScript(target: CodexInfrastructureTarget,

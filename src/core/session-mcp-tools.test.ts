@@ -3,15 +3,16 @@ import { resolveSessionMcpTools } from "./session-mcp-tools.js";
 import { resolveCapabilities } from "./tool-capabilities.js";
 import type { McpClientManager } from "./mcp-client.js";
 
-const mock = vi.hoisted(() => ({ initialize: vi.fn(), getTools: vi.fn(() => [{ name: "mcp__mutate" }]), shutdown: vi.fn(), construct: vi.fn() }));
-vi.mock("./mcp-client.js", () => ({ McpClientManager: class {
+const mock = vi.hoisted(() => ({ initialize: vi.fn(), getTools: vi.fn(() => [{ name: "mcp__bound__read" }, { name: "mcp__bound__mutate" }]), shutdown: vi.fn(), construct: vi.fn() }));
+vi.mock("./mcp-client.js", () => ({ buildMcpToolName: (server: string, tool: string) => `mcp__${server}__${tool}`, McpClientManager: class {
   constructor() { mock.construct(); }
   initialize = mock.initialize;
   getTools = mock.getTools;
   shutdown = mock.shutdown;
 } }));
 afterEach(() => vi.clearAllMocks());
-const mcpServers = { bound: { transport: "streamable-http" as const, url: "https://mcp.test" } };
+const mcpServers = { bound: { transport: "streamable-http" as const, url: "https://mcp.test",
+  env: { SICLAW_MCP_READ_ONLY_TOOLS: '["read"]' } } };
 
 describe("sandbox-only dynamic tool boundary", () => {
   it("honors a disabled harness for both configured and shared MCP tools", async () => {
@@ -31,7 +32,7 @@ describe("sandbox-only dynamic tool boundary", () => {
 
   it("drops shared tools when capabilities change to sandbox-only on rebuild", async () => {
     const mcpManager = mock as unknown as McpClientManager;
-    const previous = await resolveSessionMcpTools({ allowedTools: ["bash"], mcpManager });
+    const previous = await resolveSessionMcpTools({ allowedTools: ["bash"], mcpManager, mcpServers });
     expect(previous.mcpTools).toHaveLength(1);
     mock.getTools.mockClear();
     expect(await resolveSessionMcpTools({ allowedTools: ["run_script"], ...previous })).toEqual({ mcpTools: [] });
@@ -41,7 +42,7 @@ describe("sandbox-only dynamic tool boundary", () => {
 
   it.each([null, [], ["bash"], ["run_script", "bash"]])("preserves direct MCP for ordinary capability selections: %j", async allowedTools => {
     const result = await resolveSessionMcpTools({ allowedTools, mcpServers });
-    expect(result.mcpTools).toEqual([{ name: "mcp__mutate" }]);
+    expect(result.mcpTools).toEqual([{ name: "mcp__bound__read" }]);
     expect(mock.initialize).toHaveBeenCalledOnce();
   });
 });

@@ -51,7 +51,10 @@ import {
   type ModelEnvelopeManifest,
 } from "./model-envelope.js";
 import { createPromptInspection, type PromptInspection } from "./prompt-inspection.js";
-import type { McpClientManager } from "./mcp-client.js";
+import type { McpClientManager, McpServerConfig } from "./mcp-client.js";
+import { mcpSensitiveValues } from "./mcp-security.js";
+import { createModelOutputRedactor, redactModelJson } from "../shared/model-output-redactor.js";
+import { redactDataDocument } from "../tools/infra/kubectl-sanitize.js";
 import { resolveSessionMcpTools } from "./session-mcp-tools.js";
 import { loadConfig, getEmbeddingConfig, getConfigPath, getDefaultLlm, isMemoryEnabled } from "./config.js";
 import { initExtraCommands } from "../tools/infra/extra-commands.js";
@@ -348,18 +351,36 @@ function isPathInsideDir(absolutePath: string, dir: string): boolean {
   return resolved === resolvedDir || resolved.startsWith(resolvedDir + path.sep);
 }
 
+function canonicalFilePath(candidate: string): string {
+  let existing = path.resolve(candidate);
+  const suffix: string[] = [];
+  while (!fs.existsSync(existing) && existing !== path.dirname(existing)) {
+    suffix.unshift(path.basename(existing)); existing = path.dirname(existing);
+  }
+  return path.join(fs.realpathSync(existing), ...suffix);
+}
+
 function assertToolPathAllowed(
   absolutePath: string,
   allowedDirs: string[],
   operation: string,
   blockedDirs: Array<{ dir: string; reason: string }>,
 ): void {
-  assertPathAllowed(absolutePath, allowedDirs, operation);
+  // File tools run as the credential owner. Lexical allowlists cannot stop a
+  // workspace symlink pointing at credentials or another user's resource tree.
+  const real = canonicalFilePath(absolutePath);
+  const canonicalRoots = allowedDirs.map(canonicalFilePath);
+  assertPathAllowed(real, canonicalRoots, operation);
+  for (const blocked of blockedDirs) {
+    const canonical = canonicalFilePath(blocked.dir);
+    if (isPathInsideDir(real, canonical)) throw new Error(`${operation} blocked: ${blocked.reason}`);
+  }
   if (operation === "write" || operation === "edit") {
     // New files may not exist yet. Check each component beneath the allowed
     // workspace before mkdir/read/write so a pre-existing link cannot redirect
     // a file tool into another resource directory.
-    const root = allowedDirs.find(dir => isPathInsideDir(absolutePath, dir))!;
+    const root = [...allowedDirs, ...canonicalRoots].find(dir => isPathInsideDir(absolutePath, dir));
+    if (!root) throw new Error(`${operation} blocked: symbolic link alias is not a writable workspace path`);
     let current = path.resolve(root);
     for (const part of ["", ...path.relative(current, path.resolve(absolutePath)).split(path.sep)]) {
       current = path.join(current, part);
@@ -642,8 +663,12 @@ export async function createSiclawSession(
   const exposeConfiguredMcp = compiledContext.harness.mcpExposure === "configured";
   const sandboxOnly = allowedTools?.length && allowedTools.every(name => name === "run_script");
   const mcpServers = exposeConfiguredMcp && !sandboxOnly ? (opts?.mcpServers ?? config.mcpServers ?? {}) : {};
+  const sensitiveValues = () => [...Object.values(config.providers).map(provider => provider.apiKey),
+    ...mcpSensitiveValues(mcpServers), ...(kubeconfigRef.credentialBroker?.getSensitiveValues() ?? [])];
+  const redactModelOutput = createModelOutputRedactor(sensitiveValues);
   const toolResultArtifactStore = new ToolResultArtifactStore({
     rootDir: toolResultArtifactsDir,
+    redactOutput: redactModelOutput,
     getScope: () => ({
       agentId: agentId ?? `user:${userId}`,
       sessionId: sessionIdRef.current || sessionManagerId,
@@ -660,9 +685,27 @@ export async function createSiclawSession(
   const { mcpManager, mcpTools: discoveredMcpTools } = await resolveSessionMcpTools({
     enabled: opts?.agentEngine !== "codex" && exposeConfiguredMcp, allowedTools,
     mcpServers,
+    sensitiveValues,
     mcpManager: opts?.mcpManager, mcpTools: opts?.mcpTools,
   });
-  const mcpTools = discoveredMcpTools.map(tool => withToolResultArtifactCapture(tool, toolResultArtifactStore));
+  const secureTool = (original: ToolDefinition): ToolDefinition => ({ ...original, execute: async (...args) => {
+    let result: Awaited<ReturnType<ToolDefinition["execute"]>>;
+    try {
+      const invocation: Parameters<ToolDefinition["execute"]> = [...args];
+      // Arbitrary chunk boundaries can divide a token. Deliver the complete
+      // sanitized result; raw tool progress content must not escape this gate.
+      invocation[3] = undefined;
+      result = await original.execute(...invocation);
+    } catch (error) {
+      if (args[2]?.aborted) throw new DOMException("Tool execution aborted", "AbortError");
+      let message = "Tool execution failed at the security boundary.";
+      try { if (error instanceof Error) message = redactModelOutput(redactDataDocument(error.message).text); } catch { /* suppress */ }
+      throw new Error(message);
+    }
+    try { return redactModelJson(result, redactModelOutput); }
+    catch { throw new Error("Tool output suppressed: sanitization failed or exceeded the safety budget."); }
+  } });
+  const mcpTools = discoveredMcpTools.map(tool => withToolResultArtifactCapture(secureTool(tool), toolResultArtifactStore));
   // Sandbox-only agents use the reviewed broker; the harness gate and artifact
   // recovery remain in effect for every other MCP selection.
   // Configured MCP tools are orthogonal to the built-in `allowedTools`
@@ -688,11 +731,13 @@ export async function createSiclawSession(
   const tracesDir = path.resolve(cwd, ".siclaw", "traces");
   const readAllowedDirs = [
     builtinSkillsRoot, skillsBase, userDataDir, reportsDir, tracesDir, reposDir, docsDir, knowledgeDir,
-    os.tmpdir(),
     ...(opts?.portalSkillsDir ? [opts.portalSkillsDir] : []),
   ];
   const writeAllowedDirs = [userDataDir];
   const blockedFileDirs = [
+    ...[path.dirname(getConfigPath()), path.resolve(cwd, config.paths.credentialsDir),
+      path.resolve(cwd, ".siclaw", "config"), sessionManager.getSessionDir(), path.join(userDataDir, "agent", "codex")]
+      .map(dir => ({ dir, reason: "private credentials, configuration or agent state" })),
     {
       dir: toolResultArtifactsDir,
       reason: "tool-result artifacts are internal; use tool_result_read or tool_result_search",
@@ -713,7 +758,8 @@ export async function createSiclawSession(
           if (citationSupport && start !== undefined) {
             citationSupport.noteRead(p, typeof content === "string" ? content : content.toString("utf8"), start);
           }
-          return content;
+          const text = new TextDecoder("utf-8", { fatal: true }).decode(content);
+          return Buffer.from(redactModelOutput(redactDataDocument(text).text));
         },
         access: async (p) => { assertToolPathAllowed(p, readAllowedDirs, "read", blockedFileDirs); return fsAccess(p, fs.constants.R_OK); },
       },
@@ -734,7 +780,8 @@ export async function createSiclawSession(
     withGrepPathReason(createGrepTool(cwd, {
       operations: {
         isDirectory: (p) => { assertToolPathAllowed(p, readAllowedDirs, "grep", blockedFileDirs); return fs.statSync(p).isDirectory(); },
-        readFile: (p) => { assertToolPathAllowed(p, readAllowedDirs, "grep", blockedFileDirs); return fs.readFileSync(p, "utf-8"); },
+        readFile: (p) => { assertToolPathAllowed(p, readAllowedDirs, "grep", blockedFileDirs);
+          return redactModelOutput(redactDataDocument(fs.readFileSync(p, "utf-8")).text); },
       },
     }), readAllowedDirs, blockedFileDirs),
     createFindTool(cwd, {
@@ -772,8 +819,12 @@ export async function createSiclawSession(
     nativePlanning: true, nativeSubagents: true, nativeInfrastructure: true, handoffAvailable: false });
 
   for (let i = 0; i < customTools.length; i++) {
-    const tool = customTools[i];
-    if (!tool.name.startsWith("tool_result_") && !mcpTools.includes(tool)) {
+    const original = customTools[i];
+    // This gate precedes artifact capture, events and Pi's model context.
+    // Native Codex uses its executor/MCP gates instead of these Pi tools.
+    const tool = mcpTools.includes(original) ? original : secureTool(original);
+    customTools[i] = tool;
+    if (!tool.name.startsWith("tool_result_") && !mcpTools.includes(original)) {
       customTools[i] = withToolResultArtifactCapture(tool, toolResultArtifactStore,
         tool.name === "spawn_subagent" ? 0 : 4096);
     }
@@ -982,7 +1033,7 @@ export async function createSiclawSession(
         allowCommands: customTools.some((tool) => tool.name === "bash"),
         allowFileCommands: allowNativeFileRead,
         production: process.env.NODE_ENV === "production", environment: { PATH: process.env.PATH ?? "/usr/bin:/bin" },
-        skillScripts: nativeScriptGrants };
+        skillScripts: nativeScriptGrants, redactOutput: redactModelOutput };
     const environments: Array<{ id: string; grants: typeof nativeGrants }> = [];
     const allowNativePod = customTools.some(tool => tool.name === "pod_exec");
     const allowNativeNode = customTools.some(tool => tool.name === "node_exec");
@@ -1014,16 +1065,6 @@ export async function createSiclawSession(
         "The broker resolves identity, credentials and configured bastions; do not supply SSH options or credentials. " +
         "Bound SSH host handles (first 50): " + hosts.slice(0, 50).map(host => host.id || host.name).join(", ");
     }
-    const nativeMcpServers: Record<string, unknown> = {};
-    for (const [name, value] of Object.entries(mcpServers)) {
-      if (!value || typeof value !== "object") continue;
-      const server = value as Record<string, unknown>;
-      if (server.transport === "stdio") nativeMcpServers[name] = { command: server.command,
-        args: server.args ?? [], env: server.env ?? {}, required: true, default_tools_approval_mode: "approve" };
-      else if (server.transport === "streamable-http") nativeMcpServers[name] = { url: server.url,
-        http_headers: server.headers ?? {}, required: true, default_tools_approval_mode: "approve" };
-      else throw new Error(`Codex mode requires a native stdio or streamable-http MCP transport: ${name}`);
-    }
     brain = await CodexAgentBrain.create({
       sessionManager, systemPrompt: [compiledContext.systemPrompt,
         ...buildAppendSystemPrompt(memoryEnabled ? memoryDir : null, knowledgeDir,
@@ -1046,7 +1087,8 @@ export async function createSiclawSession(
             "The default is 180 seconds. Poll through native write_stdin; session/turn Stop cancels execution. Interactive input is unavailable. " +
             "Execution requires its separate local/pod/node/host script capability. Only the selected, unchanged Skill assets are executable."
           : ""].join("\n\n"),
-      toolsetsByName, cwd: userDataDir, nativePlanEnabled, grants: nativeGrants, environments, mcpServers: nativeMcpServers, codexHome,
+      toolsetsByName, cwd: userDataDir, nativePlanEnabled, grants: nativeGrants, environments,
+      mcpServers: mcpServers as Record<string, McpServerConfig>, sensitiveValues, codexHome,
       allowSubagents: nativeAllowSubagents,
       onPlanUpdate: opts?.sessionEventEmitter
         ? (plan) => projectCodexPlan(taskListId, opts.sessionEventEmitter!, plan) : undefined,

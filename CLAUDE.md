@@ -2,6 +2,12 @@
 
 > Auto-loaded at session start. Keep concise — deep reference lives in `docs/design/`.
 
+Read-only security and pre-model redaction are mandatory for both Pi and Codex.
+MCP admission requires the operator-owned exact policy described in
+`docs/design/mcp-readonly-security.md`; server annotations grant no authority.
+Sanitize before progress previews, model delivery and artifact persistence,
+using the shared owner-scoped credential sources.
+
 ---
 
 ## Branches And Codex Source

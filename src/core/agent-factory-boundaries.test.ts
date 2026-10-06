@@ -15,8 +15,9 @@ vi.mock("./config.js", async importOriginal => ({
   loadConfig: () => ({ providers: {}, allowedTools: null, paths: {
     skillsDir: ".siclaw/skills", userDataDir: ".siclaw/user-data",
     knowledgeDir: ".siclaw/knowledge", reposDir: "repos", docsDir: "docs",
+    credentialsDir: ".siclaw/credentials",
   } }),
-  getConfigPath: () => path.join(fixture.root, "settings.json"),
+  getConfigPath: () => path.join(fixture.root, ".siclaw/config/settings.json"),
   getDefaultLlm: () => undefined,
   isMemoryEnabled: () => false,
 }));
@@ -56,6 +57,24 @@ async function create(agentType: "sre" | "custom" | "knowledge_qa", scoped = tru
   return result;
 }
 describe("factory resource boundaries", () => {
+  it("blocks credential symlinks and another temp workspace, and sanitizes scoped file reads before model delivery", async () => {
+    const result = await create("sre");
+    const workspace = path.join(fixture.root, ".siclaw/user-data");
+    const credentials = path.join(fixture.root, ".siclaw/credentials");
+    await fs.mkdir(workspace, { recursive: true }); await fs.mkdir(credentials, { recursive: true });
+    await fs.writeFile(path.join(credentials, "cluster.key"), "private credential marker");
+    await fs.symlink(credentials, path.join(workspace, "alias"));
+    const read = result.customTools.find(tool => tool.name === "read")!;
+    await expect(read.execute("link", { path: path.join(workspace, "alias/cluster.key") })).rejects.toThrow(/blocked|outside/);
+    const other = await fs.mkdtemp(path.join(os.tmpdir(), "other-owner-"));
+    try {
+      await fs.writeFile(path.join(other, "data"), "private other owner");
+      await expect(read.execute("other", { path: path.join(other, "data") })).rejects.toThrow(/outside/);
+    } finally { await fs.rm(other, { recursive: true, force: true }); }
+    await fs.writeFile(path.join(workspace, "evidence"), "healthy evidence\npassword: tiny\n");
+    const safe = await read.execute("evidence", { path: path.join(workspace, "evidence") });
+    expect(JSON.stringify(safe)).toContain("healthy evidence"); expect(JSON.stringify(safe)).not.toContain("tiny");
+  });
   it.each(["sre", "custom", "knowledge_qa"] as const)("filters ambient Skills before the first %s sync", async type => {
     await skill("agent-config/skills", "ambient-helper");
     await skill("skills/core", "bundled-helper");

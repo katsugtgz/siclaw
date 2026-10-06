@@ -53,6 +53,10 @@ snapshot, K8s/Docker/Helm, or user-facing workflows.
   resource sets, and cleanup must never touch another invocation.
 - Shell execution security is layered: OS-level isolation first, whitelist-only
   command validation second, plus pre/post execution sanitization.
+- MCP tools require the operator-owned exact policy in
+  `docs/design/mcp-readonly-security.md`; server annotations grant no authority.
+  Sanitize before model delivery, progress previews and artifact persistence.
+  Pi and Codex must reuse this policy and the owner-scoped credential sources.
 - Portal/Gateway DB and Memory DB are separate persistence domains. Do not mix
   user/session config with embedding/chunk/investigation storage.
 - AgentBox and Runtime are separate processes in K8s mode. Code under

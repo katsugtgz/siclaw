@@ -29,6 +29,7 @@
 import { execFile } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { load as loadYaml, JSON_SCHEMA } from "js-yaml";
 import { ConcurrencyLimiter } from "../core/concurrency-limiter.js";
 import type {
   CredentialTransport,
@@ -347,6 +348,9 @@ class ResourceRegistry<TMeta extends { name: string }> {
 // ---------------------------------------------------------------------------
 
 export class CredentialBroker {
+  // Keep rotated/revoked values until this owner is disposed: older tool
+  // artifacts and upstream error messages can still echo those credentials.
+  private readonly sensitiveValues = new Set<string>();
   private readonly clusters: ResourceRegistry<ClusterMeta>;
   private readonly hosts: ResourceRegistry<HostMeta>;
   private readonly cleanupTimer: ReturnType<typeof setInterval>;
@@ -441,6 +445,7 @@ export class CredentialBroker {
     }
 
     const response = await this.transport.getClusterCredential(sourceId, purpose);
+    this.rememberSensitiveValues(response);
     const meta = mergeClusterMeta(cached?.meta, response);
     const ttlMs = (response.credential.ttl_seconds ?? 300) * 1000;
     const filePaths = this.clusters.setMaterialized(response.credential.name, meta, response.credential.files, ttlMs);
@@ -635,6 +640,7 @@ export class CredentialBroker {
     _options: { bypassCache?: boolean } = {},
   ): Promise<CredentialResponse> {
     const response = await this.transport.getHostCredential(sourceId, purpose);
+    this.rememberSensitiveValues(response);
     const cached = this.hosts.get(sourceId);
     const meta = mergeHostMeta(cached?.meta, response, sourceId);
     const ttlMs = (response.credential.ttl_seconds ?? 300) * 1000;
@@ -696,6 +702,49 @@ export class CredentialBroker {
     clearInterval(this.cleanupTimer);
     this.clusters.dispose();
     this.hosts.dispose();
+    this.sensitiveValues.clear();
+  }
+
+  /** Private backend redaction source, never a tool response or sync payload. */
+  getSensitiveValues(): readonly string[] { return [...this.sensitiveValues]; }
+
+  private rememberSensitiveValues(response: CredentialResponse): void {
+    const files = [...response.credential.files, ...(response.credential.jump_chain ?? []).flatMap(hop => hop.files)];
+    for (const file of files) {
+      if (!file.content) continue;
+      this.sensitiveValues.add(file.content);
+      // Host passwords and keys may be echoed without their trailing newline
+      // or PEM wrapper. Retain their literal body as well as the full file.
+      if (!/kubeconfig/i.test(file.name)) {
+        this.sensitiveValues.add(file.content.trim());
+        for (const line of file.content.split(/\r?\n/)) {
+          if (line.length >= 16 && !line.startsWith("-----")) this.sensitiveValues.add(line);
+        }
+        continue;
+      }
+      try {
+        const visit = (value: unknown, depth: number): void => {
+          if (depth > 48) throw new Error("Credential structure exceeds safety budget");
+          if (Array.isArray(value)) { for (const item of value) visit(item, depth + 1); return; }
+          if (!value || typeof value !== "object") return;
+          for (const [key, item] of Object.entries(value)) {
+            if (/token|password|client-key|private-key|secret/i.test(key) && typeof item === "string" && item) {
+              this.sensitiveValues.add(item);
+              if (/data$/i.test(key)) this.sensitiveValues.add(Buffer.from(item, "base64").toString("utf8"));
+            }
+            // Kubeconfig exec/auth-provider env pairs can carry arbitrary keys.
+            if (key === "env" && Array.isArray(item)) for (const pair of item) {
+              if (pair && typeof pair === "object" && typeof pair.value === "string" && pair.value) this.sensitiveValues.add(pair.value);
+            }
+            visit(item, depth + 1);
+          }
+        };
+        visit(loadYaml(file.content, { schema: JSON_SCHEMA }), 0);
+      } catch { throw new Error("Credential could not be registered for safe output redaction"); }
+    }
+    if (Buffer.byteLength(JSON.stringify([...this.sensitiveValues])) > 8 * 1024 * 1024) {
+      throw new Error("Credential redaction set exceeds safety budget");
+    }
   }
 
 }

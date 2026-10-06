@@ -91,7 +91,7 @@ describe("mcp.probe RPC", () => {
     const out: any = await probe({ server: { name: "siverse", url } }, { sendEvent: vi.fn() } as any);
     expect(out.probe).toMatchObject({
       name: "siverse", transport: "streamable-http", state: "failed", toolCount: 0,
-      error: { kind: "not_found", httpStatus: 404, contentType: "text/html", message: "HTML page: Simate" },
+      error: { kind: "not_found", httpStatus: 404, contentType: "text/html", message: "MCP connection or security validation failed" },
     });
   });
 

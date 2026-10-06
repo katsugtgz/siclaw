@@ -8,6 +8,10 @@ import type {
 } from "../brain-session.js";
 import { CodexAppServer } from "./codex-app-server.js";
 import { CodexExecutorRelay } from "./codex-executor-relay.js";
+import { CodexMcpGateway } from "./codex-mcp-gateway.js";
+import type { McpServerConfig } from "../mcp-client.js";
+import { mcpSensitiveValues } from "../mcp-security.js";
+import { createModelOutputRedactor, type SensitiveValueSource } from "../../shared/model-output-redactor.js";
 import type { CodexExecutorGrants } from "./codex-executor-policy.js";
 import type { AgentMailbox } from "../agent-mailbox.js";
 import type { LlmCallPromptBoundary } from "../llm-call-recorder.js";
@@ -115,6 +119,8 @@ export class CodexAgentBrain implements BrainSession {
   private readonly listeners = new Set<(event: unknown) => void>();
   private readonly providers = new Map<string, JsonObject>();
   private readonly executor: CodexExecutorRelay;
+  private readonly mcpGateway: CodexMcpGateway;
+  private nativeMcpServers: JsonObject = {};
   private readonly clusterExecutors = new Map<string, CodexExecutorRelay>();
   private readonly home: string;
   private readonly marker: string;
@@ -146,7 +152,7 @@ export class CodexAgentBrain implements BrainSession {
 
   private constructor(
     private readonly sessionManager: SessionManager,
-    private readonly native: { grants: CodexExecutorGrants; mcpServers?: JsonObject; allowSubagents?: boolean; codexHome?: string;
+    private readonly native: { grants: CodexExecutorGrants; mcpServers?: Record<string, McpServerConfig>; sensitiveValues?: SensitiveValueSource; allowSubagents?: boolean; codexHome?: string;
       environments?: Array<{ id: string; grants: CodexExecutorGrants }> },
     private readonly systemPrompt: string,
     private readonly toolsetsByName: ReadonlyMap<string, string>,
@@ -156,6 +162,22 @@ export class CodexAgentBrain implements BrainSession {
     private readonly onPlanUpdate?: (plan: unknown) => void,
   ) {
     const sessionDir = sessionManager.getSessionDir();
+    this.mcpGateway = new CodexMcpGateway(native.mcpServers ?? {}, () => [
+      ...mcpSensitiveValues(native.mcpServers ?? {}), ...(native.sensitiveValues?.() ?? []),
+      ...[...this.providers.values()].flatMap(provider => [string(provider.apiKey),
+        ...(record(provider.headers) ? Object.values(provider.headers).filter((value): value is string => typeof value === "string") : [])]),
+    ]);
+    const redact = createModelOutputRedactor(() => [
+      ...mcpSensitiveValues(native.mcpServers ?? {}), ...(native.sensitiveValues?.() ?? []),
+      ...[...this.providers.values()].flatMap(provider => [string(provider.apiKey),
+        ...(record(provider.headers) ? Object.values(provider.headers).flatMap(value => typeof value === "string"
+          ? [value, value.replace(/^(?:Bearer|Basic)\s+/i, "")] : []) : [])]),
+    ]);
+    const inheritedOutputGate = native.grants.redactOutput;
+    const outputGate = (text: string) => redact(inheritedOutputGate?.(text) ?? text);
+    native.grants = { ...native.grants, redactOutput: outputGate };
+    native.environments = native.environments?.map(environment => ({ ...environment,
+      grants: { ...environment.grants, redactOutput: outputGate } }));
     const legacyHome = path.join(sessionDir, "codex-home");
     this.home = native.codexHome ?? legacyHome;
     this.marker = path.join(sessionDir, "codex-thread.json");
@@ -201,22 +223,28 @@ export class CodexAgentBrain implements BrainSession {
 
   static async create(options: {
     sessionManager: SessionManager; systemPrompt: string; grants: CodexExecutorGrants;
-    mcpServers?: JsonObject; allowSubagents?: boolean; codexHome?: string;
+    mcpServers?: Record<string, McpServerConfig>; sensitiveValues?: SensitiveValueSource; allowSubagents?: boolean; codexHome?: string;
     environments?: Array<{ id: string; grants: CodexExecutorGrants }>;
     toolsetsByName: ReadonlyMap<string, string>;
     cwd: string; skillPaths: Array<{ name: string; filePath: string }>;
     nativePlanEnabled?: boolean; onPlanUpdate?: (plan: unknown) => void;
   }): Promise<CodexAgentBrain> {
     const brain = new CodexAgentBrain(options.sessionManager,
-      { grants: options.grants, mcpServers: options.mcpServers, allowSubagents: options.allowSubagents,
+      { grants: options.grants, mcpServers: options.mcpServers, sensitiveValues: options.sensitiveValues, allowSubagents: options.allowSubagents,
         environments: options.environments, codexHome: options.codexHome }, options.systemPrompt,
       options.toolsetsByName, options.cwd, options.skillPaths,
       options.nativePlanEnabled, options.onPlanUpdate);
     fs.mkdirSync(brain.home, { recursive: true, mode: 0o700 });
     brain.syncSkills();
-    await brain.executor.start();
-    for (const executor of brain.clusterExecutors.values()) await executor.start();
-    return brain;
+    try {
+      brain.nativeMcpServers = await brain.mcpGateway.start();
+      await brain.executor.start();
+      for (const executor of brain.clusterExecutors.values()) await executor.start();
+      return brain;
+    } catch (error) {
+      await brain.close();
+      throw error;
+    }
   }
 
   subscribe(listener: (event: any) => void): () => void {
@@ -497,6 +525,7 @@ export class CodexAgentBrain implements BrainSession {
     this.loadedThreadId = undefined;
     await this.executor.close();
     for (const executor of this.clusterExecutors.values()) await executor.close();
+    await this.mcpGateway.close();
     // A persistence failure must not leak the app-server/executor processes.
     // The pending journal is retained for the next owner-scoped session load.
     await this.children.flush();
@@ -565,14 +594,16 @@ export class CodexAgentBrain implements BrainSession {
         ...(provider.authHeader === false ? {} : { env_key: "SICLAW_CODEX_MODEL_TOKEN" }),
         ...(record(provider.headers) ? { http_headers: provider.headers } : {}), wire_api: "responses",
       } },
-      mcp_servers: this.native?.mcpServers ?? {},
+      mcp_servers: this.nativeMcpServers,
       features: { shell_tool: Boolean(this.native?.grants?.allowCommands || this.native?.grants?.allowFileCommands || this.native?.grants?.writeRoots.length || this.native?.grants.infrastructure ||
           this.native?.grants.skillScripts && Object.values(this.native.grants.skillScripts.allowed).some(Boolean) ||
           this.native?.environments?.some(environment => environment.grants.allowCommands)),
         code_mode_host: true, memories: true, request_permissions_tool: false, send_message_to_user_async: false,
         apps: false, plugins: false, browser_use: false, computer_use: false, image_generation: false,
         multi_agent: this.native?.allowSubagents ?? false,
-        view_image: Boolean(this.native?.grants.allowFileCommands || this.native?.grants.writeRoots.length), goals: false },
+        // Arbitrary image bytes cannot be text-redacted. Reviewed renderer MCP
+        // results retain their separate, sanitized-input provenance boundary.
+        view_image: false, goals: false },
     };
   }
 

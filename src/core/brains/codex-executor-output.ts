@@ -24,7 +24,7 @@ interface ProcessOutput {
 export class CodexExecutorOutput {
   private readonly processes = new Map<string, ProcessOutput>();
 
-  constructor(private readonly maxBytes = 8 * 1024 * 1024) {
+  constructor(private readonly maxBytes = 8 * 1024 * 1024, private readonly redactOutput: (text: string) => string = text => text) {
     if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) throw new Error("Invalid native output limit");
   }
 
@@ -70,8 +70,11 @@ export class CodexExecutorOutput {
           stderr: stderr.toString("utf8"), hasSensitiveKubectl: state.security.hasSensitiveKubectl,
           outputMode: "data", onOutputData: (value) => { sanitized = value; },
         });
+        if (sanitized) sanitized = { text: this.redactOutput(sanitized.text),
+          stderr: this.redactOutput(sanitized.stderr), notices: sanitized.notices.map(this.redactOutput) };
       } catch {
         // A sanitizer failure must not reveal the unprocessed buffers.
+        sanitized = undefined;
       }
       data = sanitized ?? { text: "Output suppressed: native execution sanitization failed.", stderr: "", notices: [] };
     }

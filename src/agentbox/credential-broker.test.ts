@@ -63,6 +63,24 @@ afterEach(() => {
 });
 
 describe("CredentialBroker — host pipeline", () => {
+  it("registers token, host and bastion secrets privately, including rotations, without sharing another owner's set", async () => {
+    transport.clusterPayloads.set("read", { credential: { name: "read", type: "kubeconfig", files: [{ name: "read.kubeconfig",
+      content: 'apiVersion: v1\nusers:\n- name: reader\n  user:\n    token: first-cluster-token\n    exec:\n      env:\n      - name: CUSTOM_AUTH\n        value: tiny\n' }] } });
+    await broker.acquireCluster("read", "security-test");
+    expect(broker.getSensitiveValues()).toContain("first-cluster-token");
+    expect(broker.getSensitiveValues()).toContain("tiny");
+    transport.clusterPayloads.get("read")!.credential.files[0].content = 'users:\n- name: reader\n  user:\n    token: rotated-cluster-token\n';
+    await broker.acquireCluster("read", "security-test", { bypassCache: true });
+    expect(broker.getSensitiveValues()).toContain("first-cluster-token");
+    expect(broker.getSensitiveValues()).toContain("rotated-cluster-token");
+    transport.hostPayloads.set("host", { credential: { name: "host", type: "password", metadata: { ip: "10.0.0.1", port: 22, username: "reader", auth_type: "password", is_production: false }, files: [{ name: "host.password", content: "pw1\n" }],
+      jump_chain: [{ name: "bastion", metadata: { ip: "10.0.0.2", port: 22, username: "reader", auth_type: "password" }, files: [{ name: "bastion.password", content: "pw2" }] }] } });
+    await broker.acquireHost("host", "security-test");
+    expect(broker.getSensitiveValues()).toContain("pw1"); expect(broker.getSensitiveValues()).toContain("pw2");
+    const other = new CredentialBroker(new FakeTransport(), path.join(dir, "other-owner"));
+    try { expect(other.getSensitiveValues()).toEqual([]); } finally { other.dispose(); }
+    broker.dispose(); expect(broker.getSensitiveValues()).toEqual([]);
+  });
   it("creates clusters/ and hosts/ subdirectories at construction", () => {
     expect(fs.existsSync(path.join(dir, "clusters"))).toBe(true);
     expect(fs.existsSync(path.join(dir, "hosts"))).toBe(true);

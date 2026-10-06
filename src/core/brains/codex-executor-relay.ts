@@ -11,6 +11,8 @@ import { CodexExecutorOutput } from "./codex-executor-output.js";
 import { executeInfrastructureOperation, type InfrastructureOperation } from "./codex-infrastructure.js";
 import { fileURLToPath } from "node:url";
 import { shellEscape } from "../../tools/infra/command-sets.js";
+import { redactModelJson } from "../../shared/model-output-redactor.js";
+import { redactDataDocument } from "../../tools/infra/kubectl-sanitize.js";
 
 type JsonObject = Record<string, any>;
 interface Connection {
@@ -66,7 +68,7 @@ export class CodexExecutorRelay {
         ? (entry.operation.script.timeoutSeconds + 60) * 1000 : 70_000);
       try {
         const result = await executeInfrastructureOperation(this.options.grants.infrastructure, entry.operation, abort.signal,
-          this.options.grants.skillScripts, this.options.grants.environment, this.options.grants.resolveKubeconfig);
+          this.options.grants.skillScripts, this.options.grants.environment, this.options.grants.resolveKubeconfig, this.options.grants.redactOutput);
         response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(result));
       } catch { response.writeHead(502).end(); }
       finally { clearTimeout(deadline); running.delete(abort); }
@@ -98,7 +100,7 @@ export class CodexExecutorRelay {
       stdio: ["pipe", "pipe", "pipe"],
     });
     const connection: Connection = { socket, child, policy: new CodexExecutorPolicy(this.options.grants),
-      output: new CodexExecutorOutput(), pending: new Map() };
+      output: new CodexExecutorOutput(undefined, this.options.grants.redactOutput), pending: new Map() };
     this.connections.add(connection);
     const lines = createInterface({ input: child.stdout });
     lines.on("line", (line) => {
@@ -219,6 +221,19 @@ export class CodexExecutorRelay {
           sandboxedFileStreaming: false, fileWriteStreaming: false, shellSnapshotV2: false,
           capabilityDiscoveryV2: false, capabilityDiscoverySandbox: false };
       }
+    }
+    const redact = this.options.grants.redactOutput;
+    if (redact && message.error) {
+      message.error = { code: message.error.code, message: redact(String(message.error.message ?? "Native executor failed")) };
+    } else if (redact && pending.method === "fs/readFile") {
+      // Native filesystem reads return base64 bytes, bypassing process stdout.
+      const content = message.result?.dataBase64;
+      if (typeof content !== "string") throw new Error("Invalid native file output");
+      const bytes = Buffer.from(content, "base64");
+      const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+      message.result = { dataBase64: Buffer.from(redact(redactDataDocument(text).text)).toString("base64") };
+    } else if (redact && message.result !== undefined) {
+      message.result = redactModelJson(message.result, redact);
     }
     this.send(connection, message);
   }

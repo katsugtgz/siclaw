@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { preExecSecurity } from "../../tools/infra/security-pipeline.js";
 import { validateKubectlInPipeline } from "../../tools/infra/kubectl-readonly-policy.js";
 import { CodexExecutorOutput } from "./codex-executor-output.js";
+import { createModelOutputRedactor } from "../../shared/model-output-redactor.js";
 
 function security(command: string) {
   const checked = preExecSecurity(command, { context: "local", extraAllowed: new Set(["kubectl"]),
@@ -13,6 +14,21 @@ const encoded = (text: string) => Buffer.from(text).toString("base64");
 const text = (chunks: readonly { chunk: string }[]) => Buffer.concat(chunks.map((chunk) => Buffer.from(chunk.chunk, "base64"))).toString();
 
 describe("Codex native output policy", () => {
+  it("redacts newly acquired unlabelled credential echoes across chunks and fails closed if its secret source fails", () => {
+    const values: string[] = [];
+    const output = new CodexExecutorOutput(undefined, createModelOutputRedactor(() => values));
+    output.register("fresh", security("kubectl version --client"));
+    output.capture("fresh", 1, "stdout", encoded("healthy\nunlabelled late-"));
+    output.capture("fresh", 2, "stdout", encoded("credential"));
+    values.push("late-credential");
+    expect(text(output.finish("fresh", 0))).toContain("healthy");
+    expect(text(output.read("fresh").chunks)).not.toContain("late-credential");
+    const failing = new CodexExecutorOutput(undefined, () => { throw new Error("private-secret"); });
+    failing.register("fail", security("kubectl version --client"));
+    failing.capture("fail", 1, "stderr", encoded("private-secret"));
+    expect(text(failing.finish("fail", 1))).toContain("suppressed");
+    expect(text(failing.read("fail").chunks)).not.toContain("private-secret");
+  });
   it("withholds raw partial output and sanitizes a complete Secret before any native read", () => {
     const output = new CodexExecutorOutput();
     output.register("process-1", security("kubectl get secret test -o json"));

@@ -6,6 +6,9 @@ description: "How command output is sanitized before reaching the LLM agent, and
 
 # Output Sanitization Architecture
 
+The owner-scoped credential gate, native MCP boundary and artifact/progress
+requirements are specified in [Read-only MCP and pre-model output security](mcp-readonly-security.md).
+
 > **Purpose**: Document the multi-layer output sanitization strategy that prevents
 > sensitive data from reaching the LLM agent's context window.
 >

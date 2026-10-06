@@ -31,6 +31,8 @@ export interface CodexExecutorGrants {
   production: boolean;
   infrastructure?: CodexInfrastructureTarget;
   skillScripts?: NativeSkillScriptGrants;
+  /** Owner-scoped complete-output gate, including credentials acquired later. */
+  redactOutput?: (text: string) => string;
 }
 
 export interface AuthorizedCodexRequest {
@@ -175,7 +177,7 @@ export class CodexExecutorPolicy {
     });
     const command = fileCommand ?? argv[2];
     if (!infrastructure && (fileCommand ? !this.allowFileCommands : !this.allowCommands)) throw new Error("Native commands are not authorized");
-    const security: PreExecResult = infrastructure ? infrastructure.security : fileCommand ? { error: null, action: null, hasSensitiveKubectl: true }
+    const security: PreExecResult = infrastructure ? infrastructure.security : fileCommand ? { error: null, action: null, hasSensitiveKubectl: false }
       : preExecSecurity(command, { context: "local", extraAllowed: new Set(["kubectl"]),
       pipelineValidators: [validateKubectlInPipeline], analyzeTarget: "auto" });
     if (security.error) throw new Error(security.error);

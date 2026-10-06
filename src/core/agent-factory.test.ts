@@ -27,7 +27,7 @@ describe("agent-factory", () => {
 
   it("captures MCP results as scoped artifacts and exposes intrinsic recovery tools", () => {
     const source = fs.readFileSync(path.resolve(__dirname, "agent-factory.ts"), "utf8");
-    expect(source).toContain("withToolResultArtifactCapture(tool, toolResultArtifactStore)");
+    expect(source).toContain("withToolResultArtifactCapture(secureTool(tool), toolResultArtifactStore)");
     expect(source).toContain("customTools.push(...createToolResultArtifactTools(toolResultArtifactStore))");
     expect(source).not.toMatch(/if \(mcpTools\.length > 0\)[\s\S]{0,120}createToolResultArtifactTools/);
     expect(source).toContain("toolResultArtifactsDir");

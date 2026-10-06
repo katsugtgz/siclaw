@@ -16,6 +16,10 @@ direction supersedes wrapping Siclaw's Pi tool definitions in an MCP bridge.
   on the protected GitLab source branch.
 - Preserve whitelist-only execution, credential brokering, OS user isolation,
   path authorization, output sanitization, and cancellation guarantees.
+- Native MCP runs through the protocol security gateway described in
+  [Read-only MCP and pre-model output security](mcp-readonly-security.md).
+  Pi and Codex share explicit operation admission and owner-scoped redaction;
+  arbitrary opaque outputs and filesystem image viewing are unavailable.
 - Validate SiCore as the UI first. Defer Portal UI work until runtime acceptance.
 - Codex uses its own native memories, conversation history, resume and
   compaction. Do not implement compatibility with Siclaw's memory mechanism.

@@ -4,6 +4,8 @@ import path from "node:path";
 import { Type } from "@sinclair/typebox";
 import { createReadTool } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { createModelOutputRedactor } from "../shared/model-output-redactor.js";
+import { postExecSecurity } from "../tools/infra/security-pipeline.js";
 import {
   ToolResultArtifactStore,
   createToolResultArtifactTools,
@@ -63,6 +65,27 @@ describe("ToolResultArtifactStore", () => {
     }
     expect(assembled).toBe(text);
     expect((await fs.stat(rootDir)).mode & 0o777).toBe(0o700);
+  });
+
+  it("redacts known credentials before truncation, full-output capture, hashing and persistence", async () => {
+    const secret = "bare-output-credential.20261006";
+    const artifacts = new ToolResultArtifactStore({ rootDir, getScope: () => scope,
+      redactOutput: createModelOutputRedactor(() => [secret]) });
+    // The value crosses the old 3000-character preview boundary, without a
+    // password/token label. A post-preview redactor cannot catch that fragment.
+    const raw = "h".repeat(2993) + secret + "m".repeat(12000) + secret + "tail";
+    const tool = withToolResultArtifactCapture({ name: "fixture", label: "Fixture", description: "Fixture",
+      parameters: Type.Object({}), execute: async () => ({ content: [{ type: "text", text: postExecSecurity(raw, null) }], details: {} }) }, artifacts, 0);
+    const result = await tool.execute("call", {}, undefined, undefined, {} as never);
+    const reference = getToolResultArtifactReference(result.details)!;
+    expect(reference).toBeDefined();
+    const full = await artifacts.readFull(reference.id);
+    expect(full.text).toContain("m".repeat(12000)); expect(full.text).not.toContain(secret);
+    expect(JSON.stringify(result)).not.toContain("bare-ou");
+    const directory = await artifacts.scopedDirectory();
+    for (const file of await fs.readdir(directory)) expect(await fs.readFile(path.join(directory, file), "utf8")).not.toContain(secret);
+    const failing = new ToolResultArtifactStore({ rootDir, getScope: () => scope, redactOutput: () => { throw new Error(secret); } });
+    expect(await failing.capture({ text: secret, toolCallId: "bad", toolName: "fixture" })).toHaveProperty("failure.reason", "write_failed");
   });
 
   it("rejects a symlink as the private artifact root", async () => {

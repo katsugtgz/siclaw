@@ -77,7 +77,7 @@ describe("Codex native executor policy", () => {
     fs.writeFileSync(file, "safe");
     const allowed = policy.authorize("process/start", start(read, "cat notes.md"));
     expect(allowed.params.argv).toEqual(["/bin/bash", "-c", `'cat' '${fs.realpathSync(file)}'`]);
-    expect(allowed.command?.security.hasSensitiveKubectl).toBe(true);
+    expect(allowed.command?.security.hasSensitiveKubectl).toBe(false);
     fs.symlinkSync(denied, path.join(read, "alias"));
     for (const command of ["cat /etc/passwd", "cat alias/key", "cat notes.md; touch owned", "cat $(id)",
       "rg --pre sh pattern notes.md", "rg -L pattern .", "rg --files .", "head -n nope notes.md"]) {

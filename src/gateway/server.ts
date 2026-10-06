@@ -2525,7 +2525,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     }
     const requested = Number(params.timeoutMs);
     const timeoutMs = Number.isFinite(requested) ? Math.min(Math.max(Math.trunc(requested), 1_000), 30_000) : 10_000;
-    const manager = new McpClientManager({ mcpServers: { [name]: { ...server, transport } as any } });
+    const manager = new McpClientManager({ mcpServers: { [name]: { ...server, transport } as any } }, undefined, { discoveryOnly: true });
     let timer: NodeJS.Timeout | undefined;
     const timedOut = new Promise<"timeout">((resolve) => { timer = setTimeout(() => resolve("timeout"), timeoutMs); });
     try {
