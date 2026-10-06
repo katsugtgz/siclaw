@@ -50,6 +50,12 @@ class CodexUsageBoundary implements LlmCallPromptBoundary {
   beginAttempt(attempt?: number): void { if (attempt && attempt > 0) this.attempt = attempt; }
   rollbackAttempt(): void {}
 
+  observeSnapshot(threadId: string, usage: JsonObject): void {
+    const total = record(usage.total) ? usage.total : {};
+    const tokens = number(total.totalTokens);
+    if (tokens > (this.lastTotalByThread.get(threadId) ?? 0)) this.lastTotalByThread.set(threadId, tokens);
+  }
+
   recordUsage(threadId: string, model: BrainModelInfo | undefined, usage: JsonObject): void {
     const sink = this.sink;
     const last = record(usage.last) ? usage.last : {};
@@ -763,7 +769,13 @@ export class CodexAgentBrain implements BrainSession {
       }
     } else if (event.method === "thread/tokenUsage/updated") {
       const usage = record(params.tokenUsage) ? params.tokenUsage : {};
-      this.llmCalls.recordUsage(this.threadId!, this.model, usage);
+      // Native resume replays the latest historical usage with its old turn id.
+      // Keep that snapshot for UI/deduplication; only the active turn is a new call.
+      if (active?.started && active.id === string(params.turnId)) {
+        this.llmCalls.recordUsage(this.threadId!, this.model, usage);
+      } else {
+        this.llmCalls.observeSnapshot(this.threadId!, usage);
+      }
       const total = record(usage.total) ? usage.total : {};
       const next = { input: number(total.inputTokens), output: number(total.outputTokens),
         cacheRead: number(total.cachedInputTokens), cacheWrite: number(total.cacheWriteInputTokens),

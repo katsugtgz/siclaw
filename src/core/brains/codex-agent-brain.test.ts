@@ -119,8 +119,9 @@ describe("CodexAgentBrain compatibility", () => {
         models: [{ id: "test", cost: { input: 1, output: 2, cacheRead: 0.5 } }] });
       await brain.setModel(model);
       brain.threadId = "thread-usage";
+      brain.active = { id: "live-turn", started: true };
       brain.llmCalls.setUsageSink({ context: () => ({ sessionId: "session-1", executionRole: "root" }), record });
-      const event = { method: "thread/tokenUsage/updated", params: { threadId: "thread-usage",
+      const event = { method: "thread/tokenUsage/updated", params: { threadId: "thread-usage", turnId: "live-turn",
         tokenUsage: { total: { inputTokens: 12, outputTokens: 3, cachedInputTokens: 2, totalTokens: 15 },
           last: { inputTokens: 12, outputTokens: 3, cachedInputTokens: 2, totalTokens: 15 },
           modelContextWindow: 8_000 } } };
@@ -134,6 +135,38 @@ describe("CodexAgentBrain compatibility", () => {
           input_tokens: 12, output_tokens: 3, input_tokens_details: { cached_tokens: 2 },
         } }),
       }));
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not bill a restored historical token snapshot as another model call", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "siclaw-codex-restored-usage-"));
+    try {
+      const brain = new (CodexAgentBrain as any)(
+        { getSessionDir: () => dir, getEntries: () => [] },
+        { grants: { readRoots: [], writeRoots: [], deniedRoots: [], allowCommands: false, production: false } },
+        "", new Map(), dir, [],
+      ) as any;
+      const record = vi.fn();
+      brain.registerProvider("test", { baseUrl: "https://example.test/v1", apiKey: "fixture", models: [{ id: "test" }] });
+      await brain.setModel(model);
+      brain.threadId = "restored-thread";
+      brain.llmCalls.setUsageSink({ context: () => ({ sessionId: "session-1", executionRole: "root" }), record });
+      const snapshot = (turnId: string, total: number) => ({ method: "thread/tokenUsage/updated", params: {
+        threadId: "restored-thread", turnId, tokenUsage: {
+          total: { totalTokens: total }, last: { inputTokens: 12, outputTokens: 3, totalTokens: 15 },
+        },
+      } });
+      brain.handleEvent(snapshot("old-turn", 100));
+      expect(record).not.toHaveBeenCalled();
+      brain.active = { id: "new-turn", started: true };
+      brain.handleEvent(snapshot("old-turn", 100));
+      brain.handleEvent(snapshot("new-turn", 100));
+      expect(record).not.toHaveBeenCalled();
+      brain.handleEvent(snapshot("new-turn", 115));
+      brain.handleEvent(snapshot("new-turn", 115));
+      expect(record).toHaveBeenCalledTimes(1);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }

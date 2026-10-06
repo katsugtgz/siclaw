@@ -46,6 +46,8 @@ let calls = 0;
 let rootCalls = 0;
 let childCalls = 0;
 let childId;
+let completedRootResponses = 0;
+const usageObservations = [];
 const planEvents = [];
 let holdNextResponse = false;
 let streamingRequestSeen;
@@ -179,6 +181,7 @@ const model = createServer(async (request, response) => {
     streamingRequestSeen?.();
     return; // Keep the real model request open until Codex interrupts it.
   }
+  if (!memoryTurn && !childTurn) completedRootResponses++;
   send("response.output_item.added", { output_index: 0,
     item: toolCall ? { ...item, arguments: "", status: "in_progress" }
       : { ...item, ...(item.type === "message" ? { content: [] } : {}),
@@ -210,6 +213,8 @@ const makeBrain = async (sessionManager) => {
   assert.equal(resources.session, undefined, "Codex must not instantiate a Pi AgentSession");
   assert.deepEqual(resources.customTools, [], "Codex must not receive Pi ToolDefinitions");
   const brain = resources.brain;
+  brain.llmCalls.setUsageSink({context:()=>({sessionId:"native-source-smoke",executionRole:"root"}),
+    record:observation=>usageObservations.push(observation)});
   brain.registerProvider("fixture", { apiKey: "test", headers: {"X-Native-Smoke": "fixture"}, baseUrl: `http://127.0.0.1:${port}/v1`,
     api: "openai-responses", models: [{ id: "gpt-5.5", api: "openai-responses",
       contextWindow: 128_000, maxTokens: 1_000 }] });
@@ -268,6 +273,11 @@ try {
   const afterInterrupt = rootCalls;
   await brain.prompt("Continue after Stop");
   assert.equal(rootCalls, afterInterrupt + 1);
+  assert.equal(usageObservations.length, completedRootResponses,
+    "native resume snapshots must not add model usage observations");
+  assert.equal(usageObservations.reduce((sum, entry) => sum + entry.usageEvidence.rawUsage.input_tokens +
+    entry.usageEvidence.rawUsage.output_tokens, 0), completedRootResponses * 16,
+    "recorded usage must match actual completed parent model responses");
   console.log(`Native Codex brain smoke passed: ${calls} model calls, 1 native child (${childCalls} calls), plan, command, patch, read/redaction, denied command/path, resume, early/active Stop, continuation${realCluster ? ", real roce-test environment, parent/child broker refresh" : ""}`);
 
 } finally {
