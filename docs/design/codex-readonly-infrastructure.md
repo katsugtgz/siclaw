@@ -227,3 +227,57 @@ After acceptance, the test reader's namespace Role is restored to Pod
 get/list/watch only, its temporary node ClusterRole/Binding is removed, and the
 SSH Pod/Service/public-key ConfigMap plus the private SiCore host/credential are
 removed. Diagnostic Jobs/Pods finish cleanup; the existing Runtime and PVC remain.
+
+### Native process and streaming acceptance (2026-10-07)
+
+Implementation `ae4ff48e` keeps the official source pin `d4684bba` unchanged.
+The process output ledger and default adapter deadlines are removed. Native
+exec-server owns sequence numbers, replay, retention, closure and cancellation;
+Codex owns yield/poll behavior and output token/head-tail budgets. Security
+framing is applied before bytes enter that native process stream.
+
+- Full regression: **418 files / 8748 tests**, TypeScript and build pass.
+- Shared document primitives cover complete Pi/file/MCP documents and native
+  streams: PEM, YAML mappings/scalars, quoted/folded/continued values, Pod env
+  name/value pairs, registry auth, nested Secret objects and JSON records.
+  Known owner credential literals/encodings are protected across byte/line
+  splits. Malformed or oversized records are suppressed independently; a
+  formatting expansion also respects the record budget.
+- Linux validation uses the immutable, previously verified source-built Codex
+  parent `codex-security-9d76db98` at digest
+  `sha256:84c812b35584a6a9d75bbd8aa845283a0726c638b188fe9a3fc915118c6c8a6b`
+  and compiles the current AgentBox TypeScript. No npm Codex is installed.
+  The repository's full-source `Dockerfile.agentbox` remains unchanged.
+- Actual lifetime probes on the unchanged transport (`749781af`) confirm a
+  command beyond 60 seconds and a reviewed script beyond 300 seconds. A private
+  HTTP keepalive prevents idle transport deadlines without becoming model
+  output. Final `ae4ff48e` Linux image passes all five source-built native MCP,
+  brain, script, stream and executor smoke gates, including >8 MiB safe logs,
+  native replay/sequence, separate connection ownership, sandbox UID **1001**,
+  immutable scripts, denied stdin and complete process-tree Stop. Model-request
+  fixtures verify pre-model credential redaction and zero upstream MCP writes.
+- Real SiCore/Responses/K8sSpawner run on `749781af` uses session
+  `8bf1ad16-66ce-4aa6-81a6-6937f348c157`: the 75-second bound-cluster read exits
+  zero, reviewed script help succeeds, deletion/private-file reads are refused,
+  and native child `be8505bc-dc66-4364-956e-f392e098d614` performs an actual read
+  with native spawn/wait/close. The native rollout records **3 write_stdin calls**.
+  A first run surfaced an expired test token; refreshing the same reader
+  credential fixes it without changing permission grants.
+- Cold restore and Stop on `a1305f01` retain that same parent/child history.
+  Stop session `c1776153-4ec4-4ca8-a94e-899c8e9bdbac` is acknowledged through
+  SiCore; the earlier Stop's long sleep descendants are confirmed gone.
+  Parent/child SSE and persisted records exclude the fresh reader credential.
+- The independent `siclaw-native-validation-runtime` now selects final image
+  `codex-stream-validation-ae4ff48e`, digest
+  `sha256:325d4106126d09dafedf242a00cdac5ccb7d548d0db569c02553b77d07440198`.
+  Final shared-redactor changes have Linux/component evidence; the live
+  conversation evidence above names its exact deployed revision separately.
+  Frontend, SiCore code and upstream Codex source are unchanged in this work.
+- Original bindings remain one cluster and no hosts/MCP/extra Skill/Knowledge
+  bindings. Reader RBAC remains only namespace Pod get/list/watch. The temporary
+  local token file and redundant source rebuilds are removed/stopped. The test
+  Runtime, Agent and its private PVC subdirectory are kept for follow-up runs.
+
+This verifies the native long-process/output migration and its security gates.
+Full raw log archival/search, executor reconnect, Portal UI, cross-Agent handoff
+and the separately deferred native-memory isolation are outside this acceptance.
