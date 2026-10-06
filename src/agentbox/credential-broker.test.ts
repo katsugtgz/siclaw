@@ -88,7 +88,7 @@ describe("CredentialBroker — host pipeline", () => {
     await broker.acquireCluster("read", "security-test", { bypassCache: true });
     expect(broker.getSensitiveValues()).toContain("first-cluster-token");
     expect(broker.getSensitiveValues()).toContain("rotated-cluster-token");
-    transport.hostPayloads.set("host", { credential: { name: "host", type: "password", metadata: { ip: "10.0.0.1", port: 22, username: "reader", auth_type: "password", is_production: false }, files: [{ name: "host.password", content: "pw1\n" }],
+    transport.hostPayloads.set("host", { credential: { name: "host", type: "ssh", metadata: { ip: "10.0.0.1", port: 22, username: "reader", auth_type: "password", is_production: false }, files: [{ name: "host.password", content: "pw1\n" }],
       jump_chain: [{ name: "bastion", metadata: { ip: "10.0.0.2", port: 22, username: "reader", auth_type: "password" }, files: [{ name: "bastion.password", content: "pw2" }] }] } });
     await broker.acquireHost("host", "security-test");
     expect(broker.getSensitiveValues()).toContain("pw1"); expect(broker.getSensitiveValues()).toContain("pw2");

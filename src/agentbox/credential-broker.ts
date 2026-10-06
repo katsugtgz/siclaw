@@ -400,7 +400,7 @@ export class CredentialBroker {
         existingFiles.push({ name, content: fs.readFileSync(file, "utf8") });
       }
     }
-    this.rememberSensitiveValues({ credential: { name: "private-cache", type: "redaction-snapshot", files: existingFiles } });
+    this.rememberSensitiveFiles(existingFiles);
     this.cleanupTimer = setInterval(() => {
       this.clusters.evictExpired();
       this.hosts.evictExpired();
@@ -729,6 +729,10 @@ export class CredentialBroker {
 
   private rememberSensitiveValues(response: CredentialResponse): void {
     const files = [...response.credential.files, ...(response.credential.jump_chain ?? []).flatMap(hop => hop.files)];
+    this.rememberSensitiveFiles(files);
+  }
+
+  private rememberSensitiveFiles(files: CredentialFile[]): void {
     for (const file of files) {
       if (!file.content) continue;
       this.sensitiveValues.add(file.content);
