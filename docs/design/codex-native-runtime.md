@@ -185,10 +185,11 @@ No test account secrets belong in source, image layers or recorded evidence.
   native thread id, pending Plan snapshot and workspace file. Restarting only
   the test Runtime preserves the CA and existing AgentBox; resumed file reads
   and real broker queries succeed.
-- A native V1 child reads/waits/closes successfully. Its real native rollout
-  contains parent lineage. SiCore nevertheless returns no child session for
-  the spawn id, and usage facts contain only `root` roles. Child projection,
-  persistence and attribution remain implementation gaps.
+- The initial native V1 child reads/waits/closes, but that image does not persist
+  a public child session or attribute child usage. These implementation gaps are
+  closed by the later native child projection acceptance below. The existing
+  `children?group_id=...` endpoint is batch discovery (`group#item` lineage),
+  not an individual native child's discovery contract.
 - Root usage did reach SiCore, but cold attachment was overcounted: the native
   root has 20 completed calls / 321881 tokens, versus 25 facts / 406000 tokens.
   Upstream explicitly replays the last usage snapshot with its historical
@@ -334,9 +335,9 @@ not established by the component/namespace results.
 - Test-namespace Runtime/AgentBox with SiCore: streaming/reasoning, tool/plan and
   child views, Stop/steer, restart/resume, model routing and usage accounting.
   K8sSpawner deployment is approved; mTLS callbacks, pending Plan persistence,
-  real namespace credentials and Pod/Runtime recovery pass. Child persistence,
-  complete child usage attribution and the remaining business contracts still need
-  acceptance. No Portal UI acceptance is attempted.
+  real namespace credentials, Pod/Runtime recovery and the native child projection
+  acceptance below pass. Remaining business contracts still need acceptance.
+  No Portal UI acceptance is attempted.
 - Native product services: knowledge labels/citations, enabled investigation
   workflow state, reports, schedules, host/node/pod
   diagnostic bindings and script execution. The removed Pi tools are not claimed
@@ -346,12 +347,63 @@ not established by the component/namespace results.
   consolidation needs authorized execution and real-provider acceptance. Further
   memory isolation work is deferred by the user.
 - Native clarification, file attachments and structured-result contracts;
-  external MCP output/artifact policy; child detail persistence and resource/model
+  external MCP output/artifact policy; child resource/model
   policy. Explicit unsupported requests must never silently run Pi.
 - Interactive/background execution, stateful streaming, bounded finished-process
   output retention and executor reconnect.
 
 Full Pi replacement and complete end-to-end acceptance are not yet established.
+
+## Native child projection acceptance (2026-10-06)
+
+Implementation `85337308` observes native V1 collaboration items and V2
+`subAgentActivity`, including owned descendants. Upstream already attaches child
+listeners; Siclaw does not resume a child to subscribe or run a Pi child session.
+Native Codex still creates, coordinates, waits for and closes its children.
+
+- A private journal maps native thread IDs to stable public child session UUIDs,
+  retains pending persistence, and fences replayed items and usage. Unrelated
+  internal threads cannot acquire ownership through an event alone.
+- AgentBox uses the existing Runtime-owned `GatewayClient` persistence contract:
+  create the owned child row before transcript/usage, redact persisted content,
+  and emit existing terminal records. Committed appends with lost acknowledgements
+  are reconciled against transcript projection keys before retry; this reuses
+  the existing append API and does not add a database uniqueness guarantee.
+- Child billing uses the native child model metadata and `internal_subagent`
+  role, with deterministic call IDs and frozen parent dispatch identity.
+  `b9087f4c` captures native continuation identity at tool start, before a fast
+  child response can precede the parent's tool completion. Child work keeps its
+  parent resident while running; no Pi mailbox wakeup controls native lifecycle.
+- SiCore branch `feat/native-codex-child-ui` adds native launch-name tolerance in
+  two UI modules. Existing child authorization, transcript readers and completion
+  folding are reused. No backend/schema or production dependency changes.
+
+The independent K8sSpawner Runtime now selects source-built AgentBox image
+`siclaw-agentbox:codex-child-b9087f4c`, digest
+`sha256:78412a96b5a002465a7892dab259b41fab76a9969833776961b429856964a692`.
+Codex remains pinned to GitLab main `d4684bba63aba4c941d5a251054609e722b64779`.
+Existing SiCore API/Web deployments are unchanged; an isolated local Next.js UI
+uses the actual test API and MySQL.
+
+| Real native check | Result |
+| --- | --- |
+| V1 safe workspace read and `/etc/hostname` rejection | Pass; child transcript includes success and denied tool rows |
+| V2 safe workspace read and same path rejection | Pass; native V2 lifecycle, no invented close operation |
+| V1 parent/child usage before cold restore | 6 calls / 74565 tokens; 3 calls / 30789 tokens |
+| V1 cold restore and native resume/send/wait/close of the same child | Pass; unchanged public child ID, 10 persisted child rows |
+| V1 usage after continuation | Parent 11 / 145709; child 5 / 51986, exact native rollout match |
+| V2 cold restore and completed-child replay fence | Parent 6 / 77794; child remains 3 / 38067, exact native rollout match |
+| Child dispatch attribution | V1 continuation belongs to the new parent trace; V2 inactive child keeps its original trace |
+| Pending projection journal | Empty after both live runs and cold restores |
+
+Source-built smoke checks one native child, three child model calls, transcript,
+failure rows, terminal state, executor grants and parent resume/Stop. The final
+Siclaw source passes **409 files / 8055 tests**, TypeScript and build. SiCore's
+five focused files pass **208 tests** and TypeScript. Real Playwright checks
+native V1 audit and V2 Preview cards, child reads and reload persistence; audit
+trace placement is checked so asynchronous placement cannot hide a native card
+inside a generic command batch. Native HTTP/LLM timing is not invented; missing
+timing and separate child trace envelopes remain explicitly labelled by audit.
 
 ## Deferred follow-ups
 
