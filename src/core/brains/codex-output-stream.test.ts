@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { CodexOutputStream } from "./codex-output-stream.js";
 import { analyzeOutput } from "../../tools/infra/output-sanitizer.js";
 import { createModelOutputRedactor, SensitiveLiteralStream } from "../../shared/model-output-redactor.js";
+import { redactDataDocument } from "../../tools/infra/kubectl-sanitize.js";
 
 const bytes = (text: string) => Buffer.from(text);
 describe("native output security framing", () => {
@@ -98,6 +99,11 @@ describe("native output security framing", () => {
     safe += stream.push(bytes('{"password":"' + "x".repeat(100) + '"}\nafter\n')) + stream.finish();
     expect(safe).toContain("healthy"); expect(safe).toContain("after"); expect(safe).not.toContain("xxx");
   });
+  it("continues after a JSON record exceeds its budget during formatting", () => {
+    const stream = new CodexOutputStream(null, text => text, () => [], 64);
+    const safe = stream.push(bytes('{"items":[1,2,3,4,5,6,7,8,9,10]}\nhealthy\n')) + stream.finish();
+    expect(safe).toContain('suppressed'); expect(safe).toContain('healthy');
+  });
   it("fails closed on malformed bytes and a failing credential source", () => {
     const utf8 = new CodexOutputStream();
     expect(utf8.push(new Uint8Array([0xff]))).toContain("suppressed"); expect(utf8.finish()).toBe("");
@@ -109,6 +115,14 @@ describe("native output security framing", () => {
     const token = 'ghp_' + 'a'.repeat(40);
     const safe = stream.push(bytes(`diagnostic ${token}\n`)) + stream.finish();
     expect(safe).not.toContain(token);
+  });
+  it("shares multiline protection with complete file/MCP/Pi documents", () => {
+    const safe = redactDataDocument('password: "hidden-first\nhidden-second"\nsafe: yes\n');
+    expect(safe.text).not.toContain('hidden-'); expect(safe.text).toContain('safe: yes'); expect(safe.redacted).toBe(true);
+  });
+  it("protects name/value credentials in generic complete documents", () => {
+    const safe = redactDataDocument('{"spec":{"template":{"spec":{"containers":[{"env":[{"name":"API_TOKEN","value":"hidden-env"}]}]}}}}');
+    expect(safe.text).not.toContain('hidden-env'); expect(safe.redacted).toBe(true); expect(()=>JSON.parse(safe.text)).not.toThrow();
   });
   it("requires new command-specific sanitizers to declare their stream contract", () => {
     const stream = new CodexOutputStream({type:"sanitize",lineSafe:false,sanitize:() => "safe"});

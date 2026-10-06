@@ -12,7 +12,7 @@ const SUPPRESSED = "[Output record suppressed: unable to sanitize safely]";
 export class CodexOutputStream {
   private readonly decoder = new TextDecoder("utf-8", { fatal: true });
   private readonly literals: SensitiveLiteralStream;
-  private readonly line: (line: string) => string;
+  private readonly line: (line: string) => string | undefined;
   private pending = "";
   private json = false;
   private depth = 0;
@@ -88,12 +88,15 @@ export class CodexOutputStream {
     if (json) {
       // Malformed structured data has no text fallback: kind/data/env fields
       // might occur after an already emitted value.
-      try { JSON.parse(text); } catch { return SUPPRESSED; }
-      text = this.action?.streamMode === "json" ? this.action.sanitize(text, () => {}) : sanitizeJSON(text, "pod", () => {});
-      text = redactDataDocument(text).text;
+      try {
+        JSON.parse(text);
+        text = this.action?.streamMode === "json" ? this.action.sanitize(text, () => {}) : sanitizeJSON(text, "pod", () => {});
+        text = redactDataDocument(text).text;
+      } catch { return SUPPRESSED; }
     } else if (this.action?.streamMode === "json" && text.trim()) return SUPPRESSED;
     else if (this.action?.streamMode === "env-nul") text = this.action.sanitize(text, () => {});
-    else text = this.line(text);
+    else text = this.line(text) ?? "";
+    if (Buffer.byteLength(text) > this.recordBudget) return SUPPRESSED;
     return this.redact(text);
   }
 

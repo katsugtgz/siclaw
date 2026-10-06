@@ -250,86 +250,20 @@ export function redactLines(text: string): { text: string; redacted: boolean } {
  * to the end of the text, since a truncated key is still a key).
  */
 export function redactDocument(text: string): { text: string; redacted: boolean } {
-  const lines = text.split("\n");
-  const out: string[] = [];
+  const redact = createDocumentLineRedactor();
   let redacted = false;
-  /** Indent of a sensitive key whose value is a nested mapping, while inside it. */
-  let sensitiveMappingIndent: number | null = null;
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-
-    // Everything nested under a sensitive key is part of that secret, whatever
-    // the inner field names are: `password:` followed by `inner: hunter2` says
-    // nothing about `inner`, so judging that line on its own merits would leak it.
-    // Field names are kept — they say WHAT was configured, not what its value is.
-    if (sensitiveMappingIndent !== null) {
-      if (!ownedByBlock(line, sensitiveMappingIndent)) {
-        sensitiveMappingIndent = null;
-      } else if (line.trim() === "") {
-        out.push(line);
-        continue;
-      } else {
-        const nested = splitKeyValue(line);
-        // A nested mapping of its own has no value on this line to redact.
-        if (nested && nested.value === "") {
-          out.push(line);
-          continue;
-        }
-        out.push(nested ? `${nested.prefix}${REDACTED}` : REDACTED);
-        redacted = true;
-        continue;
-      }
-    }
-
-    // PEM: swallow through END. Checked before the key/value shapes because the
-    // BEGIN marker can itself sit after a key (`tls.key: -----BEGIN …`).
-    if (PEM_BEGIN_RE.test(line)) {
-      const split = splitKeyValue(line);
-      out.push(split ? `${split.prefix}${REDACTED}` : REDACTED);
-      redacted = true;
-      while (i < lines.length && !PEM_END_RE.test(lines[i])) i++;
-      continue;
-    }
-
-    const split = splitKeyValue(line);
-    if (split && (isSensitiveKeyName(split.key) || looksLikeSensitiveValue(split.value))) {
-      // A block scalar (`key: |`) puts the value on the lines below, where no key
-      // name marks it — the whole indented run collapses into this REDACTED.
-      if (BLOCK_SCALAR_RE.test(split.value)) {
-        out.push(`${split.prefix}${REDACTED}`);
-        redacted = true;
-        while (i + 1 < lines.length && ownedByBlock(lines[i + 1], split.indent)) i++;
-        continue;
-      }
-      // An empty value opens a nested mapping: nothing on THIS line to redact,
-      // and its children are pairs that match on their own keys.
-      if (split.value === "") {
-        out.push(line);
-        sensitiveMappingIndent = split.indent;
-        continue;
-      }
-      out.push(`${split.prefix}${REDACTED}`);
-      redacted = true;
-      continue;
-    }
-
-    const replaced = redactOneLine(line);
-    if (replaced !== null) {
-      out.push(replaced);
-      redacted = true;
-      continue;
-    }
-
-    out.push(line);
+  const out: string[] = [];
+  for (const line of text.split("\n")) {
+    const safe = redact(line);
+    if (safe !== line) redacted = true;
+    if (safe !== undefined) out.push(safe);
   }
-
   return { text: out.join("\n"), redacted };
 }
 
 /** One complete text line at a time, with the same document vocabulary. State
  * belongs to one stdout/stderr stream, never to a user or process-global cache. */
-export function createDocumentLineRedactor(environmentRecords = false): (line: string) => string {
+export function createDocumentLineRedactor(environmentRecords = false): (line: string) => string | undefined {
   let pem = false, block: number | null = null, mapping: number | null = null;
   let sensitiveEnvironment = false, podEnvironmentIndent: number | null = null;
   let quote: string | null = null, continuation = false;
@@ -349,15 +283,15 @@ export function createDocumentLineRedactor(environmentRecords = false): (line: s
     if (environmentRecords) {
       if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(line)) {
         sensitiveEnvironment = !!split && (isSensitiveKeyName(split.key) || looksLikeSensitiveValue(split.value));
-      } else if (sensitiveEnvironment) return "";
+      } else if (sensitiveEnvironment) return undefined;
     }
-    if (pem) { if (PEM_END_RE.test(line)) pem = false; return ""; }
-    if (quote) { if (closesQuote(line, quote)) quote = null; return ""; }
-    if (continuation) { continuation = continued(line); return ""; }
-    if (block !== null) { if (ownedByBlock(line, block)) return ""; block = null; }
+    if (pem) { if (PEM_END_RE.test(line)) pem = false; return undefined; }
+    if (quote) { if (closesQuote(line, quote)) quote = null; return undefined; }
+    if (continuation) { continuation = continued(line); return undefined; }
+    if (block !== null) { if (ownedByBlock(line, block)) return undefined; block = null; }
     if (mapping !== null) {
       if (!ownedByBlock(line, mapping)) mapping = null;
-      else return split ? `${split.prefix}${REDACTED}` : line.trim() ? REDACTED : line;
+      else return split ? split.value === "" ? line : `${split.prefix}${REDACTED}` : line.trim() ? REDACTED : line;
     }
     // Pod YAML puts the variable name on a different line from its value.
     if (podEnvironmentIndent !== null) {
@@ -1152,7 +1086,11 @@ function redactJsonPayload(
         if (records.every(row => row === undefined || row !== null && typeof row === "object")) {
           let redacted = false;
           const text = records.map((row, index) => {
-            if (row === undefined || !redactJsonTree(row)) return lines[index];
+            if (row === undefined) return lines[index];
+            const pairs = redactSensitiveNameValuePairs(row);
+            const registry = redactRegistryAuth(row);
+            const generic = redactJsonTree(row);
+            if (!pairs && !registry && !generic) return lines[index];
             redacted = true;
             return JSON.stringify(row);
           }).join("\n");
@@ -1165,7 +1103,12 @@ function redactJsonPayload(
       : null;
   }
 
-  const redacted = redactJsonTree(parsed);
+  // Apply the same shape-aware name/value and registry protection to generic
+  // documents (file/MCP/diagnostic envelopes), not only kubectl JSON commands.
+  const pairs = redactSensitiveNameValuePairs(parsed);
+  const registry = redactRegistryAuth(parsed);
+  const generic = redactJsonTree(parsed);
+  const redacted = pairs || registry || generic;
   // A line-level caller must not turn one line into several: it would corrupt the surrounding
   // document's shape, and the streaming sanitizer works a line at a time.
   const text = redacted
