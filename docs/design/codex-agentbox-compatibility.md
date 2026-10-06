@@ -21,7 +21,8 @@ selection are still reused by the adapter.
 
 The runtime design's dated records include actual Responses/SiCore/K8sSpawner
 acceptance for the native diagnostic path, separately from component/fake-model
-checks. Remaining product contracts (citations, investigation/report/schedule
+checks. Native citation display and MCP errors have [scoped live acceptance](codex-knowledge-citations.md).
+Remaining product contracts (investigation/report/schedule
 services, structured questions and non-image attachments) are listed in
 [Remaining acceptance work](codex-native-runtime.md#remaining-acceptance-work-reconciled-2026-10-07).
 Full Pi feature replacement is not yet established.
