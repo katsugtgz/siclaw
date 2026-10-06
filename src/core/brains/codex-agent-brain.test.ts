@@ -9,6 +9,18 @@ const model = { id: "test", name: "Test", provider: "test", api: "openai-respons
   contextWindow: 8_000, maxTokens: 1_000, reasoning: false };
 
 describe("CodexAgentBrain compatibility", () => {
+  it("keeps an error-only native MCP reason in events and persisted tool results", () => {
+    const brain = Object.create(CodexAgentBrain.prototype) as any;
+    const events: any[] = [], messages: any[] = [];
+    brain.threadId = "root"; brain.active = { toolNames: new Set() };
+    brain.toolItems = new Map(); brain.toolsetsByName = new Map(); brain.listeners = new Set([(event: any) => events.push(event)]);
+    brain.appendCache = (message: any) => messages.push(message);
+    brain.native = { grants: { redactOutput: (text: string) => text.replaceAll("private-secret", "[REDACTED]") } };
+    brain.handleEvent({ method: "item/started", params: { threadId: "root", item: { id: "call", type: "mcpToolCall", tool: "read", arguments: {} } } });
+    brain.handleEvent({ method: "item/completed", params: { threadId: "root", item: { id: "call", type: "mcpToolCall", status: "failed", error: { message: "Safe failure private-secret" } } } });
+    expect(events.find(event => event.type === "tool_execution_end").result.content[0].text).toBe("Safe failure [REDACTED]");
+    expect(messages.find(message => message.role === "toolResult").content[0].text).toBe("Safe failure [REDACTED]");
+  });
   it("enables native update_plan and forwards its app-server notification", () => {
     const brain = Object.create(CodexAgentBrain.prototype) as any;
     const onPlanUpdate = vi.fn();

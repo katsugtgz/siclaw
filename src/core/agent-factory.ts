@@ -255,6 +255,7 @@ function buildAppendSystemPrompt(
   knowledgeDir?: string,
   knowledgeCitationsEnabled = false,
   operationalKnowledge = true,
+  knowledgeCitationToolName = "knowledge_cite",
 ): string[] {
   const parts: string[] = [];
 
@@ -327,7 +328,7 @@ When the user does provide identifying info, IMMEDIATELY update \`${memoryDir}/P
     parts.push(wikiCatalog);
   }
   if (knowledgeCitationsEnabled && knowledgeDir) {
-    parts.push(buildKnowledgeCitationSystemPrompt(knowledgeDir));
+    parts.push(buildKnowledgeCitationSystemPrompt(knowledgeDir, knowledgeCitationToolName));
   }
 
   return parts;
@@ -1015,6 +1016,7 @@ export async function createSiclawSession(
   // Codex owns its native tools and children. Cross-Agent handoff is not exposed
   // by this engine; the separately selectable Pi runtime keeps its own contract.
   if (useCodex) {
+    const nativeKnowledgeEnabled = Boolean(citationSupport && (!Array.isArray(allowedTools) || allowedTools.includes("read")));
     fs.mkdirSync(userDataDir, { recursive: true });
     const allowNativeFileRead = customTools.some((tool) => ["read", "grep", "find", "ls"].includes(tool.name));
     const nativeSkills = loadedSkills.map((skill) => ({name:skill.name, filePath:skill.filePath}));
@@ -1072,7 +1074,7 @@ export async function createSiclawSession(
     brain = await CodexAgentBrain.create({
       sessionManager, systemPrompt: [compiledContext.systemPrompt,
         ...buildAppendSystemPrompt(memoryEnabled ? memoryDir : null, knowledgeDir,
-          Boolean(citationSupport), compiledContext.harness.includeOperationalSafety),
+          nativeKnowledgeEnabled, compiledContext.harness.includeOperationalSafety, "mcp__siclaw_knowledge.knowledge_cite"),
         environments.length ? "Authorized read-only infrastructure execution environments: " +
           environments.map((entry) => entry.id).join(", ") +
           ". Select environment_id in native exec_command. cluster: environments support read-only kubectl queries; " +
@@ -1093,6 +1095,8 @@ export async function createSiclawSession(
           : ""].join("\n\n"),
       toolsetsByName, cwd: userDataDir, nativePlanEnabled, grants: nativeGrants, environments,
       mcpServers: mcpServers as Record<string, McpServerConfig>, sensitiveValues, codexHome,
+      ...(nativeKnowledgeEnabled
+        ? { knowledge: { directory: knowledgeDir, emit: opts!.sessionEventEmitter! } } : {}),
       allowSubagents: nativeAllowSubagents,
       onPlanUpdate: opts?.sessionEventEmitter
         ? (plan) => projectCodexPlan(taskListId, opts.sessionEventEmitter!, plan) : undefined,

@@ -12,6 +12,9 @@ import { CodexMcpGateway } from "./codex-mcp-gateway.js";
 import type { McpServerConfig } from "../mcp-client.js";
 import { mcpSensitiveValues } from "../mcp-security.js";
 import { createModelOutputRedactor, type SensitiveValueSource } from "../../shared/model-output-redactor.js";
+import { projectCodexMcpResult } from "./codex-mcp-result.js";
+import { CodexKnowledge } from "./codex-knowledge.js";
+import type { KnowledgeSourceCitation } from "../../shared/knowledge-citations.js";
 import type { CodexExecutorGrants } from "./codex-executor-policy.js";
 import type { AgentMailbox } from "../agent-mailbox.js";
 import type { LlmCallPromptBoundary } from "../llm-call-recorder.js";
@@ -120,6 +123,7 @@ export class CodexAgentBrain implements BrainSession {
   private readonly providers = new Map<string, JsonObject>();
   private readonly executor: CodexExecutorRelay;
   private readonly mcpGateway: CodexMcpGateway;
+  private readonly knowledge?: CodexKnowledge;
   private nativeMcpServers: JsonObject = {};
   private readonly clusterExecutors = new Map<string, CodexExecutorRelay>();
   private readonly home: string;
@@ -153,7 +157,8 @@ export class CodexAgentBrain implements BrainSession {
   private constructor(
     private readonly sessionManager: SessionManager,
     private readonly native: { grants: CodexExecutorGrants; mcpServers?: Record<string, McpServerConfig>; sensitiveValues?: SensitiveValueSource; allowSubagents?: boolean; codexHome?: string;
-      environments?: Array<{ id: string; grants: CodexExecutorGrants }> },
+      environments?: Array<{ id: string; grants: CodexExecutorGrants }>;
+      knowledge?: { directory: string; emit: (event: { type: "knowledge_sources"; sources: KnowledgeSourceCitation[] }) => void } },
     private readonly systemPrompt: string,
     private readonly toolsetsByName: ReadonlyMap<string, string>,
     private readonly cwd: string,
@@ -193,7 +198,17 @@ export class CodexAgentBrain implements BrainSession {
           throw new Error("Native child ancestry or model identity is unavailable");
         }
         return string(thread.model);
-      });
+      }, outputGate);
+    if (native.knowledge) {
+      this.knowledge = new CodexKnowledge({ knowledgeDir: native.knowledge.directory,
+        redact: outputGate, sensitiveValues,
+        owned: id => id === this.threadId ? !!this.active && !this.abortPending : this.children.ownsActive(id),
+        emit: (id, sources) => {
+          if (id === this.threadId) native.knowledge!.emit({ type: "knowledge_sources", sources });
+          else this.children.setKnowledgeSources(id, sources);
+        } });
+      this.mcpGateway.registerKnowledge(this.knowledge.tool, (args, id, signal) => this.knowledge!.call(args, id, signal));
+    }
     this.messages = sessionManager.getEntries()
       .filter((entry) => entry.type === "message")
       .map((entry) => entry.message);
@@ -229,10 +244,11 @@ export class CodexAgentBrain implements BrainSession {
     toolsetsByName: ReadonlyMap<string, string>;
     cwd: string; skillPaths: Array<{ name: string; filePath: string }>;
     nativePlanEnabled?: boolean; onPlanUpdate?: (plan: unknown) => void;
+    knowledge?: { directory: string; emit: (event: { type: "knowledge_sources"; sources: KnowledgeSourceCitation[] }) => void };
   }): Promise<CodexAgentBrain> {
     const brain = new CodexAgentBrain(options.sessionManager,
       { grants: options.grants, mcpServers: options.mcpServers, sensitiveValues: options.sensitiveValues, allowSubagents: options.allowSubagents,
-        environments: options.environments, codexHome: options.codexHome }, options.systemPrompt,
+        environments: options.environments, codexHome: options.codexHome, knowledge: options.knowledge }, options.systemPrompt,
       options.toolsetsByName, options.cwd, options.skillPaths,
       options.nativePlanEnabled, options.onPlanUpdate);
     fs.mkdirSync(brain.home, { recursive: true, mode: 0o700 });
@@ -520,6 +536,7 @@ export class CodexAgentBrain implements BrainSession {
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
+    this.knowledge?.close();
     this.active?.mailboxStop?.abort();
     await this.client?.close();
     this.client = undefined;
@@ -746,6 +763,7 @@ export class CodexAgentBrain implements BrainSession {
   private handleEvent(event: CodexEvent): void {
     const params = event.params;
     this.children?.handle(event);
+    this.knowledge?.observe(event);
     if (string(params.threadId) !== this.threadId) return;
     if (event.method === "turn/plan/updated") {
       this.onPlanUpdate?.(params.plan);
@@ -812,11 +830,11 @@ export class CodexAgentBrain implements BrainSession {
         const started = this.toolItems.get(id);
         this.toolItems.delete(id);
         const name = string(item.tool) || started?.name || "unknown";
-        const result = record(item.result) ? item.result : {};
-        const isError = item.status !== "completed" || result.isError === true;
+        const result = projectCodexMcpResult(item, this.native?.grants.redactOutput);
+        const isError = result.isError;
         const args = item.arguments ?? started?.args ?? {};
-        const content = Array.isArray(result.content) ? result.content : [];
-        const details = result.structuredContent;
+        const content = result.content;
+        const details = result.details;
         if (!isError) active?.toolNames.add(name);
         this.emit({ type: "tool_execution_end", toolCallId: id, toolName: name,
           args, toolset: this.toolsetsByName.get(name), result: { content, details },

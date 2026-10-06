@@ -1,4 +1,6 @@
 import fs from "node:fs";
+import { projectCodexMcpResult } from "./codex-mcp-result.js";
+import { appendKnowledgeSourceCitations, knowledgeCitationsMetadata, type KnowledgeSourceCitation } from "../../shared/knowledge-citations.js";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import type { UsageObservation, UsageSink } from "../../shared/model-usage.js";
@@ -60,12 +62,14 @@ export class CodexChildProjection {
   private draining?: Promise<void>;
   private error?: Error;
   private readonly file: string;
+  private readonly knowledgeSources = new Map<string, KnowledgeSourceCitation[]>();
 
   constructor(directory: string, private readonly root: () => string | undefined,
     private readonly context: () => ReturnType<UsageSink["context"]>,
     private readonly model: () => { id: string; provider: string },
     private readonly usage: (child: Child, params: ObjectValue, callId: string) => UsageObservation | undefined,
-    private readonly inspect?: (threadId: string, parentThreadId: string) => Promise<string>) {
+    private readonly inspect?: (threadId: string, parentThreadId: string) => Promise<string>,
+    private readonly redact?: (text: string) => string) {
     this.file = path.join(directory, "codex-children.json");
     if (fs.existsSync(this.file)) {
       const saved = JSON.parse(fs.readFileSync(this.file, "utf8")) as Journal;
@@ -81,6 +85,11 @@ export class CodexChildProjection {
   setSink(sink: NativeChildSink): void {
     this.sink = sink;
     this.startDrain();
+  }
+
+  ownsActive(threadId: string): boolean { return this.children.get(threadId)?.active === true; }
+  setKnowledgeSources(threadId: string, sources: KnowledgeSourceCitation[]): void {
+    if (this.ownsActive(threadId)) this.knowledgeSources.set(threadId, sources);
   }
 
   /** Called before the root-only public stream filter. */
@@ -168,24 +177,27 @@ export class CodexChildProjection {
     const p = event.params;
     const turn = object(p.turn) ? p.turn : {};
     if (event.method === "turn/started") {
+      this.knowledgeSources.delete(child.threadId);
       child.turnId = text(turn.id);
       this.status(child, "running", "", child.turnId);
     } else if (event.method === "item/completed" && object(p.item)) {
       const item = p.item;
       const key = `item:${text(item.id)}`;
       if (item.type === "agentMessage") {
-        const content = text(item.text);
+        const sources = item.phase === "commentary" ? [] : this.knowledgeSources.get(child.threadId) ?? [];
+        const content = appendKnowledgeSourceCitations(text(item.text), sources);
         if (content) {
           if (item.phase !== "commentary") child.summary = content;
           this.enqueue(child, key, { type: "message", role: "assistant", content,
-            metadata: { phase: item.phase, assistant_item: { api: "openai-responses", model: child.modelId } } });
+            metadata: { phase: item.phase, assistant_item: { api: "openai-responses", model: child.modelId },
+              ...(sources.length ? { knowledge_citations: knowledgeCitationsMetadata(sources) } : {}) } });
         }
       } else if (item.type === "userMessage" && Array.isArray(item.content)) {
         const content = item.content.filter(object).map(block => text(block.text)).join("\n");
         if (content) this.enqueue(child, key, { type: "message", role: "user", content });
       } else if (["commandExecution", "fileChange", "mcpToolCall", "collabAgentToolCall"].includes(text(item.type))) {
         const toolName = item.type === "commandExecution" ? "exec_command" : item.type === "fileChange" ? "apply_patch" : text(item.tool);
-        const result = object(item.result) ? item.result : {};
+        const result = item.type === "mcpToolCall" ? projectCodexMcpResult(item, this.redact) : object(item.result) ? item.result : {};
         const failed = item.status === "failed" || item.status === "declined" || result.isError === true || typeof item.exitCode === "number" && item.exitCode !== 0;
         const content = text(item.aggregatedOutput) || (Array.isArray(result.content)
           ? result.content.filter(object).map(block => text(block.text)).join("\n") : "");

@@ -35,6 +35,18 @@ const usage = (total: number, turnId = "turn-1") => event("thread/tokenUsage/upd
 });
 
 describe("native child projection", () => {
+  it("persists native MCP error-only reasons and child citation attribution", async () => {
+    const f = fixture();
+    try {
+      const p = f.create(); p.handle(spawn()); p.handle(event("turn/started", "child", { turn: { id: "turn-1" } }));
+      p.handle(event("item/completed", "child", { item: { id: "error", type: "mcpToolCall", tool: "read", status: "failed", error: { message: "Backend read failed" } } }));
+      p.setKnowledgeSources("child", [{ title: "Runbook", url: "https://docs.example.org/runbook", repoId: "repo", page: "guide.md" }]);
+      p.handle(event("item/completed", "child", { item: { id: "answer", type: "agentMessage", phase: "final_answer", text: "Read complete." } }));
+      await p.flush();
+      expect(f.operations).toContainEqual(expect.objectContaining({ type: "message", role: "tool", content: "Backend read failed", outcome: "error" }));
+      expect(f.operations).toContainEqual(expect.objectContaining({ type: "message", role: "assistant", metadata: expect.objectContaining({ knowledge_citations: expect.objectContaining({ repo_ids: ["repo"] }) }) }));
+    } finally { f.cleanup(); }
+  });
   it("projects buffered child events only after an owned spawn, preserving dispatch receipt and model", async () => {
     const f = fixture();
     try {

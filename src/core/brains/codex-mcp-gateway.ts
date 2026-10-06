@@ -14,7 +14,8 @@ import { McpModelSecurity, resolveMcpReadOnlyPolicy, mcpTransportEnv, mcpSensiti
 import type { SensitiveValueSource } from "../../shared/model-output-redactor.js";
 
 interface Upstream {
-  client: Client;
+  client?: Client;
+  local?: (args: Record<string, unknown>, callId: string, signal: AbortSignal) => Promise<any>;
   policy: McpReadOnlyPolicy;
   tools: Tool[];
   security: McpModelSecurity;
@@ -32,12 +33,19 @@ export class CodexMcpGateway {
   private http?: HttpServer;
   private address?: string;
   private closed = false;
+  private intrinsic?: { name: string; tool: Tool; call: NonNullable<Upstream["local"]> };
 
   constructor(private readonly configs: Record<string, McpServerConfig>, private readonly secrets: SensitiveValueSource = () => [],
     private readonly privateRoots: () => readonly string[] = () => []) {}
 
+  /** Reviewed product service, independently implemented from Pi ToolDefinitions. */
+  registerKnowledge(tool: Tool, call: NonNullable<Upstream["local"]>): void {
+    if (this.http || this.intrinsic || this.configs.siclaw_knowledge) throw new Error("Reserved knowledge service name is already configured");
+    this.intrinsic = { name: "siclaw_knowledge", tool, call };
+  }
+
   async start(): Promise<Record<string, unknown>> {
-    if (!Object.keys(this.configs).length) return {};
+    if (!Object.keys(this.configs).length && !this.intrinsic) return {};
     try {
       for (const [index, [name, config]] of Object.entries(this.configs).entries()) {
         const policy = resolveMcpReadOnlyPolicy(config);
@@ -84,6 +92,11 @@ export class CodexMcpGateway {
         // The native server name remains the configured name for UI compatibility.
         void name;
       }
+      if (this.intrinsic) {
+        const security = new McpModelSecurity(this.secrets, this.privateRoots);
+        const policy: McpReadOnlyPolicy = { tools: new Set(["knowledge_cite"]), resources: new Set(), prompts: new Set(), trustedRenderer: false };
+        this.upstreams.set("/knowledge", { policy, security, tools: [this.intrinsic.tool], local: this.intrinsic.call });
+      }
       if (!this.upstreams.size) return {};
       this.http = createServer((request, response) => {
         void (async () => {
@@ -110,7 +123,13 @@ export class CodexMcpGateway {
               if ("task" in params) throw new Error("MCP tasks are not authorized");
               // Native clients may attach progress/tracing metadata. Consume
               // it locally; never relay opaque client metadata upstream.
+              const metadata = (params as any)._meta;
+              // The native call id is trusted only after matching an owned
+              // app-server item; model-visible arguments cannot choose it.
               delete (params as Record<string, unknown>)._meta;
+              if (upstream.local && metadata && typeof metadata.callId === "string" && metadata.callId.length <= 256) {
+                (params as any)._meta = { siclawNativeCallId: metadata.callId };
+              }
             }
           }
           if (!session) {
@@ -132,6 +151,8 @@ export class CodexMcpGateway {
         if (this.upstreams.has(`/mcp/${index}`)) native[name] = { url: `http://${this.address}/mcp/${index}`,
           http_headers: { Authorization: `Bearer ${this.token}` }, required: true, default_tools_approval_mode: "approve" };
       }
+      if (this.intrinsic) native[this.intrinsic.name] = { url: `http://${this.address}/knowledge`,
+        http_headers: { Authorization: `Bearer ${this.token}` }, required: true, default_tools_approval_mode: "approve" };
       return native;
     } catch {
       await this.close();
@@ -157,8 +178,9 @@ export class CodexMcpGateway {
       if (!upstream.policy.trustedRenderer) upstream.security.arguments(args);
       try {
         const safeArgs = upstream.policy.trustedRenderer ? JSON.parse(upstream.security.text(JSON.stringify(args))) : args;
-        const result = await upstream.client.callTool({ name, arguments: safeArgs }, undefined,
-          { signal: extra.signal, timeout: 65_000 });
+        const result = upstream.local
+          ? await upstream.local(safeArgs, typeof request.params._meta?.siclawNativeCallId === "string" ? request.params._meta.siclawNativeCallId : "", extra.signal)
+          : await upstream.client!.callTool({ name, arguments: safeArgs }, undefined, { signal: extra.signal, timeout: 65_000 });
         return upstream.security.result(result, upstream.policy.trustedRenderer);
       } catch {
         return { isError: true, content: [{ type: "text", text: "MCP operation failed; upstream error details were suppressed." }] };
@@ -173,7 +195,7 @@ export class CodexMcpGateway {
         if (!upstream.policy.resources.has(request.params.uri)) throw new McpError(ErrorCode.InvalidParams, "MCP resource is not authorized");
         upstream.security.arguments({ uri: request.params.uri });
         try {
-          const result = await upstream.client.readResource({ uri: request.params.uri }, { signal: extra.signal, timeout: 30_000 });
+          const result = await upstream.client!.readResource({ uri: request.params.uri }, { signal: extra.signal, timeout: 30_000 });
           const safe = upstream.security.result({ content: result.contents.map(resource => ({ type: "resource", resource })) });
           return { contents: safe.content.map(block => block.type === "resource" ? block.resource
             : { uri: request.params.uri, text: block.type === "text" ? block.text : "Resource suppressed" }) };
@@ -186,7 +208,7 @@ export class CodexMcpGateway {
         if (!upstream.policy.prompts.has(request.params.name)) throw new McpError(ErrorCode.InvalidParams, "MCP prompt is not authorized");
         upstream.security.arguments(request.params.arguments ?? {});
         try {
-          const result = await upstream.client.getPrompt({ name: request.params.name, arguments: request.params.arguments }, { signal: extra.signal, timeout: 30_000 });
+          const result = await upstream.client!.getPrompt({ name: request.params.name, arguments: request.params.arguments }, { signal: extra.signal, timeout: 30_000 });
           if (JSON.stringify(result).length > 8 * 1024 * 1024 || result.messages.length > 1000) throw new Error("Oversized prompt");
           return { messages: result.messages.map(message => ({ role: message.role,
             content: upstream.security.result({ content: [message.content] }).content[0] })) };
@@ -203,7 +225,7 @@ export class CodexMcpGateway {
     this.sessions.clear(); this.pendingSessions.clear();
     this.http?.closeAllConnections();
     await new Promise<void>(resolve => this.http ? this.http.close(() => resolve()) : resolve());
-    await Promise.allSettled([...this.upstreams.values()].map(upstream => upstream.client.close()));
+    await Promise.allSettled([...this.upstreams.values()].map(upstream => upstream.client?.close()));
     this.upstreams.clear(); this.http = undefined;
   }
 }
