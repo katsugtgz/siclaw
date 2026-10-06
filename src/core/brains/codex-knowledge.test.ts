@@ -50,8 +50,15 @@ describe("Codex native citation provenance", () => {
     const f = fixture(); expect((await f.cite()).isError).toBe(true);
   });
   it("does not treat approved scripts, searches or remote transport as local knowledge reads", async () => {
-    for (const command of ["bash approved.sh", "ssh host -- cat guide.md", "head -n 1 guide.md"]) {
+    for (const command of ["bash approved.sh", "ssh host -- cat guide.md", "rg GPU guide.md"]) {
       const f = fixture(); f.read("root", f.raw, command); expect((await f.cite()).isError).toBe(true);
+    }
+  });
+  it("accepts native head/tail only when the observed output is the complete page", async () => {
+    for (const binary of ["head", "tail"]) {
+      const f = fixture(); f.read("root", f.raw, `${binary} -n 200 ${f.page}`); expect((await f.cite()).structuredContent?.cited).toBe(1);
+      const partial = fixture(); partial.read("root", "# Guide\n", `${binary} -n 1 ${partial.page}`);
+      expect((await partial.cite()).isError).toBe(true);
     }
   });
   it("refuses changed content and remount during a read", async () => {

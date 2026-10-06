@@ -128,9 +128,17 @@ export class CodexKnowledge {
     try {
       let args = parseArgs(String(item.command));
       if (args.length === 3 && ["/bin/bash", "/bin/sh", "/bin/zsh"].includes(args[0]) && ["-c", "-lc"].includes(args[1])) args = parseArgs(args[2]);
-      if (args[0] !== "cat" || args.length < 2 || args.length > 17 || args.slice(1).some(arg => arg.startsWith("-"))) return [];
+      if (!["cat", "head", "tail"].includes(args[0]) || args.length < 2 || args.length > 20) return [];
+      const files: string[] = [];
+      for (let index = 1; index < args.length; index++) {
+        const arg = args[index];
+        if (args[0] !== "cat" && ["-n", "-c"].includes(arg) && /^\d{1,7}$/.test(args[index + 1] ?? "")) { index++; continue; }
+        if (arg.startsWith("-") || files.length >= 16) return [];
+        files.push(arg);
+      }
+      if (!files.length) return [];
       const root = fs.realpathSync(this.options.knowledgeDir);
-      return args.slice(1).map(value => {
+      return files.map(value => {
         const filename = path.resolve(item.cwd, value);
         if (fs.lstatSync(filename).isSymbolicLink()) throw new Error();
         const canonical = fs.realpathSync(filename);
