@@ -69,6 +69,7 @@ import {
 } from "./knowledge-citation-tool.js";
 import { resolveSkillDirectories } from "./skill-directories.js";
 import { createSkillScriptResolver } from "../tools/infra/script-resolver.js";
+import { createNativeSkillScriptGrants } from "./brains/codex-skill-scripts.js";
 
 import { allowsBackgroundExec } from "./background-execution-policy.js";
 import type { SessionMode, KubeconfigRef, MemoryRef, DpStateRef, MutableDpStateRef } from "./types.js";
@@ -963,6 +964,12 @@ export async function createSiclawSession(
     fs.mkdirSync(userDataDir, { recursive: true });
     const allowNativeFileRead = customTools.some((tool) => ["read", "grep", "find", "ls"].includes(tool.name));
     const nativeSkills = loadedSkills.map((skill) => ({name:skill.name, filePath:skill.filePath}));
+    const nativeScriptGrants = createNativeSkillScriptGrants(nativeSkills, skillScriptResolver, {
+      local: customTools.some(tool => tool.name === "local_script"),
+      pod: customTools.some(tool => tool.name === "pod_script"),
+      node: customTools.some(tool => tool.name === "node_script"),
+      host: customTools.some(tool => tool.name === "host_script"),
+    });
     const codexHome = codexHomeForScope(userDataDir, {agentId, userId:opts?.userId,
       sessionId:sessionManagerId, skills:nativeSkills});
     const nativeGrants: CodexExecutorGrants = { readRoots: allowNativeFileRead ? readAllowedDirs : [],
@@ -974,11 +981,13 @@ export async function createSiclawSession(
           path.resolve(cwd, config.paths.credentialsDir), path.resolve(cwd, ".siclaw", "config")],
         allowCommands: customTools.some((tool) => tool.name === "bash"),
         allowFileCommands: allowNativeFileRead,
-        production: process.env.NODE_ENV === "production", environment: { PATH: process.env.PATH ?? "/usr/bin:/bin" } };
+        production: process.env.NODE_ENV === "production", environment: { PATH: process.env.PATH ?? "/usr/bin:/bin" },
+        skillScripts: nativeScriptGrants };
     const environments: Array<{ id: string; grants: typeof nativeGrants }> = [];
     const allowNativePod = customTools.some(tool => tool.name === "pod_exec");
     const allowNativeNode = customTools.some(tool => tool.name === "node_exec");
-    if (kubeconfigRef.credentialBroker && (nativeGrants.allowCommands || allowNativePod || allowNativeNode)) {
+    if (kubeconfigRef.credentialBroker && (nativeGrants.allowCommands || allowNativePod || allowNativeNode ||
+      nativeScriptGrants.allowed.local || nativeScriptGrants.allowed.pod || nativeScriptGrants.allowed.node)) {
       const clusters = await kubeconfigRef.credentialBroker.refreshClusters();
       const broker = kubeconfigRef.credentialBroker;
       for (const cluster of clusters) {
@@ -997,10 +1006,10 @@ export async function createSiclawSession(
       }
     }
     let nativeHostHint = "";
-    if (kubeconfigRef.credentialBroker && customTools.some(tool => tool.name === "host_exec")) {
+    if (kubeconfigRef.credentialBroker && (customTools.some(tool => tool.name === "host_exec") || nativeScriptGrants.allowed.host)) {
       const broker = kubeconfigRef.credentialBroker;
       const hosts = await broker.refreshHosts();
-      nativeGrants.infrastructure = { kind: "ssh", broker };
+      nativeGrants.infrastructure = { kind: "ssh", broker, allowCommands: customTools.some(tool => tool.name === "host_exec") };
       nativeHostHint = "Use native exec_command in the siclaw environment for SSH: ssh <bound-host-name-or-id> -- <read-only command>. " +
         "The broker resolves identity, credentials and configured bastions; do not supply SSH options or credentials. " +
         "Bound SSH host handles (first 50): " + hosts.slice(0, 50).map(host => host.id || host.name).join(", ");
@@ -1025,7 +1034,18 @@ export async function createSiclawSession(
           "when authorized, use kubectl -n <namespace> exec <pod> [-c <container>] -- <read-only command> " +
           "or kubectl debug node/<node> -- <read-only command>. Node helper image/lifecycle are platform-owned. " +
           "Do not supply credentials, connection overrides, interactive shells or write commands." : "",
-        nativeHostHint].join("\n\n"),
+        nativeHostHint,
+        nativeScriptGrants.assets.length && Object.values(nativeScriptGrants.allowed).some(Boolean)
+          ? "Execute loaded Skill scripts with native exec_command, after reading their SKILL.md: bash <absolute Skill scripts/*.sh path> <args> " +
+            "or python3 <absolute Skill scripts/*.py path> <args>. Local scripts run in siclaw, or in cluster:<name> to use that bound kubeconfig. " +
+            "For authorized remote scripts use ssh <bound-host> -- bash/python3 <local Skill script path> <args>, " +
+            "kubectl -n <namespace> exec <pod> [-c <container>] -- bash/python3 <local Skill script path> <args>, " +
+            "or kubectl debug node/<node> -- bash/python3 <local Skill script path> <args>. " +
+            "The platform sends the approved asset bytes to remote stdin; do not upload, edit or copy scripts yourself. " +
+            "Use one literal call, no pipeline, redirection, inline code or interpreter options. Optional timeout <1-300 seconds> may precede the interpreter. " +
+            "The default is 180 seconds. Poll through native write_stdin; session/turn Stop cancels execution. Interactive input is unavailable. " +
+            "Execution requires its separate local/pod/node/host script capability. Only the selected, unchanged Skill assets are executable."
+          : ""].join("\n\n"),
       toolsetsByName, cwd: userDataDir, nativePlanEnabled, grants: nativeGrants, environments, mcpServers: nativeMcpServers, codexHome,
       allowSubagents: nativeAllowSubagents,
       onPlanUpdate: opts?.sessionEventEmitter

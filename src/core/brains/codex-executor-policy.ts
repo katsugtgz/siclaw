@@ -10,6 +10,7 @@ import { randomUUID } from "node:crypto";
 import { authorizeCodexFileCommand } from "./codex-file-command.js";
 import { authorizeInfrastructureCommand, type CodexInfrastructureTarget, type InfrastructureOperation } from "./codex-infrastructure.js";
 import { extractCommands } from "../../tools/infra/command-validator.js";
+import { authorizeSkillScriptCommand, SCRIPT_SECURITY, type NativeSkillScriptGrants } from "./codex-skill-scripts.js";
 
 type JsonObject = Record<string, unknown>;
 
@@ -29,6 +30,7 @@ export interface CodexExecutorGrants {
   environment?: Readonly<Record<string, string>>;
   production: boolean;
   infrastructure?: CodexInfrastructureTarget;
+  skillScripts?: NativeSkillScriptGrants;
 }
 
 export interface AuthorizedCodexRequest {
@@ -54,6 +56,7 @@ export class CodexExecutorPolicy {
   private readonly allowFileCommands: boolean;
   private readonly production: boolean;
   private readonly infrastructure?: CodexInfrastructureTarget;
+  private readonly skillScripts?: NativeSkillScriptGrants;
 
   constructor(grants: CodexExecutorGrants) {
     this.readRoots = grants.readRoots.map(canonicalPath);
@@ -68,6 +71,7 @@ export class CodexExecutorPolicy {
     this.allowFileCommands = grants.allowFileCommands ?? grants.allowCommands;
     this.production = grants.production;
     this.infrastructure = grants.infrastructure;
+    this.skillScripts = grants.skillScripts;
     this.environment = { ...sanitizeEnv({ ...grants.environment }),
       KUBECONFIG: grants.kubeconfigPath ?? "/dev/null" };
   }
@@ -157,7 +161,11 @@ export class CodexExecutorPolicy {
     // KUBECONFIG/PATH even though the RPC environment is sanitized.
     if (extractCommands(argv[2]).some(command => /^\s*[a-zA-Z_][a-zA-Z0-9_]*=/.test(command))) throw new Error("Native shell environment overrides are not authorized");
     params.cwd = this.authorizePath(params.cwd, false, true);
-    const infrastructure = this.infrastructure ? authorizeInfrastructureCommand(argv[2], this.infrastructure) : undefined;
+    const script = authorizeSkillScriptCommand(argv[2], fileURLToPath(String(params.cwd)), "local", this.skillScripts);
+    const infrastructure: InfrastructureOperation | undefined = script
+      ? { kind: "local-script", command: argv[2], script, security: SCRIPT_SECURITY }
+      : this.infrastructure ? authorizeInfrastructureCommand(argv[2], this.infrastructure, this.skillScripts,
+        fileURLToPath(String(params.cwd))) : undefined;
     const fileCommand = infrastructure ? undefined : authorizeCodexFileCommand(argv[2], fileURLToPath(String(params.cwd)), (uri, directory) => {
       const authorized = this.authorizePath(uri, false);
       if (directory && this.deniedRoots.some((root) => within(root, fileURLToPath(authorized)))) {
@@ -192,10 +200,10 @@ export class CodexExecutorPolicy {
 
   /** Trusted transport rewrite after native command authorization. Reuses the
    * same sandbox identity and process-group cleanup as ordinary native exec. */
-  setTransportCommand(params: JsonObject, command: string): void {
+  setTransportCommand(params: JsonObject, command: string, timeoutS = 70): void {
     this.assertProcess(params.processId);
     const pgidFile = this.sandboxSessions.get(String(params.processId));
-    params.argv = ["/bin/bash", "-c", this.production ? buildSandboxCommand(command, { timeoutS: 70, pgidFile }) : command];
+    params.argv = ["/bin/bash", "-c", this.production ? buildSandboxCommand(command, { timeoutS, pgidFile }) : command];
   }
 
   private assertProcess(id: unknown): void {

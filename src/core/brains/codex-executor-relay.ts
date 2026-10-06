@@ -54,7 +54,7 @@ export class CodexExecutorRelay {
       const ticket = request.headers.authorization?.replace(/^Bearer /i, "") ?? "";
       const entry = this.tickets.get(ticket);
       if (request.method !== "POST" || request.url !== "/infrastructure" || !entry || entry.expiresAt < Date.now() ||
-          entry.connection.socket.readyState !== WebSocket.OPEN || !this.options.grants.infrastructure) {
+          entry.connection.socket.readyState !== WebSocket.OPEN) {
         response.writeHead(403).end(); return;
       }
       this.tickets.delete(ticket);
@@ -62,9 +62,11 @@ export class CodexExecutorRelay {
       const running = this.infrastructureRuns.get(entry.connection) ?? new Set<AbortController>();
       this.infrastructureRuns.set(entry.connection, running); running.add(abort);
       response.once("close", () => { if (!response.writableEnded) abort.abort(); });
-      const deadline = setTimeout(() => abort.abort(), 70_000);
+      const deadline = setTimeout(() => abort.abort(), entry.operation.script
+        ? (entry.operation.script.timeoutSeconds + 60) * 1000 : 70_000);
       try {
-        const result = await executeInfrastructureOperation(this.options.grants.infrastructure, entry.operation, abort.signal);
+        const result = await executeInfrastructureOperation(this.options.grants.infrastructure, entry.operation, abort.signal,
+          this.options.grants.skillScripts, this.options.grants.environment, this.options.grants.resolveKubeconfig);
         response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(result));
       } catch { response.writeHead(502).end(); }
       finally { clearTimeout(deadline); running.delete(abort); }
@@ -138,7 +140,8 @@ export class CodexExecutorRelay {
             const helper = fileURLToPath(new URL("./codex-infrastructure-client.js", import.meta.url));
             const endpoint = this.address!.replace(/^ws:/, "http:").replace(/\/executor$/, "/infrastructure");
             connection.policy.setTransportCommand(authorized.params,
-              [process.execPath, helper, endpoint, ticket].map(shellEscape).join(" "));
+              [process.execPath, helper, endpoint, ticket].map(shellEscape).join(" "), authorized.infrastructure.script
+                ? authorized.infrastructure.script.timeoutSeconds + 60 : 70);
           } else if (this.options.grants.resolveKubeconfig) {
             try {
               const kubeconfig = await this.options.grants.resolveKubeconfig();
