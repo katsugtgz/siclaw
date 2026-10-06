@@ -109,7 +109,8 @@ export class GatewayClient {
    * mTLS client certificate by the Gateway — no userId/agentId needed here.
    */
   async listAgentTasks(): Promise<AgentTask[]> {
-    const data = await this.request("/api/internal/agent-tasks", "GET");
+    const query = this.sessionId ? `?session_id=${encodeURIComponent(this.sessionId)}` : "";
+    const data = await this.request(`/api/internal/agent-tasks${query}`, "GET");
     return data.tasks || [];
   }
 
