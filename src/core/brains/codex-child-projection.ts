@@ -98,8 +98,9 @@ export class CodexChildProjection {
         for (const id of receivers) {
           const child = this.children.get(text(id));
           if (!child) continue;
-          if (["sendInput", "followupTask"].includes(text(item.tool)) && item.status === "completed") {
-            child.context = { ...this.context() }; // Freeze dispatch identity, not a future parent turn.
+          if (["sendInput", "followupTask", "resumeAgent"].includes(text(item.tool)) && item.status !== "failed") {
+            child.context = { ...(this.children.get(threadId)?.context ?? this.context()) };
+            this.save(); // Capture before the native child can complete its first response.
           }
           const states = object(item.agentsStates) ? item.agentsStates : {};
           const value = states[text(id)];

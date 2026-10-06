@@ -82,6 +82,22 @@ describe("native child projection", () => {
     } finally { f.cleanup(); }
   });
 
+  it("captures a continuation receipt before a child response can precede the parent's tool completion", async () => {
+    const f = fixture();
+    try {
+      const p = f.create();
+      p.handle(spawn());
+      f.receipt("continuation-request");
+      p.handle(event("item/started", "root", { item: { type: "collabAgentToolCall", tool: "sendInput",
+        id: "send-1", status: "inProgress", receiverThreadIds: ["child"] } }));
+      p.handle(event("turn/started", "child", { turn: { id: "continuation-turn" } }));
+      p.handle(usage(7, "continuation-turn"));
+      await p.flush();
+      const call = f.operations.find(op => op.type === "usage");
+      expect(call?.type === "usage" && call.observation.apiRequestId).toBe("continuation-request");
+    } finally { f.cleanup(); }
+  });
+
   it("retries a failed durable append after restart and excludes historical usage replay", async () => {
     const f = fixture();
     try {
