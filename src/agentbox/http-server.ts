@@ -73,6 +73,7 @@ import {
   type SubagentTierCandidates,
 } from "../core/subagent-models.js";
 import type { BrainSession, PromptFile, PromptImage, PromptMedia } from "../core/brain-session.js";
+import { PROMPT_FILE_MIMES } from "../core/prompt-attachments.js";
 import { compactDispatchLogMessage } from "../shared/dispatch-observability.js";
 import { SESSION_CONTEXT_UNAVAILABLE_CODE, SESSION_CONTEXT_UNAVAILABLE_STATUS } from "../shared/session-context.js";
 
@@ -220,7 +221,7 @@ const MAX_PROMPT_IMAGE_BASE64_CHARS = MAX_PROMPT_MEDIA_BASE64_CHARS;
 const SUPPORTED_PROMPT_IMAGE_MIMES = new Set(["image/png", "image/jpeg", "image/webp"]);
 const MAX_PROMPT_FILES = MAX_PROMPT_MEDIA_ITEMS;
 const MAX_PROMPT_FILE_BASE64_CHARS = MAX_PROMPT_MEDIA_BASE64_CHARS;
-const SUPPORTED_PROMPT_FILE_MIMES = new Set(["application/pdf"]);
+const SUPPORTED_PROMPT_FILE_MIMES = PROMPT_FILE_MIMES;
 const BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
 
 class HttpRequestError extends Error {
@@ -324,7 +325,7 @@ function validatePromptFiles(raw: unknown): PromptMediaValidationResult<PromptFi
 
     const normalizedMime = mimeType.trim().toLowerCase();
     if (!SUPPORTED_PROMPT_FILE_MIMES.has(normalizedMime)) {
-      return { error: `files[${index}].mimeType must be application/pdf` };
+      return { error: `files[${index}].mimeType must be a supported text document or application/pdf` };
     }
     if (filename.trim() === "") {
       return { error: `files[${index}].filename must not be empty` };
@@ -1204,15 +1205,15 @@ export function createHttpServer(
       // call below. Applying them here would be before the model switch, which
       // pi silently discards.
 
-      if (requiredInputsForPromptMedia(promptMedia).length > 0) {
+      if (requiredInputsForPromptMedia(promptMedia, managed.brain.brainType).length > 0) {
         if (shouldUseModelRouteRunner(configuredModelRouting, managed.modelRouteState)) {
           const candidates = normalizeCandidates(configuredModelRouting?.candidates);
-          if (filterCandidatesForPromptMedia(candidates, promptMedia).length === 0) {
+          if (filterCandidatesForPromptMedia(candidates, promptMedia, managed.brain.brainType).length === 0) {
             throw new Error(unsupportedPromptMediaMessage(promptMedia));
           }
         } else {
           const candidate = singleCandidateForMediaPreflight(body, configuredModelRouting);
-          if (!candidate || !candidateSupportsPromptMedia(candidate, promptMedia)) {
+          if (!candidate || !candidateSupportsPromptMedia(candidate, promptMedia, managed.brain.brainType)) {
             throw new Error(unsupportedPromptMediaMessage(promptMedia));
           }
         }

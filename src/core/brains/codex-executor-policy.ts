@@ -16,6 +16,8 @@ import type { SensitiveValueSource } from "../../shared/model-output-redactor.js
 type JsonObject = Record<string, unknown>;
 
 export interface CodexExecutorGrants {
+  /** Trusted sanitized input mounts below the otherwise private session root. */
+  inputRoots?: readonly string[];
   readRoots: readonly string[];
   writeRoots: readonly string[];
   deniedRoots: readonly string[];
@@ -56,6 +58,8 @@ export class CodexExecutorPolicy {
   private readonly processes = new Set<string>();
   private readonly sandboxSessions = new Map<string, string>();
   private readonly environment: Record<string, string>;
+  private readonly inputRoots: string[];
+  private readonly declaredInputRoots: string[];
   private readonly allowCommands: boolean;
   private readonly allowFileCommands: boolean;
   private readonly production: boolean;
@@ -63,6 +67,8 @@ export class CodexExecutorPolicy {
   private readonly skillScripts?: NativeSkillScriptGrants;
 
   constructor(grants: CodexExecutorGrants) {
+    this.inputRoots = (grants.inputRoots ?? []).map(canonicalPath);
+    this.declaredInputRoots = (grants.inputRoots ?? []).map(root => path.resolve(root));
     this.readRoots = grants.readRoots.map(canonicalPath);
     this.writeRoots = grants.writeRoots.map(canonicalPath);
     this.deniedRoots = grants.deniedRoots.map(canonicalPath);
@@ -108,10 +114,15 @@ export class CodexExecutorPolicy {
         if (params.chunk !== "") throw new Error("Native process input is not authorized");
         return { params };
       case "fs/readFile":
-      case "fs/getMetadata":
-      case "fs/canonicalize":
       case "fs/readDirectory":
         params.path = this.authorizePath(params.path, false);
+        return { params };
+      case "fs/getMetadata":
+      case "fs/canonicalize":
+        // Native environment initialization must resolve its cwd. Metadata on
+        // that exact root grants no directory listing or file contents.
+        params.path = this.authorizePath(params.path, false, typeof params.path === "string" &&
+          this.executionRoots.includes(canonicalPath(fileURLToPath(params.path))));
         return { params };
       case "fs/writeFile":
       case "fs/createDirectory":
@@ -171,15 +182,17 @@ export class CodexExecutorPolicy {
       ? { kind: "local-script", command: argv[2], script, security: SCRIPT_SECURITY }
       : this.infrastructure ? authorizeInfrastructureCommand(argv[2], this.infrastructure, this.skillScripts,
         fileURLToPath(String(params.cwd))) : undefined;
+    let inputCommand = true;
     const fileCommand = infrastructure ? undefined : authorizeCodexFileCommand(argv[2], fileURLToPath(String(params.cwd)), (uri, directory) => {
       const authorized = this.authorizePath(uri, false);
+      if (!this.inputRoots.some(root => within(fileURLToPath(authorized), root))) inputCommand = false;
       if (directory && this.deniedRoots.some((root) => within(root, fileURLToPath(authorized)))) {
         throw new Error("Native directory search overlaps a denied path");
       }
       return authorized;
     });
     const command = fileCommand ?? argv[2];
-    if (!infrastructure && (fileCommand ? !this.allowFileCommands : !this.allowCommands)) throw new Error("Native commands are not authorized");
+    if (!infrastructure && (fileCommand ? !this.allowFileCommands && !inputCommand : !this.allowCommands)) throw new Error("Native commands are not authorized");
     const security: PreExecResult = infrastructure ? infrastructure.security : fileCommand ? { error: null, action: null, hasSensitiveKubectl: false }
       : preExecSecurity(command, { context: "local", extraAllowed: new Set(["kubectl"]),
       pipelineValidators: [validateKubectlInPipeline], analyzeTarget: "auto" });
@@ -225,6 +238,12 @@ export class CodexExecutorPolicy {
     }
     const requested = path.resolve(fileURLToPath(uri));
     const canonical = canonicalPath(requested);
+    const inputRoot = this.inputRoots.find((root, index) =>
+      (within(requested, root) || within(requested, this.declaredInputRoots[index])) && within(canonical, root));
+    if (!write && !execution && inputRoot && !this.deniedRoots.some(root => within(root, inputRoot) && within(canonical, root))) {
+      assertNoWriteLinks(canonical, inputRoot);
+      return pathToFileURL(canonical).href;
+    }
     const roots = execution ? this.executionRoots : write ? this.writeRoots : [...this.readRoots, ...this.writeRoots];
     const declared = execution ? this.declaredExecutionRoots : write ? this.declaredWriteRoots
       : [...this.declaredReadRoots, ...this.declaredWriteRoots];

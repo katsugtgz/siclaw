@@ -121,7 +121,7 @@ describe("CodexAgentBrain compatibility", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "siclaw-codex-usage-"));
     try {
       const brain = new (CodexAgentBrain as any)(
-        { getSessionDir: () => dir, getEntries: () => [] },
+        { getSessionDir: () => dir, getSessionId: () => "test-session", getEntries: () => [], getBranch: () => [] },
         { grants: { readRoots: [], writeRoots: [], deniedRoots: [], allowCommands: false, production: false } }, "", new Map(), dir, [],
       ) as any;
       const record = vi.fn();
@@ -156,7 +156,7 @@ describe("CodexAgentBrain compatibility", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "siclaw-codex-restored-usage-"));
     try {
       const brain = new (CodexAgentBrain as any)(
-        { getSessionDir: () => dir, getEntries: () => [] },
+        { getSessionDir: () => dir, getSessionId: () => "test-session", getEntries: () => [], getBranch: () => [] },
         { grants: { readRoots: [], writeRoots: [], deniedRoots: [], allowCommands: false, production: false } },
         "", new Map(), dir, [],
       ) as any;

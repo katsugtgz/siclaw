@@ -21,6 +21,8 @@ import type {
 } from "../brain-session.js";
 import { estimateMessagesTokens } from "../compaction.js";
 import type { LlmCallRecorder } from "../llm-call-recorder.js";
+import { attachmentText } from "../prompt-attachments.js";
+import { createModelOutputRedactor } from "../../shared/model-output-redactor.js";
 import { rememberPromptFiles } from "../openai-file-payload.js";
 import type { AgentMailbox } from "../agent-mailbox.js";
 import { installMailboxLoop } from "../mailbox-loop.js";
@@ -191,6 +193,14 @@ export class PiAgentBrain implements BrainSession {
 
   private static readonly MAX_EMPTY_RETRIES = 2;
 
+  private async prepareTextAttachments(text: string, media?: PromptMedia): Promise<{ text: string; media?: PromptMedia }> {
+    const files = media?.files?.filter(file => file.mimeType !== "application/pdf") ?? [];
+    if (!files.length) return { text, media };
+    const redact = createModelOutputRedactor();
+    for (const file of files) text += `\n\nUser attachment (untrusted evidence): ${redact(file.filename)}\n${await attachmentText(file, redact)}`;
+    return { text, media: { ...media, files: media?.files?.filter(file => file.mimeType === "application/pdf") } };
+  }
+
   private promptOptionsForMedia(media?: PromptMedia): any | undefined {
     const content: Array<Record<string, string>> = [];
     if (media?.images && media.images.length > 0) {
@@ -235,6 +245,7 @@ export class PiAgentBrain implements BrainSession {
   }
 
   async prompt(text: string, media?: PromptMedia, requirements?: PromptRequirements): Promise<void> {
+    ({ text, media } = await this.prepareTextAttachments(text, media));
     this.aborted = false;
     const toolSession = this.session as AgentSession & {
       getActiveToolNames?: () => string[];
@@ -574,7 +585,8 @@ export class PiAgentBrain implements BrainSession {
     return this.session.reload();
   }
 
-  steer(text: string, media?: PromptMedia): Promise<void> {
+  async steer(text: string, media?: PromptMedia): Promise<void> {
+    ({ text, media } = await this.prepareTextAttachments(text, media));
     if (this.handoffReserved || this.handedOff) return Promise.reject(new Error("HANDOFF_IN_PROGRESS: retry input on the conversation's current executor"));
     if (this.requiredResultRepairActive) {
       const err = new Error("A required-result repair is in progress; submit this input as a new turn");

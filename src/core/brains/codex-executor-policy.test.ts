@@ -27,6 +27,22 @@ const start = (cwd: string, command: string, processId = "process-1") => ({
 });
 
 describe("Codex native executor policy", () => {
+  it("allows only this session's immutable input mount when general file tools are disabled", () => {
+    const { root, read } = fixture();
+    const inputs = path.join(root, "inputs"), own = path.join(inputs, "own"), other = path.join(inputs, "other");
+    fs.mkdirSync(inputs); fs.mkdirSync(own); fs.mkdirSync(other);
+    fs.writeFileSync(path.join(own, "log.txt"), "safe evidence");
+    fs.symlinkSync(read, path.join(own, "escape"));
+    const policy = new CodexExecutorPolicy({ readRoots: [], writeRoots: [], deniedRoots: [inputs],
+      inputRoots: [own], executionRoots: [read], allowCommands: false, allowFileCommands: false, production: false });
+    expect(policy.authorize("fs/canonicalize", { path: uri(read) }).params.path).toBe(uri(fs.realpathSync(read)));
+    expect(() => policy.authorize("fs/readDirectory", { path: uri(read) })).toThrow();
+    expect(policy.authorize("process/start", start(read, `cat ${path.join(own, "log.txt")}`)).params).toBeDefined();
+    expect(() => policy.authorize("fs/readFile", { path: uri(path.join(other, "log.txt")) })).toThrow();
+    expect(() => policy.authorize("fs/readFile", { path: uri(path.join(own, "escape", "key")) })).toThrow();
+    expect(() => policy.authorize("fs/writeFile", { path: uri(path.join(own, "log.txt")) })).toThrow();
+    expect(() => policy.authorize("process/start", start(read, `cat ${path.join(read, "x")}`, "another"))).toThrow();
+  });
   it("refuses shell environment overrides of broker identity before native process execution", () => {
     const { policy, read } = fixture();
     for (const cmd of ["KUBECONFIG=/tmp/other kubectl get pods", "PATH=/tmp kubectl get pods", "echo ok; KUBECONFIG=/tmp/x kubectl get pods"]) {

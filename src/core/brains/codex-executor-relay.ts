@@ -1,5 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { randomBytes, timingSafeEqual } from "node:crypto";
+import { randomBytes, timingSafeEqual, createHash } from "node:crypto";
 import fs from "node:fs";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -17,19 +17,27 @@ import { redactDataDocument } from "../../tools/infra/kubectl-sanitize.js";
 type JsonObject = Record<string, any>;
 interface Connection {
   socket: WebSocket;
-  child: ChildProcessWithoutNullStreams;
+  backend: WebSocket;
+  sessionId?: string;
+  detached?: NodeJS.Timeout;
+  disposed?: boolean;
+  resuming?: boolean;
   policy: CodexExecutorPolicy;
   pending: Map<string | number, { method: string; processId?: string }>;
 }
 
 /** An opt-in native executor relay, not a Pi tool bridge. The official
  * exec-server owns process/filesystem mechanics. This initial implementation
- * deliberately rejects reconnect, interactive IO and file-stream RPCs until
- * their full lifecycle and security contracts have been implemented. */
+ * uses the official session registry for reconnect/replay. Interactive IO and
+ * file-stream RPCs remain unavailable without reviewed grants. */
 export class CodexExecutorRelay {
   private readonly token = randomBytes(32).toString("hex");
   private readonly connections = new Set<Connection>();
   private http?: Server;
+  private backend?: { child: ChildProcessWithoutNullStreams; url: string; token: string };
+  private startingBackend?: Promise<NonNullable<CodexExecutorRelay["backend"]>>;
+  private closing = false;
+  private readonly sessions = new Map<string, Connection>();
   private websocket?: WebSocketServer;
   private address?: string;
   private readonly tickets = new Map<string, { operation: InfrastructureOperation; connection: Connection; expiresAt: number }>();
@@ -50,12 +58,13 @@ export class CodexExecutorRelay {
 
   async start(): Promise<void> {
     if (this.http) return;
+    this.closing = false;
     fs.mkdirSync(this.options.home, { recursive: true, mode: 0o700 });
     const http = createServer(async (request, response) => {
       const ticket = request.headers.authorization?.replace(/^Bearer /i, "") ?? "";
       const entry = this.tickets.get(ticket);
       if (request.method !== "POST" || request.url !== "/infrastructure" || !entry || entry.expiresAt < Date.now() ||
-          entry.connection.socket.readyState !== WebSocket.OPEN) {
+          entry.connection.disposed) {
         response.writeHead(403).end(); return;
       }
       this.tickets.delete(ticket);
@@ -111,39 +120,81 @@ export class CodexExecutorRelay {
     this.address = `ws://127.0.0.1:${(http.address() as AddressInfo).port}/executor`;
   }
 
+  private async ensureBackend(): Promise<NonNullable<CodexExecutorRelay["backend"]>> {
+    if (this.backend) return this.backend;
+    if (this.startingBackend) return this.startingBackend;
+    if (this.closing) throw new Error("Executor relay is closing");
+    this.startingBackend = (async () => {
+      const token = randomBytes(32).toString("hex");
+      const child = spawn(this.options.executable, ["exec-server", "--listen", "ws://127.0.0.1:0", "--strict-config", "--concurrent-requests", "32",
+        "--ws-auth", "capability-token", "--ws-token-sha256", createHash("sha256").update(token).digest("hex")], {
+        cwd: this.options.cwd,
+        env: { PATH: process.env.PATH, HOME: this.options.home, CODEX_HOME: this.options.home },
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      child.stderr.resume();
+      const url = await new Promise<string>((resolve, reject) => {
+        const lines = createInterface({ input: child.stdout });
+        const timer = setTimeout(() => { child.kill("SIGKILL"); reject(new Error("Native executor startup timed out")); }, 15_000);
+        const fail = () => { clearTimeout(timer); reject(new Error("Native executor failed to start")); };
+        child.once("error", fail); child.once("exit", fail);
+        lines.on("line", line => {
+          if (!/^ws:\/\/127\.0\.0\.1:\d+$/.test(line)) return;
+          clearTimeout(timer); child.removeListener("error", fail); child.removeListener("exit", fail);
+          resolve(line);
+        });
+      });
+      if (this.closing) { child.kill("SIGTERM"); throw new Error("Executor relay is closing"); }
+      const backend = { child, url, token }; this.backend = backend;
+      child.once("exit", () => {
+        if (this.backend === backend) this.backend = undefined;
+        for (const connection of [...this.connections]) this.dispose(connection);
+      });
+      return backend;
+    })();
+    try { return await this.startingBackend; }
+    finally { this.startingBackend = undefined; }
+  }
+
   private connect(socket: WebSocket): void {
-    const child = spawn(this.options.executable, ["exec-server", "--listen", "stdio", "--strict-config"], {
-      cwd: this.options.cwd,
-      env: { PATH: process.env.PATH, HOME: this.options.home, CODEX_HOME: this.options.home },
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-    const connection: Connection = { socket, child, policy: new CodexExecutorPolicy(this.options.grants),
-      pending: new Map() };
-    this.connections.add(connection);
-    const lines = createInterface({ input: child.stdout });
-    lines.on("line", (line) => {
-      try { this.backendMessage(connection, JSON.parse(line)); }
-      catch { socket.close(1011, "Native executor output failed validation"); }
-    });
-    // Native diagnostics are not part of the model/UI stream.
-    child.stderr.resume();
-    child.once("error", () => socket.close(1011, "Native executor failed to start"));
-    child.once("exit", () => socket.close(1011, "Native executor exited"));
-    socket.on("message", async (raw) => {
+    let connection: Connection | undefined;
+    let initializing = false;
+    socket.on("message", async raw => {
       let message: JsonObject;
       try { message = JSON.parse(raw.toString()); }
       catch { socket.close(1008, "Invalid native executor message"); return; }
       try {
         if (!object(message) || typeof message.method !== "string" ||
-            (message.id !== undefined && typeof message.id !== "string" && typeof message.id !== "number")) {
-          throw new Error("Invalid native executor envelope");
-        }
-        if (message.method === "initialize" && message.params?.resumeSessionId) {
-          throw new Error("Native executor reconnect is not implemented");
-        }
-        if (message.id !== undefined && connection.pending.has(message.id)) {
-          throw new Error("Duplicate native executor request id");
-        }
+            (message.id !== undefined && typeof message.id !== "string" && typeof message.id !== "number")) throw new Error("Invalid native executor envelope");
+        if (!connection) {
+          if (initializing || message.method !== "initialize" || message.id === undefined) throw new Error("Native executor must initialize first");
+          initializing = true;
+          const resume = message.params?.resumeSessionId ?? undefined;
+          if (resume !== undefined && (typeof resume !== "string" || !resume || resume.length > 128)) throw new Error("Invalid native session identity");
+          const owned = resume ? this.sessions.get(resume) : undefined;
+          if (resume && (!owned || owned.disposed)) throw Object.assign(new Error(`unknown session id ${resume}`), { code: -32600 });
+          if (owned && (!owned.detached || owned.resuming)) throw Object.assign(new Error(`session ${resume} is already attached to another connection`), { code: -32010 });
+          if (owned) owned.resuming = true;
+          if (!owned && this.connections.size >= 64) throw new Error("Native session capacity exceeded");
+          const server = await this.ensureBackend();
+          if (socket.readyState !== WebSocket.OPEN) return;
+          const backend = new WebSocket(server.url, { headers: { Authorization: `Bearer ${server.token}` }, maxPayload: 2 * 1024 * 1024 });
+          const current: Connection = owned ?? { socket, backend, policy: new CodexExecutorPolicy(this.options.grants), pending: new Map() };
+          connection = current;
+          if (current.detached) clearTimeout(current.detached);
+          current.detached = undefined; current.socket = socket; current.backend = backend; current.pending.clear();
+          this.connections.add(current);
+          backend.on("message", raw => {
+            if (current.backend !== backend) return;
+            try { this.backendMessage(current, JSON.parse(raw.toString())); }
+            catch { socket.close(1011, "Native executor output failed validation"); }
+          });
+          backend.on("error", () => { if (current.backend === backend) socket.close(1011, "Native executor connection failed"); });
+          backend.once("close", () => { if (current.backend === backend) socket.close(1011, "Native executor disconnected"); });
+          await new Promise<void>((resolve, reject) => { backend.once("open", resolve); backend.once("error", reject); backend.once("close", () => reject(new Error("Native executor unavailable"))); });
+        } else if (message.method === "initialize") throw new Error("Native executor is already initialized");
+        if (socket.readyState !== WebSocket.OPEN || connection.disposed) return;
+        if (message.id !== undefined && connection.pending.has(message.id)) throw new Error("Duplicate native executor request id");
         const authorized = connection.policy.authorize(message.method, message.params ?? {});
         const processId = typeof authorized.params.processId === "string" ? authorized.params.processId : undefined;
         if (message.method === "process/start") {
@@ -152,41 +203,44 @@ export class CodexExecutorRelay {
           const ticket = randomBytes(32).toString("hex");
           const operation: InfrastructureOperation = authorized.infrastructure ?? {
             kind: "local-command", command: authorized.command!.text, security: authorized.command!.security,
-            cwd: String(authorized.params.cwd), environment: authorized.params.env as Record<string, string>,
-            production: this.options.grants.production,
+            cwd: String(authorized.params.cwd), environment: authorized.params.env as Record<string, string>, production: this.options.grants.production,
           };
           this.tickets.set(ticket, { operation, connection, expiresAt: Date.now() + 15_000 });
           const helper = fileURLToPath(new URL("./codex-infrastructure-client.js", import.meta.url));
           const endpoint = this.address!.replace(/^ws:/, "http:").replace(/\/executor$/, "/infrastructure");
-          connection.policy.setTransportCommand(authorized.params,
-            [process.execPath, helper, endpoint, ticket].map(shellEscape).join(" "));
-          if (socket.readyState !== WebSocket.OPEN) {
-            this.tickets.delete(ticket); connection.policy.releaseProcess(processId!); return;
-          }
+          connection.policy.setTransportCommand(authorized.params, [process.execPath, helper, endpoint, ticket].map(shellEscape).join(" "));
         }
-        if (message.id !== undefined) {
-          connection.pending.set(message.id, { method: message.method, processId });
-        }
-        child.stdin.write(`${JSON.stringify({ ...message, params: authorized.params })}\n`);
+        if (message.id !== undefined) connection.pending.set(message.id, { method: message.method, processId });
+        connection.backend.send(JSON.stringify({ ...message, params: authorized.params }));
       } catch (error) {
         if (message.id === undefined) socket.close(1008, "Unauthorized native executor notification");
-        else this.send(connection, { id: message.id, error: { code: -32602,
-          message: error instanceof Error ? error.message : "Native execution denied" } });
+        else if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ id: message.id, error: { code: (error as { code?: number }).code ?? -32602,
+          message: error instanceof Error ? error.message : "Native execution denied" } }));
       }
     });
     socket.once("close", () => {
-      for (const [ticket, entry] of this.tickets) if (entry.connection === connection) this.tickets.delete(ticket);
-      for (const abort of this.infrastructureRuns.get(connection) ?? []) abort.abort();
-      this.infrastructureRuns.delete(connection);
-      connection.policy.stopAll();
-      lines.close();
-      child.stdin.end();
-      child.kill("SIGTERM");
-      const timer = setTimeout(() => child.kill("SIGKILL"), 2_000);
-      timer.unref();
-      child.once("exit", () => clearTimeout(timer));
-      this.connections.delete(connection);
+      const current = connection;
+      if (!current || current.socket !== socket || current.disposed) return;
+      current.resuming = false;
+      current.backend.close();
+      // Native registry owns the 30-second detached session and process replay.
+      // Retain only its authorization context, never process output or a job ledger.
+      if (!current.sessionId) { this.dispose(current); return; }
+      current.detached = setTimeout(() => this.dispose(current), 30_000);
+      current.detached.unref();
     });
+  }
+
+  private dispose(connection: Connection): void {
+    if (connection.disposed) return;
+    connection.disposed = true;
+    if (connection.detached) clearTimeout(connection.detached);
+    if (connection.sessionId) this.sessions.delete(connection.sessionId);
+    for (const [ticket, entry] of this.tickets) if (entry.connection === connection) this.tickets.delete(ticket);
+    for (const abort of this.infrastructureRuns.get(connection) ?? []) abort.abort();
+    this.infrastructureRuns.delete(connection);
+    connection.policy.stopAll(); connection.backend.close(); connection.socket.close(1000);
+    this.connections.delete(connection);
   }
 
   private backendMessage(connection: Connection, message: JsonObject): void {
@@ -203,6 +257,17 @@ export class CodexExecutorRelay {
     connection.pending.delete(message.id);
     if (message.error && pending.method === "process/start" && pending.processId) {
       connection.policy.releaseProcess(pending.processId);
+    }
+    if (!message.error && pending.method === "initialize") {
+      const id = message.result?.sessionId;
+      if (typeof id !== "string" || !id || connection.sessionId && connection.sessionId !== id || this.sessions.has(id) && this.sessions.get(id) !== connection) throw new Error("Invalid native session identity");
+      connection.sessionId = id; connection.resuming = false; this.sessions.set(id, connection);
+    }
+    if (message.error && pending.method === "initialize") {
+      this.send(connection, message);
+      if (connection.sessionId && message.error.code === -32010) connection.socket.close(1011, "Native session detach is pending");
+      else this.dispose(connection);
+      return;
     }
     if (!message.error && ["initialize", "environment/info"].includes(pending.method)) {
       const info = pending.method === "initialize" ? message.result?.environmentInfo : message.result;
@@ -235,26 +300,22 @@ export class CodexExecutorRelay {
   }
 
   async close(): Promise<void> {
-    const connections = [...this.connections];
-    for (const connection of connections) connection.socket.close(1000);
-    for (const connection of connections) {
-      connection.policy.stopAll();
-      connection.child.stdin.end();
-      connection.child.kill("SIGTERM");
-    }
-    await Promise.all(connections.map((connection) => new Promise<void>((resolve) => {
-      if (connection.child.exitCode !== null || connection.child.signalCode !== null) { resolve(); return; }
-      const timer = setTimeout(() => connection.child.kill("SIGKILL"), 2_000);
-      connection.child.once("exit", () => { clearTimeout(timer); resolve(); });
-      connection.child.once("error", () => { clearTimeout(timer); resolve(); });
-    })));
-    this.connections.clear();
-    await new Promise<void>((resolve) => this.websocket ? this.websocket.close(() => resolve()) : resolve());
-    await new Promise<void>((resolve) => this.http ? this.http.close(() => resolve()) : resolve());
-    this.websocket = undefined;
-    this.http = undefined;
-    this.address = undefined;
+    this.closing = true;
+    for (const connection of [...this.connections]) this.dispose(connection);
+    for (const socket of this.websocket?.clients ?? []) socket.terminate();
+    const child = this.backend?.child; this.backend = undefined;
+    if (child && child.exitCode === null && child.signalCode === null) await new Promise<void>(resolve => {
+      const timer = setTimeout(() => child.kill("SIGKILL"), 2_000);
+      child.once("exit", () => { clearTimeout(timer); resolve(); });
+      child.once("error", () => { clearTimeout(timer); resolve(); });
+      child.kill("SIGTERM");
+    });
+    await this.startingBackend?.catch(() => {});
+    await new Promise<void>(resolve => this.websocket ? this.websocket.close(() => resolve()) : resolve());
+    await new Promise<void>(resolve => this.http ? this.http.close(() => resolve()) : resolve());
+    this.websocket = undefined; this.http = undefined; this.address = undefined;
   }
+
 }
 
 function object(value: unknown): value is JsonObject {

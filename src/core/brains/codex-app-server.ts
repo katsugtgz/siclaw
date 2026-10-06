@@ -41,6 +41,7 @@ export class CodexAppServer {
   }>();
   private readonly listeners = new Set<(event: Notification) => void>();
   private readonly failureListeners = new Set<(error: Error) => void>();
+  private userInputHandler?: (params: JsonObject) => Promise<JsonObject>;
   private closing = false;
 
   constructor(
@@ -60,7 +61,7 @@ export class CodexAppServer {
       "-c", "features.shell_tool=true",
       "-c", "features.code_mode_host=true",
       "-c", "features.request_permissions_tool=false",
-      "-c", "features.send_message_to_user_async=false",
+      "-c", "features.send_message_to_user_async=true",
       "-c", "features.apps=false",
       "-c", "features.plugins=false",
       "-c", "features.browser_use=false",
@@ -112,6 +113,8 @@ export class CodexAppServer {
     this.failureListeners.add(listener);
     return () => this.failureListeners.delete(listener);
   }
+
+  onUserInput(handler: (params: JsonObject) => Promise<JsonObject>): void { this.userInputHandler = handler; }
 
   async request(method: string, params: JsonObject, timeoutMs = 30_000): Promise<JsonObject> {
     const child = this.child;
@@ -168,7 +171,17 @@ export class CodexAppServer {
       return;
     }
     if (typeof message.method !== "string") return;
-    if (typeof id === "number") {
+    if (typeof id === "number" || typeof id === "string") {
+      if (message.method === "item/tool/requestUserInput" && this.userInputHandler) {
+        const child = this.child;
+        void this.userInputHandler((message.params ?? {}) as JsonObject).then(result => {
+          if (this.child === child) child?.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, result })}\n`);
+        }, () => {
+          if (this.child === child) child?.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id,
+            error: { code: -32602, message: "User question rejected by Siclaw" } })}\n`);
+        });
+        return;
+      }
       // Native tools own execution. Unexpected server requests fail closed,
       // including command/file approvals and credential prompts.
       this.child?.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id,

@@ -43,7 +43,7 @@ export interface MemoryRef {
 // docs/design/2026-04-24-dp-mode-refactor-design.md.
 
 /**
- * Writable version of DpStateRef — held only by the extension (single writer).
+ * Writable version of DpStateRef — held by the selected engine adapter (single writer).
  * Agentbox and other consumers receive the readonly DpStateRef view.
  */
 export interface MutableDpStateRef {

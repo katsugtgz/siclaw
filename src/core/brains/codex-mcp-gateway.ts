@@ -11,11 +11,11 @@ import { CallToolRequestSchema, ListToolsRequestSchema, ListResourcesRequestSche
   ListPromptsRequestSchema, GetPromptRequestSchema, McpError, ErrorCode, type Tool } from "@modelcontextprotocol/sdk/types.js";
 import { mergeMcpStdioEnv, type McpServerConfig } from "../mcp-client.js";
 import { McpModelSecurity, resolveMcpReadOnlyPolicy, mcpTransportEnv, mcpSensitiveValues, type McpReadOnlyPolicy } from "../mcp-security.js";
-import type { SensitiveValueSource } from "../../shared/model-output-redactor.js";
+import { redactModelJson, type SensitiveValueSource } from "../../shared/model-output-redactor.js";
 
 interface Upstream {
   client?: Client;
-  local?: (args: Record<string, unknown>, callId: string, signal: AbortSignal) => Promise<any>;
+  local?: (args: Record<string, unknown>, callId: string, signal: AbortSignal, name: string) => Promise<any>;
   policy: McpReadOnlyPolicy;
   tools: Tool[];
   security: McpModelSecurity;
@@ -33,19 +33,23 @@ export class CodexMcpGateway {
   private http?: HttpServer;
   private address?: string;
   private closed = false;
-  private intrinsic?: { name: string; tool: Tool; call: NonNullable<Upstream["local"]> };
+  private readonly intrinsic = new Map<string, { tools: Tool[]; call: NonNullable<Upstream["local"]> }>();
 
   constructor(private readonly configs: Record<string, McpServerConfig>, private readonly secrets: SensitiveValueSource = () => [],
     private readonly privateRoots: () => readonly string[] = () => []) {}
 
   /** Reviewed product service, independently implemented from Pi ToolDefinitions. */
   registerKnowledge(tool: Tool, call: NonNullable<Upstream["local"]>): void {
-    if (this.http || this.intrinsic || this.configs.siclaw_knowledge) throw new Error("Reserved knowledge service name is already configured");
-    this.intrinsic = { name: "siclaw_knowledge", tool, call };
+    this.registerService("siclaw_knowledge", [tool], call);
+  }
+
+  registerService(name: "siclaw_knowledge" | "siclaw_workflow", tools: Tool[], call: NonNullable<Upstream["local"]>): void {
+    if (this.http || this.intrinsic.has(name) || this.configs[name]) throw new Error("Reserved product service name is already configured");
+    this.intrinsic.set(name, { tools, call });
   }
 
   async start(): Promise<Record<string, unknown>> {
-    if (!Object.keys(this.configs).length && !this.intrinsic) return {};
+    if (!Object.keys(this.configs).length && !this.intrinsic.size) return {};
     try {
       for (const [index, [name, config]] of Object.entries(this.configs).entries()) {
         const policy = resolveMcpReadOnlyPolicy(config);
@@ -92,10 +96,11 @@ export class CodexMcpGateway {
         // The native server name remains the configured name for UI compatibility.
         void name;
       }
-      if (this.intrinsic) {
+      for (const [name, intrinsic] of this.intrinsic) {
         const security = new McpModelSecurity(this.secrets, this.privateRoots);
-        const policy: McpReadOnlyPolicy = { tools: new Set(["knowledge_cite"]), resources: new Set(), prompts: new Set(), trustedRenderer: false };
-        this.upstreams.set("/knowledge", { policy, security, tools: [this.intrinsic.tool], local: this.intrinsic.call });
+        const policy: McpReadOnlyPolicy = { tools: new Set(intrinsic.tools.map(tool => tool.name)), resources: new Set(), prompts: new Set(), trustedRenderer: false };
+        const route = name === "siclaw_knowledge" ? "/knowledge" : "/workflow";
+        this.upstreams.set(route, { policy, security, tools: intrinsic.tools, local: intrinsic.call });
       }
       if (!this.upstreams.size) return {};
       this.http = createServer((request, response) => {
@@ -151,7 +156,7 @@ export class CodexMcpGateway {
         if (this.upstreams.has(`/mcp/${index}`)) native[name] = { url: `http://${this.address}/mcp/${index}`,
           http_headers: { Authorization: `Bearer ${this.token}` }, required: true, default_tools_approval_mode: "approve" };
       }
-      if (this.intrinsic) native[this.intrinsic.name] = { url: `http://${this.address}/knowledge`,
+      for (const [name] of this.intrinsic) native[name] = { url: `http://${this.address}/${name === "siclaw_knowledge" ? "knowledge" : "workflow"}`,
         http_headers: { Authorization: `Bearer ${this.token}` }, required: true, default_tools_approval_mode: "approve" };
       return native;
     } catch {
@@ -177,9 +182,10 @@ export class CodexMcpGateway {
       const args = request.params.arguments ?? {};
       if (!upstream.policy.trustedRenderer) upstream.security.arguments(args);
       try {
-        const safeArgs = upstream.policy.trustedRenderer ? JSON.parse(upstream.security.text(JSON.stringify(args))) : args;
+        const safeArgs = upstream.local ? redactModelJson(args, text => upstream.security.text(text))
+          : upstream.policy.trustedRenderer ? JSON.parse(upstream.security.text(JSON.stringify(args))) : args;
         const result = upstream.local
-          ? await upstream.local(safeArgs, typeof request.params._meta?.siclawNativeCallId === "string" ? request.params._meta.siclawNativeCallId : "", extra.signal)
+          ? await upstream.local(safeArgs, typeof request.params._meta?.siclawNativeCallId === "string" ? request.params._meta.siclawNativeCallId : "", extra.signal, name)
           : await upstream.client!.callTool({ name, arguments: safeArgs }, undefined, { signal: extra.signal, timeout: 65_000 });
         return upstream.security.result(result, upstream.policy.trustedRenderer);
       } catch {

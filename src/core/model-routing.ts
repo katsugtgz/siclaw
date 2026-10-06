@@ -1,6 +1,7 @@
 import { llmCallFromMessage, type LlmCallEnvelope } from "./llm-call-recorder.js";
 import { modelNeedsRebind } from "./brain-session.js";
 import type {
+  BrainType,
   BrainModelInfo,
   BrainProviderResponse,
   BrainSession,
@@ -483,24 +484,24 @@ function candidateInputSet(candidate: ModelRouteCandidate): Set<string> {
   return new Set(model.input.filter((input): input is string => typeof input === "string"));
 }
 
-export function requiredInputsForPromptMedia(media?: PromptMedia): string[] {
+export function requiredInputsForPromptMedia(media?: PromptMedia, engine?: BrainType): string[] {
   const required: string[] = [];
   if (media?.images && media.images.length > 0) required.push("image");
-  if (media?.files && media.files.length > 0) required.push("pdf");
+  if (engine !== "codex" && media?.files?.some(file => file.mimeType === "application/pdf")) required.push("pdf");
   return required;
 }
 
-export function candidateSupportsPromptMedia(candidate: ModelRouteCandidate, media?: PromptMedia): boolean {
-  const required = requiredInputsForPromptMedia(media);
+export function candidateSupportsPromptMedia(candidate: ModelRouteCandidate, media?: PromptMedia, engine?: BrainType): boolean {
+  const required = requiredInputsForPromptMedia(media, engine);
   if (required.length === 0) return true;
   const inputs = candidateInputSet(candidate);
   return required.every((input) => inputs.has(input));
 }
 
-export function filterCandidatesForPromptMedia(candidates: ModelRouteCandidate[], media?: PromptMedia): ModelRouteCandidate[] {
-  const required = requiredInputsForPromptMedia(media);
+export function filterCandidatesForPromptMedia(candidates: ModelRouteCandidate[], media?: PromptMedia, engine?: BrainType): ModelRouteCandidate[] {
+  const required = requiredInputsForPromptMedia(media, engine);
   if (required.length === 0) return candidates;
-  return candidates.filter((candidate) => candidateSupportsPromptMedia(candidate, media));
+  return candidates.filter((candidate) => candidateSupportsPromptMedia(candidate, media, engine));
 }
 
 /**
@@ -739,9 +740,9 @@ export async function runPromptWithModelRouting(
   // modelConfig, so it would otherwise be filtered out for lack of declared inputs.
   const allCandidates = normalizeCandidates(policy.candidates);
   const candidates = allCandidates.length > 1
-    ? filterCandidatesForPromptMedia(allCandidates, media)
+    ? filterCandidatesForPromptMedia(allCandidates, media, brain.brainType)
     : allCandidates;
-  if (requiredInputsForPromptMedia(media).length > 0 && candidates.length === 0) {
+  if (requiredInputsForPromptMedia(media, brain.brainType).length > 0 && candidates.length === 0) {
     return {
       success: false,
       exhausted: true,

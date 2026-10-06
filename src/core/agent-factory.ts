@@ -199,7 +199,7 @@ export interface SiclawSessionResult {
   mcpManager?: McpClientManager;
   memoryIndexer?: MemoryIndexer;
   knowledgeIndexer?: KnowledgeResolver;
-  /** Read-only DP state ref — pi-agent extension writes, agentbox reads for recovery */
+  /** Read-only DP state ref — selected engine writes, agentbox reads for recovery */
   dpStateRef?: DpStateRef;
   /** Mutable ref — populated when session ID is assigned (for skill_call events) */
   sessionIdRef: { current: string };
@@ -1098,6 +1098,11 @@ export async function createSiclawSession(
       ...(nativeKnowledgeEnabled
         ? { knowledge: { directory: knowledgeDir, emit: opts!.sessionEventEmitter! } } : {}),
       allowSubagents: nativeAllowSubagents,
+      dpStateRef: mutableDpStateRef,
+      workflow: { schedule: customTools.some(tool => tool.name === "manage_schedule"),
+        report: customTools.some(tool => tool.name === "task_report"), sessionId: () => sessionIdRef.current },
+      ...(opts?.sessionEventEmitter && (mode === "web" || mode === "channel" || opts.allowInputRequest === true)
+        ? { userQuestions: { emit: opts.sessionEventEmitter, waitForAnswer: opts.allowInputRequest !== true } } : {}),
       onPlanUpdate: opts?.sessionEventEmitter
         ? (plan) => projectCodexPlan(taskListId, opts.sessionEventEmitter!, plan) : undefined,
       skillPaths: nativeSkills,
