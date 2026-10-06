@@ -42,6 +42,12 @@ The shipped GPFS query permits `/usr/lpp/mmfs/bin/mmlscluster`; unconfigured
 locations and temporary lookalikes remain denied. These execution boundary
 restrictions do not add another command registry.
 
+Both engines' shared output pipeline redacts complete generic diagnostic stdout
+when no command-specific sanitizer applies, before JSON projection, artifact
+capture or model delivery. Generic reads such as `curl`, `cat` and `zgrep` must
+not rely on later UI/persistence redaction. Existing structural sanitizers keep
+their JSON projection contract and separately report data-mode notices.
+
 Each launch refreshes the current bound inventory and acquires current
 credentials. Removed targets fail closed. Pod/node GET authorization selects
 the exact named target before remote execution. Kubernetes RBAC remains
@@ -66,6 +72,11 @@ a namespace. An explicit operator `SICLAW_DEBUG_IMAGE` pin takes precedence over
 the bound cluster's diagnostic image and the default image. The model cannot
 override either. Node commands enter the host's root and cwd as well as its
 mount/UTS/IPC/network/PID namespaces.
+
+Pi's existing namespace initialization also accepts a prepared namespace when
+creation is forbidden but its existence can be verified by GET. If neither
+creation nor verification succeeds, the original initialization error remains.
+This does not grant namespace creation to a read-only diagnostic account.
 
 Codex prompt assembly omits Pi infrastructure tool-name guidance while keeping
 the same SRE capability grants and operational safety. Native environments and

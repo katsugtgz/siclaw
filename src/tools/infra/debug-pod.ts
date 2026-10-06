@@ -168,7 +168,12 @@ export async function ensureDebugNamespace(
   } catch (err: any) {
     // "AlreadyExists" is expected and safe to ignore
     if (err.stderr && err.stderr.includes("already exists")) return;
-    throw err;
+    // A prepared namespace may be readable while namespace creation is not
+    // granted. Use it without widening the diagnostic account's permissions.
+    // Preserve the original create error if it cannot be verified to exist.
+    try {
+      await spawnAsync("kubectl", [...env.kubeconfigArgs, "get", "namespace", namespace, "-o", "name"], timeoutMs, env.childEnv);
+    } catch { throw err; }
   }
 }
 

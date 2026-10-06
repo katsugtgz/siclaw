@@ -16,7 +16,7 @@ import {
 } from "./output-sanitizer.js";
 import { processToolOutput, sanitizeOutput } from "./tool-render.js";
 import { getCommandBinary, parseArgs } from "./command-sets.js";
-import { detectSensitiveResource, redactDocument, REDACTION_NOTICE, kubectlSubcommand } from "./kubectl-sanitize.js";
+import { detectSensitiveResource, redactDocument, redactDataDocument, REDACTION_NOTICE, kubectlSubcommand } from "./kubectl-sanitize.js";
 
 // ── Pre-exec ────────────────────────────────────────────────────────
 
@@ -137,10 +137,20 @@ export function postExecSecurity(
   // it and suppress the result — dropping the exit code and stderr that are the
   // only evidence of what went wrong.
   let sanitized = stdout;
+  let documentRedacted = false;
   if (stdout.trim()) {
     sanitized = applySanitizer(sanitized, action, report);
     if (opts?.hasSensitiveKubectl) {
       sanitized = redactSensitiveContent(sanitized, report);
+    }
+    // Generic diagnostics (curl, cat, zgrep) can print secrets without a
+    // command-specific output rule. Apply the complete-document policy before
+    // projection, artifact capture or delivery to either engine.
+    if (!action && !opts?.hasSensitiveKubectl) {
+      const document = redactDataDocument(sanitized);
+      sanitized = document.text;
+      documentRedacted = document.redacted;
+      if (documentRedacted) report?.(REDACTION_NOTICE.trim());
     }
   }
 
@@ -197,6 +207,7 @@ export function postExecSecurity(
       combined += REDACTION_NOTICE;
     }
   }
+  if (documentRedacted && !combined.includes(REDACTION_NOTICE.trim())) combined += REDACTION_NOTICE;
   return processToolOutput(combined);
 }
 

@@ -154,6 +154,20 @@ describe("postExecSecurity", () => {
     expect(postExecSecurity("hello world", null)).toBe("hello world");
   });
 
+  it("redacts complete generic diagnostic stdout before either engine receives it", () => {
+    const result = postExecSecurity("DIAGNOSTIC_OK\npassword: generic-private-value\n", null);
+    expect(result).toContain("DIAGNOSTIC_OK");expect(result).not.toContain("generic-private-value");
+    expect(result).toContain("**REDACTED**");
+  });
+
+  it("redacts JSON before projection and keeps SDK data separate from notices", () => {
+    let data: any;
+    const result = postExecSecurity('{"password":"json-private-value","diagnostic":"ok"}', null,
+      { outputMode: "data", onOutputData: value => { data = value; }, project: text => JSON.stringify(JSON.parse(text).password) });
+    expect(JSON.parse(result)).toBe("**REDACTED**");expect(data.notices.length).toBeGreaterThan(0);
+    expect(JSON.stringify(data)).not.toContain("json-private-value");
+  });
+
   it("truncates long output", () => {
     const output = "x".repeat(200_000);
     const result = postExecSecurity(output, null);
