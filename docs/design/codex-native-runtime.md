@@ -236,3 +236,9 @@ not established by the component/namespace results.
   output retention and executor reconnect.
 
 Full Pi replacement and complete end-to-end acceptance are not yet established.
+
+## Deferred follow-ups
+
+- **Native Codex memory isolation:** recorded at the user's request on
+  2026-10-06. Further isolation design, review and implementation are deferred
+  until the user resumes this topic. Existing memory behavior is unchanged.
