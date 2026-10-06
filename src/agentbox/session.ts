@@ -518,6 +518,7 @@ export class AgentBoxSessionManager {
 
   // ── Shared components (AgentBox-level, outlive individual sessions) ──
   private _sharedMemoryIndexer: MemoryIndexer | null = null;
+  private _sharedMemoryInitialized = false;
   private _sharedKnowledgeIndexer: KnowledgeResolver | null = null;
   /** Whether shared components have been initialized */
   private _sharedInitialized = false;
@@ -883,17 +884,20 @@ export class AgentBoxSessionManager {
    * Lazily initialize shared components (memory indexer, MCP manager).
    * Called on first getOrCreate(). Idempotent.
    */
-  private async ensureSharedComponents(): Promise<void> {
-    if (this._sharedInitialized) return;
-    this._sharedInitialized = true;
-
-    try {
-      this._sharedKnowledgeIndexer = await this.createSharedKnowledgeIndexer();
-      console.log(`[agentbox-session] Shared knowledge label resolver initialized`);
-    } catch (err) {
-      console.warn(`[agentbox-session] Shared knowledge label resolver init failed:`, err);
-      this._sharedKnowledgeIndexer = null;
+  private async ensureSharedComponents(includePiMemory: boolean): Promise<void> {
+    if (!this._sharedInitialized) {
+      this._sharedInitialized = true;
+      try {
+        this._sharedKnowledgeIndexer = await this.createSharedKnowledgeIndexer();
+        console.log(`[agentbox-session] Shared knowledge label resolver initialized`);
+      } catch (err) {
+        console.warn(`[agentbox-session] Shared knowledge label resolver init failed:`, err);
+        this._sharedKnowledgeIndexer = null;
+      }
     }
+
+    if (!includePiMemory || this._sharedMemoryInitialized) return;
+    this._sharedMemoryInitialized = true;
 
     if (!isMemoryEnabled()) {
       this._sharedMemoryIndexer = null;
@@ -3575,7 +3579,7 @@ export class AgentBoxSessionManager {
     }
 
     // Ensure shared components are ready
-    await this.ensureSharedComponents();
+    await this.ensureSharedComponents(agentEngine === "pi-agent");
 
     // An incompatible binding (for example a PDF or a non-Responses model)
     // switches the session to Pi. Its append-only transcript is the new source
@@ -3588,7 +3592,7 @@ export class AgentBoxSessionManager {
     console.log(`[agentbox-session] Creating session: ${id} in ${sessionDir}`);
     const modelRouteState = this.loadModelRouteState(id);
 
-    if (isMemoryEnabled()) {
+    if (agentEngine === "pi-agent" && isMemoryEnabled()) {
       const memoryDir = this.getMemoryDir();
       if (!fs.existsSync(memoryDir)) {
         fs.mkdirSync(memoryDir, { recursive: true });
@@ -3688,7 +3692,7 @@ export class AgentBoxSessionManager {
       kubeconfigRef,
       mode: effectiveMode,
       activeMode,
-      memoryIndexer: this._sharedMemoryIndexer ?? undefined,
+      memoryIndexer: agentEngine === "pi-agent" ? this._sharedMemoryIndexer ?? undefined : undefined,
       knowledgeIndexer: this._sharedKnowledgeIndexer ?? undefined,
       userId: effectiveUserId,
       agentId: this.agentId ?? null,
@@ -3738,7 +3742,7 @@ export class AgentBoxSessionManager {
     this.attachUsage(result.brain, id, "root");
 
     // New session: sync memory index, then purge stale investigations (chained to avoid race)
-    if (isMemoryEnabled() && isNewSession && this._sharedMemoryIndexer) {
+    if (result.brain.brainType !== "codex" && isMemoryEnabled() && isNewSession && this._sharedMemoryIndexer) {
       const memDir = this.getMemoryDir();
       this._sharedMemoryIndexer.sync()
         .then(() => this._sharedMemoryIndexer!.purgeStaleInvestigations(memDir, { skipSync: true }))
@@ -4160,7 +4164,7 @@ export class AgentBoxSessionManager {
     await managed.brain.close?.();
 
     // 1. Auto-save session memory (dedup: only if new messages since last save)
-    if (isMemoryEnabled()) {
+    if (managed.brain.brainType !== "codex" && isMemoryEnabled()) {
       try {
         const sessionDir = this.getSessionDir(sessionId);
         const memoryDir = this.getMemoryDir();
@@ -4192,7 +4196,7 @@ export class AgentBoxSessionManager {
     }
 
     // 3. Sync shared memory index to pick up the new summary file
-    if (isMemoryEnabled() && this._sharedMemoryIndexer) {
+    if (managed.brain.brainType !== "codex" && isMemoryEnabled() && this._sharedMemoryIndexer) {
       await this._sharedMemoryIndexer.sync().catch((err) => {
         console.warn(`[agentbox-session] Memory sync on release failed:`, err);
       });
@@ -4395,6 +4399,7 @@ export class AgentBoxSessionManager {
     }
 
     this._sharedInitialized = false;
+    this._sharedMemoryInitialized = false;
   }
 
   /**

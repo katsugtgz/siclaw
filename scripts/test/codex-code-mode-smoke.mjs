@@ -27,10 +27,12 @@ const model = createServer(async (request, response) => {
       JSON.stringify((tools ?? body.tools ?? []).map((tool) => ({name:tool.name,type:tool.type}))));
     assert.equal(body.tools, undefined, "preserve native Responses Lite presentation");
     calls++;
+    const memoryTurn=body.input.filter(x=>x.type==="message"&&x.role==="user").at(-1)
+      ?.content?.some(x=>x.text?.startsWith("## Memory Writing Agent:"));
     // V2 model-originated messages are opaque encrypted_content, not text.
     const child = body.input.filter((item) => ["message","agent_message"].includes(item.type))
       .some((message) => JSON.stringify(message).includes("CODE_MODE_NATIVE_CHILD"));
-    const turn = child ? ++childCalls : ++rootCalls;
+    const turn = memoryTurn ? 0 : child ? ++childCalls : ++rootCalls;
     const side = child ? "child" : "root";
     if (turn === 2) {
       const output = body.input.find((item) => item.type === "custom_tool_call_output" && item.call_id === `${side}-1`);
@@ -54,7 +56,7 @@ const model = createServer(async (request, response) => {
         nativeCall = {name:"wait_agent",arguments:'{"timeout_ms":10000}'};
       }
     }
-    const answer = child ? "Code Mode child complete" : "Code Mode complete";
+    const answer = memoryTurn ? "Native memory consolidation complete" : child ? "Code Mode child complete" : "Code Mode complete";
     const item = nativeCall ? {id:`${side}-${turn}`,type:"function_call",namespace:"collaboration",call_id:`${side}-${turn}`,...nativeCall}
       : source ? { id:`${side}-${turn}`, type:"custom_tool_call",namespace:"functions",name:"exec",call_id:`${side}-${turn}`,input:source }
       : { id:`answer-${calls}`, type:"message",role:"assistant",content:[{type:"output_text",text:answer,annotations:[]}] };
@@ -92,7 +94,7 @@ try {
     const deadline=Date.now()+5000;
     while (childCalls<3 && Date.now()<deadline) await new Promise((resolve) => setTimeout(resolve,50));
     assert.equal(childCalls,3);
-  } else assert.equal(calls,2);
+  } else assert.equal(rootCalls,2);
   assert.ok(brain.getConversationMessages().some((message) => message.role==="assistant" &&
     message.content?.some?.((item) => item.text==="Code Mode complete")));
   console.log(`Native Code Mode smoke passed: gpt-6.1-sol, Responses Lite, source-built host, native exec_command${nativeChildren ? ", native V2 spawn/wait and child execution" : ""}`);

@@ -508,6 +508,22 @@ describe("AgentBoxSessionManager — getOrCreate", () => {
     expect(fs.existsSync(path.join(_cfgUserDataDir, "memory"))).toBe(false);
   });
 
+  it("keeps Codex independent of Siclaw memory even when the legacy switch is enabled", async () => {
+    _memoryEnabled = true;
+    const mgr = new AgentBoxSessionManager();
+    await mgr.getOrCreate("native-memory", "web", undefined, "normal", "alice",
+      false,false,undefined,false,"codex");
+    expect(createMemoryIndexer).not.toHaveBeenCalled();
+    expect(lastCreateSiclawSession.calls[0].memoryIndexer).toBeUndefined();
+    expect(fs.existsSync(path.join(_cfgUserDataDir,"memory"))).toBe(false);
+    await mgr.release("native-memory");
+    expect(saveSessionKnowledge).not.toHaveBeenCalled();
+    await mgr.getOrCreate("pi-memory","web",undefined,"normal","alice");
+    expect(createMemoryIndexer).toHaveBeenCalledTimes(1);
+    expect(lastCreateSiclawSession.calls[1].memoryIndexer).toBeDefined();
+    await mgr.closeAll();
+  });
+
   it("populates sessionIdRef.current so skill_call events can attribute the session", async () => {
     // NOTE: We cannot inspect the sessionIdRef directly through the mock
     // factory pattern (mocks' return values are awaited-consumed), so we

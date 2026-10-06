@@ -74,14 +74,18 @@ const model = createServer(async (request, response) => {
   assert.ok(!toolNames.includes("spawn_subagent"));
   assert.ok(!toolNames.includes("transfer_to_agent"));
   calls++;
+  const memoryTurn = body.input.filter(x=>x.type==="message"&&x.role==="user").at(-1)
+    ?.content?.some(x=>x.text?.startsWith("## Memory Writing Agent:"));
   const childTurn = body.input.filter((entry) => entry.type === "message" && entry.role === "user")
     .at(-1)?.content?.some((entry) => entry.text?.includes("CHILD_ONLY_NATIVE"));
-  if (childTurn) childCalls++; else rootCalls++;
-  if (rootCalls === 1 && !childTurn) assert.ok(JSON.stringify(body.input).includes("legacy-kubectl-evidence"),
+  if (!memoryTurn) { if (childTurn) childCalls++; else rootCalls++; }
+  if (rootCalls === 1 && !childTurn && !memoryTurn) assert.ok(JSON.stringify(body.input).includes("legacy-kubectl-evidence"),
     "restoring a Pi transcript into Codex must preserve its historical tool evidence");
   const id = `response_${calls}`;
   let item;
-  if (childTurn && childCalls === 1) item = { id: `child_cmd_${calls}`, type: "function_call", name: "exec_command",
+  if (memoryTurn) item = {id:`memory_${calls}`,type:"message",role:"assistant",status:"completed",
+    content:[{type:"output_text",text:"Native memory consolidation complete",annotations:[]}]};
+  else if (childTurn && childCalls === 1) item = { id: `child_cmd_${calls}`, type: "function_call", name: "exec_command",
     call_id: "child-command", arguments: JSON.stringify(clusterCommand), status: "completed" };
   else if (childTurn && childCalls === 2) {
     const output = body.input.find((entry) => entry.type === "function_call_output" && entry.call_id === "child-command");
@@ -149,7 +153,7 @@ const model = createServer(async (request, response) => {
   response.writeHead(200, { "content-type": "text/event-stream" });
   const send = (type, payload) => response.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...payload })}\n\n`);
   send("response.created", { response: { ...envelope, status: "in_progress", output: [] } });
-  if (holdNextResponse) {
+  if (holdNextResponse && !memoryTurn) {
     holdNextResponse = false;
     streamingRequestSeen?.();
     return; // Keep the real model request open until Codex interrupts it.
@@ -228,11 +232,11 @@ try {
   brain = await makeBrain(SessionManager.continueRecent(process.cwd(), transcriptDir));
   await brain.prompt("Again");
   assert.ok(brain.getConversationMessages().length >= 6);
-  const beforeStop = calls;
+  const beforeStop = rootCalls;
   const stopping = brain.prompt("Stop before model call");
   await brain.abort();
   await stopping;
-  assert.equal(calls, beforeStop);
+  assert.equal(rootCalls, beforeStop);
   holdNextResponse = true;
   const streamingRequest = new Promise((resolve) => { streamingRequestSeen = resolve; });
   const streaming = brain.prompt("Stop during a model stream");
@@ -240,9 +244,9 @@ try {
   await withTimeout(streamingRequest, "streaming model request");
   await withTimeout(brain.abort(), "active Stop");
   await withTimeout(streaming, "interrupted turn completion");
-  const afterInterrupt = calls;
+  const afterInterrupt = rootCalls;
   await brain.prompt("Continue after Stop");
-  assert.equal(calls, afterInterrupt + 1);
+  assert.equal(rootCalls, afterInterrupt + 1);
   console.log(`Native Codex brain smoke passed: ${calls} model calls, 1 native child (${childCalls} calls), plan, command, patch, read/redaction, denied command/path, resume, early/active Stop, continuation${realCluster ? ", real roce-test environment, parent/child broker refresh" : ""}`);
 
 } finally {

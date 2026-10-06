@@ -96,6 +96,7 @@ export class CodexAgentBrain implements BrainSession {
   private client: CodexAppServer | undefined;
   private loadedThreadId: string | undefined;
   private threadId: string | undefined;
+  private rolloutPath: string | undefined;
   private lastTurnId: string | undefined;
   private active: PendingTurn | undefined;
   private model: BrainModelInfo | undefined;
@@ -118,7 +119,7 @@ export class CodexAgentBrain implements BrainSession {
 
   private constructor(
     private readonly sessionManager: SessionManager,
-    private readonly native: { grants: CodexExecutorGrants; mcpServers?: JsonObject; allowSubagents?: boolean;
+    private readonly native: { grants: CodexExecutorGrants; mcpServers?: JsonObject; allowSubagents?: boolean; codexHome?: string;
       environments?: Array<{ id: string; grants: CodexExecutorGrants }> },
     private readonly systemPrompt: string,
     private readonly toolsetsByName: ReadonlyMap<string, string>,
@@ -128,8 +129,26 @@ export class CodexAgentBrain implements BrainSession {
     private readonly onPlanUpdate?: (plan: unknown) => void,
   ) {
     const sessionDir = sessionManager.getSessionDir();
-    this.home = path.join(sessionDir, "codex-home");
+    const legacyHome = path.join(sessionDir, "codex-home");
+    this.home = native.codexHome ?? legacyHome;
     this.marker = path.join(sessionDir, "codex-thread.json");
+    this.messages = sessionManager.getEntries()
+      .filter((entry) => entry.type === "message")
+      .map((entry) => entry.message);
+    if (fs.existsSync(this.marker)) {
+      try {
+        const saved = JSON.parse(fs.readFileSync(this.marker, "utf8")) as { threadId?: unknown; lastTurnId?: unknown; rolloutPath?: unknown };
+        this.threadId = string(saved.threadId) || undefined;
+        this.lastTurnId = string(saved.lastTurnId) || undefined;
+        this.rolloutPath = string(saved.rolloutPath) || undefined;
+        // Existing native SQLite history stays in its original home. New
+        // conversations use the owner-scoped home; never copy a live DB.
+        if (this.threadId && fs.existsSync(legacyHome)) this.home = legacyHome;
+      } catch {
+        // A corrupt sidecar must not make a recoverable Pi transcript unusable.
+        fs.rmSync(this.marker, { force: true });
+      }
+    }
     this.executor = new CodexExecutorRelay({ executable: process.env.SICLAW_CODEX_BIN || "codex",
       home: path.join(this.home, "executor"), cwd, grants: native.grants ?? {
         readRoots: [], writeRoots: [], deniedRoots: [], allowCommands: false, production: false,
@@ -138,24 +157,12 @@ export class CodexAgentBrain implements BrainSession {
       this.clusterExecutors.set(environment.id, new CodexExecutorRelay({ executable: process.env.SICLAW_CODEX_BIN || "codex",
         home: path.join(this.home, `executor-${index}`), cwd, grants: environment.grants }));
     }
-    this.messages = sessionManager.getEntries()
-      .filter((entry) => entry.type === "message")
-      .map((entry) => entry.message);
-    if (fs.existsSync(this.marker)) {
-      try {
-        const saved = JSON.parse(fs.readFileSync(this.marker, "utf8")) as { threadId?: unknown; lastTurnId?: unknown };
-        this.threadId = string(saved.threadId) || undefined;
-        this.lastTurnId = string(saved.lastTurnId) || undefined;
-      } catch {
-        // A corrupt sidecar must not make a recoverable Pi transcript unusable.
-        fs.rmSync(this.marker, { force: true });
-      }
-    }
+
   }
 
   static async create(options: {
     sessionManager: SessionManager; systemPrompt: string; grants: CodexExecutorGrants;
-    mcpServers?: JsonObject; allowSubagents?: boolean;
+    mcpServers?: JsonObject; allowSubagents?: boolean; codexHome?: string;
     environments?: Array<{ id: string; grants: CodexExecutorGrants }>;
     toolsetsByName: ReadonlyMap<string, string>;
     cwd: string; skillPaths: Array<{ name: string; filePath: string }>;
@@ -163,7 +170,7 @@ export class CodexAgentBrain implements BrainSession {
   }): Promise<CodexAgentBrain> {
     const brain = new CodexAgentBrain(options.sessionManager,
       { grants: options.grants, mcpServers: options.mcpServers, allowSubagents: options.allowSubagents,
-        environments: options.environments }, options.systemPrompt,
+        environments: options.environments, codexHome: options.codexHome }, options.systemPrompt,
       options.toolsetsByName, options.cwd, options.skillPaths,
       options.nativePlanEnabled, options.onPlanUpdate);
     fs.mkdirSync(brain.home, { recursive: true, mode: 0o700 });
@@ -286,6 +293,7 @@ export class CodexAgentBrain implements BrainSession {
     const thread = result.thread;
     if (!record(thread) || !string(thread.id)) throw new Error("Codex did not return a forked thread");
     this.threadId = string(thread.id);
+    this.rolloutPath = string(thread.path) || undefined;
     this.loadedThreadId = this.threadId;
     await client.request("thread/settings/update", { threadId: this.threadId,
       sandboxPolicy: { type: "externalSandbox", networkAccess: "enabled" } });
@@ -502,6 +510,8 @@ export class CodexAgentBrain implements BrainSession {
       // prepend an ambient AGENTS.md from the AgentBox working directory.
       project_doc_max_bytes: 0,
       agents: { enabled: this.native?.allowSubagents ?? false },
+      memories: { use_memories: true, dedicated_tools: true,
+        ...(this.model ? {extract_model:this.model.id, consolidation_model:this.model.id} : {}) },
       tools: { experimental_request_user_input: { enabled: false },
         update_plan: { enabled: this.nativePlanEnabled } },
       model_providers: { siclaw_model: {
@@ -511,7 +521,7 @@ export class CodexAgentBrain implements BrainSession {
       } },
       mcp_servers: this.native?.mcpServers ?? {},
       features: { shell_tool: Boolean(this.native?.grants?.allowCommands || this.native?.grants?.allowFileCommands || this.native?.grants?.writeRoots.length),
-        code_mode_host: true, request_permissions_tool: false, send_message_to_user_async: false,
+        code_mode_host: true, memories: true, request_permissions_tool: false, send_message_to_user_async: false,
         apps: false, plugins: false, browser_use: false, computer_use: false, image_generation: false,
         multi_agent: this.native?.allowSubagents ?? false,
         view_image: Boolean(this.native?.grants.allowFileCommands || this.native?.grants.writeRoots.length), goals: false },
@@ -523,7 +533,7 @@ export class CodexAgentBrain implements BrainSession {
     const client = await this.ensureClient();
     const existing = this.threadId;
     const result = await client.request(existing ? "thread/resume" : "thread/start", {
-      ...(existing ? { threadId: existing } : {}),
+      ...(existing ? { threadId: existing, ...(this.rolloutPath ? {path:this.rolloutPath} : {}) } : {}),
       model: this.model?.id, modelProvider: "siclaw_model", config: this.codexConfig(),
       cwd: this.cwd, sandbox: "read-only", approvalPolicy: "never",
       developerInstructions: this.systemPrompt,
@@ -533,6 +543,7 @@ export class CodexAgentBrain implements BrainSession {
     const thread = result.thread;
     if (!record(thread) || !string(thread.id)) throw new Error("Codex did not return a thread id");
     this.threadId = string(thread.id);
+    this.rolloutPath = string(thread.path) || this.rolloutPath;
     await client.request("thread/settings/update", { threadId: this.threadId,
       sandboxPolicy: { type: "externalSandbox", networkAccess: "enabled" } });
     try {
@@ -804,17 +815,22 @@ export class CodexAgentBrain implements BrainSession {
   private persistThread(): void {
     if (!this.threadId) return;
     const tmp = `${this.marker}.${randomUUID()}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify({ threadId: this.threadId, lastTurnId: this.lastTurnId }), { mode: 0o600 });
+    fs.writeFileSync(tmp, JSON.stringify({ threadId: this.threadId, lastTurnId: this.lastTurnId, rolloutPath:this.rolloutPath }), { mode: 0o600 });
     fs.renameSync(tmp, this.marker);
   }
 
   private syncSkills(): void {
     const root = path.join(this.home, "skills");
-    fs.rmSync(root, { recursive: true, force: true });
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });
     for (const skill of this.skillPaths) {
       if (!/^[a-zA-Z0-9_-]+$/.test(skill.name)) continue;
-      fs.symlinkSync(path.dirname(skill.filePath), path.join(root, skill.name), "dir");
+      const link = path.join(root, skill.name);
+      const target = path.dirname(skill.filePath);
+      if (fs.existsSync(link)) {
+        if (!fs.lstatSync(link).isSymbolicLink() || fs.readlinkSync(link) !== target) {
+          throw new Error("Native Skill scope changed; rebuild the Codex session");
+        }
+      } else fs.symlinkSync(target, link, "dir");
     }
   }
 

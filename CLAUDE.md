@@ -19,6 +19,10 @@ environments, and agent lifecycle. Siclaw-specific policy and services belong
 at Codex extension boundaries. Do not implement Codex by wrapping Pi tool
 definitions or requiring a Pi AgentSession. The implementation is described in `docs/design/codex-native-runtime.md`.
 SiCore is the first UI acceptance target; Portal UI acceptance comes last.
+Codex uses its own native memories. Do not migrate Siclaw's memory tools,
+indexer, profile prompt, flush hooks or auto-save into Codex. Native storage
+is scoped to the owner and selected Skills; SICLAW_MEMORY_ENABLED governs
+only the separately selectable Pi implementation.
 `Dockerfile.agentbox` fetches
 GitLab `main` over SSH and verifies a pinned
 `CODEX_COMMIT`. Advance the pin only after Codex Rust tests/build, the Siclaw

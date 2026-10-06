@@ -1,5 +1,6 @@
 import { scheduleToolOutputCleanup } from "./tool-output-cleanup.js";
 import type { CodexExecutorGrants } from "./brains/codex-executor-policy.js";
+import { codexHomeForScope } from "./brains/codex-home.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -425,6 +426,7 @@ export async function createSiclawSession(
   opts?: CreateSiclawSessionOpts,
 ): Promise<SiclawSessionResult> {
   const config = loadConfig();
+  const useCodex = opts?.agentEngine === "codex";
 
   // Register deployment-configured extra whitelist commands (idempotent,
   // fail-loud on invalid config). Must run before any exec tool validates
@@ -468,7 +470,7 @@ export async function createSiclawSession(
     agentType: opts?.agentType ?? "sre",
     allowedTools: opts?.allowedTools ?? config.allowedTools,
     harnessResolved: opts?.harnessResolved,
-    memoryConfigured: isMemoryEnabled(),
+    memoryConfigured: !useCodex && isMemoryEnabled(),
     mode,
     agentPrompt: opts?.systemPromptAppend,
     subagentPrompt: opts?.subagentPrompt,
@@ -763,7 +765,6 @@ export async function createSiclawSession(
 
   // Codex owns its progress checklist. Keep Pi's task ledger available for Pi
   // fallback, but do not advertise two competing plan APIs to a Codex turn.
-  const useCodex = opts?.agentEngine === "codex";
   const nativePlanEnabled = useCodex && ["task_create", "task_update"].every((name) =>
     customTools.some((tool) => tool.name === name));
   if (useCodex) compiledContext = compileAgentContext({ ...contextInput,
@@ -868,7 +869,7 @@ export async function createSiclawSession(
           ? [`\n## Research Workspace\nSave working notes and generated results under \`${userDataDir}\`. Use available Skill helpers when computation or processing helps answer the question; reading a Skill does not authorize unrelated actions.`]
           : []),
       // Extension registration order: compactionSafeguard handles session_before_compact.
-      extensionFactories: [
+      extensionFactories: useCodex ? [] : [
         contextPruningExtension,
         compactionSafeguardExtension,
         ...(memoryEnabled ? [(api: ExtensionAPI) => memoryFlushExtension(api, memoryIndexerRef.current)] : []),
@@ -961,10 +962,14 @@ export async function createSiclawSession(
   if (useCodex) {
     fs.mkdirSync(userDataDir, { recursive: true });
     const allowNativeFileRead = customTools.some((tool) => ["read", "grep", "find", "ls"].includes(tool.name));
+    const nativeSkills = loadedSkills.map((skill) => ({name:skill.name, filePath:skill.filePath}));
+    const codexHome = codexHomeForScope(userDataDir, {agentId, userId:opts?.userId,
+      sessionId:sessionManagerId, skills:nativeSkills});
     const nativeGrants: CodexExecutorGrants = { readRoots: allowNativeFileRead ? readAllowedDirs : [],
         executionRoots: [userDataDir], writeRoots: customTools.some((tool) =>
           tool.name === "write" || tool.name === "edit") ? writeAllowedDirs : [],
         deniedRoots: [...blockedFileDirs.map((item) => item.dir), sessionManager.getSessionDir(),
+          path.join(userDataDir,"agent","codex"),
           path.dirname(getConfigPath()),
           path.resolve(cwd, config.paths.credentialsDir), path.resolve(cwd, ".siclaw", "config")],
         allowCommands: customTools.some((tool) => tool.name === "bash"),
@@ -999,13 +1004,11 @@ export async function createSiclawSession(
         environments.length ? "Authorized Kubernetes clusters are native execution environments: " +
           environments.map((entry) => entry.id).join(", ") +
           ". Select environment_id in exec_command for cluster queries. Credentials are injected by the executor." : ""].join("\n\n"),
-      toolsetsByName, cwd: userDataDir, nativePlanEnabled, grants: nativeGrants, environments, mcpServers: nativeMcpServers,
+      toolsetsByName, cwd: userDataDir, nativePlanEnabled, grants: nativeGrants, environments, mcpServers: nativeMcpServers, codexHome,
       allowSubagents: nativeAllowSubagents,
       onPlanUpdate: opts?.sessionEventEmitter
         ? (plan) => projectCodexPlan(taskListId, opts.sessionEventEmitter!, plan) : undefined,
-      skillPaths: loadedSkills.map((skill) => ({
-        name: skill.name, filePath: skill.filePath,
-      })),
+      skillPaths: nativeSkills,
     });
   } else {
     brain = new PiAgentBrain(session!, toolsetsByName, llmCallRecorder);

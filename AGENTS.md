@@ -101,6 +101,10 @@ Memory DB: node:sqlite + FTS5 + sqlite-vec
   `docs/design/codex-native-runtime.md` for the replacement direction.
 - Validate the Codex runtime with SiCore as the UI first. Portal UI acceptance
   follows only after that runtime path is complete.
+- Codex owns its native memory mechanism. Do not adapt Siclaw memory tools,
+  indexes, profile prompts, flush hooks or session-summary persistence into
+  Codex. Keep native storage private to the owner and selected Skill scope;
+  the legacy Siclaw memory switch applies only to Pi sessions.
 - `Dockerfile.agentbox` fetches GitLab `main` and verifies the exact
   `CODEX_COMMIT` before building. Advance the pin after reviewing the source
   diff and passing Codex Rust tests/build, the Siclaw app-server smoke test,

@@ -17,6 +17,8 @@ describe("CodexAgentBrain compatibility", () => {
     brain.onPlanUpdate = onPlanUpdate;
     brain.currentProviderConfig = () => ({ baseUrl: "http://127.0.0.1:2/v1" });
     expect(brain.codexConfig().tools.update_plan.enabled).toBe(true);
+    expect(brain.codexConfig().features.memories).toBe(true);
+    expect(brain.codexConfig().memories).toMatchObject({use_memories:true,dedicated_tools:true});
     brain.handleEvent({ method: "turn/plan/updated", params: { threadId: "other",
       plan: [{ step: "ignored", status: "pending" }] } });
     brain.handleEvent({ method: "turn/plan/updated", params: { threadId: "thread-1",

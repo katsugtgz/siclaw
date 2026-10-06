@@ -17,11 +17,16 @@ direction supersedes wrapping Siclaw's Pi tool definitions in an MCP bridge.
 - Preserve whitelist-only execution, credential brokering, OS user isolation,
   path authorization, output sanitization, and cancellation guarantees.
 - Validate SiCore as the UI first. Defer Portal UI work until runtime acceptance.
-- Scope parity to currently enabled Pi product capabilities. Long-term memory
-  is disabled by default and is not a required migration feature. Keep it
-  disabled for this acceptance scope; evaluate native Codex memory separately
-  if the product explicitly enables it later. Conversation history, resume and
-  compaction remain in scope and use Codex natively.
+- Codex uses its own native memories, conversation history, resume and
+  compaction. Do not implement compatibility with Siclaw's memory mechanism.
+  SICLAW_MEMORY_ENABLED, the legacy indexer/profile/flush hooks and session
+  auto-save apply only to Pi. Native Codex memory is enabled through upstream
+  configuration and uses the upstream storage format and dedicated tools.
+  New conversations share a private native home only within the same Agent,
+  user and selected Skill set. Anonymous contexts remain conversation-scoped.
+  Existing Codex conversations retain their original native home so that
+  SQLite history is not copied or lost. Native notes/search/generation are
+  owned by Codex; no Siclaw memory file or index is imported.
 
 ## Extension boundaries verified in the pinned source
 
@@ -35,7 +40,8 @@ The source pin is `aiops/codex` main at
 | Native `exec-server` protocol | Process launch, reads/writes, signals, termination, filesystem and PTY operations | Enforce command/resource/path grants and sanitize data before returning it to Codex |
 | Native shell, `apply_patch`, image reading | Model-facing tool schemas and orchestration | Authoritative execution policy at the executor boundary |
 | Native MCP and dynamic tools | Tool discovery, invocation and native orchestration | Product-specific services and external server authorization |
-| Native hooks | Lifecycle integration and supplementary policy feedback | Enabled investigation workflow and audit integration; optional memory work |
+| Native memories | Generation, consolidation, prompts, notes and retrieval | Private persistent storage for the authorized owner and Skill scope |
+| Native hooks | Lifecycle integration and supplementary policy feedback | Enabled investigation workflow and audit integration |
 | Native multi-agent | Child creation, coordination, context and termination | Role/tier grants, resource inheritance, reports and existing SiCore task events |
 
 `codex exec-server` ships as a subcommand of the source-built CLI. No npm Codex
@@ -133,8 +139,8 @@ including any required source-built runtime helpers.
   source-built native executor security tests.
 - Deploy the reviewed native path in the test namespace and validate SiCore
   streaming, tools, plan, Stop, steer, restart/resume, model routing, attachments,
-  reports, jobs, native subtasks and scheduling. Long-term memory and handoff are
-  outside the current acceptance scope.
+  reports, jobs, native subtasks, scheduling and native memory persistence/
+  isolation. Cross-Agent handoff is outside the current acceptance scope.
 - Test denial paths independently: unauthorized commands/resources/files,
   leaked environment variables, raw output secrets, cross-session handles,
   policy failure, executor failure and canceled process groups.
@@ -144,6 +150,18 @@ including any required source-built runtime helpers.
 No test account secrets belong in source, image layers or recorded evidence.
 
 ## Current verification evidence (2026-10-05)
+
+### Native memory update (2026-10-06)
+
+- The real factory uses official `memories` tools for notes and reads, even
+  with `SICLAW_MEMORY_ENABLED=true`; no legacy indexer, profile prompt or
+  auto-save is initialized for Codex.
+- Source-built native checks pass for write/read, a second conversation's
+  memory retrieval, another owner's denial, old native-home history resume
+  and the existing plan/command/child/Stop/resume workflow.
+- Fake Responses fixtures distinguish native memory-consolidation sessions
+  from user turns. The upstream generation pipeline and prompts are retained;
+  summary quality still needs real-provider acceptance.
 
 - Runtime source at `755cfd84`; subsequent commits update validation scripts.
   Codex source remains pinned to GitLab main `d4684bba63aba4c941d5a251054609e722b64779`.
@@ -199,8 +217,9 @@ not established by the component/namespace results.
   workflow state, reports, schedules, host/node/pod
   diagnostic bindings and script execution. The removed Pi tools are not claimed
   as implementations of these services.
-- Long-term memory search, generation and publication are optional future
-  capabilities, not blockers for the current disabled-memory Pi replacement.
+- Siclaw memory search, generation and publication are not migration targets.
+  Native Codex memory needs its own source-built read/write, restart and owner
+  isolation checks; retaining old Pi memory code does not establish support.
 - Native clarification, file attachments and structured-result contracts;
   external MCP output/artifact policy; child detail persistence and resource/model
   policy. Explicit unsupported requests must never silently run Pi.
