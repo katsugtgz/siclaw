@@ -333,36 +333,34 @@ The model is a deterministic fake Responses server in these checks. Real model
 quality, production provider protocol compatibility and SiCore UI acceptance are
 not established by the component/namespace results.
 
-## Remaining acceptance work
+## Remaining acceptance work (reconciled 2026-10-07)
 
-- Real provider acceptance must include the catalog's native Responses Lite
-  and opaque agent-message contract when applicable; fake Responses checks
-  do not establish those provider capabilities.
-- Test-namespace Runtime/AgentBox with SiCore: streaming/reasoning, tool/plan and
-  child views, Stop/steer, restart/resume, model routing and usage accounting.
-  K8sSpawner deployment is approved; mTLS callbacks, pending Plan persistence,
-  real namespace credentials, Pod/Runtime recovery and the native child projection
-  acceptance below pass. Remaining business contracts still need acceptance.
-  No Portal UI acceptance is attempted.
-- Native product services: knowledge labels/citations, enabled investigation
-  workflow state, reports and schedules. Reviewed Skill script execution now
-  uses the native exec-server boundary; see [Native Skill scripts](codex-skill-script-execution.md)
-  for its contract and acceptance evidence. Read-only cluster,
-  node, Pod and SSH native command bindings are implemented and tested in
-  [Native read-only infrastructure](codex-readonly-infrastructure.md). Other
-  infrastructure contracts remain outside that acceptance. The removed Pi tools are not claimed
-  as implementations of these services.
-- Siclaw memory search, generation and publication are not migration targets.
-  Native notes/read and history resume have source-built checks. Automatic native
-  consolidation needs authorized execution and real-provider acceptance. Further
-  memory isolation work is deferred by the user.
-- Native clarification, file attachments and structured-result contracts;
-  external MCP output/artifact policy; child resource/model
-  policy. Explicit unsupported requests must never silently run Pi.
-- Interactive/background execution, stateful streaming, bounded finished-process
-  output retention and executor reconnect.
+Use the dated acceptance sections and linked records for exact source/image
+revisions. Read-only cluster/node/Pod/SSH execution, reviewed Skill scripts,
+shared resource mounts/brokering, MCP admission/pre-model sanitization, native
+Plan, native child projection/continuation/usage, long processes and native
+output retention now have component, source-built and scoped live evidence.
+They are no longer blanket migration TODOs. The latest long-process/security
+evidence is in [Native read-only infrastructure](codex-readonly-infrastructure.md#native-process-and-streaming-acceptance-2026-10-07).
 
-Full Pi replacement and complete end-to-end acceptance are not yet established.
+| Priority | Remaining contract | Current evidence and required result |
+| --- | --- | --- |
+| First | MCP failure reason in the SiCore tool card/history | `CodexAgentBrain.handleEvent` projects `item.result.content` but does not project native `item.error`; error-only items can persist an empty reason. Preserve the safe native reason through existing events and storage. |
+| First | Knowledge answer citation display | Knowledge selection/mounts and native reads are shared. Pi's `noteRead`/`knowledge_cite` path exists, but Codex does not register that product service or observe those reads for the citation sink. Add a native integration for validated read provenance and the existing citation event/card contract. |
+| Next | Enabled investigation state, reports and schedules | Codex skips Pi extension factories and does not register the corresponding product operations. Implement only enabled business contracts through native extension/service APIs, without exposing Pi ToolDefinitions. Native `update_plan` remains the plan owner. |
+| Next | Native structured user questions | Natural-language questions in chat remain available. Native `experimental_request_user_input`/async user-message tools are disabled and unsolicited server requests are rejected. Connect authorized native question requests/answers to the existing SiCore input contract. Infrastructure approvals remain governed by the whitelist. |
+| Next | Non-image attachments | User image input is supported; `PromptMedia.files` is explicitly rejected. Reuse the shared scoped attachment materialization and expose approved file reads through native execution, with private-path and output controls. |
+| Acceptance | Target Responses provider/model combinations and failures | Named live runs establish their exact combinations, not every catalog entry. Exercise required Responses Lite/opaque history contracts, model/provider/key changes and failure recovery when those combinations are selected. Keep test-body fixtures separate from real provider evidence. |
+| Lower | Native executor reconnect | Cold conversation restore works. `initialize.resumeSessionId` is rejected; a lost execution connection cancels its owned processes. Supporting reconnect requires owned handle/replay and resource authorization, not another job ledger. |
+
+Interactive shell/PTY and arbitrary opaque image/file output remain deliberate
+safety boundaries. Full raw log archival/search is optional product work; native
+truncation/continuation already owns ordinary large-output behavior. Cross-Agent
+handoff, Portal UI and memory isolation retain their separately deferred scopes.
+Siclaw memory search, generation and publication remain outside this migration.
+
+These remaining product contracts prevent a blanket claim of full Pi feature
+replacement. Do not interpret successful executor tests as their implementation.
 
 ## Native child projection acceptance (2026-10-06)
 
@@ -417,6 +415,17 @@ timing and separate child trace envelopes remain explicitly labelled by audit.
 
 ## Deferred follow-ups
 
+- **Large structured output and incremental redaction:** recorded at the user's
+  request on 2026-10-07; implement later, not during the current backlog review.
+  The current 8 MiB limit applies to one text record or one complete JSON
+  document, not the total process output. Oversized/malformed structured records
+  are suppressed, and invalid UTF-8 or a failing secret source suppresses the
+  affected stdout/stderr stream. The future goal is bounded incremental
+  structural redaction before Codex's native retention/token/head-tail budgets,
+  so a large valid JSON document can deliver safe content without wholesale
+  suppression. Never restore completeness by forwarding raw bytes or truncating
+  sensitive structure before redaction. Preserve the current safety boundary
+  until that work is explicitly resumed and verified.
 - **Native Codex memory isolation:** recorded at the user's request on
   2026-10-06. Further isolation design, review and implementation are deferred
   until the user resumes this topic. Existing memory behavior is unchanged.

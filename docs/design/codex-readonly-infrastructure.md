@@ -112,6 +112,12 @@ record redaction budget is 8 MiB. This security framing is independent of native
 whole-process output/token limits. Full-log archiving/search is a separate
 product feature and is not required for native runtime compatibility.
 
+On 2026-10-07 the user deferred improving large structured-record completeness.
+Keep the existing record budget/suppression behavior until that follow-up is
+resumed. The recorded goal is incremental structural redaction before native
+truncation, not removal of the pre-model safety gate; see
+[Deferred follow-ups](codex-native-runtime.md#deferred-follow-ups).
+
 ## Acceptance
 
 Require native source-built positive reads and negative writes for all four

@@ -19,6 +19,9 @@ The former Pi ToolDefinition MCP bridge has been removed. Codex no longer
 requires a Pi AgentSession. Shared session JSONL serialization and resource
 selection are still reused by the adapter.
 
-This is not yet a full Pi replacement: native product services and the remaining
-end-to-end gates are listed in the runtime design. Component and fake-model
-checks do not establish real-model or SiCore UI acceptance.
+The runtime design's dated records include actual Responses/SiCore/K8sSpawner
+acceptance for the native diagnostic path, separately from component/fake-model
+checks. Remaining product contracts (citations, investigation/report/schedule
+services, structured questions and non-image attachments) are listed in
+[Remaining acceptance work](codex-native-runtime.md#remaining-acceptance-work-reconciled-2026-10-07).
+Full Pi feature replacement is not yet established.
