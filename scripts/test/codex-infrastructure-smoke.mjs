@@ -23,7 +23,7 @@ const server = new ssh2.Server({ hostKeys: [key] }, client => {
   client.on("ready", () => client.on("session", accept => {
     const session = accept();
     session.on("exec", (accept, _reject, info) => {
-      assert.match(info.command, /'timeout'.*(?:uname|curl|sichek|printenv)/);
+      assert.match(info.command, /'timeout'.*(?:uname|curl|sichek|printenv|mmlscluster)/);
       executions++;
       const stream = accept();
       stream.write("NATIVE_SSH_READ_OK\npassword: private-runtime-fixture\nOPENAI_API_KEY=private-env-fixture\n");
@@ -69,7 +69,7 @@ try {
   const extras = new URL("../../docker/extra-commands.json", import.meta.url);
   setExtraCommands(parseExtraCommandsConfig(readFileSync(extras, "utf8"), extras.pathname));
   for (const [processId, command] of [["safe", "uname -a"], ["curl", "curl -sS https://example.test/healthz"],
-    ["extra", "sichek gpu"], ["env", "printenv"]]) {
+    ["extra", "sichek gpu"], ["vendor-path", "/usr/lpp/mmfs/bin/mmlscluster --ces"], ["env", "printenv"]]) {
     assert.ok((await start(processId, `ssh fixture-host -- ${command}`)).result);
     const deadline = Date.now() + 20000;
     while (!events.some(e => e.method === "process/exited" && e.params.processId === processId)) {
@@ -81,21 +81,22 @@ try {
   const text = events.filter(e => e.method === "process/output").map(e => Buffer.from(e.params.chunk, "base64").toString()).join("");
   assert.match(text, /NATIVE_SSH_READ_OK/);
   assert.ok(!text.includes("private-runtime-fixture")); assert.ok(!text.includes("private-env-fixture"));
-  assert.equal(executions, 4); assert.equal(credentialRequests, 4);
+  assert.equal(executions, 5); assert.equal(credentialRequests, 5);
   assert.ok((await start("write", "ssh fixture-host -- touch /tmp/owned")).error);
   assert.ok((await start("options", "ssh -i /tmp/key fixture-host -- uname")).error);
   assert.ok((await start("bad-curl", "ssh fixture-host -- curl -X POST https://example.test")).error);
   assert.ok((await start("bad-extra", "ssh fixture-host -- sichek daemon")).error);
+  assert.ok((await start("untrusted-path", "ssh fixture-host -- /tmp/mmlscluster --ces")).error);
   setExtraCommands({});
   assert.ok((await start("removed-extra", "ssh fixture-host -- sichek gpu")).error);
-  assert.equal(executions, 4);
+  assert.equal(executions, 5);
   bound = false;
   assert.ok((await start("revoked", "ssh fixture-host -- uname")).result);
   const revokedDeadline = Date.now() + 20000;
   while (!events.some(e => e.method === "process/exited" && e.params.processId === "revoked")) {
     assert.ok(Date.now() < revokedDeadline); await new Promise(resolve => setTimeout(resolve, 50));
   }
-  assert.equal(executions, 4); assert.equal(credentialRequests, 4);
+  assert.equal(executions, 5); assert.equal(credentialRequests, 5);
   assert.notEqual(events.find(e => e.method === "process/exited" && e.params.processId === "revoked").params.exitCode, 0);
   console.log("Native infrastructure smoke passed: official exec-server, shared whitelist/extras, broker SSH, write denial, sanitized IPC and revoked binding");
 } finally {

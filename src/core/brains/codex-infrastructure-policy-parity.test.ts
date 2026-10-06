@@ -64,10 +64,18 @@ describe.each(contexts)("Pi/Codex shared %s whitelist", context => {
     const file = new URL("../../../docker/extra-commands.json", import.meta.url);
     setExtraCommands(parseExtraCommandsConfig(readFileSync(file, "utf8"), file.pathname));
     for (const command of ["sichek gpu", "sichek all", "sichek daemon", "sichek ibtest", "mmlscluster --ces",
+      "/usr/lpp/mmfs/bin/mmlscluster --ces",
       "mmlscluster unexpected", "mmchcluster -p node-a"]) expectParity(command, context);
     expect(nativeOperation("sichek gpu", context).security.error).toBeNull();
+    const direct = context === "host" ? "ssh bound-host -- /usr/lpp/mmfs/bin/mmlscluster --ces"
+      : `kubectl ${context === "pod" ? "exec pod-a" : "debug node/node-a"} -- /usr/lpp/mmfs/bin/mmlscluster --ces`;
+    expect(authorizeInfrastructureCommand(direct, context === "host" ? ssh : cluster)?.security.error).toBeNull();
+    for (const path of ["/tmp/mmlscluster", "/opt/unreviewed/mmlscluster", "/usr/lpp/mmfs/bin/../bin/mmlscluster"]) {
+      expect(() => nativeOperation(`${path} --ces`, context)).toThrow();
+    }
     setExtraCommands({});
     expect(() => nativeOperation("sichek gpu", context)).toThrow(/not in the allowed command list/);
+    expect(() => nativeOperation("/usr/lpp/mmfs/bin/mmlscluster --ces", context)).toThrow();
   });
   it("accepts configured binary names with dots and enforces additive-only rules", () => {
     const extras = parseExtraCommandsConfig(JSON.stringify({ version: 1, commands: {

@@ -38,6 +38,10 @@ contract. Summary:
   file can never relax built-in restrictions.
 - **Declarative constraints only**: `category` + `allowedFlags` / `blockedFlags` /
   `allowedSubcommands` / `positionals` / `requiredFlags`. No custom validators.
+- Optional `executablePaths` lists exact reviewed vendor locations under `/usr`
+  or `/opt` for native execution (for example GPFS's
+  `/usr/lpp/mmfs/bin/mmlscluster`). It does not relax argument restrictions or
+  authorize a temporary executable with a whitelisted basename.
 - **Forbidden names**: shells, interpreters, `sed`/`awk`, `nc`/`wget`/`socat`,
   `sudo`/`nsenter`, argument-executing wrappers (`xargs`, `timeout`, `watch`, …),
   `ssh`/`scp`/`rsync`, and `kubectl` are rejected at load time.

@@ -36,8 +36,11 @@ passive. Arbitrary filesystem writes, mutating command flags, Kubernetes API
 mutations and unapproved binaries remain rejected. Pod commands retain Pi's
 single-command restriction; node and SSH commands may use validated pipelines.
 Native transport separately rejects environment/identity overrides, interactive
-input and executable paths outside standard system directories. These execution
-boundary restrictions do not add another command registry.
+input and executable paths outside standard system directories unless the
+shared deployment config explicitly lists that vendor binary's canonical path.
+The shipped GPFS query permits `/usr/lpp/mmfs/bin/mmlscluster`; unconfigured
+locations and temporary lookalikes remain denied. These execution boundary
+restrictions do not add another command registry.
 
 Each launch refreshes the current bound inventory and acquires current
 credentials. Removed targets fail closed. Pod/node GET authorization selects

@@ -122,6 +122,22 @@ describe("parseExtraCommandsConfig", () => {
     expect(() => parseExtraCommandsConfig(wrap({ x: { category: "network", allowedSubcommands: { allowed: ["a"] } } }), "t")).toThrow(/allowedSubcommands/);
   });
 
+  it("accepts exact reviewed vendor paths without changing argument constraints", () => {
+    const parsed = parseExtraCommandsConfig(wrap({ vendorctl: { category: "diagnostic",
+      executablePaths: ["/opt/vendor/bin/vendorctl"], allowedFlags: ["--show"] } }), "paths.json");
+    expect(parsed.vendorctl.executablePaths).toEqual(["/opt/vendor/bin/vendorctl"]);
+    setExtraCommands(parsed);
+    expect(validateCommand("/opt/vendor/bin/vendorctl --show", { context: "host" })).toBeNull();
+    expect(validateCommand("/opt/vendor/bin/vendorctl --reset", { context: "host" })).not.toBeNull();
+  });
+
+  it.each([[], "not-an-array", [1], ["vendorctl"], ["/tmp/vendorctl"], ["/opt/vendor/bash"],
+    ["/opt/vendor/../vendor/vendorctl"], ["/opt/vendor//vendorctl"], ["/opt/*/vendorctl"], ["/opt/vendor/$HOME/vendorctl"]])(
+    "rejects unsafe vendor executablePaths: %j", executablePaths => {
+      expect(() => parseExtraCommandsConfig(wrap({ vendorctl: { category: "diagnostic", executablePaths } }), "paths.json"))
+        .toThrow(/executablePaths/);
+    });
+
   it("rejects a non-object command entry", () => {
     expect(() => parseExtraCommandsConfig(wrap({ x: "network" }), "t")).toThrow(/object/i);
   });

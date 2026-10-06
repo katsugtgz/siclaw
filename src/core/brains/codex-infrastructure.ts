@@ -1,5 +1,5 @@
 import type { CredentialBroker } from "../../agentbox/credential-broker.js";
-import { parseArgs, shellEscape, CONTAINER_SENSITIVE_PATHS } from "../../tools/infra/command-sets.js";
+import { parseArgs, shellEscape, CONTAINER_SENSITIVE_PATHS, isTrustedCommandExecutable } from "../../tools/infra/command-sets.js";
 import { preExecSecurity, postExecSecurity, type PreExecResult } from "../../tools/infra/security-pipeline.js";
 import { acquireSshTarget, sshExec } from "../../tools/infra/ssh-client.js";
 import { prepareExecEnv, spawnAsync, validateNodeName, validatePodName } from "../../tools/infra/exec-utils.js";
@@ -11,7 +11,6 @@ import { getCommandBinary } from "../../tools/infra/command-sets.js";
 import { redactText, buildRedactionConfig } from "../../shared/output-redactor.js";
 import { redactDataDocument } from "../../tools/infra/kubectl-sanitize.js";
 import { kubectlSubcommand, kubectlConnectionOverride } from "../../tools/infra/kubectl-sanitize.js";
-import path from "node:path";
 
 export type CodexInfrastructureTarget =
   | { kind: "ssh"; broker: CredentialBroker }
@@ -106,7 +105,7 @@ export function authorizeInfrastructureCommand(command: string, target: CodexInf
 }
 
 function validRemoteBinary(binary: string): boolean {
-  return /^(?:\/(?:usr\/)?s?bin\/)?[a-zA-Z0-9_][a-zA-Z0-9_.+-]*$/.test(binary);
+  return /^[a-zA-Z0-9_./+-]+$/.test(binary) && isTrustedCommandExecutable(binary);
 }
 
 function authorizeRemoteCommand(command: string, context: "host" | "node" | "pod"): PreExecResult {
@@ -115,8 +114,7 @@ function authorizeRemoteCommand(command: string, context: "host" | "node" | "pod
   // same preExecSecurity/COMMANDS policy below.
   for (const part of extractCommands(command)) {
     const binary = parseArgs(part)[0] ?? "";
-    const trustedBinaryPath = !binary.includes("/") || ["/bin", "/sbin", "/usr/bin", "/usr/sbin"].includes(path.posix.dirname(binary));
-    if (!trustedBinaryPath || /^\s*[a-zA-Z_][a-zA-Z0-9_]*=/.test(part)) {
+    if (!isTrustedCommandExecutable(binary) || /^\s*[a-zA-Z_][a-zA-Z0-9_]*=/.test(part)) {
       throw new Error("Remote executable path or environment override is not authorized");
     }
   }

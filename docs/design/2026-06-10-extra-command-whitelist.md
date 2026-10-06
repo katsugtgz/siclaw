@@ -23,6 +23,11 @@ loaded at agent startup and merged into the built-in registry.
    declarative `CommandDef` constraint fields (`allowedFlags`, `blockedFlags`,
    `allowedSubcommands`, `positionals`, `requiredFlags`). Custom `validate` functions are
    not expressible in JSON — by design, configuration cannot inject code.
+   Optional `executablePaths` metadata lists reviewed vendor binary locations
+   for native transports. Each path must be canonical, under `/usr` or `/opt`,
+   and have exactly the configured command's basename. It does not relax command
+   arguments or permit a different binary. Standard system directories remain
+   available; arbitrary temporary paths remain rejected by native transports.
 3. **Forbidden names.** Binaries the built-in whitelist excludes *on purpose* cannot be
    re-added via configuration: shells/interpreters (`bash`, `python3`, …), multi-call
    wrappers that bundle a shell (`busybox`, `toybox`), Turing-complete text tools (`sed`,
@@ -74,7 +79,9 @@ Validation rules (violations throw):
 - Command names must match `^[a-z0-9][a-z0-9._+-]*$` (lookup lowercases binary names).
 - `category` must be one of the existing `CommandCategory` values.
 - Only `category`, `description`, and the five declarative constraint fields are
-  accepted; unknown keys (including `validate`) are rejected.
+  accepted, plus optional `executablePaths`; unknown keys (including `validate`)
+  are rejected. `executablePaths` must be a non-empty list of canonical absolute
+  paths under `/usr` or `/opt` with the entry's own command basename.
 - Flags must be non-empty strings starting with `-`; `positionals` must be
   `"allow" | "block" |` a non-negative integer; `allowedSubcommands` must be
   `{ position: <non-negative int>, allowed: <non-empty string[]> }`.

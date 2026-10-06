@@ -9,6 +9,7 @@
  * Contract: docs/design/2026-06-10-extra-command-whitelist.md
  */
 import { existsSync, readFileSync } from "node:fs";
+import path from "node:path";
 import {
   ALL_COMMAND_CATEGORIES,
   setExtraCommands,
@@ -55,7 +56,7 @@ const INTERPRETER_VERSION_PATTERN =
   /^(sh|bash|dash|ash|zsh|ksh|csh|tcsh|fish|python|perl|ruby|node|deno|bun|lua|php|tclsh|awk|gawk|sed)[0-9]/;
 
 const ALLOWED_ENTRY_KEYS = new Set([
-  "category", "description",
+  "category", "description", "executablePaths",
   "allowedFlags", "blockedFlags", "allowedSubcommands", "positionals", "requiredFlags",
 ]);
 
@@ -93,6 +94,15 @@ function parseEntry(source: string, name: string, raw: unknown): CommandDef {
   }
 
   const def: CommandDef = { category: category as CommandCategory };
+
+  if (entry.executablePaths !== undefined) {
+    const paths = entry.executablePaths;
+    if (!Array.isArray(paths) || paths.length === 0 || paths.some(value => typeof value !== "string" ||
+      !/^\/(?:usr|opt)\/[a-zA-Z0-9_./+-]+$/.test(value) || path.posix.normalize(value) !== value || path.posix.basename(value) !== name)) {
+      fail(source, `"${name}".executablePaths must list canonical absolute /usr or /opt paths whose basename is "${name}"`);
+    }
+    def.executablePaths = paths;
+  }
 
   if (entry.allowedFlags !== undefined) def.allowedFlags = checkFlagArray(source, name, "allowedFlags", entry.allowedFlags);
   if (entry.blockedFlags !== undefined) def.blockedFlags = checkFlagArray(source, name, "blockedFlags", entry.blockedFlags);
