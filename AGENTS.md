@@ -99,6 +99,11 @@ Memory DB: node:sqlite + FTS5 + sqlite-vec
   services at native extension boundaries; do not wrap Pi tool definitions or
   require a Pi AgentSession as the Codex implementation. See
   `docs/design/codex-native-runtime.md` for the replacement direction.
+- Pi and Codex share Agent resource selection, Skill/Knowledge materialization,
+  MCP configuration and credential brokering. Keep one resource sync/mount
+  pipeline; adapters project selected assets into their engine's native APIs.
+  Codex Skill scripts use `docs/design/codex-skill-script-execution.md`, never
+  a second Skill store or Pi script-tool bridge.
 - Validate the Codex runtime with SiCore as the UI first. Portal UI acceptance
   follows only after that runtime path is complete.
 - Codex owns its native memory mechanism. Do not adapt Siclaw memory tools,

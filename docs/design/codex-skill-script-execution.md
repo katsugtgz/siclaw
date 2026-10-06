@@ -83,3 +83,44 @@ tree Stop. Verify native parent and child behavior through the selected
 source-built Codex. Distinguish local component checks, Linux SSH/Pod protocol
 fixtures and actual deployed Pod/node/SSH/SiCore evidence. No physical-host or
 multi-bastion coverage is inferred from protocol fixtures.
+
+### Verified acceptance (2026-10-06)
+
+- Source `26bcf59e`: 415 files / 8707 tests, TypeScript and build pass. The shared
+  loader correction fixes the discovered empty-bundle/image-root gap for both
+  engines, while scoped, inheritance/disable and overlay tests remain passing.
+- The official pinned source-built exec-server passes local shell/Python,
+  argument, asset replacement, output sanitization and process-tree Stop checks.
+  The Linux production image also passes real local/SSH shell and Python script
+  execution and an argv/stdin Pod transport fixture with sandbox UID isolation,
+  resource revocation and remote process-tree Stop.
+- The independent `sicore-test` Runtime selects
+  `codex-skill-test-26bcf59e`, digest
+  `sha256:37823084afc4e4e5fdfc25a72e89743388ad9d87321da0d6a0a1406473910ebd`.
+  The Codex source pin and Runtime binary are unchanged. Existing image-provided
+  `node-logs` executes through actual Responses, SiCore, broker/mTLS and
+  K8sSpawner: four valid scripts succeed (local help, Pod fixture log, SSH
+  fixture log and real `nodepool-062` kubelet journal). The local API fallback
+  intentionally returns Forbidden/exit 6 because the reader lacks nodes/proxy;
+  no broader credential is substituted.
+- Five unsafe script forms are refused before execution: unreviewed temporary
+  file, incorrect interpreter, Pod inline shell, SSH inline Python and command
+  chaining. SSE and persisted output contain no fixture password; the attempted
+  write marker does not exist. Two initial native file-read grammar refusals
+  (`sed`, unsupported `head` form) are recorded separately; the subsequent
+  permitted `cat` reads SKILL.md. They are not counted as script failures or
+  successful reads.
+- One actual native child has two successful scripts and one unreviewed-script
+  refusal in its persisted child transcript, then closes through native
+  lifecycle calls. Removing the SiCore SSH binding blocks a new approved-script
+  invocation in the same conversation, despite the asset remaining loaded.
+- Original Agent resource bindings and reader Pod-only Role are restored.
+  Temporary node permissions, SSH Pod/Service/ConfigMap, SiCore host/credential
+  and private key/token files are removed. The independent Runtime and PVC
+  remain for subsequent acceptance. Raw evidence stays in the private validation
+  directory, not this repository.
+
+The real cluster round uses existing shell assets. Python and process-tree Stop
+have production Linux protocol/process checks; no physical-host/multi-bastion
+or full long-running streaming claim is made. Pod-network-namespace selection,
+arbitrary user uploads and general inline code are not added by this change.

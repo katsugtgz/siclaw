@@ -18,6 +18,12 @@ The target integration retains Codex native instructions, tools, execution
 environments, and agent lifecycle. Siclaw-specific policy and services belong
 at Codex extension boundaries. Do not implement Codex by wrapping Pi tool
 definitions or requiring a Pi AgentSession. The implementation is described in `docs/design/codex-native-runtime.md`.
+
+Pi and Codex share Agent resource selection, Skill/Knowledge materialization,
+MCP configuration and credential brokering. Keep one resource sync/mount
+pipeline; adapters project selected resources into native engine APIs.
+Codex Skill scripts follow `docs/design/codex-skill-script-execution.md`, without
+a separate Skill store or Pi script-tool bridge.
 SiCore is the first UI acceptance target; Portal UI acceptance comes last.
 Codex uses its own native memories. Do not migrate Siclaw's memory tools,
 indexer, profile prompt, flush hooks or auto-save into Codex. Native storage
