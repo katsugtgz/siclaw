@@ -1,5 +1,5 @@
 import { TextDecoder } from "node:util";
-import { SensitiveLiteralStream, type SensitiveValueSource } from "../../shared/model-output-redactor.js";
+import { createModelOutputRedactor, SensitiveLiteralStream, type SensitiveValueSource } from "../../shared/model-output-redactor.js";
 import { createDocumentLineRedactor, redactDataDocument, sanitizeJSON } from "../../tools/infra/kubectl-sanitize.js";
 import type { OutputAction } from "../../tools/infra/output-sanitizer.js";
 
@@ -23,7 +23,7 @@ export class CodexOutputStream {
   private failed = false;
 
   constructor(private readonly action: OutputAction | null = null,
-    private readonly redact: (text: string) => string = text => text,
+    private readonly redact: (text: string) => string = createModelOutputRedactor(),
     source: SensitiveValueSource = () => [], private readonly recordBudget = 8 * 1024 * 1024) {
     this.literals = new SensitiveLiteralStream(source);
     this.line = createDocumentLineRedactor(action?.streamMode === "env");

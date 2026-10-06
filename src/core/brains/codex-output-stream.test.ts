@@ -104,6 +104,12 @@ describe("native output security framing", () => {
     const fail = new CodexOutputStream(null, text => text, () => { throw new Error("hidden error"); });
     expect(fail.push(bytes("private\n"))).toContain("suppressed"); expect(fail.finish()).toBe("");
   });
+  it("keeps the generic redaction floor when no optional owner gate is supplied", () => {
+    const stream = new CodexOutputStream();
+    const token = 'ghp_' + 'a'.repeat(40);
+    const safe = stream.push(bytes(`diagnostic ${token}\n`)) + stream.finish();
+    expect(safe).not.toContain(token);
+  });
   it("requires new command-specific sanitizers to declare their stream contract", () => {
     const stream = new CodexOutputStream({type:"sanitize",lineSafe:false,sanitize:() => "safe"});
     expect(stream.push(bytes("private\n")) + stream.finish()).not.toContain("private");
