@@ -160,6 +160,57 @@ No test account secrets belong in source, image layers or recorded evidence.
 
 ## Current verification evidence
 
+### K8sSpawner acceptance update (2026-10-06)
+
+- The user explicitly approved the standard namespace Role/ServiceAccount and
+  shared-PVC test deployment. The independent Runtime now uses K8sSpawner and
+  persisted CA `siclaw-native-validation-ca`. ProcessSpawner is scaled to zero.
+  SiCore's existing API/Web deployments are unchanged.
+- AgentBox `agentbox-79068105-473b-4417-8935-b4f11c16c5b3-0` runs the source-built
+  `codex-executor-b7c3642d` image with read-only rootfs, RuntimeDefault seccomp
+  and the normal capability set. Its PVC mount is limited to the new test
+  Agent's `agents/79068105-473b-4417-8935-b4f11c16c5b3` subpath.
+- Actual mTLS settings, resource sync and persistence callbacks succeed. The
+  Agent resolves as SRE with its locked capability set. A pending native Plan
+  survives UI reload. Completed plans auto-clear after five seconds by the
+  existing product behavior; persisted reset/upsert events confirm this is
+  not missing history.
+- SiCore's real credential API issues a short-lived test kubeconfig to the
+  native cluster environment. `kubectl -n sicore-test get pods -o json` succeeds
+  through the broker. The fixture ServiceAccount can only get/list/watch Pods
+  in `sicore-test`; no administrator kubeconfig is copied. The required
+  management-host record is actual node metadata, with no SSH credential or
+  claim of SSH acceptance.
+- Deleting/recreating only the test AgentBox changes its Pod UID and preserves
+  native thread id, pending Plan snapshot and workspace file. Restarting only
+  the test Runtime preserves the CA and existing AgentBox; resumed file reads
+  and real broker queries succeed.
+- A native V1 child reads/waits/closes successfully. Its real native rollout
+  contains parent lineage. SiCore nevertheless returns no child session for
+  the spawn id, and usage facts contain only `root` roles. Child projection,
+  persistence and attribution remain implementation gaps.
+- Root usage did reach SiCore, but cold attachment was overcounted: the native
+  root has 20 completed calls / 321881 tokens, versus 25 facts / 406000 tokens.
+  Upstream explicitly replays the last usage snapshot with its historical
+  turn id on attachment. Fix `fe33b2a8` counts only active-turn usage and seeds
+  historical snapshots for deduplication. The regression fails before the fix;
+  source-built smoke matches actual completed parent responses after it.
+  Typecheck/build and **407 files / 8049 tests** pass. Live image acceptance
+  for this second fix passes: three real Responses calls with two normal
+  release/resume cycles produce exactly three SiCore facts / 29922 tokens,
+  matching the native rollout's three calls / 29922 tokens.
+- Fixed image `siclaw-agentbox:codex-usage-fe33b2a8` is deployed to the independent
+  test Runtime, registry digest
+  `sha256:9150f9e9bdf01e3183c00e8bff1c54fd2102ac341bade55115158c2e2579773a`.
+  A cross-namespace query using the restricted fixture returns Kubernetes
+  Forbidden; no alternate credential or execution environment is used.
+
+One test dispatch failed before model execution with a test-cluster etcd timeout;
+retry after confirming Pod health succeeded. This is recorded separately from
+Codex/provider failures. The standard Runtime's startup orphan sweep removed an
+old certificate Secret with no backing Pod; no existing running AgentBox was
+replaced.
+
 ### Live Responses and SiCore update (2026-10-06)
 
 - Independent Runtime registration and two private test Agents are used in
@@ -282,8 +333,10 @@ not established by the component/namespace results.
   do not establish those provider capabilities.
 - Test-namespace Runtime/AgentBox with SiCore: streaming/reasoning, tool/plan and
   child views, Stop/steer, restart/resume, model routing and usage accounting.
-  Test login is available. K8sSpawner deployment approval, authoritative callbacks
-  and persistence remain pending. No Portal UI acceptance is attempted.
+  K8sSpawner deployment is approved; mTLS callbacks, pending Plan persistence,
+  real namespace credentials and Pod/Runtime recovery pass. Child persistence,
+  complete child usage attribution and the remaining business contracts still need
+  acceptance. No Portal UI acceptance is attempted.
 - Native product services: knowledge labels/citations, enabled investigation
   workflow state, reports, schedules, host/node/pod
   diagnostic bindings and script execution. The removed Pi tools are not claimed
