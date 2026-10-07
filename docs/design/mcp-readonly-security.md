@@ -301,3 +301,46 @@ zero. Test credentials and raw private logs must not be included in reports.
 The live SiCore run verifies real routing, brokering, events and persistence.
 Exact model-request-body checks use the deterministic source-built Codex smoke;
 the live external provider's encrypted HTTP traffic is not captured.
+
+### Native JS / dynamic authorization acceptance (2026-10-07)
+
+- Implementation `7aad3f55824a2aeb480f339b2c4d4d4ef528a607`; Codex remains
+  pinned to `d4684bba`. No Rust patch, production dependency, DB migration or
+  Pi runner bridge is added. Full regression: **426 files / 8793 tests**,
+  TypeScript and build pass.
+- Source-built deterministic MCP parent/child/resume checks pass with 14
+  Responses requests and zero upstream writes. Linux native Code Mode executes
+  JavaScript calling the native MCP tool through owned-item attribution; fixed
+  tenant injection, namespace/tenant override denial, model-body credential
+  absence and zero write execution pass. This JS test uses a deterministic
+  provider; it is separate from the real-provider Web acceptance below.
+- Shanghai builds derive from the previously accepted source-built Codex image;
+  only compiled Siclaw code is replaced. Independent test AgentBox digest:
+  `sha256:37f2c9138e80e1f134e02a989fe957536d8a88636ebef3163d7dae10644500a5`.
+  Runtime digest:
+  `sha256:e57f8ac8604b7e85090cb4dccd606f29a6ef9fa2e8b00bf30279caaba3b57f1c`.
+- Actual `sicore-test` SiCore, Runtime, AgentBox mTLS and `gpt-5.6-luna` without
+  fallback pass in session `42eb821e-dea4-4d6c-b388-0e8e432ea6c2`. The temporary
+  stdio MCP is a protocol/security fixture, not a production business backend.
+  It receives `tenant=team-a`, `namespace=sicore-test` and no reserved policy env.
+  Out-of-scope namespace and fixed-tenant override are refused; only one read
+  reaches the fixture, and no writes. Runtime records matching caller/session,
+  operation and argument/policy digests before dispatch and before delivery.
+  SSE and persisted messages contain no fixture credential.
+- Live revocation passes in `493bb4af-c332-4ca1-a5a9-cfc048fab763`: after a
+  successful read, the native turn waits for a real clarification/steer. The
+  control plane removes its binding while that same turn remains active. A
+  second invocation of the cached native tool is refused. The combined upstream
+  count across these two accepted scenarios is two reads and zero writes.
+  An earlier malformed test call used `label` instead of `namespace`; it was
+  correctly refused and did not count as a successful revocation baseline.
+- Original cluster/host/MCP bindings are verified/restored; the exact temporary
+  MCP registration is deleted. Histories and audits remain. Test API and Runtime
+  are Ready 1/1; normal SiCore API/Web still use their original `memui18` images.
+  One transient etcd/exec/port-forward failure recovered through read-only checks;
+  it was not a policy bypass or permission fallback.
+
+This establishes the read-only v1 boundary, not production business-tool safety,
+write authorization, a policy-management UI, all non-Web entry points or external
+resource/prompt attribution. Keep write rules unavailable pending a separately
+reviewed approval/durable-outcome contract.
