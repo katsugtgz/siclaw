@@ -3,9 +3,15 @@ import os from "node:os";
 import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { CodexMcpGateway } from "./codex-mcp-gateway.js";
 import { McpClientManager } from "../mcp-client.js";
+import { mcpDigest } from "../mcp-operation-policy.js";
+import type { McpOperationAuthorizer } from "../../shared/mcp-authorization.js";
+
+const authorizeFixture: McpOperationAuthorizer = async operation => ({ protocol: 1, effect: "read", agentId: "a", userId: "u", sessionId: "s",
+  server: operation.server, kind: operation.kind, name: operation.name, argumentsDigest: mcpDigest(operation.arguments),
+  configurationDigest: operation.configurationDigest, policyDigest: "a".repeat(64) });
 
 const fixture = path.resolve("scripts/test/fixtures/mcp-security-server.mjs");
 const secret = "sre-fixture-secret.2026+october";
@@ -17,7 +23,7 @@ describe("native MCP pre-model security boundary", () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "siclaw-mcp-security-"));
     const counter = path.join(directory, "calls");
     const gateway = new CodexMcpGateway({ fixture: { transport: "stdio", command: process.execPath,
-      args: [fixture], env: { ...env, COUNTER_FILE: counter } } }, () => [secret]);
+      args: [fixture], env: { ...env, COUNTER_FILE: counter } } }, () => [secret], () => [], authorizeFixture);
     const client = new Client({ name: "native-test", version: "1.0.0" });
     try {
       const projected = await gateway.start();
@@ -59,6 +65,46 @@ describe("native MCP pre-model security boundary", () => {
   it("does not launch or authorize a server without an explicit policy even when it advertises readOnlyHint", async () => {
     const gateway = new CodexMcpGateway({ untrusted: { transport: "stdio", command: "must-not-launch" } });
     try { expect(await gateway.start()).toEqual({}); } finally { await gateway.close(); }
+  });
+
+  it("requires dynamic authorization and suppresses a result when authority changes after dispatch", async () => {
+    let allow = false, phaseChange = false;
+    const authorize = vi.fn<McpOperationAuthorizer>(async (operation, _signal, phase) => {
+      if (!allow || phaseChange && phase === "after") throw new Error(`authorization error includes ${secret}`);
+      return authorizeFixture(operation, _signal, phase);
+    });
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "siclaw-native-mcp-permission-"));
+    const counter = path.join(directory, "calls");
+    const gateway = new CodexMcpGateway({ fixture: { transport: "stdio", command: process.execPath, args: [fixture], env: { ...env, COUNTER_FILE: counter } } },
+      () => [secret], () => [], authorize);
+    const client = new Client({ name: "native-permission-test", version: "1" });
+    try {
+      const projected = await gateway.start(); const config = projected.fixture as { url: string; http_headers: Record<string, string> };
+      await client.connect(new StreamableHTTPClientTransport(new URL(config.url), { requestInit: { headers: config.http_headers } }));
+      const denied = await client.callTool({ name: "read_fixture", arguments: {} });
+      expect(denied.isError).toBe(true); expect(JSON.stringify(denied)).not.toContain(secret); expect(fs.existsSync(counter)).toBe(false);
+      expect(JSON.stringify(denied)).toContain("No upstream operation was dispatched");
+      allow = true; phaseChange = true;
+      const revoked = await client.callTool({ name: "read_fixture", arguments: {} });
+      expect(revoked.isError).toBe(true); expect(JSON.stringify(revoked)).not.toContain("healthy"); expect(JSON.stringify(revoked)).not.toContain(secret);
+      expect(JSON.stringify(revoked)).toContain("Do not automatically repeat");
+      expect(fs.readFileSync(counter, "utf8").trim()).toBe("read_fixture");
+      phaseChange = false;
+      expect((await client.callTool({ name: "read_fixture", arguments: {} })).isError).not.toBe(true);
+    } finally { await client.close(); await gateway.close(); fs.rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it("never executes an explicitly configured write rule even with a permissive callback", async () => {
+    const gateway = new CodexMcpGateway({ denied: { transport: "stdio", command: "must-not-launch", env: {
+      SICLAW_MCP_READ_ONLY_TOOLS: '["write_fixture"]', SICLAW_MCP_OPERATION_POLICY: '{"version":1,"tools":{"write_fixture":{"effect":"write"}}}',
+    } } }, () => [], () => [], authorizeFixture);
+    try { expect(await gateway.start()).toEqual({}); } finally { await gateway.close(); }
+  });
+
+  it("does not project a server namespace containing a known credential", async () => {
+    const gateway = new CodexMcpGateway({ [secret]: { transport: "stdio", command: "must-not-launch", env } }, () => [secret], () => [], authorizeFixture);
+    await expect(gateway.start()).rejects.toThrow(/security initialization failed/);
+    await gateway.close();
   });
 
   it("Pi uses the same admission and output policy before ToolDefinition results", async () => {

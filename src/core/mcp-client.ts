@@ -13,6 +13,7 @@ import { type ResolvedToolDefinition } from "./tool-registry.js";
 import type { Tool as McpTool } from "@modelcontextprotocol/sdk/types.js";
 import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
 import { McpModelSecurity, resolveMcpReadOnlyPolicy, mcpTransportEnv, mcpSensitiveValues } from "./mcp-security.js";
+import { authorizeMcpArguments, type McpToolRule } from "./mcp-operation-policy.js";
 import { redactModelJson, type SensitiveValueSource } from "../shared/model-output-redactor.js";
 
 // ---------------------------------------------------------------------------
@@ -565,7 +566,7 @@ export class McpClientManager {
             detectedTransport === "stdio"
               ? visualMcpRequestTimeoutMs(serverImplementationName, mcpTool.name, stdioEnv)
               : undefined,
-            { security, allowImages: policy.trustedRenderer },
+            { security, allowImages: policy.trustedRenderer, argumentRule: policy.toolRules?.get(mcpTool.name) },
           );
           this.tools.push(toolDef);
         }
@@ -677,7 +678,7 @@ export function createMcpToolDefinition(
   },
   client: any,
   requestTimeoutMs?: number,
-  trustedOptions?: { includeRawResult?: boolean; security?: McpModelSecurity; allowImages?: boolean },
+  trustedOptions?: { includeRawResult?: boolean; security?: McpModelSecurity; allowImages?: boolean; argumentRule?: McpToolRule },
 ): ResolvedToolDefinition {
   const fullName = buildMcpToolName(serverName, mcpTool.name);
   const inputSchema = mcpTool.inputSchema ?? { type: "object", properties: {} };
@@ -712,10 +713,11 @@ export function createMcpToolDefinition(
       try {
         signal?.throwIfAborted();
         if (!trustedOptions?.allowImages) security.arguments(args ?? {});
+        const approvedArgs = authorizeMcpArguments(trustedOptions?.argumentRule, args ?? {});
         const rawResult = await client.callTool(
           {
             name: mcpTool.name,
-            arguments: args ?? {},
+            arguments: approvedArgs,
           },
           undefined,
           requestTimeoutMs === undefined && !signal ? undefined : { ...(requestTimeoutMs === undefined ? {} : { timeout: requestTimeoutMs }), ...(signal ? { signal } : {}) },

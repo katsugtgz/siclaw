@@ -25,6 +25,7 @@ import { parseRequestMode } from "../shared/request-mode.js";
 import { normalizeHandoffTrace } from "../shared/handoff-trace.js";
 import { createScriptSandboxApi } from "./script-sandbox/api.js";
 import { SandboxTurnContext } from "./script-sandbox/turn-context.js";
+import { NativeMcpAuthorization } from "./mcp-authorization.js";
 import crypto from "node:crypto";
 import http from "node:http";
 import https from "node:https";
@@ -246,6 +247,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
   };
 
   const sandboxTurns = new SandboxTurnContext();
+  const nativeMcpAuthorization = new NativeMcpAuthorization(frontendClient, (sessionId, agentId) => sandboxTurns.user(sessionId, agentId));
   const scriptSandbox = createScriptSandboxApi(spawner?.name ?? "local", frontendClient, async (principal, args, signal, approval) => {
     const handle = await agentBoxManager.getForSession(webExecutionScope(principal.agentId, (await sessionRegistry.get(principal.sessionId))?.userId), principal.sessionId);
     // K8s pool replicas share a certificate whose boxId names the pool, not a Pod.
@@ -2827,6 +2829,10 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           }
 
           // MCP servers — filtered by agent binding (via RPC)
+          if (url === "/api/internal/mcp-authorize" && method === "POST") {
+            void nativeMcpAuthorization.handle(req, res, identity);
+            return;
+          }
           if (url === "/api/internal/mcp-servers" && method === "GET") {
             if (!identity) { res.writeHead(401, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "Client certificate required" })); return; }
             handleMcpServers(req, res, identity, frontendClient);

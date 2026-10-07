@@ -2,23 +2,40 @@
 // which includes the matching codex-code-mode-host and upstream V8 sandbox.
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { chmodSync, mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, mkdtempSync, rmSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { CodexAgentBrain } from "../../dist/core/brains/codex-agent-brain.js";
+import { mcpDigest } from "../../dist/core/mcp-operation-policy.js";
 
 const root = mkdtempSync(join(tmpdir(), "siclaw-code-mode-"));
 chmodSync(root, 0o755);
 let calls = 0;
 let rootCalls = 0, childCalls = 0;
 const nativeChildren = process.env.SICLAW_CODEX_CODE_MODE_CHILDREN === "1";
+const nativeMcp = process.env.SICLAW_CODEX_CODE_MODE_MCP === "1";
+const mcpSecret = "native-js-mcp-private-fixture-20261007";
+const counter = join(root, "mcp-calls");
 let fixtureError;
-const code = 'text(JSON.stringify(await tools.exec_command({cmd:"kubectl version --client",login:false})));';
+const code = nativeMcp ? `
+if (['process','require','fetch','WebSocket','Deno','Bun'].some(name=>typeof globalThis[name] !== 'undefined')) throw new Error('JS host IO exposed');
+if (typeof tools.mcp__fixture__write_fixture !== 'undefined') throw new Error('Write tool exposed');
+const result = await tools.mcp__fixture__read_fixture({namespace:'sicore-test'});
+if (!JSON.stringify(result).includes('healthy')) throw new Error('MCP read failed');
+for (const args of [{namespace:'prod'}, {namespace:'sicore-test',tenant:'other-tenant'}]) {
+  let blocked = false;
+  try { const denied = await tools.mcp__fixture__read_fixture(args); blocked = JSON.stringify(denied).includes('MCP operation failed') || denied.isError === true; }
+  catch { blocked = true; }
+  if (!blocked) throw new Error('MCP argument scope bypassed');
+}
+text('NATIVE_JS_MCP_ACCEPTED');
+` : 'text(JSON.stringify(await tools.exec_command({cmd:"kubectl version --client",login:false})));';
 const model = createServer(async (request, response) => {
   try {
     let raw = "";
     for await (const part of request) raw += part;
+    if (nativeMcp) assert.ok(!raw.includes(mcpSecret), "MCP credential must not reach model requests");
     const body = JSON.parse(raw);
     assert.equal(body.model, "gpt-6.1-sol");
     assert.equal(request.url, "/v1/responses");
@@ -36,7 +53,7 @@ const model = createServer(async (request, response) => {
     const side = child ? "child" : "root";
     if (turn === 2) {
       const output = body.input.find((item) => item.type === "custom_tool_call_output" && item.call_id === `${side}-1`);
-      assert.match(JSON.stringify(output), /Client Version/);
+      assert.match(JSON.stringify(output), nativeMcp ? /NATIVE_JS_MCP_ACCEPTED/ : /Client Version/);
       assert.ok(!JSON.stringify(output).includes("host unavailable"));
     }
     let source = turn === 1 ? code : undefined;
@@ -83,13 +100,34 @@ try {
   brain = await CodexAgentBrain.create({sessionManager:SessionManager.create(root,join(root,"transcripts")),
     systemPrompt:"Reply briefly",grants:{readRoots:[root],writeRoots:[],deniedRoots:[join(root,"transcripts")],
       allowCommands:true,production:process.env.NODE_ENV==="production",environment:{PATH:process.env.PATH}},
-    cwd:root,skillPaths:[],toolsetsByName:new Map(),allowSubagents:nativeChildren});
+    cwd:root,skillPaths:[],toolsetsByName:new Map(),allowSubagents:nativeChildren,
+    ...(nativeMcp ? {
+      mcpServers: { fixture: { transport:'stdio',command:process.execPath,args:[resolve('scripts/test/fixtures/mcp-security-server.mjs')],
+        env:{FIXTURE_SECRET:mcpSecret,COUNTER_FILE:counter,SICLAW_MCP_OPERATION_POLICY:JSON.stringify({version:1,tools:{
+          read_fixture:{effect:'read',fixedArguments:{'/tenant':'team-a'},allowedArguments:{'/namespace':['sicore-test']}},
+          write_fixture:{effect:'write'},
+        }})} } },
+      authorizeMcp: async operation => {
+        assert.equal(operation.kind,'tool');assert.equal(operation.name,'read_fixture');
+        assert.equal(operation.arguments.tenant,'team-a');assert.equal(operation.arguments.namespace,'sicore-test');
+        return {protocol:1,effect:'read',agentId:'fixture-agent',userId:'fixture-user',sessionId:'fixture-session',server:operation.server,kind:operation.kind,
+          name:operation.name,argumentsDigest:mcpDigest(operation.arguments),configurationDigest:operation.configurationDigest,policyDigest:'a'.repeat(64)};
+      },
+    } : {}),
+  });
   brain.registerProvider("fixture", {apiKey:"test",baseUrl:`http://127.0.0.1:${model.address().port}/v1`,
     api:"openai-responses",models:[{id:"gpt-6.1-sol",api:"openai-responses",contextWindow:128000,maxTokens:1000}]});
   await brain.setModel(brain.findModel("fixture","gpt-6.1-sol"));
   try { await brain.prompt("Inspect the kubectl client with native tools"); }
   catch (error) { throw fixtureError ?? error; }
   if (fixtureError) throw fixtureError;
+  if (nativeMcp) {
+    assert.ok(existsSync(counter));
+    assert.deepEqual(readFileSync(counter,'utf8').trim().split('\n'),nativeChildren ? ['read_fixture','read_fixture'] : ['read_fixture']);
+    assert.ok(!JSON.stringify(brain.getConversationMessages()).includes(mcpSecret));
+    assert.ok(brain.getTools().some(tool=>tool.name==='mcp__fixture__read_fixture'));
+    assert.ok(!brain.getTools().some(tool=>tool.name==='mcp__fixture__write_fixture'));
+  }
   if (nativeChildren) {
     const deadline=Date.now()+5000;
     while (childCalls<3 && Date.now()<deadline) await new Promise((resolve) => setTimeout(resolve,50));
@@ -97,7 +135,7 @@ try {
   } else assert.equal(rootCalls,2);
   assert.ok(brain.getConversationMessages().some((message) => message.role==="assistant" &&
     message.content?.some?.((item) => item.text==="Code Mode complete")));
-  console.log(`Native Code Mode smoke passed: gpt-6.1-sol, Responses Lite, source-built host, native exec_command${nativeChildren ? ", native V2 spawn/wait and child execution" : ""}`);
+  console.log(`Native Code Mode smoke passed: gpt-6.1-sol, Responses Lite, source-built host, ${nativeMcp ? "native MCP, fixed tenant/namespace scope, no credential delivery, upstream write executions=0" : "native exec_command"}${nativeChildren ? ", native V2 spawn/wait and child execution" : ""}`);
 } finally {
   await brain?.close();
   model.closeAllConnections();

@@ -77,6 +77,128 @@ resources/prompts. Unknown methods, subscriptions, tasks, sampling and elicitati
 are not forwarded. Client progress/tracing metadata is consumed locally.
 HTTP redirects are rejected, including SSE GET and POST requests.
 
+## Native JS and per-operation authorization (2026-10-07)
+
+Codex free-code execution uses its native JavaScript Code Mode, not a Pi
+`run_script` wrapper. The adapter does not initialize the disposable Python/Bash
+runner for Codex. Existing reviewed Skill assets remain a separate capability;
+this does not add unrestricted shell or interpreter execution.
+
+```text
+Native JS tools.mcp__<server>__<tool>(arguments)
+  -> Codex native MCP client
+  -> private loopback gateway / live owned native item
+  -> AgentBox GatewayClient / Runtime mTLS identity
+  -> Runtime current Web caller + control-plane session authorization
+  -> current shared Agent MCP bindings and configuration
+  -> exact operator tool and argument policy
+  -> selected upstream SDK client
+  -> authorization recheck + pre-model sanitization
+  -> native JS / model / SiCore events
+```
+
+Code Mode receives tool schemas and sanitized results, never the upstream URL,
+headers, env, OAuth token or API key. Proxy authentication is only transport
+authentication: it grants no tool authority. The native item binds server,
+tool, arguments, thread and turn. Unknown calls, caller-supplied identities,
+substituted arguments, replay, ended turns and unavailable authorization fail
+closed. Native children inherit the owning public session's verified caller;
+they cannot manufacture another public session or actor.
+
+`POST /api/internal/mcp-authorize` accepts only a trusted `session_id` and an
+operation descriptor. Runtime derives Agent/box identity from its existing
+certificate and the user from the live authenticated Web turn, not from model
+arguments or historical session ownership. Existing `sandbox.resolve` with an
+empty source verifies the upstream session/user/access; `config.getResources`
+and `config.getMcpServers` retain the one shared tenant/product/preview resolution
+pipeline. No new resource store, DB migration or credential export API is added.
+Standalone Portal retains its administrator-owned Web-session restriction.
+
+The private permit contains only actor IDs and digests binding the exact
+operation, approved arguments, configuration and policy. It is not a durable
+grant or a model-visible result. Authorization is performed before dispatch and
+again before result delivery. Binding revocation, credential/configuration
+rotation, changed caller, cancellation and policy changes suppress the result;
+stale transports are never silently reused under a new grant. A changed
+configuration requires ordinary session rebuild. Stop aborts active MCP
+transports as well as permission checks. Each owning gateway allows at most ten
+simultaneous tool calls; this is not a distributed per-target traffic quota.
+
+Only attributable native tool items are supported by this dynamic gate today.
+External resource/prompt reads and non-Web channel/API/task/headless callers
+fail closed until they have their own verified caller/attribution contracts.
+This is an intentional security restriction, not equivalent acceptance of every
+legacy entry point. Intrinsic knowledge/workflow services retain their separate
+owned-turn contracts. Pi remains separately selectable.
+
+### Operator argument scopes
+
+The optional reserved `SICLAW_MCP_OPERATION_POLICY` uses the existing server
+`env` configuration channel and is consumed only by Siclaw. It is never forwarded
+to the server. A present v1 policy is authoritative over the legacy name list:
+
+```json
+{
+  "version": 1,
+  "tools": {
+    "query_metrics": {
+      "effect": "read",
+      "fixedArguments": { "/tenant": "team-a" },
+      "allowedArguments": { "/target/namespace": ["production-a"] }
+    },
+    "restart_workload": { "effect": "write" }
+  }
+}
+```
+
+Constraints use exact JSON pointers and typed JSON equality. Missing fixed fields
+are injected by the trusted proxy; caller overrides are refused. Scoped fields
+must be present and match one of their explicit values. Wildcard tool names,
+unknown versions, malformed policies, executable expressions and prototype
+paths grant nothing. Pi and Codex reuse the argument evaluator. Legacy exact
+read-only lists remain supported when no v1 operation policy is configured.
+
+These scopes constrain only explicitly reviewed argument fields. They do not
+infer the semantics of arbitrary SQL, shell, HTTP proxy or code-execution tools.
+Fixed scope data must be non-secret routing values, not credentials. Reviewed
+atomic implementations and least-privilege upstream credentials remain required.
+
+### Future writes
+
+V1 parses an operator `effect: "write"` declaration but never advertises or
+executes it, even if the MCP server claims `readOnlyHint: true`. Enabling writes
+requires a separate control-plane authorization/approval contract, not removing
+this deny or trusting Codex's transport approval setting. Bind that future grant
+to current user/role, Agent, immutable server/resource identity, target fields,
+exact approved argument digest, native call identity, policy revision, expiry
+and single use. Re-authorize after queueing; track dispatched/finished/unknown
+outcomes and never automatically replay a write after transport loss.
+
+Permission audit records currently contain decision, effect, actor/session,
+server/tool, call identity and argument/policy digests. They do not include code,
+raw arguments, endpoints, headers, env, credentials or upstream error messages.
+This is the governance extension boundary; a write-approval UI, role-policy
+editor and durable write receipt are not implemented by the read-only v1 gate.
+
+### Native security evaluation gates
+
+These evaluate the transparent authorization boundary, not the quality of
+external business tools. Use fixed protocol fixtures plus real Web-control-plane
+acceptance; do not infer production MCP correctness from a fixture.
+
+| Case | Required result |
+| --- | --- |
+| Native JS aggregation invokes an allowed MCP | Native Code Mode executes; sanitized result reaches JS |
+| SDK discovery reports a secret or spoofed read-only writer | Secret absent; writer not callable |
+| Actor/session substituted in the request | Refused before upstream dispatch |
+| Native call ID replayed or arguments substituted | Refused by owned-item attribution |
+| Fixed tenant omitted or overridden | Trusted injection or refusal; no caller override |
+| Namespace outside the explicit argument scope | Refused; upstream execution count unchanged |
+| Server unbound/disabled or credential/configuration rotated | Current lookup refuses the stale snapshot |
+| Caller ends/changes while permission lookup is pending | Refused; no stale caller permit |
+| Authority revoked after upstream response | Result withheld; operation not automatically repeated |
+| Stop, source loss or transport failure | Bounded cancellation; unknown outcomes not replayed |
+
 ## Pre-model sanitization
 
 Pi and native Codex reuse the same MCP policy and result sanitizer. Sanitization

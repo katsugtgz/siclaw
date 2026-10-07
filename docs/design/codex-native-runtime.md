@@ -17,6 +17,10 @@ direction supersedes wrapping Siclaw's Pi tool definitions in an MCP bridge.
   on the protected GitLab source branch.
 - Preserve whitelist-only execution, credential brokering, OS user isolation,
   path authorization, output sanitization, and cancellation guarantees.
+- Free code is native JavaScript Code Mode only. Do not add a Python/Bash
+  `run_script` compatibility wrapper. Native MCP goes through Siclaw's
+  per-operation caller/binding/argument authorization; upstream credentials stay
+  outside Code Mode. Current write rules are explicitly non-executable.
 - Native MCP runs through the protocol security gateway described in
   [Read-only MCP and pre-model output security](mcp-readonly-security.md).
   Pi and Codex share explicit operation admission and owner-scoped redaction;

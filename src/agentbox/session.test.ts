@@ -307,6 +307,22 @@ describe("AgentBoxSessionManager — getOrCreate", () => {
     await mgr.closeAll();
   });
 
+  it("keeps Codex free code native and binds MCP authorization to its trusted session", async () => {
+    const mgr = new AgentBoxSessionManager();
+    const scriptSandboxInfo = vi.fn(async () => ({ enabled: true })), runScript = vi.fn(), authorizeNativeMcp = vi.fn(async () => ({ protocol: 1 }));
+    mgr.gatewayClient = { scriptSandboxInfo, runScript, authorizeNativeMcp } as any;
+    // The fixture follows the same explicit engine argument as production.
+    await mgr.getOrCreate("native-js-session", "web", undefined, "normal", undefined, undefined, undefined, undefined, undefined, "codex");
+    const created = lastCreateSiclawSession.calls.at(-1);
+    if (created.agentEngine !== "codex") throw new Error("Native engine fixture did not select Codex");
+    expect(scriptSandboxInfo).not.toHaveBeenCalled();
+    expect(created.scriptExecutor).toBeUndefined(); expect(created.scriptSandboxInfo).toBeUndefined();
+    const signal = new AbortController().signal, operation = { server: "metrics", name: "query" };
+    await created.authorizeNativeMcp(operation, signal, "before");
+    expect(authorizeNativeMcp).toHaveBeenCalledWith("native-js-session", operation, signal, undefined);
+    expect(runScript).not.toHaveBeenCalled(); await mgr.closeAll();
+  });
+
   it("a refused tool is an ERROR in the tool_call diagnostic, not a success", async () => {
     // The third hand-rolled copy of the outcome judgement lived here, on the telemetry
     // channel, and an invariant test is the only reason it was found. An invariant proves

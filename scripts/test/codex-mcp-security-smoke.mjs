@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { CodexAgentBrain } from "../../dist/core/brains/codex-agent-brain.js";
+import { mcpDigest } from "../../dist/core/mcp-operation-policy.js";
 
 assert.ok(process.env.SICLAW_CODEX_BIN, "Use the pinned official source-built Codex binary");
 const root = mkdtempSync(join(tmpdir(), "siclaw-mcp-model-gate-"));
@@ -101,6 +102,9 @@ let brain;
 const transcripts = join(root, "transcripts");
 const makeBrain = async sessionManager => {
   const created = await CodexAgentBrain.create({ sessionManager, cwd: workspace, systemPrompt: "Use native tools. Reply briefly.",
+    authorizeMcp: async operation => ({ protocol: 1, effect: "read", agentId: "fixture-agent", userId: "fixture-user", sessionId: sessionManager.getSessionId(),
+      server: operation.server, kind: operation.kind, name: operation.name, argumentsDigest: mcpDigest(operation.arguments),
+      configurationDigest: operation.configurationDigest, policyDigest: "a".repeat(64) }),
     skillPaths: [], toolsetsByName: new Map(), allowSubagents: true,
     sensitiveValues: () => sensitive,
     grants: { readRoots: [workspace], writeRoots: [], deniedRoots: [transcripts], allowCommands: false,

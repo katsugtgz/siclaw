@@ -12,8 +12,12 @@ import { CallToolRequestSchema, ListToolsRequestSchema, ListResourcesRequestSche
 import { mergeMcpStdioEnv, type McpServerConfig } from "../mcp-client.js";
 import { McpModelSecurity, resolveMcpReadOnlyPolicy, mcpTransportEnv, mcpSensitiveValues, type McpReadOnlyPolicy } from "../mcp-security.js";
 import { redactModelJson, type SensitiveValueSource } from "../../shared/model-output-redactor.js";
+import { authorizeMcpArguments, mcpDigest } from "../mcp-operation-policy.js";
+import { mcpConfigurationDigest, validateMcpPermit, type McpOperationAuthorizer, type McpOperation } from "../../shared/mcp-authorization.js";
 
 interface Upstream {
+  name: string;
+  configurationDigest?: string;
   client?: Client;
   local?: (args: Record<string, unknown>, callId: string, signal: AbortSignal, name: string) => Promise<any>;
   policy: McpReadOnlyPolicy;
@@ -34,9 +38,18 @@ export class CodexMcpGateway {
   private address?: string;
   private closed = false;
   private readonly intrinsic = new Map<string, { tools: Tool[]; call: NonNullable<Upstream["local"]> }>();
+  private readonly stopping = new AbortController();
+  private activeCalls = 0;
+  private readonly activeRequests = new Set<AbortController>();
+
+  cancelRequests(): void { for (const controller of this.activeRequests) controller.abort(); }
 
   constructor(private readonly configs: Record<string, McpServerConfig>, private readonly secrets: SensitiveValueSource = () => [],
-    private readonly privateRoots: () => readonly string[] = () => []) {}
+    private readonly privateRoots: () => readonly string[] = () => [], private readonly authorize?: McpOperationAuthorizer) {}
+
+  getTools(): Array<{ server: string; tool: Tool }> {
+    return [...this.upstreams.values()].filter(entry => !entry.local).flatMap(entry => entry.tools.map(tool => ({ server: entry.name, tool })));
+  }
 
   /** Reviewed product service, independently implemented from Pi ToolDefinitions. */
   registerKnowledge(tool: Tool, call: NonNullable<Upstream["local"]>): void {
@@ -57,10 +70,11 @@ export class CodexMcpGateway {
         if (!policy.tools.size && !policy.resources.size && !policy.prompts.size) continue;
         const client = new Client({ name: "siclaw-mcp-security", version: "1.0.0" }, { capabilities: {} });
         const security = new McpModelSecurity(() => [...mcpSensitiveValues(this.configs), ...this.secrets()], this.privateRoots);
+        if (security.redact(name) !== name) throw new Error("MCP server names must not contain credentials");
         if ([...policy.resources, ...policy.prompts].some(value => security.redact(value) !== value)) {
           throw new Error("MCP resource/prompt handles must not contain credentials");
         }
-        const entry: Upstream = { client, policy, tools: [], security };
+        const entry: Upstream = { name, configurationDigest: mcpConfigurationDigest(config), client, policy, tools: [], security };
         this.upstreams.set(`/mcp/${index}`, entry);
         const signal = AbortSignal.timeout(30_000);
         const transport = config.transport === "stdio"
@@ -100,7 +114,7 @@ export class CodexMcpGateway {
         const security = new McpModelSecurity(this.secrets, this.privateRoots);
         const policy: McpReadOnlyPolicy = { tools: new Set(intrinsic.tools.map(tool => tool.name)), resources: new Set(), prompts: new Set(), trustedRenderer: false };
         const route = name === "siclaw_knowledge" ? "/knowledge" : "/workflow";
-        this.upstreams.set(route, { policy, security, tools: intrinsic.tools, local: intrinsic.call });
+        this.upstreams.set(route, { name, policy, security, tools: intrinsic.tools, local: intrinsic.call });
       }
       if (!this.upstreams.size) return {};
       this.http = createServer((request, response) => {
@@ -132,7 +146,7 @@ export class CodexMcpGateway {
               // The native call id is trusted only after matching an owned
               // app-server item; model-visible arguments cannot choose it.
               delete (params as Record<string, unknown>)._meta;
-              if (upstream.local && metadata && typeof metadata.callId === "string" && metadata.callId.length <= 256) {
+              if (metadata && typeof metadata.callId === "string" && metadata.callId.length <= 256) {
                 (params as any)._meta = { siclawNativeCallId: metadata.callId };
               }
             }
@@ -181,16 +195,39 @@ export class CodexMcpGateway {
       }
       const args = request.params.arguments ?? {};
       if (!upstream.policy.trustedRenderer) upstream.security.arguments(args);
+      if (this.activeCalls >= 10) throw new McpError(ErrorCode.InvalidParams, "MCP call capacity exhausted");
+      this.activeCalls++;
+      const controller = new AbortController(); this.activeRequests.add(controller);
+      let execution: "not_dispatched" | "unknown" | "finished" = "not_dispatched";
       try {
-        const safeArgs = upstream.local ? redactModelJson(args, text => upstream.security.text(text))
-          : upstream.policy.trustedRenderer ? JSON.parse(upstream.security.text(JSON.stringify(args))) : args;
+        const approved = upstream.local ? args : authorizeMcpArguments(upstream.policy.toolRules?.get(name), args);
+        const safeArgs = upstream.local ? redactModelJson(approved, text => upstream.security.text(text))
+          : upstream.policy.trustedRenderer ? JSON.parse(upstream.security.text(JSON.stringify(approved))) : approved;
+        const signal = AbortSignal.any([extra.signal, controller.signal, this.stopping.signal, AbortSignal.timeout(65_000)]);
+        const operation: McpOperation = { server: upstream.name, kind: "tool", name, arguments: safeArgs,
+          callId: typeof request.params._meta?.siclawNativeCallId === "string" ? request.params._meta.siclawNativeCallId : "",
+          configurationDigest: upstream.configurationDigest ?? "" };
+        const permit = upstream.local ? undefined : validateMcpPermit(await this.requireAuthorizer()(operation, signal, "before"), operation);
+        signal.throwIfAborted();
+        execution = "unknown";
         const result = upstream.local
-          ? await upstream.local(safeArgs, typeof request.params._meta?.siclawNativeCallId === "string" ? request.params._meta.siclawNativeCallId : "", extra.signal, name)
-          : await upstream.client!.callTool({ name, arguments: safeArgs }, undefined, { signal: extra.signal, timeout: 65_000 });
+          ? await upstream.local(safeArgs, operation.callId, signal, name)
+          : await upstream.client!.callTool({ name, arguments: safeArgs }, undefined, { signal, timeout: 65_000 });
+        execution = "finished";
+        if (permit) {
+          const current = validateMcpPermit(await this.requireAuthorizer()(operation, signal, "after"), operation);
+          if (mcpDigest(current) !== mcpDigest(permit)) throw new Error("MCP authorization changed before result delivery");
+        }
+        signal.throwIfAborted();
         return upstream.security.result(result, upstream.policy.trustedRenderer);
       } catch {
-        return { isError: true, content: [{ type: "text", text: "MCP operation failed; upstream error details were suppressed." }] };
-      }
+        const message = execution === "not_dispatched"
+          ? "MCP operation failed: denied or authorization unavailable. No upstream operation was dispatched."
+          : execution === "finished"
+            ? "MCP operation failed: execution finished but result delivery was denied or suppressed. Do not automatically repeat the operation."
+            : "MCP operation failed: execution outcome is unknown. Do not automatically retry. Upstream error details were suppressed.";
+        return { isError: true, content: [{ type: "text", text: message }] };
+      } finally { this.activeCalls--; this.activeRequests.delete(controller); }
     });
     // Never relay upstream capabilities, notifications, sampling, elicitation,
     // subscriptions or arbitrary methods. Explicitly selected text resources
@@ -201,7 +238,12 @@ export class CodexMcpGateway {
         if (!upstream.policy.resources.has(request.params.uri)) throw new McpError(ErrorCode.InvalidParams, "MCP resource is not authorized");
         upstream.security.arguments({ uri: request.params.uri });
         try {
+          const operation: McpOperation = { server: upstream.name, kind: "resource", name: request.params.uri, arguments: {},
+            callId: typeof request.params._meta?.siclawNativeCallId === "string" ? request.params._meta.siclawNativeCallId : "", configurationDigest: upstream.configurationDigest! };
+          const permit = validateMcpPermit(await this.requireAuthorizer()(operation, extra.signal, "before"), operation);
           const result = await upstream.client!.readResource({ uri: request.params.uri }, { signal: extra.signal, timeout: 30_000 });
+          const current = validateMcpPermit(await this.requireAuthorizer()(operation, extra.signal, "after"), operation);
+          if (mcpDigest(current) !== mcpDigest(permit)) throw new Error("MCP authorization changed");
           const safe = upstream.security.result({ content: result.contents.map(resource => ({ type: "resource", resource })) });
           return { contents: safe.content.map(block => block.type === "resource" ? block.resource
             : { uri: request.params.uri, text: block.type === "text" ? block.text : "Resource suppressed" }) };
@@ -214,7 +256,12 @@ export class CodexMcpGateway {
         if (!upstream.policy.prompts.has(request.params.name)) throw new McpError(ErrorCode.InvalidParams, "MCP prompt is not authorized");
         upstream.security.arguments(request.params.arguments ?? {});
         try {
+          const operation: McpOperation = { server: upstream.name, kind: "prompt", name: request.params.name, arguments: request.params.arguments ?? {},
+            callId: typeof request.params._meta?.siclawNativeCallId === "string" ? request.params._meta.siclawNativeCallId : "", configurationDigest: upstream.configurationDigest! };
+          const permit = validateMcpPermit(await this.requireAuthorizer()(operation, extra.signal, "before"), operation);
           const result = await upstream.client!.getPrompt({ name: request.params.name, arguments: request.params.arguments }, { signal: extra.signal, timeout: 30_000 });
+          const current = validateMcpPermit(await this.requireAuthorizer()(operation, extra.signal, "after"), operation);
+          if (mcpDigest(current) !== mcpDigest(permit)) throw new Error("MCP authorization changed");
           if (JSON.stringify(result).length > 8 * 1024 * 1024 || result.messages.length > 1000) throw new Error("Oversized prompt");
           return { messages: result.messages.map(message => ({ role: message.role,
             content: upstream.security.result({ content: [message.content] }).content[0] })) };
@@ -227,12 +274,19 @@ export class CodexMcpGateway {
 
   async close(): Promise<void> {
     this.closed = true;
+    this.stopping.abort();
+    this.cancelRequests();
     await Promise.allSettled([...this.sessions.values(), ...this.pendingSessions].map(session => session.server.close()));
     this.sessions.clear(); this.pendingSessions.clear();
     this.http?.closeAllConnections();
     await new Promise<void>(resolve => this.http ? this.http.close(() => resolve()) : resolve());
     await Promise.allSettled([...this.upstreams.values()].map(upstream => upstream.client?.close()));
     this.upstreams.clear(); this.http = undefined;
+  }
+
+  private requireAuthorizer(): McpOperationAuthorizer {
+    if (!this.authorize) throw new Error("MCP dynamic authorization is unavailable");
+    return this.authorize;
   }
 }
 

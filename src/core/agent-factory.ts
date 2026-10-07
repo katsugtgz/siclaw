@@ -82,6 +82,8 @@ export interface CreateSiclawSessionOpts {
   agentEngine?: "pi-agent" | "codex";
   scriptExecutor?: import("../script-sandbox/types.js").ScriptExecutor;
   scriptSandboxInfo?: import("../script-sandbox/types.js").ScriptSandboxInfo;
+  /** Trusted Runtime authorizer, not a tool/model-provided permission. */
+  authorizeNativeMcp?: import("../shared/mcp-authorization.js").McpOperationAuthorizer;
   sessionManager?: SessionManager;
   kubeconfigRef?: KubeconfigRef;
   mode?: SessionMode;  // replaces excludeTools / extraTools
@@ -616,8 +618,8 @@ export async function createSiclawSession(
     mode,
     refs: {
       kubeconfigRef, userId, agentId, sessionIdRef, taskListId, turnRef,
-      scriptExecutor: opts?.scriptExecutor,
-      scriptSandboxInfo: opts?.scriptSandboxInfo,
+      scriptExecutor: useCodex ? undefined : opts?.scriptExecutor,
+      scriptSandboxInfo: useCodex ? undefined : opts?.scriptSandboxInfo,
       isSubagent: opts?.isSubagent ?? false,
       memoryRef, dpStateRef,
       memoryIndexer: memoryEnabled ? memoryIndexer : undefined,
@@ -662,7 +664,7 @@ export async function createSiclawSession(
 
   // -- MCP external tools (dynamic discovery, not in registry) --
   const exposeConfiguredMcp = compiledContext.harness.mcpExposure === "configured";
-  const sandboxOnly = allowedTools?.length && allowedTools.every(name => name === "run_script");
+  const sandboxOnly = opts?.agentEngine !== "codex" && allowedTools?.length && allowedTools.every(name => name === "run_script");
   const mcpServers = exposeConfiguredMcp && !sandboxOnly ? (opts?.mcpServers ?? config.mcpServers ?? {}) : {};
   const sensitiveValues = () => [...Object.values(config.providers).map(provider => provider.apiKey),
     ...mcpSensitiveValues(mcpServers), ...(kubeconfigRef.credentialBroker?.getSensitiveValues() ?? [])];
@@ -1095,6 +1097,7 @@ export async function createSiclawSession(
           : ""].join("\n\n"),
       toolsetsByName, cwd: userDataDir, nativePlanEnabled, grants: nativeGrants, environments,
       mcpServers: mcpServers as Record<string, McpServerConfig>, sensitiveValues, codexHome,
+      authorizeMcp: opts?.authorizeNativeMcp,
       ...(nativeKnowledgeEnabled
         ? { knowledge: { directory: knowledgeDir, emit: opts!.sessionEventEmitter! } } : {}),
       allowSubagents: nativeAllowSubagents,

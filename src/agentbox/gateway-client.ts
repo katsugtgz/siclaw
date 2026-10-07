@@ -241,6 +241,15 @@ export class GatewayClient {
     } finally { invocation.close(); }
   }
 
+  async authorizeNativeMcp(sessionId: string, operation: import("../shared/mcp-authorization.js").McpOperation,
+    signal: AbortSignal, expectedAgentId?: string): Promise<import("../shared/mcp-authorization.js").McpAuthorizationPermit> {
+    const value = await this.request("/api/internal/mcp-authorize", "POST", { session_id: sessionId, operation }, 30_000, signal);
+    const { validateMcpPermit } = await import("../shared/mcp-authorization.js");
+    const permit = validateMcpPermit(value, operation);
+    if (permit.sessionId !== sessionId || expectedAgentId !== undefined && permit.agentId !== expectedAgentId) throw new Error("MCP authorization principal mismatch");
+    return permit;
+  }
+
   /**
    * Make HTTP(S) request to Gateway with mTLS authentication
    */

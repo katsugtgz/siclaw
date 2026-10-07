@@ -6,11 +6,12 @@ import type { McpServerConfig } from "./mcp-client.js";
 import { createModelOutputRedactor, redactModelJson, type SensitiveValueSource } from "../shared/model-output-redactor.js";
 import { redactDataDocument } from "../tools/infra/kubectl-sanitize.js";
 import { argumentPathSecurityError } from "../tools/infra/argument-path-security.js";
+import { MCP_OPERATION_POLICY_ENV, resolveMcpToolRules, type McpToolRule } from "./mcp-operation-policy.js";
 
 const POLICY_ENV = "SICLAW_MCP_READ_ONLY_TOOLS";
 const RESOURCE_ENV = "SICLAW_MCP_READ_ONLY_RESOURCES";
 const PROMPT_ENV = "SICLAW_MCP_READ_ONLY_PROMPTS";
-const RESERVED_ENV = new Set([POLICY_ENV, RESOURCE_ENV, PROMPT_ENV]);
+const RESERVED_ENV = new Set([POLICY_ENV, RESOURCE_ENV, PROMPT_ENV, MCP_OPERATION_POLICY_ENV]);
 const MAX_RESULT_BYTES = 8 * 1024 * 1024;
 
 export interface McpReadOnlyPolicy {
@@ -19,6 +20,7 @@ export interface McpReadOnlyPolicy {
   prompts: ReadonlySet<string>;
   /** Only the baked renderer may return opaque images. Its input is sanitized. */
   trustedRenderer: boolean;
+  toolRules?: ReadonlyMap<string, McpToolRule>;
 }
 
 function allowlist(value: unknown): Set<string> {
@@ -39,11 +41,12 @@ export function resolveMcpReadOnlyPolicy(config: McpServerConfig): McpReadOnlyPo
   const expectedRenderer = fileURLToPath(new URL("../../mcp/create-chart/dist/index.js", import.meta.url));
   const trustedRenderer = config.transport === "stdio" && config.command === "sudo" &&
     JSON.stringify(config.args) === JSON.stringify(["-E", "-u", "sandbox", "--", "node", expectedRenderer]);
-  const tools = allowlist(env?.[POLICY_ENV]);
-  if (trustedRenderer && env?.[POLICY_ENV] === undefined) {
+  const toolRules = resolveMcpToolRules(env?.[MCP_OPERATION_POLICY_ENV]);
+  const tools = toolRules ? new Set([...toolRules].filter(([, rule]) => rule.effect === "read").map(([name]) => name)) : allowlist(env?.[POLICY_ENV]);
+  if (trustedRenderer && env?.[POLICY_ENV] === undefined && !toolRules) {
     tools.add("render_chart"); tools.add("render_mermaid");
   }
-  return { tools, resources: allowlist(env?.[RESOURCE_ENV]), prompts: allowlist(env?.[PROMPT_ENV]), trustedRenderer };
+  return { tools, resources: allowlist(env?.[RESOURCE_ENV]), prompts: allowlist(env?.[PROMPT_ENV]), trustedRenderer, ...(toolRules ? { toolRules } : {}) };
 }
 
 export function mcpTransportEnv(env: Record<string, string> | undefined): Record<string, string> | undefined {

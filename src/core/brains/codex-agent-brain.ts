@@ -9,8 +9,11 @@ import type {
 import { CodexAppServer } from "./codex-app-server.js";
 import { CodexExecutorRelay } from "./codex-executor-relay.js";
 import { CodexMcpGateway } from "./codex-mcp-gateway.js";
-import type { McpServerConfig } from "../mcp-client.js";
-import { mcpSensitiveValues } from "../mcp-security.js";
+import { buildMcpToolName, type McpServerConfig } from "../mcp-client.js";
+import { mcpSensitiveValues, resolveMcpReadOnlyPolicy } from "../mcp-security.js";
+import { authorizeMcpArguments } from "../mcp-operation-policy.js";
+import { CodexMcpAuthorization } from "./codex-mcp-authorization.js";
+import type { McpOperationAuthorizer } from "../../shared/mcp-authorization.js";
 import { createModelOutputRedactor, type SensitiveValueSource } from "../../shared/model-output-redactor.js";
 import { redactDataDocument } from "../../tools/infra/kubectl-sanitize.js";
 import { projectCodexMcpResult } from "./codex-mcp-result.js";
@@ -131,6 +134,7 @@ export class CodexAgentBrain implements BrainSession {
   private readonly providerSecrets = new Set<string>();
   private readonly executor: CodexExecutorRelay;
   private readonly mcpGateway: CodexMcpGateway;
+  private readonly mcpAuthorization: CodexMcpAuthorization;
   private readonly knowledge?: CodexKnowledge;
   private readonly workflow?: CodexWorkflow;
   private readonly userInput?: CodexUserInput;
@@ -170,6 +174,7 @@ export class CodexAgentBrain implements BrainSession {
   private constructor(
     private readonly sessionManager: SessionManager,
     private readonly native: { grants: CodexExecutorGrants; mcpServers?: Record<string, McpServerConfig>; sensitiveValues?: SensitiveValueSource; allowSubagents?: boolean; codexHome?: string;
+      authorizeMcp?: McpOperationAuthorizer;
       environments?: Array<{ id: string; grants: CodexExecutorGrants }>;
       workflow?: { schedule: boolean; report: boolean; sessionId: () => string };
       userQuestions?: { emit: (event: Record<string, unknown>) => void; waitForAnswer?: boolean };
@@ -183,11 +188,20 @@ export class CodexAgentBrain implements BrainSession {
     private readonly onPlanUpdate?: (plan: unknown) => void,
   ) {
     const sessionDir = sessionManager.getSessionDir();
+    this.mcpAuthorization = new CodexMcpAuthorization({ authorize: native.authorizeMcp,
+      owns: (id, turnId) => !this.closed && !this.abortPending && (id === this.threadId
+        ? !!this.active && this.active.id === turnId : this.children?.ownsActive(id) === true),
+      projectArguments: (server, name, args) => {
+        const config = native.mcpServers?.[server];
+        if (!config) throw new Error("MCP server is not selected");
+        return authorizeMcpArguments(resolveMcpReadOnlyPolicy(config).toolRules?.get(name), args);
+      },
+    });
     this.mcpGateway = new CodexMcpGateway(native.mcpServers ?? {}, () => [
       ...mcpSensitiveValues(native.mcpServers ?? {}), ...(native.sensitiveValues?.() ?? []), ...this.providerSecrets,
       ...[...this.providers.values()].flatMap(provider => [string(provider.apiKey),
         ...(record(provider.headers) ? Object.values(provider.headers).filter((value): value is string => typeof value === "string") : [])]),
-    ], () => native.grants.deniedRoots);
+    ], () => native.grants.deniedRoots, this.mcpAuthorization.authorize);
     const sensitiveValues: SensitiveValueSource = () => [
       ...mcpSensitiveValues(native.mcpServers ?? {}), ...(native.sensitiveValues?.() ?? []), ...this.providerSecrets,
       ...[...this.providers.values()].flatMap(provider => [string(provider.apiKey),
@@ -290,6 +304,7 @@ export class CodexAgentBrain implements BrainSession {
   static async create(options: {
     sessionManager: SessionManager; systemPrompt: string; grants: CodexExecutorGrants;
     mcpServers?: Record<string, McpServerConfig>; sensitiveValues?: SensitiveValueSource; allowSubagents?: boolean; codexHome?: string;
+    authorizeMcp?: McpOperationAuthorizer;
     environments?: Array<{ id: string; grants: CodexExecutorGrants }>;
     toolsetsByName: ReadonlyMap<string, string>;
     cwd: string; skillPaths: Array<{ name: string; filePath: string }>;
@@ -300,7 +315,7 @@ export class CodexAgentBrain implements BrainSession {
     knowledge?: { directory: string; emit: (event: { type: "knowledge_sources"; sources: KnowledgeSourceCitation[] }) => void };
   }): Promise<CodexAgentBrain> {
     const brain = new CodexAgentBrain(options.sessionManager,
-      { grants: options.grants, mcpServers: options.mcpServers, sensitiveValues: options.sensitiveValues, allowSubagents: options.allowSubagents,
+      { grants: options.grants, mcpServers: options.mcpServers, authorizeMcp: options.authorizeMcp, sensitiveValues: options.sensitiveValues, allowSubagents: options.allowSubagents,
         environments: options.environments, codexHome: options.codexHome, knowledge: options.knowledge, workflow: options.workflow, userQuestions: options.userQuestions, dpStateRef: options.dpStateRef }, options.systemPrompt,
       options.toolsetsByName, options.cwd, options.skillPaths,
       options.nativePlanEnabled, options.onPlanUpdate);
@@ -339,6 +354,7 @@ export class CodexAgentBrain implements BrainSession {
           step: { type: "string" }, status: { type: "string", enum: ["pending", "in_progress", "completed"] },
         } } } } } });
     for (const tool of this.workflow?.tools ?? []) tools.push({ name: tool.name, description: tool.description, parameters: tool.inputSchema });
+    for (const { server, tool } of this.mcpGateway.getTools()) tools.push({ name: buildMcpToolName(server, tool.name), description: tool.description, parameters: tool.inputSchema });
     if (this.userInput) tools.push({ name: "request_user_input" }, { name: "send_message_to_user_async" });
     return tools;
   }
@@ -535,6 +551,8 @@ export class CodexAgentBrain implements BrainSession {
   }
   async abort(): Promise<void> {
     this.userInput?.cancel();
+    this.mcpAuthorization?.cancel();
+    this.mcpGateway?.cancelRequests();
     if (this.promptInFlight) this.abortPending = true;
     this.retryWake?.();
     this.rejectPendingSteers(new Error("Codex turn aborted"));
@@ -606,6 +624,7 @@ export class CodexAgentBrain implements BrainSession {
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
+    this.mcpAuthorization.close();
     this.knowledge?.close();
     this.active?.mailboxStop?.abort();
     this.userInput?.cancel();
@@ -867,6 +886,7 @@ export class CodexAgentBrain implements BrainSession {
     this.children?.handle(event);
     this.knowledge?.observe(event);
     this.workflow?.observe(event);
+    this.mcpAuthorization?.observe(event);
     if (string(params.threadId) !== this.threadId) return;
     if (event.method === "turn/plan/updated") {
       this.onPlanUpdate?.(params.plan);
@@ -905,7 +925,7 @@ export class CodexAgentBrain implements BrainSession {
       } else if (item.type === "mcpToolCall") {
         this.mailbox?.steer();
         if (active) this.watchMailbox(active);
-        const name = string(item.tool);
+        const name = this.nativeMcpToolName(item);
         this.toolItems.set(string(item.id), { name, args: item.arguments ?? {} });
         this.emit({ type: "tool_execution_start", toolCallId: string(item.id), toolName: name,
           args: item.arguments ?? {}, toolset: this.toolsetsByName.get(name), startedAt: Date.now() });
@@ -941,7 +961,7 @@ export class CodexAgentBrain implements BrainSession {
         if (active) active.assistantHadContent = true;
         const started = this.toolItems.get(id);
         this.toolItems.delete(id);
-        const name = string(item.tool) || started?.name || "unknown";
+        const name = this.nativeMcpToolName(item) || started?.name || "unknown";
         const result = projectCodexMcpResult(item, this.native?.grants.redactOutput);
         const isError = result.isError;
         const args = item.arguments ?? started?.args ?? {};
@@ -1022,6 +1042,11 @@ export class CodexAgentBrain implements BrainSession {
       if (status === "failed") active.reject(this.safeError(record(turn.error) ? string(turn.error.message) : "Codex turn failed"));
       else active.resolve();
     }
+  }
+
+  private nativeMcpToolName(item: JsonObject): string {
+    const server = string(item.server), name = string(item.tool);
+    return server && name && Object.hasOwn(this.native?.mcpServers ?? {}, server) ? buildMcpToolName(server, name) : name;
   }
 
   private safeError(error: unknown): Error {

@@ -3684,11 +3684,14 @@ export class AgentBoxSessionManager {
         console.warn(`[agentbox-session] fetchHandoffTargets failed for ${id}:`, err);
       }
     }
-    const scriptInfo = effectiveMode === "web" && gc ? await gc.scriptSandboxInfo() : undefined;
+    // Codex owns JS Code Mode. Never advertise the legacy Python/Bash runner
+    // or couple native code execution to the disposable-runner enablement switch.
+    const scriptInfo = agentEngine === "pi-agent" && effectiveMode === "web" && gc ? await gc.scriptSandboxInfo() : undefined;
     const result = await createSiclawSession({
       agentEngine,
       scriptExecutor: scriptInfo?.enabled ? (request, _sessionId, signal) => gc!.runScript(request, id, signal) : undefined,
       scriptSandboxInfo: scriptInfo,
+      authorizeNativeMcp: gc ? (operation, signal) => gc.authorizeNativeMcp(id, operation, signal, this.agentId ?? undefined) : undefined,
       sessionManager: frameworkSessionManager,
       kubeconfigRef,
       mode: effectiveMode,
