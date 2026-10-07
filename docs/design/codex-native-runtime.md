@@ -1,6 +1,7 @@
 # Native Codex runtime for Siclaw
 
-Status: native extension discovery and implementation in progress. This
+Status: native runtime and in-scope SiCore product contracts implemented with
+scoped acceptance evidence below. This
 direction supersedes wrapping Siclaw's Pi tool definitions in an MCP bridge.
 
 ## Requirements
@@ -88,8 +89,10 @@ credentials at each process launch, including native children. Native file
 commands use a literal read-only argv grammar and authorized paths. Native
 process stop/connection close invoke the existing sandbox session reaper.
 
-Interactive stdin/PTY, reconnect and file streaming remain disabled and fail
-closed. Native long processes, continuation and output budgets remain owned by
+Interactive stdin/PTY and file streaming remain disabled and fail closed.
+Executor reconnect reuses the official authenticated exec-server session and
+replay contract; see [Product contracts](codex-product-compatibility.md).
+Native long processes, continuation and output budgets remain owned by
 Codex. Safe complete text records flow while a process runs; structural data
 waits for its security boundary. See
 [codex-readonly-infrastructure.md](codex-readonly-infrastructure.md#native-long-processes-and-output).
@@ -347,11 +350,11 @@ evidence is in [Native read-only infrastructure](codex-readonly-infrastructure.m
 | --- | --- | --- |
 | Accepted | MCP failure reason in the SiCore tool card/history | Native error-only reasons are safely projected for parent and child, including events and persisted tool rows. See [Native knowledge/error acceptance](codex-knowledge-citations.md#accepted-on-2026-10-07). |
 | Accepted | Knowledge answer citation display | Native complete-read provenance and the reviewed citation MCP service use the shared validator/mount and existing source events. Parent and child original links/attribution pass actual SiCore acceptance. See [Native knowledge/error acceptance](codex-knowledge-citations.md#accepted-on-2026-10-07). |
-| Implemented; live acceptance pending | Investigation mode, reports and schedules | The current Pi mode/Markdown-checkpoint contract replaces the previously removed hypothesis state machine. Codex uses native input/steering, Plan and children; reviewed MCP operations reuse the shared scheduling service and report contract. See [Product contracts](codex-product-compatibility.md). |
-| Implemented; live acceptance pending | Native structured user questions | Owned native question RPCs use existing chat/steer, input-required events and reply chips. Secret/approval requests remain denied. |
-| Implemented; live acceptance pending | Non-image attachments | Shared UTF-8 document validation/extraction, exact conversation mounts and native reads; PDF uses the existing configured OCR service. No AgentBox parser dependency or Pi tool bridge. |
-| Acceptance | Target Responses provider/model combinations and failures | Named live runs establish their exact combinations, not every catalog entry. Exercise required Responses Lite/opaque history contracts, model/provider/key changes and failure recovery when those combinations are selected. Keep test-body fixtures separate from real provider evidence. |
-| Implemented; Linux acceptance pending | Native executor reconnect | The official authenticated WebSocket exec-server owns the 30-second detached session and process replay. The adapter preserves only its owned grants/handles. |
+| Accepted within enabled capabilities | Investigation mode, reports and schedules | Native mode/Markdown checkpoints, shared scheduling/report services, actual scheduled report persistence and same-task create/list/rename/update/pause/delete pass. The SRE harness correctly does not grant scheduling; Custom preview supplies the enabled schedule contract. See [Product acceptance](codex-product-compatibility.md#accepted-on-2026-10-07). |
+| Accepted | Native structured user questions | Actual native question RPC, existing input-required/steer answer delivery and SiCore history/reload pass. Secret/approval requests remain denied. |
+| Accepted | Non-image attachments | Real UTF-8 log upload/native read and existing OCR-backed PDF text extraction pass. Exact conversation mounts and shared sanitization remain authoritative. See [Product acceptance](codex-product-compatibility.md#accepted-on-2026-10-07). |
+| Accepted for named bindings; future model upgrade gate | Responses models and failures | Existing named live runs cover gpt-5.6-luna and gpt-6-astra. Source-built deterministic Responses tests cover model/provider/key changes, safe 401, recovery and cold resume. They do not prove real production credential rotation or every catalog entry. |
+| Accepted on Linux | Native executor reconnect | The official authenticated WebSocket exec-server owns the detached session, same process and sequence replay; source-built Linux checks cover no-repeat replay, isolation and cancellation. No second output/job ledger. |
 
 Interactive shell/PTY and arbitrary opaque image/file output remain deliberate
 safety boundaries. Full raw log archival/search is optional product work; native
@@ -359,8 +362,10 @@ truncation/continuation already owns ordinary large-output behavior. Cross-Agent
 handoff, Portal UI and memory isolation retain their separately deferred scopes.
 Siclaw memory search, generation and publication remain outside this migration.
 
-These remaining product contracts prevent a blanket claim of full Pi feature
-replacement. Do not interpret successful executor tests as their implementation.
+The in-scope product contracts now have their own evidence, independently of
+executor checks. This does not establish every provider/catalog combination or
+the separately deferred scopes. The latest product acceptance records the
+SiCore paused-task list fix and actual database validation.
 
 ## Native child projection acceptance (2026-10-06)
 

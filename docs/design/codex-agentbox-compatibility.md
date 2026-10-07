@@ -22,7 +22,9 @@ selection are still reused by the adapter.
 The runtime design's dated records include actual Responses/SiCore/K8sSpawner
 acceptance for the native diagnostic path, separately from component/fake-model
 checks. Native citation display and MCP errors have [scoped live acceptance](codex-knowledge-citations.md).
-Remaining product contracts (investigation/report/schedule
-services, structured questions and non-image attachments) are listed in
-[Remaining acceptance work](codex-native-runtime.md#remaining-acceptance-work-reconciled-2026-10-07).
-Full Pi feature replacement is not yet established.
+Investigation/report/schedule services, structured questions, non-image
+attachments and native executor reconnect have [scoped product acceptance](codex-product-compatibility.md#accepted-on-2026-10-07).
+The [acceptance matrix](codex-native-runtime.md#remaining-acceptance-work-reconciled-2026-10-07)
+distinguishes real named model runs from deterministic provider-failure tests.
+Deferred scopes and untested provider/catalog combinations are not a claim of
+full Pi feature replacement.
