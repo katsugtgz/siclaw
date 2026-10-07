@@ -10,7 +10,7 @@ assert.ok(process.env.SICLAW_CODEX_BIN, 'Use the official source-built Codex');
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'native-product-smoke-')); fs.chmodSync(root, 0o755);
 const workspace = path.join(root, 'workspace'); fs.mkdirSync(workspace);
 const events = [], questions = [], requests = [], tasks = new Map();
-const secret = 'owner-product-secret', rotated = 'owner-rotated-secret';
+const secret = 'owner-product-secret', rotated = 'owner-rotated-secret', headerSecret = 'owner-header-secret';
 let phase = 'product', step = 0, calls = 0, failure, brain;
 const fn = (name, args, id, namespace) => ({ id, type: 'function_call', ...(namespace ? { namespace } : {}), name, call_id: id, arguments: JSON.stringify(args), status: 'completed' });
 const answer = text => ({ id: `answer-${calls}`, type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text, annotations: [] }] });
@@ -22,21 +22,24 @@ const runtime = createServer(async (req, res) => {
   let raw = ''; for await (const part of req) raw += part;
   const body = raw ? JSON.parse(raw) : {}, url = new URL(req.url, 'http://fixture');
   requests.push({ method: req.method, path: url.pathname, body });
-  if (req.method !== 'GET') assert.equal(body.session_id ?? url.searchParams.get('session_id'), 'trusted-public-session');
+  assert.equal(body.session_id ?? url.searchParams.get('session_id'), 'trusted-public-session');
   res.setHeader('Content-Type', 'application/json');
   if (req.method === 'GET') res.end(JSON.stringify({ tasks: [...tasks.values()] }));
   else if (req.method === 'POST') { const task = { ...body, id: 'owned-task' }; tasks.set(task.id, task); res.end(JSON.stringify(task)); }
   else if (req.method === 'PUT') { Object.assign(tasks.get('owned-task'), body); res.end(JSON.stringify(tasks.get('owned-task'))); }
   else { tasks.delete('owned-task'); res.end('{}'); }
 });
-const model = createServer(async (req, res) => { try {
+const handleModel = async (req, res) => { try {
   let data = ''; for await (const part of req) data += part;
   const body = JSON.parse(data); calls++;
-  assert.ok(!data.includes(secret) && !data.includes(rotated), 'credential reached a model body');
-  assert.equal(req.headers.authorization, `Bearer ${phase === 'product' ? secret : rotated}`);
+  assert.ok(![secret, rotated, headerSecret].some(value => data.includes(value)), 'credential reached a model body');
+  const alternate = ['url', 'header', 'anonymous'].includes(phase);
+  assert.equal(req.headers.host, `127.0.0.1:${(alternate ? alternateModel : model).address().port}`, 'stale provider URL');
+  assert.equal(req.headers.authorization, ['header', 'anonymous'].includes(phase) ? undefined : `Bearer ${phase === 'product' ? secret : rotated}`);
+  assert.equal(req.headers['x-fixture-token'], phase === 'header' ? headerSecret : undefined, 'stale provider headers');
   let item;
   if (phase === 'fail') { res.writeHead(401, { 'Content-Type': 'application/json' }).end(JSON.stringify({ error: { message: `Unauthorized token ${rotated}` } })); return; }
-  if (phase === 'rotate' || phase === 'recover' || phase === 'switch') {
+  if (['rotate', 'recover', 'switch', 'url', 'header', 'anonymous'].includes(phase)) {
     assert.equal(body.model, phase === 'switch' ? 'gpt-5.4' : 'gpt-5.5'); item = answer(`NATIVE_${phase.toUpperCase()}_ACCEPTED`);
   } else {
     const user = body.input.filter(x=>x.type==='message'&&x.role==='user').at(-1)?.content??[];
@@ -77,11 +80,12 @@ const model = createServer(async (req, res) => { try {
   if (item.type === 'function_call') send('response.function_call_arguments.delta', { output_index: 0, delta: item.arguments });
   else if (item.type === 'message') send('response.output_text.delta', { output_index: 0, content_index: 0, delta: item.content[0].text });
   send('response.output_item.done', { output_index: 0, item }); send('response.completed', { response: envelope }); res.end();
-} catch (error) { failure ??= error; res.writeHead(500).end('{"error":{"message":"product fixture failed"}}'); } });
-await Promise.all([new Promise(resolve => runtime.listen(0, '127.0.0.1', resolve)), new Promise(resolve => model.listen(0, '127.0.0.1', resolve))]);
+} catch (error) { failure ??= error; res.writeHead(500).end('{"error":{"message":"product fixture failed"}}'); } };
+const model = createServer(handleModel), alternateModel = createServer(handleModel);
+await Promise.all([runtime, model, alternateModel].map(server => new Promise(resolve => server.listen(0, '127.0.0.1', resolve))));
 process.env.SICLAW_GATEWAY_URL = `http://127.0.0.1:${runtime.address().port}`;
 const state = { active: false }, transcripts = path.join(root, 'transcripts');
-const provider = key => ({ api: 'openai-responses', apiKey: key, baseUrl: `http://127.0.0.1:${model.address().port}/v1`,
+const provider = (key, server = model) => ({ api: 'openai-responses', apiKey: key, baseUrl: `http://127.0.0.1:${server.address().port}/v1`,
   models: ['gpt-5.5', 'gpt-5.4'].map(id => ({ id, api: 'openai-responses', contextWindow: 128000, maxTokens: 1000 })) });
 const make = async manager => {
   const result = await CodexAgentBrain.create({ sessionManager: manager, cwd: workspace, systemPrompt: 'Use native tools. Produce the requested final report.', skillPaths: [], toolsetsByName: new Map(),
@@ -103,8 +107,12 @@ try {
   phase = 'switch'; await brain.setModel(brain.findModel('fixture', 'gpt-5.4')); await brain.prompt('Verify model switching');
   phase = 'fail'; await brain.setModel(brain.findModel('fixture', 'gpt-5.5')); await assert.rejects(brain.prompt('Verify authentication failure'), error => !error.message.includes(rotated) && /Unauthorized|401|unauthorized/i.test(error.message));
   phase = 'recover'; await brain.prompt('Verify recovery after failure');
-  const messages = brain.getConversationMessages(); assert.ok(!JSON.stringify(messages).includes(secret) && !JSON.stringify(messages).includes(rotated));
+  phase = 'url'; brain.registerProvider('fixture', provider(rotated, alternateModel)); await brain.prompt('Verify provider URL rebinding');
+  phase = 'header'; brain.registerProvider('fixture', { ...provider('', alternateModel), authHeader: false, headers: { 'X-Fixture-Token': headerSecret } }); await brain.prompt('Verify explicit header-only authentication');
+  phase = 'anonymous'; brain.registerProvider('fixture', { ...provider('', alternateModel), authHeader: false, headers: {} }); await brain.prompt('Verify removal of all authentication headers');
+  const messages = JSON.stringify(brain.getConversationMessages()); assert.ok(![secret, rotated, headerSecret].some(value => messages.includes(value)));
   await brain.close(); brain = await make(SessionManager.continueRecent(workspace, transcripts)); brain.registerProvider('fixture', provider(rotated)); await brain.setModel(brain.findModel('fixture', 'gpt-5.5'));
+  phase = 'recover';
   await brain.prompt('Verify cold resume after provider recovery'); assert.equal(state.active, false); if (failure) throw failure;
-  console.log('Native product smoke passed: sanitized file reads, native question/answer, all schedule actions with trusted owner, task report, DP mode, credential rotation, model switch, safe 401, failure recovery and cold resume');
-} catch (error) { throw failure ?? error; } finally { await brain?.close(); await Promise.all([new Promise(resolve => runtime.close(resolve)), new Promise(resolve => model.close(resolve))]); fs.rmSync(root, { recursive: true, force: true }); }
+  console.log('Native product smoke passed: sanitized file reads, native question/answer, all schedule actions with trusted owner, task report, DP mode, credential rotation, model/URL/header-only/no-auth changes, safe 401, failure recovery and cold resume');
+} catch (error) { throw failure ?? error; } finally { await brain?.close(); await Promise.all([runtime, model, alternateModel].map(server => new Promise(resolve => server.close(resolve)))); fs.rmSync(root, { recursive: true, force: true }); }
