@@ -207,6 +207,7 @@ export class CodexMcpGateway {
       let execution: "not_dispatched" | "unknown" | "finished" = "not_dispatched";
       try {
         const approved = upstream.local ? args : authorizeMcpArguments(upstream.policy.toolRules?.get(name), args);
+        if (!upstream.policy.trustedRenderer) upstream.security.arguments(approved);
         const safeArgs = upstream.local ? this.projectProductArguments(approved)
           : upstream.policy.trustedRenderer ? JSON.parse(upstream.security.text(JSON.stringify(approved))) : approved;
         const signal = AbortSignal.any([extra.signal, controller.signal, this.stopping.signal, AbortSignal.timeout(65_000)]);

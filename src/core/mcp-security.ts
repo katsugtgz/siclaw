@@ -89,10 +89,29 @@ export function mcpSensitiveValues(servers: Record<string, unknown>): string[] {
       } catch { /* Connection validation will reject the invalid URL. */ }
     }
     if (Array.isArray(config.args)) {
-      // Flags and paths are not credentials. Positional literal values can be.
-      for (const arg of config.args) if (typeof arg === "string") {
-        if (arg.startsWith("-") && arg.includes("=")) add(arg.slice(arg.indexOf("=") + 1));
-        else if (!arg.startsWith("-") && !path.isAbsolute(arg) && arg !== "node" && arg !== "sandbox") add(arg);
+      const addArgument = (value: string) => {
+        add(value);
+        // Headers and authenticated URLs can be configured as CLI operands;
+        // an upstream echo need not preserve the enclosing flag or header.
+        const auth=/^(?:Authorization:\s*)?(Bearer|Basic)\s+(.+)$/i.exec(value);
+        if(auth){
+          add(auth[2]);
+          if(auth[1].toLowerCase()==="basic"){
+            const decoded=Buffer.from(auth[2],"base64").toString("utf8");add(decoded);
+            if(decoded.includes(":"))add(decoded.slice(decoded.indexOf(":")+1));
+          }
+        }
+        try{
+          const url=new URL(value);add(decodeURIComponent(url.username));add(decodeURIComponent(url.password));
+          for(const item of url.searchParams.values())add(item);
+        }catch{ /* Ordinary CLI operands are not URLs. */ }
+      };
+      for (let index=0;index<config.args.length;index++) {
+        const arg=config.args[index];if(typeof arg!=="string")continue;
+        const previous=config.args[index-1];
+        const credentialOperand=typeof previous==="string"&&/^--?[^=]*(?:api[-_]?key|token|secret|password|authorization|credential)[^=]*$/i.test(previous);
+        if (arg.startsWith("-") && arg.includes("=")) addArgument(arg.slice(arg.indexOf("=") + 1));
+        else if (credentialOperand || !arg.startsWith("-") && !path.isAbsolute(arg) && arg !== "node" && arg !== "sandbox") addArgument(arg);
       }
     }
   }

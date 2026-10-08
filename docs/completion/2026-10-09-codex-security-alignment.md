@@ -46,10 +46,54 @@ actually running AgentBox. API and Agent resource policy are unchanged.
 
 Real R2 re-send remains pending. Protocol fixtures are not a substitute for it.
 
-## Security audit in progress
+## Shared Pi/native security repairs
+
+Three more issues were first reproduced with failing synthetic regressions:
+
+1. MCP path checks preceded fixed-argument injection. Pi and native now validate
+   final effective arguments before authorization/dispatch. Raw/encoded/file-URI
+   private paths remain denied, including operator-injected ones; zero upstream
+   calls are asserted.
+2. MCP argv secret sources omitted some echoed fragments: Bearer/Basic bodies,
+   URL credentials/query values and absolute-looking password operands. The
+   shared live source now registers these values before discovery/model output.
+3. Safe env prefixes bypassed sensitive suffixes: NODE_AUTH_TOKEN,
+   NPM_CONFIG_PASSWORD, HOME_API_KEY and related canaries survived. Sensitive
+   names/suffixes now take priority; normal runtime/cache/locale vars still work.
+
+Final verification: 65 focused tests, 8,995 full tests, strict types/build and all
+eight Linux native gates passed. Only isolated Runtime generation 44/AgentBox
+were updated. API, published policy r6 and production are unchanged.
+
+- Runtime: `sha256:d93ef8bf82f8c185a530428b5f8eda788f0cf5b1dc56e20709a10ffe38e4a98e`.
+- AgentBox: `sha256:020a158eb19e624a54f341be1d4252fdaa52f189c1153629ae29a2c0d4f5cc37`.
+- Source: `321b814f5d2684472633c0becfdf18e63df1d63ac7d1def833e50df8c9f0e44f`.
+
+## Alignment scope and retained limits
 
 Compare Pi/native authorization before dispatch and delivery, production command
 whitelists and immutable scripts, namespace/resource limits, raw credential file
 and environment access, MCP admission/configuration rotation, owner-scoped secret
 sources, streaming/previews/artifacts/history/logging and child/task attribution.
 Reproduce issues with synthetic credential canaries before changing shared paths.
+
+| Boundary | Verified implementation/retained gate |
+|---|---|
+| Cluster | Shared owner broker; shell has no credential group; setgid kubectl uses authorized cache. Scoped native config substitutes loopback HTTPS, keeping upstream auth private. |
+| Host/bastion | Node-side ssh2/broker, no model-visible raw config or privileged shell SSH; shared command/path/output validators. |
+| Production operations | Shared whitelist and connection-override denial. Channel namespaces additionally close cluster-wide reads, writes and privileged debug. |
+| MCP | Exact operator policy, no annotation authority, final arguments validated; native item ownership and before/after Runtime revalidation. Write rules remain unavailable. |
+| Output/storage | Live owner secret sources, sanitize before model/previews/artifacts; invalid/oversized/opaque content has no raw fallback. |
+| Children/tasks | Frozen audience/original sender and expiring grants; per-holder cache, not later-speaker authority. |
+
+This is not proof that arbitrary approved code is read-only. Fixed reviewed Skill
+assets retain Pi's trusted-program boundary; least-privilege target credentials
+and asset review are required. Operator-controlled diagnostic helper lifecycle is
+not a general workload-write grant. Generic SQL/shell/HTTP MCP tools need backend
+enforcement of reviewed arguments; names/effect declarations do not certify code.
+
+No upstream patch, dependency, production-write approval, native-memory redesign
+or incremental >8 MiB redaction was added. PTY/unreviewed scripts, unsupported
+providers, Cross-Agent handoff and Portal acceptance retain their existing
+restrictions/deferred status. Real R2 re-send and group inbound remain pending;
+do not call the whole deployment production-certified from this review/fixtures.

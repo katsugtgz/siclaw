@@ -83,14 +83,15 @@ function isSensitive(name: string): boolean {
     return !SICLAW_SAFE.has(upper);
   }
 
-  // Explicit allow-list takes precedence
-  if (ALLOW_PREFIXES.some((p) => upper.startsWith(p))) return false;
-
   // Exact match blocklist
   if (BLOCKED_EXACT.has(upper)) return true;
 
   // Suffix match
   if (BLOCKED_SUFFIXES.some((s) => upper.endsWith(s))) return true;
+
+  // Safe runtime/configuration prefixes must never override a credential name
+  // such as NODE_AUTH_TOKEN or NPM_CONFIG_PASSWORD.
+  if (ALLOW_PREFIXES.some((p) => upper.startsWith(p))) return false;
 
   return false;
 }

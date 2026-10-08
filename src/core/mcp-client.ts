@@ -717,6 +717,9 @@ export function createMcpToolDefinition(
         signal?.throwIfAborted();
         if (!trustedOptions?.allowImages) security.arguments(args ?? {});
         const approvedArgs = authorizeMcpArguments(trustedOptions?.argumentRule, args ?? {});
+        // Fixed operator routing values do not grant private-file authority.
+        // Validate what will actually be dispatched after policy injection.
+        if (!trustedOptions?.allowImages) security.arguments(approvedArgs);
         const rawResult = await client.callTool(
           {
             name: mcpTool.name,

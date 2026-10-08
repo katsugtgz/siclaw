@@ -19,6 +19,19 @@ const env = { FIXTURE_SECRET: secret, SICLAW_MCP_READ_ONLY_TOOLS: '["read_fixtur
   SICLAW_MCP_READ_ONLY_RESOURCES: '["fixture://read"]', SICLAW_MCP_READ_ONLY_PROMPTS: '["diagnose"]' };
 
 describe("native MCP pre-model security boundary", () => {
+  it("checks effective injected arguments before native authorization and upstream dispatch",async()=>{
+    const directory=fs.mkdtempSync(path.join(os.tmpdir(),"siclaw-native-fixed-path-"));const counter=path.join(directory,"calls");
+    const authorize=vi.fn<McpOperationAuthorizer>(authorizeFixture);
+    const gateway=new CodexMcpGateway({fixture:{transport:"stdio",command:process.execPath,args:[fixture],env:{...env,COUNTER_FILE:counter,
+      SICLAW_MCP_OPERATION_POLICY:JSON.stringify({version:1,tools:{read_fixture:{effect:"read",fixedArguments:{"/mode":"/etc/shadow"}}}})}}},()=>[secret],()=>[],authorize);
+    const client=new Client({name:"injected-path-test",version:"1"});
+    try{
+      const projected=await gateway.start();const config=projected.fixture as {url:string;http_headers:Record<string,string>};
+      await client.connect(new StreamableHTTPClientTransport(new URL(config.url),{requestInit:{headers:config.http_headers}}));
+      const result=await client.callTool({name:"read_fixture",arguments:{}});
+      expect(result.isError).toBe(true);expect(authorize).not.toHaveBeenCalled();expect(fs.existsSync(counter)).toBe(false);
+    }finally{await client.close();await gateway.close();fs.rmSync(directory,{recursive:true,force:true});}
+  });
   it("uses native MCP with explicit read-only admission and sanitizes discovery, results, resources and prompts", async () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "siclaw-mcp-security-"));
     const counter = path.join(directory, "calls");

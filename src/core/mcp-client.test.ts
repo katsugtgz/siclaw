@@ -1,4 +1,5 @@
 import { createMcpToolDefinition } from "./mcp-client.js";
+import { McpModelSecurity } from "./mcp-security.js";
 import { describe, it, expect, vi } from "vitest";
 import {
   jsonSchemaToTypebox,
@@ -98,6 +99,16 @@ describe("jsonSchemaToTypebox", () => {
     const configProp = (result as any).properties.config;
     expect(configProp).toMatchObject({ type: "object" });
     expect(configProp.properties.host).toMatchObject({ type: "string" });
+  });
+});
+
+describe("effective MCP argument safety",()=>{
+  it.each(["/etc/shadow","file:///root/.ssh/id_rsa","%2Fetc%2Fshadow"])("blocks policy-injected sensitive paths before Pi dispatch (%s)",async target=>{
+    const callTool=vi.fn().mockResolvedValue({content:[{type:"text",text:"must-not-run"}]});
+    const tool=createMcpToolDefinition("fixture",undefined,{name:"read_fixture"},{callTool},undefined,
+      {security:new McpModelSecurity(),argumentRule:{effect:"read",fixedArguments:{"/path":target}}});
+    const result=await tool.execute("owned-call",{},new AbortController().signal);
+    expect(callTool).not.toHaveBeenCalled();expect(result.details).toHaveProperty("error");
   });
 });
 

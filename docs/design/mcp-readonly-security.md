@@ -158,6 +158,12 @@ unknown versions, malformed policies, executable expressions and prototype
 paths grant nothing. Pi and Codex reuse the argument evaluator. Legacy exact
 read-only lists remain supported when no v1 operation policy is configured.
 
+Pi and Codex path-check the final effective arguments after fixed-value injection
+as well as the original request. Fixed routing configuration never grants private
+credential/system-file access. Configured argv authentication values register
+their Bearer/Basic, URL and password fragments in the shared secret source so an
+upstream echo cannot evade redaction by omitting the enclosing flag/header.
+
 These scopes constrain only explicitly reviewed argument fields. They do not
 infer the semantics of arbitrary SQL, shell, HTTP proxy or code-execution tools.
 Fixed scope data must be non-secret routing values, not credentials. Reviewed
