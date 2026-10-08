@@ -9,7 +9,8 @@ import { spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import { WebSocket } from "ws";
 import { KubeConfig } from "@kubernetes/client-node";
-import { CredentialBroker } from "../../dist/agentbox/credential-broker.js";
+import { resolveGroupGid } from "../../dist/agentbox/credential-broker.js";
+import { BoxExecutionGrants } from "../../dist/agentbox/execution-grants.js";
 import { CodexExecutorRelay } from "../../dist/core/brains/codex-executor-relay.js";
 
 const root=fs.mkdtempSync(path.join(os.tmpdir(),"siclaw-channel-smoke-"));fs.chmodSync(root,0o755);
@@ -28,7 +29,16 @@ const real=JSON.stringify({apiVersion:"v1",kind:"Config","current-context":"priv
 const policy={version:1,revision:"fixture:1",fingerprint:"a".repeat(64),operations:["query"],namespaces:["allowed"],mcp:[],knowledgeIds:[],reports:false,attachments:false};
 assert.equal(typeof KubeConfig.prototype.applyToHTTPSOptions,"function","Image Kubernetes SDK must match source broker API");
 const validate=async()=>{if(!active)throw new Error("revoked")};
-const broker=new CredentialBroker({listClusters:async()=>[{name:"fixture"}],listHosts:async()=>[],getHostCredential:async()=>{throw Error("no hosts")},getClusterCredential:async()=>({credential:{name:"fixture",type:"kubeconfig",metadata:{name:"fixture"},files:[{name:"kubeconfig",content:real}]}})},path.join(root,"credentials"),{policy,validate});
+const credentialRoot=path.join(root,"credentials");fs.mkdirSync(credentialRoot,{mode:0o700});
+const gid=resolveGroupGid("kubecred");if(gid!==null){fs.chownSync(credentialRoot,-1,gid);fs.chmodSync(credentialRoot,0o750);}
+const identity={kind:"binding",id:"fixture-group",policyRequired:true};
+const authority=new BoxExecutionGrants({renewExecutionGrant:async()=>active?{ok:true,identity,policy,remainingMs:60000,sessionId:"fixture-session"}:{ok:false},
+  forExecutionGrant:()=>({toClientLike:()=>({request:async(url,_method,body)=>{
+    if(url==="/api/internal/credential-list")return body.kind==="cluster"?{clusters:[{name:"fixture"}]}:{hosts:[]};
+    assert.equal(url,"/api/internal/credential-request");assert.equal(body.source,"cluster");
+    return {credential:{name:"fixture",type:"kubeconfig",metadata:{name:"fixture"},files:[{name:"kubeconfig",content:real}]}};
+  }})})},credentialRoot);
+const grant=await authority.accept("fixture-grant","fixture-session",identity);const broker=grant.broker;
 let scopedPath="";
 const relay=new CodexExecutorRelay({executable:process.env.SICLAW_CODEX_BIN,home:path.join(root,"executor"),cwd:workspace,grants:{readRoots:[workspace],writeRoots:[workspace],deniedRoots:[path.join(root,"credentials")],allowCommands:true,allowFileCommands:false,production:process.env.NODE_ENV==="production",channelPolicy:policy,validateChannelPolicy:validate,resolveKubeconfig:async()=>{
  await broker.acquireCluster("fixture","channel-native-smoke",{bypassCache:true});scopedPath=(await broker.ensureCluster("fixture")).path;return scopedPath;
@@ -51,6 +61,13 @@ try {
  assert.equal(allowed.exitCode,0,JSON.stringify({allowed,paths,output:events.filter(e=>e.method==="process/output").map(e=>Buffer.from(e.params.chunk,"base64").toString()).join("")}));
  assert.ok(paths.some(p=>p.startsWith("/api/v1/namespaces/allowed/pods")));
  assert.ok(!fs.readFileSync(scopedPath,"utf8").includes(canary));
+ if(process.env.NODE_ENV==="production"){
+  assert.equal(process.getuid(),1000);assert.ok(!spawnSync("id",["-nG","sandbox"],{encoding:"utf8"}).stdout.split(/\s+/).includes("kubecred"));
+  const shellRead=spawnSync("sudo",["-n","-u","sandbox","--","cat",scopedPath],{encoding:"utf8"});assert.notEqual(shellRead.status,0);assert.ok(!shellRead.stdout.includes("token:"));
+  for(const directory of [path.dirname(path.dirname(grant.credentialsDir)),path.dirname(grant.credentialsDir),grant.credentialsDir]){
+    const stat=fs.statSync(directory);assert.equal(stat.mode&0o777,0o710);assert.equal(stat.gid,gid);
+  }
+ }
  const denied=await execute("other","kubectl get pods -n forbidden -o json");assert.ok(denied.error||denied.exitCode!==0);
  const all=await execute("all","kubectl get pods -A -o json");assert.ok(all.error||all.exitCode!==0);
  const write=await execute("write","kubectl delete pod channel-safe -n allowed");assert.ok(write.error||write.exitCode!==0);
@@ -62,7 +79,7 @@ try {
  assert.match(text,/channel-safe/);assert.ok(!text.includes(canary));
  console.log("Channel native smoke passed: real upstream exec-server, scoped kubectl, no raw credential, cross-namespace/all-namespace/write/file-read denial and revocation; fixture API, not production cluster.");
 }finally{
- socket?.close();await relay.close();broker.dispose();upstream.closeAllConnections();await new Promise(resolve=>upstream.close(resolve));
+ socket?.close();await relay.close();authority.close();upstream.closeAllConnections();await new Promise(resolve=>upstream.close(resolve));
  // kubectl's cache belongs to sandbox UID 1001. Adjust only this freshly
  // created disposable fixture workspace so cleanup cannot hide an assertion.
  if(process.env.NODE_ENV==="production")spawnSync("sudo",["-n","-u","sandbox","--","chmod","-R","a+rwX","--",workspace]);

@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { CredentialBroker } from "./credential-broker.js";
+import { CredentialBroker, resolveGroupGid } from "./credential-broker.js";
 import { HttpTransport } from "./credential-transport.js";
 import type { GatewayClient } from "./gateway-client.js";
 import { identityKey, parseWireIdentity, type ExecutionIdentity } from "../shared/execution-identity.js";
@@ -73,8 +73,26 @@ export class BoxExecutionGrants {
       if (existing) throw new Error("Execution policy changed");
     }
     if (existing) { existing.deadline = started + result.remainingMs; this.schedule(existing); return existing; }
-    const directory = path.join(this.root, "execution-grants", grantId, randomUUID());
-    fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+    const grantRoot = path.join(this.root, "execution-grants");
+    const principalRoot = path.join(grantRoot, grantId);
+    const directory = path.join(principalRoot, randomUUID());
+    // The trusted setgid kubectl needs traversal through every grant ancestor,
+    // not just read permission on the final kubeconfig. Ordinary sandbox code
+    // still has no credential group; grant directories do not grant listing.
+    const kubeGid = resolveGroupGid("kubecred");
+    for (const owned of [grantRoot, principalRoot, directory]) {
+      fs.mkdirSync(owned, { recursive: true, mode: 0o700 });
+      const stat = fs.lstatSync(owned);
+      if (!stat.isDirectory() || stat.isSymbolicLink() ||
+          typeof process.getuid === "function" && stat.uid !== process.getuid())
+        throw new Error("Unsafe execution credential directory");
+      if (kubeGid !== null) fs.chownSync(owned, -1, kubeGid);
+      fs.chmodSync(owned, kubeGid === null ? 0o700 : 0o710);
+      const applied = fs.lstatSync(owned);
+      if ((applied.mode & 0o777) !== (kubeGid === null ? 0o700 : 0o710) ||
+          kubeGid !== null && applied.gid !== kubeGid)
+        throw new Error("Execution credential isolation could not be applied");
+    }
     let grant: BoxExecutionGrant;
     const client = this.gateway.forExecutionGrant(grantId, sessionId,
       () => !grant.ended && Date.now() < grant.deadline,policy);
