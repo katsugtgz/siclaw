@@ -57,6 +57,7 @@ import { createModelOutputRedactor, redactModelJson } from "../shared/model-outp
 import { redactDataDocument } from "../tools/infra/kubectl-sanitize.js";
 import { resolveSessionMcpTools } from "./session-mcp-tools.js";
 import { loadConfig, getEmbeddingConfig, getConfigPath, getDefaultLlm, isMemoryEnabled } from "./config.js";
+import { createChannelKnowledgeView, disposeChannelKnowledgeView } from "../agentbox/channel-knowledge-view.js";
 import { initExtraCommands } from "../tools/infra/extra-commands.js";
 import { filterHarnessSkills } from "./skill-overlay.js";
 import {
@@ -78,6 +79,7 @@ import { allowsBackgroundExec } from "./background-execution-policy.js";
 import type { SessionMode, KubeconfigRef, MemoryRef, DpStateRef, MutableDpStateRef } from "./types.js";
 
 export interface CreateSiclawSessionOpts {
+  executionClient?: import("../agentbox/gateway-client.js").GatewayClient;
   /** AgentBox selects Codex only for a compatible Responses binding. */
   agentEngine?: "pi-agent" | "codex";
   scriptExecutor?: import("../script-sandbox/types.js").ScriptExecutor;
@@ -258,6 +260,7 @@ function buildAppendSystemPrompt(
   knowledgeCitationsEnabled = false,
   operationalKnowledge = true,
   knowledgeCitationToolName = "knowledge_cite",
+  includeLegacyKnowledgeOverview = true,
 ): string[] {
   const parts: string[] = [];
 
@@ -315,7 +318,9 @@ When the user does provide identifying info, IMMEDIATELY update \`${memoryDir}/P
   const config_ = loadConfig();
   const reposDir_ = path.resolve(process.cwd(), config_.paths.reposDir);
   const docsDir_ = path.resolve(process.cwd(), config_.paths.docsDir);
-  const overview = buildKnowledgeOverview({ reposDir: reposDir_, docsDir: docsDir_, memoryEnabled: !!memoryDir });
+  const overview = includeLegacyKnowledgeOverview
+    ? buildKnowledgeOverview({ reposDir: reposDir_, docsDir: docsDir_, memoryEnabled: !!memoryDir })
+    : "";
   if (overview) {
     parts.push(overview);
   }
@@ -534,10 +539,13 @@ export async function createSiclawSession(
   const memoryDir = path.join(userDataDir, "memory");
   const toolResultArtifactsDir = toolResultArtifactRoot(sessionManager.getSessionDir());
   scheduleToolOutputCleanup(path.dirname(sessionManager.getSessionDir()));
-  const knowledgeDir = opts?.knowledgeDir
+  const channelPolicy=kubeconfigRef.credentialBroker?.getChannelPolicy();
+  const originalKnowledgeDir = opts?.knowledgeDir
     ?? (opts?.portalKnowledgeDir && fs.existsSync(opts.portalKnowledgeDir)
       ? opts.portalKnowledgeDir
       : path.resolve(cwd, config.paths.knowledgeDir));
+  const knowledgeDir=channelPolicy ? createChannelKnowledgeView(originalKnowledgeDir,channelPolicy) : originalKnowledgeDir;
+  if (channelPolicy) kubeconfigRef.credentialBroker!.registerOwnedCleanup(() => disposeChannelKnowledgeView(knowledgeDir));
   const citationSupport = opts?.sessionEventEmitter
     ? createKnowledgeCitationSupport({
         knowledgeDir,
@@ -592,7 +600,8 @@ export async function createSiclawSession(
   // configuration. Typed page labels become available after one local
   // frontmatter scan; no FTS/vector content index is opened. AgentBox passes a
   // shared resolver, while standalone CLI owns this fallback instance.
-  let knowledgeIndexer = opts?.knowledgeIndexer;
+  // The box-wide resolver indexes the entire Agent mount, not this audience.
+  let knowledgeIndexer = channelPolicy ? undefined : opts?.knowledgeIndexer;
   if (!knowledgeIndexer) {
     let candidate: KnowledgeResolver | undefined;
     try {
@@ -600,6 +609,7 @@ export async function createSiclawSession(
       candidate = created;
       await created.sync();
       knowledgeIndexer = created;
+      if (channelPolicy) kubeconfigRef.credentialBroker!.registerOwnedCleanup(() => created.close());
     } catch (err) {
       try { candidate?.close(); } catch { /* ignore cleanup failure */ }
       knowledgeIndexer = undefined;
@@ -613,11 +623,26 @@ export async function createSiclawSession(
 
   // Shared task-ledger id; sub-agents pass the parent's id to share its ledger.
   const taskListId = opts?.taskListId ?? randomUUID();
+  const feedbackContext = {
+    userId: opts?.userId ?? config.userId ?? "", agentId,
+    persist: async (report: Record<string, unknown>) => {
+      // The SDK buffers a brand-new disk session until its first assistant
+      // entry. Feedback is collected after a review conversation; do not
+      // acknowledge an in-memory-only buffer as a persisted disk report.
+      if (sessionManager.getSessionFile() && !sessionManager.getEntries().some(entry => entry.type === "message" && entry.message.role === "assistant"))
+        throw new Error("A persisted feedback review conversation is required");
+      const safe = redactModelJson(report, text => redactModelOutput(redactDataDocument(text).text));
+      return { id: sessionManager.appendCustomEntry("product-feedback", safe) };
+    },
+  };
+  const allowClusterProbe = allowedTools === null || allowedTools.includes("bash") || allowedTools.includes("k8s_inspect");
 
   const customTools = registry.resolve({
     mode,
     refs: {
+      executionClient: opts?.executionClient,
       kubeconfigRef, userId, agentId, sessionIdRef, taskListId, turnRef,
+      allowClusterProbe, feedbackContext,
       scriptExecutor: useCodex ? undefined : opts?.scriptExecutor,
       scriptSandboxInfo: useCodex ? undefined : opts?.scriptSandboxInfo,
       isSubagent: opts?.isSubagent ?? false,
@@ -665,7 +690,10 @@ export async function createSiclawSession(
   // -- MCP external tools (dynamic discovery, not in registry) --
   const exposeConfiguredMcp = compiledContext.harness.mcpExposure === "configured";
   const sandboxOnly = opts?.agentEngine !== "codex" && allowedTools?.length && allowedTools.every(name => name === "run_script");
-  const mcpServers = exposeConfiguredMcp && !sandboxOnly ? (opts?.mcpServers ?? config.mcpServers ?? {}) : {};
+  const allMcpServers = exposeConfiguredMcp && !sandboxOnly ? (opts?.mcpServers ?? config.mcpServers ?? {}) : {};
+  const mcpServers = channelPolicy ? Object.fromEntries(Object.entries(allMcpServers).filter(([,server])=>
+    channelPolicy.operations.includes("mcp") && typeof server==="object" && server!==null && "siclawId" in server &&
+    channelPolicy.mcp.some(rule=>rule.serverId===server.siclawId))) : allMcpServers;
   const sensitiveValues = () => [...Object.values(config.providers).map(provider => provider.apiKey),
     ...mcpSensitiveValues(mcpServers), ...(kubeconfigRef.credentialBroker?.getSensitiveValues() ?? [])];
   const redactModelOutput = createModelOutputRedactor(sensitiveValues);
@@ -689,7 +717,7 @@ export async function createSiclawSession(
     enabled: opts?.agentEngine !== "codex" && exposeConfiguredMcp, allowedTools,
     mcpServers,
     sensitiveValues,
-    privateRoots: () => [path.dirname(getConfigPath()), ...(kubeconfigRef.credentialBroker?.getPrivateDirectory?.()
+    privateRoots: () => [path.dirname(getConfigPath()), ...(kubeconfigRef.credentialsDir ? [path.resolve(kubeconfigRef.credentialsDir)] : []), ...(kubeconfigRef.credentialBroker?.getPrivateDirectory?.()
       ? [kubeconfigRef.credentialBroker.getPrivateDirectory()] : [])],
     mcpManager: opts?.mcpManager, mcpTools: opts?.mcpTools,
   });
@@ -923,6 +951,8 @@ export async function createSiclawSession(
           knowledgeDir,
           Boolean(citationSupport),
           compiledContext.harness.includeOperationalSafety,
+          "knowledge_cite",
+          !channelPolicy,
         ).concat(compiledContext.harness.agentType === "knowledge_qa" && allowedTools?.includes("write")
           ? [`\n## Research Workspace\nSave working notes and generated results under \`${userDataDir}\`. Use available Skill helpers when computation or processing helps answer the question; reading a Skill does not authorize unrelated actions.`]
           : []),
@@ -1018,7 +1048,8 @@ export async function createSiclawSession(
   // Codex owns its native tools and children. Cross-Agent handoff is not exposed
   // by this engine; the separately selectable Pi runtime keeps its own contract.
   if (useCodex) {
-    const nativeKnowledgeEnabled = Boolean(citationSupport && (!Array.isArray(allowedTools) || allowedTools.includes("read")));
+    const nativeKnowledgeEnabled = Boolean(citationSupport && (!Array.isArray(allowedTools) || allowedTools.includes("read")) &&
+      (!channelPolicy || channelPolicy.operations.includes("knowledge") && channelPolicy.knowledgeIds.length>0));
     fs.mkdirSync(userDataDir, { recursive: true });
     const allowNativeFileRead = customTools.some((tool) => ["read", "grep", "find", "ls"].includes(tool.name));
     const nativeSkills = loadedSkills.map((skill) => ({name:skill.name, filePath:skill.filePath}));
@@ -1036,12 +1067,20 @@ export async function createSiclawSession(
         deniedRoots: [...blockedFileDirs.map((item) => item.dir), sessionManager.getSessionDir(),
           path.join(userDataDir,"agent","codex"),
           path.dirname(getConfigPath()),
+          ...(kubeconfigRef.credentialsDir ? [path.resolve(kubeconfigRef.credentialsDir)] : []),
           path.resolve(cwd, config.paths.credentialsDir), path.resolve(cwd, ".siclaw", "config")],
         allowCommands: customTools.some((tool) => tool.name === "bash"),
         allowFileCommands: allowNativeFileRead,
         production: process.env.NODE_ENV === "production", environment: { PATH: process.env.PATH ?? "/usr/bin:/bin" },
-        skillScripts: nativeScriptGrants, redactOutput: redactModelOutput };
+        skillScripts: nativeScriptGrants, redactOutput: redactModelOutput,
+        channelPolicy: kubeconfigRef.credentialBroker?.getChannelPolicy(),
+        validateChannelPolicy: () => kubeconfigRef.credentialBroker?.validateChannelPolicy() ?? Promise.resolve() };
     nativeScriptGrants.privateRoots = nativeGrants.deniedRoots;
+    if(channelPolicy){
+      nativeGrants.readRoots=[builtinSkillsRoot,skillsBase,...loadedSkills.map(skill=>path.dirname(skill.filePath)),...(nativeKnowledgeEnabled?[knowledgeDir]:[])];
+      nativeGrants.deniedRoots=[...nativeGrants.deniedRoots,originalKnowledgeDir,...(!channelPolicy.reports?[reportsDir]:[])];
+      nativeScriptGrants.privateRoots=nativeGrants.deniedRoots;
+    }
     const environments: Array<{ id: string; grants: typeof nativeGrants }> = [];
     const allowNativePod = customTools.some(tool => tool.name === "pod_exec");
     const allowNativeNode = customTools.some(tool => tool.name === "node_exec");
@@ -1070,40 +1109,54 @@ export async function createSiclawSession(
       const hosts = await broker.refreshHosts();
       nativeGrants.infrastructure = { kind: "ssh", broker, allowCommands: customTools.some(tool => tool.name === "host_exec") };
       nativeHostHint = "Use native exec_command in the siclaw environment for SSH: ssh <bound-host-name-or-id> -- <read-only command>. " +
+        "For host tools in a Pod's network namespace use ssh <bound-host> --pod <pod> --namespace <namespace> [--container <container>] -- <read-only command>. " +
+        "The bound host must be the Pod's node and its account must permit crictl/netns access. The backend resolves the netns; never supply ip netns exec or a netns name. " +
         "The broker resolves identity, credentials and configured bastions; do not supply SSH options or credentials. " +
         "Bound SSH host handles (first 50): " + hosts.slice(0, 50).map(host => host.id || host.name).join(", ");
     }
+    const nativeDraftsRoot = customTools.some(tool => tool.name === "skill_preview")
+      ? path.join(userDataDir, "skill-drafts", sessionManagerId) : undefined;
     brain = await CodexAgentBrain.create({
       sessionManager, systemPrompt: [compiledContext.systemPrompt,
         ...buildAppendSystemPrompt(memoryEnabled ? memoryDir : null, knowledgeDir,
-          nativeKnowledgeEnabled, compiledContext.harness.includeOperationalSafety, "mcp__siclaw_knowledge.knowledge_cite"),
+          nativeKnowledgeEnabled, compiledContext.harness.includeOperationalSafety, "mcp__siclaw_knowledge.knowledge_cite", !channelPolicy),
         environments.length ? "Authorized read-only infrastructure execution environments: " +
           environments.map((entry) => entry.id).join(", ") +
           ". Select environment_id in native exec_command. cluster: environments support read-only kubectl queries; " +
           "when authorized, use kubectl -n <namespace> exec <pod> [-c <container>] -- <read-only command> " +
-          "or kubectl debug node/<node> -- <read-only command>. Node helper image/lifecycle are platform-owned. " +
+          "or kubectl debug node/<node> -- <read-only command>. For host tools inside a Pod's network namespace use kubectl -n <namespace> debug pod/<pod> [-c <container>] -- <read-only command>; this requires node diagnostics, not ordinary Pod exec. " +
+          "The backend resolves the Pod's node/netns and runs in the platform-owned node helper; it does not create an ephemeral container in the target Pod. Node helper image/lifecycle are platform-owned. " +
           "Do not supply credentials, connection overrides, interactive shells or write commands." : "",
         nativeHostHint,
+        nativeDraftsRoot ? `For Skill authoring, write ALL draft files with native apply_patch under ${nativeDraftsRoot}/<name>, then call skill_preview once with that directory. Use this session-owned absolute path. Preview never approves or executes proposed code.` : "",
         nativeScriptGrants.assets.length && Object.values(nativeScriptGrants.allowed).some(Boolean)
           ? "Execute loaded Skill scripts with native exec_command, after reading their SKILL.md: bash <absolute Skill scripts/*.sh path> <args> " +
             "or python3 <absolute Skill scripts/*.py path> <args>. Local scripts run in siclaw, or in cluster:<name> to use that bound kubeconfig. " +
             "For authorized remote scripts use ssh <bound-host> -- bash/python3 <local Skill script path> <args>, " +
             "kubectl -n <namespace> exec <pod> [-c <container>] -- bash/python3 <local Skill script path> <args>, " +
             "or kubectl debug node/<node> -- bash/python3 <local Skill script path> <args>. " +
+            "Pod netns selection also supports these unchanged approved scripts via kubectl -n <namespace> debug pod/<pod> -- bash/python3 <local Skill script path> <args> (node_script grant) or ssh <bound-host> --pod <pod> --namespace <namespace> -- bash/python3 <local Skill script path> <args> (host_script grant). " +
             "The platform sends the approved asset bytes to remote stdin; do not upload, edit or copy scripts yourself. " +
             "Use one literal call, no pipeline, redirection, inline code or interpreter options. An optional timeout <positive integer seconds> may precede the interpreter. " +
             "There is no adapter runtime deadline. Poll through native write_stdin; session/turn Stop cancels execution. Interactive input is unavailable. " +
             "Execution requires its separate local/pod/node/host script capability. Only the selected, unchanged Skill assets are executable."
           : ""].join("\n\n"),
       toolsetsByName, cwd: userDataDir, nativePlanEnabled, grants: nativeGrants, environments,
+      defaultRequestMode: mode === "web" ? "async" : "sync",
       mcpServers: mcpServers as Record<string, McpServerConfig>, sensitiveValues, codexHome,
+      codexHomeScope: { userDataDir, agentId, userId: opts?.userId, sessionId: sessionManagerId },
       authorizeMcp: opts?.authorizeNativeMcp,
       ...(nativeKnowledgeEnabled
         ? { knowledge: { directory: knowledgeDir, emit: opts!.sessionEventEmitter! } } : {}),
       allowSubagents: nativeAllowSubagents,
       dpStateRef: mutableDpStateRef,
-      workflow: { schedule: customTools.some(tool => tool.name === "manage_schedule"),
-        report: customTools.some(tool => tool.name === "task_report"), sessionId: () => sessionIdRef.current },
+      workflow: { schedule: customTools.some(tool => tool.name === "manage_schedule") && (!channelPolicy || channelPolicy.reports),
+        executionClient: opts?.executionClient,
+        report: customTools.some(tool => tool.name === "task_report") && (!channelPolicy || channelPolicy.reports), sessionId: () => sessionIdRef.current || sessionManagerId,
+        kubeconfigRef, clusterList: customTools.some(tool => tool.name === "cluster_list"), hostList: customTools.some(tool => tool.name === "host_list"),
+        allowClusterProbe, draftsRoot: nativeDraftsRoot,
+        feedback: customTools.some(tool => tool.name === "save_feedback") && (!channelPolicy || channelPolicy.reports) ? feedbackContext : undefined,
+        channelUpdate: customTools.some(tool => tool.name === "channel_update") ? opts?.channelMessageExecutor : undefined },
       ...(opts?.sessionEventEmitter && (mode === "web" || mode === "channel" || opts.allowInputRequest === true)
         ? { userQuestions: { emit: opts.sessionEventEmitter, waitForAnswer: opts.allowInputRequest !== true } } : {}),
       onPlanUpdate: opts?.sessionEventEmitter

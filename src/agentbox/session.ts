@@ -1,4 +1,6 @@
 import { UsageOutbox } from "./usage-outbox.js";
+import { BoxExecutionGrants, type BoxExecutionGrant } from "./execution-grants.js";
+import type { ExecutionAuthorization } from "../shared/execution-context.js";
 import { createNativeChildSink } from "./native-child-persistence.js";
 /**
  * AgentBox session manager
@@ -126,6 +128,8 @@ import { extractToolResultId } from "../core/message-utils.js";
 type SubagentTraceContext = { apiRequestId?: string; mainTraceId?: string; spawnSpanContext?: SpanContext };
 
 export interface ManagedSession {
+  executionGrant?: BoxExecutionGrant;
+  releaseExecutionGrant?: () => void;
   agentPrompt?: string;
   id: string;
   /** User identity bound to this conversation's tools and child-session persistence. */
@@ -156,6 +160,7 @@ export interface ManagedSession {
   _promptDone: boolean;
   /** User-input policy for the whole accepted request, including root continuations. */
   _requestMode?: RequestMode;
+  _channelDeliveryId?: string;
   /** Result of the whole prompt, for live and late event-stream subscribers. */
   _promptOutcome?: import("../shared/execution-lifecycle.js").ExecutionOutcome;
   /** Launch ownership and mailbox scoped to the current user prompt. */
@@ -398,6 +403,8 @@ async function abortBrainBestEffort(
 }
 
 export class AgentBoxSessionManager {
+  private executionGrants?: BoxExecutionGrants;
+  revokeExecutionGrants(ids: readonly string[]): void { this.executionGrants?.revoke(ids); }
   private sessions = new Map<string, ManagedSession>();
   private subagentRuns = new Map<string, { mailbox: SubagentMailbox; jobId: string; restoredSession?: SessionManager }>();
   // Retain the launching request owner until notification, even if Stop/handoff
@@ -408,6 +415,7 @@ export class AgentBoxSessionManager {
   /** Both HTTP and fallback turns use the same mailbox and late-result recovery. */
   beginBackgroundWorkTurn(managed: ManagedSession, mode: RequestMode = "async"): BackgroundWorkTurn {
     managed._requestMode = mode;
+    managed.brain.beginRequest?.(mode);
     const apiRequestId = managed._apiRequestId;
     const turn = new BackgroundWorkTurn(notification => {
       const job = this.jobs.get(notification.taskId);
@@ -418,6 +426,16 @@ export class AgentBoxSessionManager {
     });
     managed._backgroundWorkTurn = turn;
     managed.brain.setMailbox?.(turn.mailbox);
+    managed.brain.setNativeChildRecovery?.(scopeId => {
+      const recover = () => {
+        if (mode !== "async" || turn.isCancelled || this.sessions.get(managed.id) !== managed || managed._aborted) return;
+        this.queueParentNotification(managed, { taskId: scopeId, status: "done", summary: "Owned native child executions ended", nativeChild: true }, apiRequestId);
+      };
+      // A late result is not steering for a newer request, even when Web turns
+      // have no API receipt. Wait for its successor to finish before recovery.
+      if (!managed._promptDone && managed._backgroundWorkTurn !== turn) managed._promptDoneCallbacks.add(recover);
+      else recover();
+    });
     return turn;
   }
 
@@ -1935,6 +1953,7 @@ export class AgentBoxSessionManager {
         type: "channel.deliver_message",
         message: {
           sessionId: request.sessionId,
+          requestId: this.sessions.get(request.sessionId)?._channelDeliveryId,
           kind: request.kind,
           text,
           fromAgentId: this.agentId,
@@ -2324,8 +2343,12 @@ export class AgentBoxSessionManager {
     }
     for (const [receipt, notifications] of byRequest) {
       const hasSubagent = notifications.some(n => this.jobs.get(n.taskId)?.type === "subagent");
+      // Native children have no Pi JobRegistry entry. Their continuation input
+      // still belongs to the framework, not a new human request, and must be
+      // durable/hidden before the model starts just like a late Pi child result.
+      const persistInput = hasSubagent || notifications.some(n => n.nativeChild);
       await this.runSyntheticPrompt(managed,
-        hasSubagent ? lateSubagentResultPrompt(notifications) : buildNotificationBatch(notifications), hasSubagent, receipt);
+        hasSubagent ? lateSubagentResultPrompt(notifications) : buildNotificationBatch(notifications), persistInput, receipt);
     }
   }
 
@@ -2552,6 +2575,7 @@ export class AgentBoxSessionManager {
           }
           if (managed._aborted) backgroundWorkTurn.cancel();
           else backgroundWorkTurn.finish();
+          managed.brain.endRequest?.();
           managed.brain.setMailbox?.(undefined);
           managed.brain.llmCalls?.endPrompt({ explicit: true });
           managed._promptDone = true;
@@ -2886,9 +2910,11 @@ export class AgentBoxSessionManager {
     const childSessionManager = this.subagentRuns.get(childSessionId)?.restoredSession
       ?? SessionManager.continueRecent(process.cwd(), childSessionDir);
     const config = loadConfig();
+    const inheritedExecutionGrant = this.sessions.get(request.parentSessionId)?.executionGrant;
     const kubeconfigRef: KubeconfigRef = {
       credentialsDir: this.credentialsDir ?? path.resolve(process.cwd(), config.paths.credentialsDir),
-      credentialBroker: this.credentialBroker,
+      credentialBroker: inheritedExecutionGrant?.broker ?? this.credentialBroker,
+      identity: inheritedExecutionGrant?.identity,
     };
     const type = getSubagentType(request.subagentType) ?? getSubagentType(DEFAULT_SUBAGENT_TYPE)!;
     const agentId = request.parentAgentId ?? this.agentId ?? null;
@@ -2912,6 +2938,7 @@ export class AgentBoxSessionManager {
     // launch, even if a queued child starts after the parent has finished its turn.
     const parentMailbox = this.backgroundWorkOwners.get(request.spawnId.split("#")[0])?.mailbox;
     const child = await createSiclawSession({
+      executionClient: inheritedExecutionGrant?.client,
       mcpManager: sharedMcpManager,
       sessionManager: childSessionManager,
       kubeconfigRef,
@@ -3517,14 +3544,28 @@ export class AgentBoxSessionManager {
     handoffPolicy?: import("../shared/agent-handoff.js").HandoffPolicy,
     structuredResultRequired = false,
     requestedAgentEngine: "pi-agent" | "codex" = "pi-agent",
+    authorization?: ExecutionAuthorization,
   ): Promise<ManagedSession> {
     const id = sessionId || this.defaultSessionId;
     const effectiveUserId = requestUserId?.trim() || this.userId;
     const codexMarker = path.join(this.getSessionDir(id), "codex-thread.json");
     const agentEngine = requestedAgentEngine;
+    let executionGrant: BoxExecutionGrant | undefined;
+    if (authorization) {
+      if (!this.gatewayClient) throw new Error("Execution authorization needs a Runtime");
+      const config = loadConfig();
+      this.executionGrants ??= new BoxExecutionGrants(this.gatewayClient,
+        this.credentialsDir ?? path.resolve(process.cwd(), config.paths.credentialsDir));
+      executionGrant = await this.executionGrants.accept(authorization.grantId, id, authorization.identity);
+      if (executionGrant.policy && agentEngine !== "codex") throw new Error("Channel policy requires the native Codex enforcement runtime");
+    }
 
     const existing = this.sessions.get(id);
     if (existing) {
+      if (existing.executionGrant?.grantId !== executionGrant?.grantId
+          && (!existing._promptDone || existing._promptInflight || (existing._backgroundWorkCount ?? 0) > 0
+            || this.hasPendingNotificationWork(existing)))
+        throw Object.assign(new Error("Session execution authorization is still in use"), { status: 409 });
       existing.lastActiveAt = new Date();
       if (effectiveUserId && existing.userId && effectiveUserId !== existing.userId) {
         throw new Error(`Session ${id} is already bound to a different user`);
@@ -3560,6 +3601,7 @@ export class AgentBoxSessionManager {
         }
         // Rebuild an idle session when its execution context changes.
         const sameInputCapability = existing.allowInputRequest === allowInputRequest
+          && existing.executionGrant?.grantId === executionGrant?.grantId
           && Boolean(existing.handoffSupported) === handoffSupported
           && Boolean(existing.structuredResultRequired) === structuredResultRequired
           && JSON.stringify(existing.handoffPolicy) === JSON.stringify(handoffPolicy)
@@ -3612,8 +3654,10 @@ export class AgentBoxSessionManager {
     const kubeconfigRef: KubeconfigRef = {
       // Prefer the per-user dir set by LocalSpawner; fall back to the
       // config-driven global path (K8s mode and CLI both use this).
+      // Protect the complete credential root, not only this grant's directory.
       credentialsDir: this.credentialsDir ?? path.resolve(process.cwd(), config.paths.credentialsDir),
-      credentialBroker: this.credentialBroker,
+      credentialBroker: executionGrant?.broker ?? this.credentialBroker,
+      identity: executionGrant?.identity,
     };
     const effectiveMode = mode ?? "web";
 
@@ -3673,7 +3717,7 @@ export class AgentBoxSessionManager {
     // full pod/process restart from the PV snapshot. taskListId == session id.
     this.rehydrateLedger(id);
 
-    const gc = this.gatewayClient;
+    const gc = executionGrant?.client ?? this.gatewayClient;
     // Load the authorized handoff index from the control plane.
     let handoffTargets: HandoffTarget[] | undefined;
     if (gc) {
@@ -3688,6 +3732,7 @@ export class AgentBoxSessionManager {
     // or couple native code execution to the disposable-runner enablement switch.
     const scriptInfo = agentEngine === "pi-agent" && effectiveMode === "web" && gc ? await gc.scriptSandboxInfo() : undefined;
     const result = await createSiclawSession({
+      executionClient: gc,
       agentEngine,
       scriptExecutor: scriptInfo?.enabled ? (request, _sessionId, signal) => gc!.runScript(request, id, signal) : undefined,
       scriptSandboxInfo: scriptInfo,
@@ -3754,6 +3799,7 @@ export class AgentBoxSessionManager {
     }
 
     const managed: ManagedSession = {
+      executionGrant,
       agentPrompt: systemPromptTemplate,
       id,
       userId: effectiveUserId,
@@ -3816,10 +3862,21 @@ export class AgentBoxSessionManager {
     };
 
     this.sessions.set(id, managed);
+    if (executionGrant) {
+      const busy = () => !managed._promptDone || Boolean(managed._promptInflight)
+        || (managed._backgroundWorkCount ?? 0) > 0 || this.hasPendingNotificationWork(managed);
+      const end = () => {
+        managed._aborted = true;
+        this.stopSessionJobs(id);
+        void managed.brain.abort().catch(() => {});
+      };
+      executionGrant.onEnd.add(end); executionGrant.busy.add(busy);
+      managed.releaseExecutionGrant = () => { executionGrant.onEnd.delete(end); executionGrant.busy.delete(busy); };
+    }
     if (result.brain.setNativeChildSink && this.gatewayClient && this.agentId && effectiveUserId) {
       const nativeRunning = new Set<string>();
-      result.brain.setNativeChildSink(createNativeChildSink({ gateway: this.gatewayClient,
-        rootSessionId: id, agentId: this.agentId, userId: effectiveUserId,
+      result.brain.setNativeChildSink(createNativeChildSink({ gateway: executionGrant?.client ?? this.gatewayClient,
+        rootSessionId: id, agentId: this.agentId, userId: executionGrant?.sender?.userId ?? effectiveUserId,
         redact: text => redactText(text, buildRedactionConfigForModelConfig(this.delegationModelConfig)),
         recordUsage: observation => {
           if (!this.usageOutbox) throw new Error("Native child usage collector is unavailable");
@@ -4184,6 +4241,7 @@ export class AgentBoxSessionManager {
     }
 
     console.log(`[agentbox-session] Releasing session: ${sessionId}`);
+    managed.releaseExecutionGrant?.();
     await managed.brain.close?.();
 
     // 1. Auto-save session memory (dedup: only if new messages since last save)
@@ -4306,6 +4364,7 @@ export class AgentBoxSessionManager {
     const managed = this.sessions.get(sessionId);
     if (managed) {
       console.log(`[agentbox-session] Closing session: ${sessionId}`);
+      managed.releaseExecutionGrant?.();
       await managed.brain.close?.();
       if (managed._releaseTimer) {
         clearTimeout(managed._releaseTimer);
@@ -4360,6 +4419,7 @@ export class AgentBoxSessionManager {
    * Called on AgentBox shutdown.
    */
   async closeAll(): Promise<void> {
+    this.executionGrants?.close();
     console.log(`[agentbox-session] Closing all sessions (${this.sessions.size})`);
     // Snapshot and clear the map atomically — prevents in-flight release()
     // from emitting a duplicate session_released for the same session.
@@ -4367,6 +4427,7 @@ export class AgentBoxSessionManager {
     this.sessions.clear();
 
     for (const [id, managed] of snapshot) {
+      managed.releaseExecutionGrant?.();
       await managed.brain.close?.();
       if (managed._releaseTimer) {
         clearTimeout(managed._releaseTimer);

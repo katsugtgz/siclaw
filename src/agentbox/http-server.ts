@@ -16,6 +16,7 @@ import fs from "node:fs";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import http from "node:http";
+import { configuredAgentEngine } from "../shared/agent-engine.js";
 import https from "node:https";
 import { isAuthenticatedRuntime } from "./runtime-auth.js";
 import { record } from "../script-sandbox/validation.js";
@@ -91,6 +92,10 @@ interface Route {
 }
 
 interface PromptRequestBody {
+  identity?: import("../shared/execution-identity.js").ExecutionIdentity;
+  sender?: import("../shared/execution-context.js").ExecutionSender;
+  grantId?: string;
+  channelDeliveryId?: string;
   requestMode?: RequestMode;
   /** Trusted Runtime continuation context; per-request, never session-cached. */
   handoffTrace?: unknown;
@@ -439,7 +444,7 @@ function requestBindingCandidate(body: PromptRequestBody): ModelRouteCandidate |
 function promptAgentEngine(_body: PromptRequestBody): "pi-agent" | "codex" {
   // An explicitly selected engine owns this session. Unsupported Responses
   // bindings fail at model binding rather than silently invoking Pi.
-  return process.env.SICLAW_AGENT_ENGINE === "codex" ? "codex" : "pi-agent";
+  return configuredAgentEngine();
 }
 
 /**
@@ -908,6 +913,14 @@ export function createHttpServer(
    * The message is sent to the Agent, and responses are returned via SSE stream.
    */
   // Dedicated callback; bypasses the prompt queue to avoid deadlocking run_script.
+  addRoute("POST", "/api/internal/execution-grants/revoke", async (req,res)=>{
+    if(!useTls && !["127.0.0.1","::1","::ffff:127.0.0.1"].includes(req.socket.remoteAddress??"")){sendJson(res,403,{error:"Revocation denied"});return;}
+    const body=await parseJsonBody(req) as {grant_ids?:unknown};
+    if(!Array.isArray(body?.grant_ids)||body.grant_ids.length>128||body.grant_ids.some(id=>typeof id!=="string"||!/^[A-Za-z0-9._-]{1,128}$/.test(id))){sendJson(res,400,{error:"Invalid revocation"});return;}
+    sessionManager.revokeExecutionGrants(body.grant_ids);sendJson(res,200,{ok:true});
+  });
+
+  // Dedicated callback; bypasses the prompt queue to avoid deadlocking run_script.
   // The unguessable per-invocation grant is required in BOTH local and mTLS modes.
   addRoute("POST", "/api/internal/sandbox-tool", async (req, res) => {
     if (!useTls && !["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(req.socket.remoteAddress ?? "")) {
@@ -1024,17 +1037,25 @@ export function createHttpServer(
       sendJson(res, SESSION_CONTEXT_UNAVAILABLE_STATUS, { error: detail });
       return;
     }
+    const { parseWireIdentity } = await import("../shared/execution-identity.js");
+    const { executionOwnerKey } = await import("../shared/execution-context.js");
+    const executionIdentity = parseWireIdentity(body.identity);
+    if ((body.identity !== undefined && !executionIdentity) || (body.grantId && !executionIdentity)
+        || (executionIdentity && !body.grantId)) {
+      sendJson(res, 403, { error: "Execution identity requires a Runtime authorization" }); return;
+    }
     const managed = await sessionManager.getOrCreate(
       body.sessionId,
       body.mode,
       body.systemPromptTemplate,
       activeMode,
-      body.userId,
+      executionIdentity ? executionOwnerKey(executionIdentity, body.sessionId ?? "") : body.userId,
       body.allowInputRequest === true,
       body.handoffSupported === true,
       parseHandoffPolicy(body.handoffPolicy),
       Boolean(requiredResultToolName),
       promptAgentEngine(body),
+      executionIdentity && body.grantId ? { grantId: body.grantId, identity: executionIdentity, sender: body.sender } : undefined,
     );
     // Still fail closed when a Ticket instance DID declare a contract: a named
     // result tool it cannot call is a misbinding, and letting the turn run would
@@ -1097,6 +1118,7 @@ export function createHttpServer(
     managed._promptDone = false;
     sessionManager.setUsageRole(managed.id, String(body.origin) === "delegation" ? "delegated" : "root", body.apiRequestId);
     managed._requestMode = requestMode;
+    managed._channelDeliveryId = typeof body.channelDeliveryId === "string" ? body.channelDeliveryId : undefined;
     managed._promptOutcome = undefined;
     managed._aborted = false;
     // LLM-call timeline: the prompt is accepted NOW. Everything between here and
@@ -1302,6 +1324,7 @@ export function createHttpServer(
       reportUnsubscribe();
       if (managed._aborted) backgroundWorkTurn.cancel();
       else backgroundWorkTurn.finish();
+      managed.brain.endRequest?.();
       managed.brain.setMailbox?.(undefined);
       managed._promptOutcome ??= managed._aborted ? "aborted" : promptOutcome;
       managed._promptDone = true;
@@ -1822,6 +1845,28 @@ export function createHttpServer(
     const managed = sessionManager.get(sessionId);
     const running = !!managed && (managed._promptDone === false || managed.isAgentActive || managed.isCompacting || managed.isRetrying);
     sendJson(res, 200, { running });
+  });
+
+  // Codex-only UI input. Never falls back to a new prompt or execution approval.
+  addRoute("GET", "/api/sessions/:sessionId/user-input", async (_req, res, params) => {
+    const brain = sessionManager.get(params.sessionId)?.brain;
+    sendJson(res, 200, { nativeUserInput: brain?.brainType === "codex" ? brain.getPendingUserInput?.() ?? null : null });
+  });
+  for (const prepare of [true, false]) addRoute("POST", `/api/sessions/:sessionId/user-input${prepare ? "/prepare" : ""}`, async (req, res, params) => {
+    const managed = sessionManager.get(params.sessionId);
+    if (managed?.brain.brainType !== "codex" || !managed.brain.submitUserInput) {
+      sendJson(res, 409, { error: "USER_INPUT_EXPIRED: No active native question" });
+      return;
+    }
+    try {
+      const answer = await parseJsonBody(req);
+      const response = answer as import("../shared/native-user-input.js").NativeUserInputAnswer;
+      const result = prepare ? managed.brain.prepareUserInput!(response) : managed.brain.submitUserInput(response);
+      sendJson(res, 200, { ok: true, ...result, traceId: tracingRecorder.getRootTraceId(params.sessionId) });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Invalid user answer";
+      sendJson(res, message.startsWith("USER_INPUT_INVALID:") ? 400 : 409, { error: message });
+    }
   });
 
   /**

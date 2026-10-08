@@ -9,6 +9,33 @@ const model = { id: "test", name: "Test", provider: "test", api: "openai-respons
   contextWindow: 8_000, maxTokens: 1_000, reasoning: false };
 
 describe("CodexAgentBrain compatibility", () => {
+  it.each([true, false])("Stop cancels owned executor handles, not only model waiting (active turn: %s)", async active => {
+    const brain = Object.create(CodexAgentBrain.prototype) as any;
+    const order: string[] = [];
+    const executor = { cancelProcesses: vi.fn(() => order.push("executor")) };
+    const cluster = { cancelProcesses: vi.fn(() => order.push("cluster")) };
+    brain.executor = executor; brain.clusterExecutors = new Map([["cluster:test", cluster]]);
+    brain.pendingSteers = []; brain.followUps = []; brain.promptInFlight = true;
+    brain.requestScopes = new Set([{ cancel: vi.fn(async () => { order.push("child"); }) }]);
+    brain.threadId = "owned-root";
+    brain.active = active ? { id: "active-turn" } : undefined;
+    brain.client = { request: vi.fn(async () => { order.push("interrupt"); }) };
+    await brain.abort();
+    expect(executor.cancelProcesses).toHaveBeenCalledOnce();
+    expect(cluster.cancelProcesses).toHaveBeenCalledOnce();
+    expect(order.slice(0, 2)).toEqual(["executor", "cluster"]);
+    expect(brain.abortPending).toBe(true);
+  });
+  it("resumes by native thread id without an unsupported rollout path parameter", async () => {
+    const brain = Object.create(CodexAgentBrain.prototype) as any;
+    const request=vi.fn().mockResolvedValue({thread:{id:"saved-thread",path:"/native/history"}});
+    brain.ensureClient=async()=>({request});brain.threadId="saved-thread";brain.rolloutPath="/prior/history";
+    brain.codexConfig=()=>({});brain.cwd="/workspace";brain.systemPrompt="scoped";
+    brain.persistThread=vi.fn();
+    await brain.ensureThread();
+    expect(request.mock.calls[0]).toEqual(["thread/resume",{threadId:"saved-thread",model:undefined,modelProvider:"siclaw_model",config:{},cwd:"/workspace",sandbox:"read-only",approvalPolicy:"never",developerInstructions:"scoped"}]);
+    expect(brain.persistThread).toHaveBeenCalledOnce();
+  });
   it("keeps an error-only native MCP reason in events and persisted tool results", () => {
     const brain = Object.create(CodexAgentBrain.prototype) as any;
     const events: any[] = [], messages: any[] = [];
@@ -184,8 +211,26 @@ describe("CodexAgentBrain compatibility", () => {
     }
   });
 
+  it("sends original user images to native input without echoing bytes into public history", async () => {
+    const brain = Object.create(CodexAgentBrain.prototype) as any;
+    Object.assign(brain, { requestScopes: new Set(), rootTurnOwners: new Map(), childTurnOwners: new Map(),
+      closed: false, model, followUps: [], pendingSteers: [], listeners: new Set(),
+      executor: { resumeProcesses: vi.fn() }, clusterExecutors: new Map() });
+    brain.transformInput = vi.fn().mockResolvedValue({ text: "Inspect the image", media: { images: [{ mimeType: "image/png", data: "aGVsbG8=" }] } });
+    brain.ensureThread = vi.fn().mockResolvedValue(undefined);
+    brain.runTurn = vi.fn().mockImplementation(async () => { brain.lastTurnHadContent = true; brain.lastToolNames = new Set(); });
+    await brain.prompt("Inspect the image");
+    const [input, publicMessage] = brain.runTurn.mock.calls[0];
+    expect(input).toContainEqual({ type: "image", url: "data:image/png;base64,aGVsbG8=" });
+    expect(publicMessage.content).toBe("Inspect the image");
+    expect(JSON.stringify(publicMessage)).not.toContain("aGVsbG8=");
+    expect(brain.executor.resumeProcesses).toHaveBeenCalledOnce();
+  });
+
   it("retries an empty completed turn with Pi-compatible retry events", async () => {
     const brain = Object.create(CodexAgentBrain.prototype) as any;
+    brain.requestScopes = new Set(); brain.rootTurnOwners = new Map(); brain.childTurnOwners = new Map();
+    brain.executor = { resumeProcesses: vi.fn() }; brain.clusterExecutors = new Map();
     const events: any[] = [];
     brain.closed = false;
     brain.model = model;

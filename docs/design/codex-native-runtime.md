@@ -102,6 +102,14 @@ waits for its security boundary. See
 [codex-readonly-infrastructure.md](codex-readonly-infrastructure.md#native-long-processes-and-output).
 
 The pinned native `thread/resume` protocol does not accept `environments`.
+It also does not accept a rollout `path`. Existing conversations therefore
+persist and owner-verify their original native HOME in the private session
+sidecar. A Skill-set change affects new-conversation HOME selection and freshly
+resolved execution/MCP grants, not the existing thread's storage location.
+Legacy sidecars recover that location only after validating its historical
+scope hash against the current owner. Redirected homes or another owner fail
+closed; no native DB, history or memory is copied. This preserves existing
+native storage behavior rather than introducing a new memory-isolation design.
 Every `turn/start` must select the authorized environments again. Siclaw also
 sets `include_local = false` and `default = "none"` in the native environment
 registry, so an omitted selection or internal worker cannot fall back to an

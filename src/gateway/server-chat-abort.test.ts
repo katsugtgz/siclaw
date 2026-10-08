@@ -138,7 +138,7 @@ async function bootRuntime(agentBoxManager = fakeAgentBoxManager(), frontendClie
     config: { port: 0, internalPort: 0, host: "127.0.0.1", serverUrl: "", portalSecret: "" } as any,
     agentBoxManager,
     frontendClient,
-    credentialService: {} as any,
+    credentialService: { attachGrants: () => {}, resolveActorResources: async () => ({ clusters: [], hosts: [] }) } as any,
   });
 }
 

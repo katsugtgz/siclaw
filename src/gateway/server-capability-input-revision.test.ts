@@ -110,7 +110,7 @@ describe("capability.start immutable input revision", () => {
       config: { port: 0, internalPort: 0, host: "127.0.0.1", serverUrl: "", portalSecret: "" } as any,
       agentBoxManager: manager,
       frontendClient: frontend,
-      credentialService: {} as any,
+      credentialService: { attachGrants: () => {}, resolveActorResources: async () => ({ clusters: [], hosts: [] }) } as any,
     });
 
     const start = server.rpcMethods.get("capability.start")!;
@@ -132,7 +132,7 @@ describe("capability.start immutable input revision", () => {
       config: { port: 0, internalPort: 0, host: "127.0.0.1", serverUrl: "", portalSecret: "" } as any,
       agentBoxManager: manager,
       frontendClient: frontend,
-      credentialService: {} as any,
+      credentialService: { attachGrants: () => {}, resolveActorResources: async () => ({ clusters: [], hosts: [] }) } as any,
     });
 
     const start = server.rpcMethods.get("capability.start")!;
@@ -167,7 +167,7 @@ describe("capability.start immutable input revision", () => {
       config: { port: 0, internalPort: 0, host: "127.0.0.1", serverUrl: "", portalSecret: "" } as any,
       agentBoxManager: manager,
       frontendClient: frontend,
-      credentialService: {} as any,
+      credentialService: { attachGrants: () => {}, resolveActorResources: async () => ({ clusters: [], hosts: [] }) } as any,
     });
 
     const start = server.rpcMethods.get("capability.start")!;
@@ -211,7 +211,7 @@ describe("capability.start immutable input revision", () => {
       config: { port: 0, internalPort: 0, host: "127.0.0.1", serverUrl: "", portalSecret: "" } as any,
       agentBoxManager: manager,
       frontendClient: frontend,
-      credentialService: {} as any,
+      credentialService: { attachGrants: () => {}, resolveActorResources: async () => ({ clusters: [], hosts: [] }) } as any,
     });
 
     await vi.waitFor(() => {

@@ -2,14 +2,15 @@ import type { CredentialBroker } from "../../agentbox/credential-broker.js";
 import { parseArgs, shellEscape, CONTAINER_SENSITIVE_PATHS, isTrustedCommandExecutable } from "../../tools/infra/command-sets.js";
 import { preExecSecurity, type PreExecResult } from "../../tools/infra/security-pipeline.js";
 import { acquireSshTarget, sshExecStream } from "../../tools/infra/ssh-client.js";
-import { prepareExecEnv, spawnAsync, validateNodeName, validatePodName } from "../../tools/infra/exec-utils.js";
+import { prepareExecEnv, spawnAsync, validateNodeName, validatePodName, validateNamespace, validateContainerName } from "../../tools/infra/exec-utils.js";
+import { resolvePodNetnsViaKubectl, resolvePodNetnsViaSsh } from "../../tools/infra/pod-netns-resolve.js";
 import { loadConfig } from "../config.js";
 import { extractCommands, validateShellOperators } from "../../tools/infra/command-validator.js";
 import { getCommandBinary } from "../../tools/infra/command-sets.js";
 import { kubectlSubcommand, kubectlConnectionOverride } from "../../tools/infra/kubectl-sanitize.js";
 import { authorizeSkillScriptCommand, executeLocalSkillScript, revalidateSkillScript, SCRIPT_SECURITY,
   type AuthorizedSkillScript, type NativeSkillScriptGrants } from "./codex-skill-scripts.js";
-import { backgroundPgidFile, wrapBackgroundSession, killRemoteSessionViaSsh, killRemoteSessionViaKubectl } from "../../tools/infra/bg-session.js";
+import { backgroundPgidFile, wrapBackgroundSession, killRemoteSessionViaSsh, killRemoteSessionViaKubectl, backgroundSessionKillScript } from "../../tools/infra/bg-session.js";
 import { ensureDebugPodReady, acquireDebugPod, releaseDebugPod } from "../../tools/infra/debug-pod.js";
 import { stdinExecCmd } from "../../tools/infra/exec-utils.js";
 import { sanitizeEnv } from "../../tools/infra/sanitize-env.js";
@@ -18,16 +19,18 @@ import { buildSandboxCommand, reapSandboxSession } from "../../tools/infra/sandb
 import { CodexOutputStream } from "./codex-output-stream.js";
 import { consumeNativeOutput, spawnNativeStream, type NativeOutputConsumer } from "./codex-process-stream.js";
 import type { SensitiveValueSource } from "../../shared/model-output-redactor.js";
+import { requireChannelNamespace } from "../../shared/channel-execution-policy.js";
 
 export type CodexInfrastructureTarget =
   | { kind: "ssh"; broker: CredentialBroker; allowCommands?: boolean }
   | { kind: "host"; name: string; broker: CredentialBroker }
   | { kind: "cluster"; name: string; broker: CredentialBroker; userId: string;
       allowApi: boolean; allowPod: boolean; allowNode: boolean };
+interface PodNetnsTarget { pod: string; namespace?: string; container?: string }
 export type InfrastructureOperation = (
-  | { kind: "host"; host?: string; command: string; security: PreExecResult }
+  | { kind: "host"; host?: string; podNetns?: PodNetnsTarget; command: string; security: PreExecResult }
   | { kind: "pod"; namespace?: string; pod: string; container?: string; command: string; security: PreExecResult }
-  | { kind: "node"; node: string; command: string; security: PreExecResult }
+  | { kind: "node"; node?: string; podNetns?: PodNetnsTarget; command: string; security: PreExecResult }
   | { kind: "local-script"; command: string; security: PreExecResult }
   | { kind: "local-command"; command: string; security: PreExecResult;
       cwd: string; environment: Record<string, string>; production: boolean }
@@ -44,13 +47,34 @@ export function authorizeInfrastructureCommand(command: string, target: CodexInf
     }
     return script ? { security: SCRIPT_SECURITY, script } : { security: authorizeRemoteCommand(inner, context) };
   };
-  if (target.kind === "host") return { kind: "host", command, ...authorize(command, "host") };
+  if (target.kind === "host") {
+    const policy=authorize(command,"host");target.broker.requireChannelOperation(policy.script ? "scripts" : "ssh_exec");
+    return { kind: "host", command, ...policy };
+  }
   const args = parseArgs(command);
   if (target.kind === "ssh") {
     if (getCommandBinary(args[0] ?? "") !== "ssh") return;
     const host = args[1];
     if (!host || host.startsWith("-") || /[\s@/:;|&<>`]/.test(host)) throw new Error("Select a bound SSH host name or id; connection options are not authorized");
-    const offset = args[2] === "--" ? 3 : 2;
+    let offset = args[2] === "--" ? 3 : 2;
+    let podNetns: PodNetnsTarget | undefined;
+    if (args[2]?.startsWith("--") && args[2] !== "--") {
+      const delimiter = args.indexOf("--", 2);
+      if (delimiter < 0) throw new Error("SSH Pod selection requires an explicit -- command boundary");
+      const values: Record<string, string> = {};
+      for (let index = 2; index < delimiter; index++) {
+        const [flag, ...inline] = args[index].split("=");
+        if (!["--pod", "--namespace", "--container"].includes(flag) || Object.hasOwn(values, flag))
+          throw new Error("SSH connection options and duplicate Pod selectors are not authorized");
+        const value = inline.length ? inline.join("=") : args[++index];
+        if (!value || index >= delimiter || value.startsWith("-")) throw new Error("Missing SSH Pod selector value");
+        values[flag] = value;
+      }
+      if (!values["--pod"]) throw new Error("SSH namespace/container selection requires --pod");
+      podNetns = { pod: values["--pod"], namespace: values["--namespace"], container: values["--container"] };
+      validatePodNetnsTarget(podNetns);
+      offset = delimiter + 1;
+    }
     const remote = args.slice(offset);
     let inner: string;
     if (remote.length === 1) inner = remote[0];
@@ -61,8 +85,10 @@ export function authorizeInfrastructureCommand(command: string, target: CodexInf
       inner = [remote[0], ...remote.slice(1).map(shellEscape)].join(" ");
     }
     const policy = authorize(inner, "host");
+    target.broker.requireChannelOperation(policy.script ? "scripts" : "ssh_exec");
+    if (podNetns) requireChannelNamespace(target.broker.getChannelPolicy(), podNetns.namespace ?? "default");
     if (target.allowCommands === false && !policy.script) throw new Error("SSH commands are not authorized by this script-only grant");
-    return { kind: "host", host, command: inner, ...policy };
+    return { kind: "host", host, ...(podNetns ? { podNetns } : {}), command: inner, ...policy };
   }
   if (getCommandBinary(args[0] ?? "") !== "kubectl") {
     if (!target.allowApi) throw new Error("This environment only authorizes node or Pod diagnostics");
@@ -91,7 +117,7 @@ export function authorizeInfrastructureCommand(command: string, target: CodexInf
       namespaceSeen = true;
       namespace = arg.startsWith("--namespace=") ? arg.slice(12) : args[++index];
     } else if (["-c", "--container"].includes(arg) || arg.startsWith("--container=")) {
-      if (verb !== "exec" || container) throw new Error("Container selection is not authorized");
+      if (container) throw new Error("Duplicate container selection");
       container = arg.startsWith("--container=") ? arg.slice(12) : args[++index];
       if (!container || !/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(container)) throw new Error("Invalid container selection");
     } else if (arg.startsWith("-")) throw new Error("Native remote transport options are not authorized");
@@ -110,21 +136,36 @@ export function authorizeInfrastructureCommand(command: string, target: CodexInf
     inner = [remote[0], ...remote.slice(1).map(shellEscape)].join(" ");
   }
   if (verb === "debug") {
+    if (target.broker.getChannelPolicy()) throw new Error("Privileged node/network-namespace debug is not authorized by a namespace-scoped channel policy");
     const policy = authorize(inner, "node");
-    if ((!target.allowNode && !policy.script) || namespaceSeen || !selection[0].startsWith("node/")) {
-      throw new Error("Only an authorized kubectl debug node/<name> -- command is supported");
+    if (!target.allowNode && !policy.script) throw new Error("Node diagnostics are not authorized");
+    if (/^pods?\//.test(selection[0])) {
+      const podNetns = { pod: selection[0].replace(/^pods?\//, ""), namespace, container };
+      validatePodNetnsTarget(podNetns);
+      return { kind: "node", podNetns, command: inner, ...policy };
     }
+    if (namespaceSeen || container || !selection[0].startsWith("node/"))
+      throw new Error("Select kubectl debug node/<name> or pod/<name>; helper configuration is platform-owned");
     const node = selection[0].slice(5);
     const error = validateNodeName(node);
     if (error) throw new Error(error);
     return { kind: "node", node, command: inner, ...policy };
   }
   const policy = authorize(inner, "pod");
+  target.broker.requireChannelOperation(policy.script ? "scripts" : "pod_exec");
+  requireChannelNamespace(target.broker.getChannelPolicy(),namespace ?? "default");
   if ((!target.allowPod && !policy.script) || namespaceSeen && (!namespace || !/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(namespace))) throw new Error("Pod namespace is not authorized");
   const pod = selection.shift()?.replace(/^pods?\//, "") ?? "";
   const error = validatePodName(pod);
   if (error) throw new Error(error);
   return { kind: "pod", namespace, pod, container, command: inner, ...policy };
+}
+
+function validatePodNetnsTarget(target: PodNetnsTarget): void {
+  const error = validatePodName(target.pod) ??
+    (target.namespace !== undefined ? validateNamespace(target.namespace) : null) ??
+    (target.container !== undefined ? validateContainerName(target.container) : null);
+  if (error) throw new Error(error);
 }
 
 function validRemoteBinary(binary: string): boolean {
@@ -208,7 +249,7 @@ async function executeRemoteOperation(target: CodexInfrastructureTarget,
   let inner = script ? stdinExecCmd(script.interpreter, script.args.map(shellEscape).join(" "))
     : ["/bin/sh", "-c", operation.command].map(shellEscape).join(" ");
   if (script?.timeoutSeconds !== undefined) inner = `timeout -s TERM -k 5 ${script.timeoutSeconds} ${inner}`;
-  const wrapped = wrapBackgroundSession(inner, pgidFile);
+  let wrapped = wrapBackgroundSession(inner, pgidFile);
   if (operation.kind === "host" && (target.kind === "ssh" || target.kind === "host")) {
     const name = target.kind === "host" ? target.name : operation.host;
     const hosts = await target.broker.refreshHosts();
@@ -221,12 +262,32 @@ async function executeRemoteOperation(target: CodexInfrastructureTarget,
     signal.addEventListener("abort", kill, { once: true });
     try {
       signal.throwIfAborted();
+      if (operation.podNetns) {
+        const resolved = await resolvePodNetnsViaSsh({ target: ssh, ...operation.podNetns,
+          namespace: operation.podNetns.namespace ?? "default", signal });
+        signal.throwIfAborted();
+        if ("error" in resolved) throw new Error(resolved.error);
+        const current = await target.broker.refreshHosts();
+        signal.throwIfAborted();
+        if (!current.some(value => value.name === host.name && value.id === host.id))
+          throw new Error("SSH host binding is no longer authorized");
+        // Keep the process-group record in the HOST namespace. Only the sealed
+        // diagnostic/script enters the Pod netns, so Stop can always reap it.
+        wrapped = wrapBackgroundSession(`ip netns exec ${shellEscape(resolved.netns)} sh -c ${shellEscape(inner)}`, pgidFile);
+      }
       const handle = await sshExecStream(ssh, wrapped, { signal, stdin: content });
+      // A silent SSH peer may never acknowledge channel close. End the local
+      // output readers too so an aborted sealed operation cannot keep the
+      // HTTP service/environment alive while the fresh remote reaper runs.
+      const closeOutput = () => { handle.abort(); handle.stdout.destroy(); handle.stderr.destroy(); };
+      signal.addEventListener("abort", closeOutput, { once: true });
       try {
+        if (signal.aborted) { closeOutput(); signal.throwIfAborted(); }
         const [done] = await Promise.all([handle.done, consumeNativeOutput(handle.stdout, handle.stderr, output)]);
         if (typeof done.exitCode !== "number" || done.signal) kill();
         return done.exitCode ?? 1;
-      } catch (error) { kill(); handle.abort(); throw error; }
+      } catch (error) { kill(); closeOutput(); throw error; }
+      finally { signal.removeEventListener("abort", closeOutput); }
     } finally { signal.removeEventListener("abort", kill); }
   }
   if (target.kind !== "cluster" || !["pod", "node"].includes(operation.kind)) throw new Error("Native execution target mismatch");
@@ -243,11 +304,28 @@ async function executeRemoteOperation(target: CodexInfrastructureTarget,
     pod = operation.pod;
     await spawnAsync("kubectl", [...env.kubeconfigArgs, "-n", namespace, "get", "pod", pod, "-o", "name"], 10000, env.childEnv, signal);
   } else if (operation.kind === "node") {
-    await spawnAsync("kubectl", [...env.kubeconfigArgs, "get", "node", operation.node, "-o", "name"], 10000, env.childEnv, signal);
     const config = loadConfig(), clusterKey = `${target.name}:${acquired.path}`;
-    const spec = { userId: target.userId, nodeName: operation.node, clusterKey,
+    const image = process.env.SICLAW_DEBUG_IMAGE || acquired.meta.debug_image || config.debugImage;
+    let nodeName = operation.node, netns: string | undefined;
+    if (operation.podNetns) {
+      const resolved = await resolvePodNetnsViaKubectl({ ...operation.podNetns,
+        namespace: operation.podNetns.namespace ?? acquired.meta.contexts?.find(value => value.name === acquired.meta.current_context)?.namespace ?? "default",
+        env, userId: target.userId, clusterKey, image, debugNamespace: config.debugNamespace,
+        requireExistingNamespace: true, enterHostRoot: true, signal });
+      signal.throwIfAborted();
+      if ("error" in resolved) throw new Error(resolved.error);
+      nodeName = resolved.node; netns = resolved.netns;
+      const current = await target.broker.refreshClusters();
+      signal.throwIfAborted();
+      if (!current.some(value => value.name === target.name)) throw new Error("Cluster binding is no longer authorized");
+    } else {
+      if (!nodeName) throw new Error("Missing node diagnostic target");
+      await spawnAsync("kubectl", [...env.kubeconfigArgs, "get", "node", nodeName, "-o", "name"], 10000, env.childEnv, signal);
+    }
+    if (!nodeName) throw new Error("Missing resolved node diagnostic target");
+    const spec = { userId: target.userId, nodeName, clusterKey,
       namespace: config.debugNamespace, requireExistingNamespace: true, command: [],
-      image: process.env.SICLAW_DEBUG_IMAGE || acquired.meta.debug_image || config.debugImage };
+      image };
     const helper = await ensureDebugPodReady(spec, env, { signal });
     namespace = helper.namespace; pod = helper.podName;
     const pinned = acquireDebugPod(spec);
@@ -257,13 +335,23 @@ async function executeRemoteOperation(target: CodexInfrastructureTarget,
     }
     release = () => releaseDebugPod(spec, pod);
     prefix = ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--root", "--wd", "--"];
+    if (netns) wrapped = wrapBackgroundSession(`ip netns exec ${shellEscape(netns)} sh -c ${shellEscape(inner)}`, pgidFile);
   } else throw new Error("Native execution target mismatch");
-  const kill = () => killRemoteSessionViaKubectl({ kubeconfigArgs: env.kubeconfigArgs,
+  const scopedTransport=target.broker.registerChannelPodTransport?.(target.name,namespace,pod,
+    operation.kind==="pod"?operation.container??"":"",[...prefix,"sh","-c",wrapped],Boolean(script),[...prefix,"sh","-c",backgroundSessionKillScript(pgidFile)]);
+  const kill = () => scopedTransport ? scopedTransport.kill() : killRemoteSessionViaKubectl({ kubeconfigArgs: env.kubeconfigArgs,
     childEnv: env.childEnv as Record<string, string>, namespace, podName: pod, pgidFile, nsenterPrefix: prefix,
     ...(operation.kind === "pod" && operation.container ? { container: operation.container } : {}) });
   signal.addEventListener("abort", kill, { once: true });
   try {
     signal.throwIfAborted();
+    if (operation.kind === "node" && operation.podNetns) {
+      // Helper preparation may await a new Job. Recheck after pinning too,
+      // before the diagnostic launch, and release that exact pin on denial.
+      const current = await target.broker.refreshClusters();
+      signal.throwIfAborted();
+      if (!current.some(value => value.name === target.name)) throw new Error("Cluster binding is no longer authorized");
+    }
     const args = [...env.kubeconfigArgs, "-n", namespace, "exec", ...(script ? ["-i"] : []), pod,
       ...(operation.kind === "pod" && operation.container ? ["-c", operation.container] : []),
       "--", ...prefix, "sh", "-c", wrapped];
@@ -272,5 +360,5 @@ async function executeRemoteOperation(target: CodexInfrastructureTarget,
     return code;
   } catch (error) {
     kill(); throw error;
-  } finally { signal.removeEventListener("abort", kill); release?.(); }
+  } finally { signal.removeEventListener("abort", kill); scopedTransport?.finish(); release?.(); }
 }

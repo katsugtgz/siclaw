@@ -1,7 +1,13 @@
 import { webExecutionScope, sourceAgentId } from "../shared/web-execution-scope.js";
+import { parseWireIdentity, userIdentity } from "../shared/execution-identity.js";
+import { parseExecutionSender } from "../shared/execution-context.js";
+import { ExecutionGrantRegistry, registerExecutionGrants, unregisterExecutionGrants } from "./execution-grants.js";
+import { handleExecutionGrantRenew } from "./execution-grant-api.js";
 import { AgentRetiredError } from "../shared/agent-retirement.js";
 import { parseHandoffPolicy } from "../shared/agent-handoff.js";
 import { parseRequestMode } from "../shared/request-mode.js";
+import { createNativeUserInputHandlers } from "./native-user-input.js";
+import { runtimeChatCapabilities } from "../shared/agent-engine.js";
 /**
  * Siclaw Agent Runtime — stateless execution engine (DB-free).
  *
@@ -190,6 +196,9 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
   // ── Credential Service ───────────────────────────────────
   if (!opts.credentialService) throw new Error("credentialService is required in StartRuntimeOptions");
   const credentialService = opts.credentialService;
+  const executionGrants = new ExecutionGrantRegistry((agent, actor, sessionId, sender) => credentialService.resolveActorResources(agent, actor, sessionId,sender));
+  credentialService.attachGrants(executionGrants);
+  registerExecutionGrants(executionGrants);
 
   // ── Session Registry resolver ────────────────────────────
   // Cache misses (e.g. async AgentBox callbacks arriving after a Runtime
@@ -247,7 +256,8 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
   };
 
   const sandboxTurns = new SandboxTurnContext();
-  const nativeMcpAuthorization = new NativeMcpAuthorization(frontendClient, (sessionId, agentId) => sandboxTurns.user(sessionId, agentId));
+  const nativeMcpAuthorization = new NativeMcpAuthorization(frontendClient, (sessionId, agentId) => sandboxTurns.user(sessionId, agentId),
+    (certificate, sessionId, grantId) => credentialService.executionGrant({ ...certificate, sessionId, grantId, channelPolicyV1:true }));
   const scriptSandbox = createScriptSandboxApi(spawner?.name ?? "local", frontendClient, async (principal, args, signal, approval) => {
     const handle = await agentBoxManager.getForSession(webExecutionScope(principal.agentId, (await sessionRegistry.get(principal.sessionId))?.userId), principal.sessionId);
     // K8s pool replicas share a certificate whose boxId names the pool, not a Pod.
@@ -703,7 +713,21 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     }
   };
 
-  rpcMethods.set("chat.capabilities", async () => ({ requestModes: ["sync", "async"] }));
+  rpcMethods.set("chat.capabilities", async () => runtimeChatCapabilities());
+  rpcMethods.set("channel.policy.invalidate",async params=>{
+    const agentId=params.agentId as string;if(!agentId)throw new Error("Agent ID required");
+    const revoked=executionGrants.revokeAgent(agentId);
+    const handles=new Set<string>();
+    for(const grant of revoked){
+      const handle=await agentBoxManager.getForSession(webExecutionScope(agentId,grant.actor.kind==="user"?grant.actor.id:undefined),grant.sessionId);
+      if(handle)handles.add(handle.endpoint);
+    }
+    await Promise.all([...handles].map(async endpoint=>{
+      const client=new AgentBoxClient(endpoint,undefined,agentBoxTlsOptions);
+      for(let offset=0;offset<revoked.length;offset+=128)await client.postJson("/api/internal/execution-grants/revoke",{grant_ids:revoked.slice(offset,offset+128).map(grant=>grant.grantId)},5000);
+    }));
+    return {ok:true,revoked:revoked.length};
+  });
 
   rpcMethods.set("chat.send", async (params, context: RpcContext) => {
     const requestMode = parseRequestMode(params.requestMode);
@@ -717,6 +741,13 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // channels stamp "channel" via their own ensureChatSession. Only consumed
     // when THIS handler creates the session row.
     const origin = params.origin as string | undefined;
+    const executionIdentity = parseWireIdentity(params.identity);
+    if (Object.hasOwn(params, "identity") && !executionIdentity)
+      throw new Error("IDENTITY_REQUIRED: malformed execution identity");
+    if ((origin === "channel" || origin === "dm") && frontendClient.consumerDeclares?.("executionIdentity") === true && !executionIdentity)
+      throw new Error("IDENTITY_REQUIRED: channel execution identity missing");
+    const executionActor = executionIdentity ?? userIdentity(userId);
+    const executionSender = parseExecutionSender(params.sender) ?? { userId };
     if (params.delegation || origin === "delegation") {
       throw new AgentRetiredError();
     }
@@ -826,6 +857,8 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         `不要提"交接"、不要复述、不要重新自我介绍。要办的事:]\n${text}`
       : text;
     const promptOpts: PromptOptions = {
+      identity: executionActor,
+      sender: executionSender,
       apiRequestId: typeof params.apiRequestId === "string" ? params.apiRequestId : undefined,
       requestMode,
       sessionId,
@@ -898,7 +931,8 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       ? params.userMessageId : undefined;
     if (!skipInitialPersistence) {
       try {
-        await ensureChatSession(sessionId, agentId, userId, text, undefined, origin);
+        await ensureChatSession(sessionId, agentId, userId, text, undefined, origin, undefined,
+          executionIdentity ? { identity: executionActor, sender: executionSender } : undefined);
         promptMessageId = await appendMessage({ sessionId, role: "user", content: text, deferSequence: true });
         await incrementMessageCount(sessionId);
       } catch (persistErr) {
@@ -922,6 +956,8 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       err.name = "AbortError";
       throw err;
     };
+    // Reuse the persisted input already forwarded across control-plane hops.
+    promptOpts.channelDeliveryId = origin === "channel" ? promptMessageId : undefined;
 
     (async () => {
       // One turn at a time for this session, across every box. The AgentBox's own 409
@@ -1006,6 +1042,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         let ackTraceId: string | undefined;
         const promptStartedAt = Date.now();
         try {
+          promptOpts.grantId = (await executionGrants.open(agentId, sessionId, executionActor, executionSender)).grantId;
           promptResult = await client.prompt(promptOpts);
           // The box has the turn. THIS is the moment the reservation becomes a
           // record of a real dispatch; everything before it could still fail
@@ -2102,6 +2139,23 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     return { ok: true, ...(requestedTurnId ? { turnId: requestedTurnId, stopped } : {}) };
   });
 
+  const nativeUserInput = createNativeUserInputHandlers({
+    client: async (params) => {
+      const agentId = params.agentId, sessionId = params.sessionId, userId = params.userId;
+      if (typeof agentId !== "string" || typeof sessionId !== "string" || typeof userId !== "string" || !agentId || !sessionId || !userId)
+        throw new Error("USER_INPUT_INVALID: Agent, session and authenticated owner are required");
+      const owner = await sessionRegistry.get(sessionId);
+      if (!owner || owner.userId !== userId) throw new Error("USER_INPUT_EXPIRED: The question is not owned by this caller");
+      const scope = webExecutionScope(agentId, owner.userId);
+      const handle = await (agentBoxManager.getForSession?.(scope, sessionId) ?? agentBoxManager.getAsync(scope));
+      return handle ? new AgentBoxClient(handle.endpoint, 10000, agentBoxTlsOptions) : undefined;
+    },
+    persist: (sessionId, requestId, text, traceId) => appendMessage({ sessionId, role: "user", content: text,
+      metadata: { kind: "steer", native_user_input_request_id: requestId }, traceId }),
+  });
+  rpcMethods.set("chat.userInput", nativeUserInput.state);
+  rpcMethods.set("chat.answerUserInput", nativeUserInput.answer);
+
   rpcMethods.set("chat.steer", async (params, context: RpcContext) => {
     const requestMode = parseRequestMode(params.requestMode);
     const agentId = params.agentId as string;
@@ -2829,6 +2883,11 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           }
 
           // MCP servers — filtered by agent binding (via RPC)
+          if (url === "/api/internal/execution-grant/renew" && method === "POST") {
+            if (!identity) { res.writeHead(401); res.end(); return; }
+            void handleExecutionGrantRenew(req, res, identity, credentialService);
+            return;
+          }
           if (url === "/api/internal/mcp-authorize" && method === "POST") {
             void nativeMcpAuthorization.handle(req, res, identity);
             return;
@@ -2994,6 +3053,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     agentBoxTlsOptions,
     credentialService,
     async close() {
+      unregisterExecutionGrants(executionGrants);
       await containerObservation?.stop();
       metricsAggregator?.destroy();
       unsubscribeCapabilityReconnect?.();

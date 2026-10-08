@@ -11,11 +11,15 @@ import { authorizeCodexFileCommand } from "./codex-file-command.js";
 import { authorizeInfrastructureCommand, type CodexInfrastructureTarget, type InfrastructureOperation } from "./codex-infrastructure.js";
 import { extractCommands } from "../../tools/infra/command-validator.js";
 import { authorizeSkillScriptCommand, SCRIPT_SECURITY, type NativeSkillScriptGrants } from "./codex-skill-scripts.js";
+import { requireChannelOperation, type ChannelExecutionPolicy } from "../../shared/channel-execution-policy.js";
 import type { SensitiveValueSource } from "../../shared/model-output-redactor.js";
 
 type JsonObject = Record<string, unknown>;
 
 export interface CodexExecutorGrants {
+  /** Trusted selected-Skill links inside private Codex home. Reads still require
+   * ordinary authority on the canonical asset; never grants home/state access. */
+  skillReadAliases?: readonly { alias: string; target: string }[];
   /** Trusted sanitized input mounts below the otherwise private session root. */
   inputRoots?: readonly string[];
   readRoots: readonly string[];
@@ -37,6 +41,8 @@ export interface CodexExecutorGrants {
   /** Owner-scoped output gate, including credentials acquired later. */
   redactOutput?: (text: string) => string;
   sensitiveValues?: SensitiveValueSource;
+  channelPolicy?: ChannelExecutionPolicy;
+  validateChannelPolicy?: () => Promise<void>;
 }
 
 export interface AuthorizedCodexRequest {
@@ -51,6 +57,7 @@ export class CodexExecutorPolicy {
   private readonly readRoots: string[];
   private readonly writeRoots: string[];
   private readonly deniedRoots: string[];
+  private readonly declaredDeniedRoots: string[];
   private readonly declaredReadRoots: string[];
   private readonly declaredWriteRoots: string[];
   private readonly executionRoots: string[];
@@ -65,13 +72,18 @@ export class CodexExecutorPolicy {
   private readonly production: boolean;
   private readonly infrastructure?: CodexInfrastructureTarget;
   private readonly skillScripts?: NativeSkillScriptGrants;
+  private readonly skillReadAliases: Array<{ alias: string; target: string }>;
+  private readonly channelPolicy?: ChannelExecutionPolicy;
 
   constructor(grants: CodexExecutorGrants) {
+    this.channelPolicy = grants.channelPolicy;
+    this.skillReadAliases = (grants.skillReadAliases ?? []).map(value => ({ alias: path.resolve(value.alias), target: canonicalPath(value.target) }));
     this.inputRoots = (grants.inputRoots ?? []).map(canonicalPath);
     this.declaredInputRoots = (grants.inputRoots ?? []).map(root => path.resolve(root));
     this.readRoots = grants.readRoots.map(canonicalPath);
     this.writeRoots = grants.writeRoots.map(canonicalPath);
     this.deniedRoots = grants.deniedRoots.map(canonicalPath);
+    this.declaredDeniedRoots = grants.deniedRoots.map(root => path.resolve(root));
     this.declaredReadRoots = grants.readRoots.map((root) => path.resolve(root));
     this.declaredWriteRoots = grants.writeRoots.map((root) => path.resolve(root));
     const executionRoots = grants.executionRoots ?? [...grants.readRoots, ...grants.writeRoots];
@@ -178,6 +190,7 @@ export class CodexExecutorPolicy {
     if (extractCommands(argv[2]).some(command => /^\s*[a-zA-Z_][a-zA-Z0-9_]*=/.test(command))) throw new Error("Native shell environment overrides are not authorized");
     params.cwd = this.authorizePath(params.cwd, false, true);
     const script = authorizeSkillScriptCommand(argv[2], fileURLToPath(String(params.cwd)), "local", this.skillScripts);
+    if (script) requireChannelOperation(this.channelPolicy,"scripts");
     const infrastructure: InfrastructureOperation | undefined = script
       ? { kind: "local-script", command: argv[2], script, security: SCRIPT_SECURITY }
       : this.infrastructure ? authorizeInfrastructureCommand(argv[2], this.infrastructure, this.skillScripts,
@@ -238,6 +251,11 @@ export class CodexExecutorPolicy {
     }
     const requested = path.resolve(fileURLToPath(uri));
     const canonical = canonicalPath(requested);
+    const skillAlias = !write && !execution && this.skillReadAliases.some(value => {
+      if (!within(requested, value.alias) || !within(canonical, value.target)) return false;
+      try { return fs.lstatSync(value.alias).isSymbolicLink() && canonicalPath(value.alias) === value.target; }
+      catch { return false; }
+    });
     const inputRoot = this.inputRoots.find((root, index) =>
       (within(requested, root) || within(requested, this.declaredInputRoots[index])) && within(canonical, root));
     if (!write && !execution && inputRoot && !this.deniedRoots.some(root => within(root, inputRoot) && within(canonical, root))) {
@@ -248,11 +266,15 @@ export class CodexExecutorPolicy {
     const declared = execution ? this.declaredExecutionRoots : write ? this.declaredWriteRoots
       : [...this.declaredReadRoots, ...this.declaredWriteRoots];
     const requestedRoot = [...declared, ...roots].find((root) => within(requested, root));
-    if (!requestedRoot || !roots.some((root) => within(canonical, root)) ||
-        this.deniedRoots.some((root) => within(canonical, root) || within(requested, root))) {
+    if ((!requestedRoot && !skillAlias) || !roots.some((root) => within(canonical, root)) ||
+        this.deniedRoots.some((root) => within(canonical, root) || (!skillAlias && within(requested, root))) ||
+        (!skillAlias && this.declaredDeniedRoots.some(root => within(requested, root)))) {
       throw new Error("Native filesystem path is outside the session grant");
     }
-    if (write) assertNoWriteLinks(requested, requestedRoot);
+    if (write) {
+      if (!requestedRoot) throw new Error("Native writable path is outside the session grant");
+      assertNoWriteLinks(requested, requestedRoot);
+    }
     return pathToFileURL(canonical).href;
   }
 }

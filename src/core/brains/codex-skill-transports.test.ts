@@ -3,7 +3,10 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const mocks = vi.hoisted(() => ({ sshExecStream: vi.fn(), acquireSshTarget: vi.fn(), spawnAsync: vi.fn(), spawnNativeStream: vi.fn(),
-  ensureDebugPodReady: vi.fn(), acquireDebugPod: vi.fn(), releaseDebugPod: vi.fn(), killRemoteSessionViaKubectl: vi.fn() }));
+  ensureDebugPodReady: vi.fn(), acquireDebugPod: vi.fn(), releaseDebugPod: vi.fn(), killRemoteSessionViaKubectl: vi.fn(),
+  resolvePodNetnsViaKubectl: vi.fn(), resolvePodNetnsViaSsh: vi.fn() }));
+vi.mock("../../tools/infra/pod-netns-resolve.js", () => ({ resolvePodNetnsViaKubectl: mocks.resolvePodNetnsViaKubectl,
+  resolvePodNetnsViaSsh: mocks.resolvePodNetnsViaSsh }));
 vi.mock("../../tools/infra/ssh-client.js", () => ({ sshExecStream: mocks.sshExecStream, acquireSshTarget: mocks.acquireSshTarget }));
 vi.mock("../../tools/infra/exec-utils.js", async original => ({ ...await original<object>(), spawnAsync: mocks.spawnAsync }));
 vi.mock("../../tools/infra/debug-pod.js", async original => ({ ...await original<object>(), ensureDebugPodReady: mocks.ensureDebugPodReady,
@@ -16,6 +19,8 @@ import { createSkillScriptResolver } from "../../tools/infra/script-resolver.js"
 const roots: string[] = [];
 beforeEach(() => { Object.values(mocks).forEach(mock => mock.mockReset());mocks.spawnAsync.mockResolvedValue({ stdout: "QUERY_OK", stderr: "" });
   mocks.spawnNativeStream.mockResolvedValue(0);
+  mocks.resolvePodNetnsViaKubectl.mockResolvedValue({ node: "node-a", netns: "cni-script" });
+  mocks.resolvePodNetnsViaSsh.mockResolvedValue({ netns: "cni-script" });
   mocks.ensureDebugPodReady.mockResolvedValue({ podName: "helper", namespace: "sicore-test" });mocks.acquireDebugPod.mockReturnValue("helper"); });
 afterEach(() => roots.splice(0).forEach(root => fs.rmSync(root, { recursive: true, force: true })));
 function fixture() {
@@ -26,13 +31,34 @@ function fixture() {
   const resolver = createSkillScriptResolver({ skillsBaseDir: root, resolvedSkillsDir: path.join(root, "resolved"), builtinDirs: [] });
   const scripts = createNativeSkillScriptGrants([{ name: "query", filePath: path.join(skill, "SKILL.md") }], resolver,
     { local: false, node: true, pod: true, host: true });
-  const broker = { refreshClusters: vi.fn().mockResolvedValue([{ name: "bound" }]), acquireCluster: vi.fn(),
+  const broker = { getChannelPolicy:()=>undefined,requireChannelOperation:vi.fn(),refreshClusters: vi.fn().mockResolvedValue([{ name: "bound" }]), acquireCluster: vi.fn(),
     ensureCluster: vi.fn().mockResolvedValue({ path: "/trusted/actor.kubeconfig", meta: {} }),
     refreshHosts: vi.fn().mockResolvedValue([{ name: "host" }]), acquireHost: vi.fn() } as any;
   return { root, file, content, scripts, broker, cluster: { kind: "cluster" as const, name: "bound", broker, userId: "reader",
     allowApi: false, allowPod: false, allowNode: false } };
 }
 describe("native script transport service", () => {
+  it("preserves separate node/host script-only grants and sealed stdin inside a Pod netns", async () => {
+    const f = fixture();
+    const node = authorizeInfrastructureCommand(`kubectl -n test debug pod/pod-a -- python3 ${f.file} literal`, f.cluster, f.scripts, f.root)!;
+    await executeInfrastructureOperation(f.cluster, node, new AbortController().signal, f.scripts);
+    const call = mocks.spawnNativeStream.mock.calls.at(-1)!;
+    expect(call[1]).toContain("-i"); expect(call[1].at(-1)).toContain("ip netns exec");
+    expect(call[1].at(-1)).toContain("cni-script"); expect(call[2].stdin).toBe(f.content);
+    expect(mocks.resolvePodNetnsViaKubectl.mock.calls[0][0]).toMatchObject({ pod: "pod-a", namespace: "test", requireExistingNamespace: true });
+    const ssh = { kind: "ssh" as const, broker: f.broker, allowCommands: false };
+    mocks.acquireSshTarget.mockResolvedValue({ host: "192.0.2.1" });
+    const { Readable } = await import("node:stream");
+    mocks.sshExecStream.mockResolvedValue({ stdout: Readable.from([]), stderr: Readable.from([]), done: Promise.resolve({ exitCode: 0 }), abort: vi.fn() });
+    const host = authorizeInfrastructureCommand(`ssh host --pod pod-a --namespace test -- python3 ${f.file} literal`, ssh, f.scripts, f.root)!;
+    await executeInfrastructureOperation(ssh, host, new AbortController().signal, f.scripts);
+    expect(mocks.sshExecStream.mock.calls[0][1]).toContain("ip netns exec");
+    expect(mocks.sshExecStream.mock.calls[0][2].stdin).toBe(f.content);
+    for (const [target, command] of [[f.cluster, `kubectl debug pod/pod-a -- python3 ${f.file}`],
+      [ssh, `ssh host --pod pod-a -- python3 ${f.file}`]] as const) {
+      expect(() => authorizeInfrastructureCommand(command, target, { ...f.scripts, allowed: { ...f.scripts.allowed, node: false, host: false } }, f.root)).toThrow();
+    }
+  });
   it("sends sealed Python bytes to exact Pod/container stdin with literal arguments", async () => {
     const f = fixture();const op = authorizeInfrastructureCommand(`kubectl -n sicore-test exec pod-a -c main -- python3 ${f.file} 'foo;literal'`, f.cluster, f.scripts, f.root)!;
     const result = await executeInfrastructureOperation(f.cluster, op, new AbortController().signal, f.scripts);

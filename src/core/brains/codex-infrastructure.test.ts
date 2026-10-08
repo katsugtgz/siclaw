@@ -9,9 +9,10 @@ vi.mock("../../tools/infra/debug-pod.js", () => ({ ensureDebugPodReady, acquireD
 vi.mock("../../tools/infra/exec-utils.js", async importOriginal => ({ ...(await importOriginal<object>()), spawnAsync }));
 vi.mock("./codex-process-stream.js", async original => ({ ...await original<object>(), spawnNativeStream }));
 function cluster(overrides = {}): CodexInfrastructureTarget {
-  return { kind: "cluster", name: "bound", broker: {} as any, userId: "user", allowApi: true, allowPod: true, allowNode: true, ...overrides };
+  return { kind: "cluster", name: "bound", broker: {getChannelPolicy:()=>undefined,requireChannelOperation:()=>{}} as any, userId: "user", allowApi: true, allowPod: true, allowNode: true, ...overrides };
 }
-const host: CodexInfrastructureTarget = { kind: "host", name: "bound-host", broker: {} as any };
+const legacyBroker={getChannelPolicy:()=>undefined,requireChannelOperation:()=>{}};
+const host: CodexInfrastructureTarget = { kind: "host", name: "bound-host", broker: legacyBroker as any };
 
 describe("native read-only infrastructure grants", () => {
   it("keeps ordinary API reads native and translates only explicitly granted remote targets", () => {
@@ -45,7 +46,7 @@ describe("native read-only infrastructure grants", () => {
     expect(() => authorizeInfrastructureCommand("kubectl debug node/node-a -- uname", cluster({ allowNode: false }))).toThrow();
   });
   it("supports native SSH syntax without arbitrary connection or credential options", () => {
-    const target: CodexInfrastructureTarget = { kind: "ssh", broker: {} as any };
+    const target: CodexInfrastructureTarget = { kind: "ssh", broker: legacyBroker as any };
     expect(authorizeInfrastructureCommand("ssh bound-host -- uname -a", target)).toMatchObject({ kind: "host", host: "bound-host" });
     for (const command of ["ssh -i /tmp/key host -- uname", "ssh root@192.0.2.1 -- uname", "ssh bound-host -- touch /tmp/x",
       "ssh bound-host 'PATH=/tmp uname'", "ssh bound-host -- sh -c id"]) expect(() => authorizeInfrastructureCommand(command, target)).toThrow();
@@ -56,14 +57,14 @@ describe("native read-only infrastructure grants", () => {
       expect(() => authorizeInfrastructureCommand(command, host)).toThrow();
     }
     expect(authorizeInfrastructureCommand("/usr/bin/uname -a", host)).toMatchObject({ kind: "host" });
-    expect(authorizeInfrastructureCommand("ssh bound-host -- /usr/bin/uname -a", { kind: "ssh", broker: {} as any }))
+    expect(authorizeInfrastructureCommand("ssh bound-host -- /usr/bin/uname -a", { kind: "ssh", broker: legacyBroker as any }))
       .toMatchObject({ kind: "host" });
     expect(authorizeInfrastructureCommand("kubectl exec pod-a -- /usr/bin/uname -a", cluster()))
       .toMatchObject({ kind: "pod" });
     expect(() => authorizeInfrastructureCommand("kubectl exec pod-a -- /tmp/uname", cluster())).toThrow();
   });
   it("refuses a revoked SSH binding before credential acquisition or execution", async () => {
-    const broker = { refreshHosts: vi.fn().mockResolvedValue([]), acquireHost: vi.fn() };
+    const broker = { ...legacyBroker,refreshHosts: vi.fn().mockResolvedValue([]), acquireHost: vi.fn() };
     const target = { ...host, broker } as unknown as CodexInfrastructureTarget;
     await expect(executeInfrastructureOperation(target, authorizeInfrastructureCommand("uname", target)!, new AbortController().signal))
       .rejects.toThrow("no longer authorized");
@@ -71,7 +72,7 @@ describe("native read-only infrastructure grants", () => {
     expect(sshExecStream).not.toHaveBeenCalled();
   });
   it("refreshes SSH credentials and sanitizes output before private IPC", async () => {
-    const broker = { refreshHosts: vi.fn().mockResolvedValue([{ name: "bound-host" }]), acquireHost: vi.fn() };
+    const broker = { ...legacyBroker,refreshHosts: vi.fn().mockResolvedValue([{ name: "bound-host" }]), acquireHost: vi.fn() };
     acquireSshTarget.mockResolvedValue({ host: "192.0.2.1" });
     sshExecStream.mockResolvedValue({ stdout: Readable.from(["password: transport-test-secret\n"]), stderr: Readable.from([]), done: Promise.resolve({exitCode:0}), abort:vi.fn() });
     const target = { ...host, broker } as unknown as CodexInfrastructureTarget;
@@ -81,7 +82,7 @@ describe("native read-only infrastructure grants", () => {
     expect(sshExecStream.mock.calls.at(-1)?.[1]).not.toContain("timeout");
   });
   it("authorizes the exact Pod and uses a cancellable noninteractive stream", async () => {
-    const broker = { refreshClusters: vi.fn().mockResolvedValue([{ name: "bound" }]), acquireCluster: vi.fn(),
+    const broker = { ...legacyBroker,refreshClusters: vi.fn().mockResolvedValue([{ name: "bound" }]), acquireCluster: vi.fn(),
       ensureCluster: vi.fn().mockResolvedValue({ path: "/tmp/authorized-config", meta: {} }) };
     spawnAsync.mockResolvedValue({ stdout: "Linux", stderr: "" });
     spawnNativeStream.mockResolvedValue(0);
@@ -93,7 +94,7 @@ describe("native read-only infrastructure grants", () => {
     expect(args.join(" ")).not.toContain("timeout"); expect(args).not.toContain("-i"); expect(args).not.toContain("-t");
   });
   it("executes node reads in the host root and only in a prepared operator namespace", async () => {
-    const broker = { refreshClusters: vi.fn().mockResolvedValue([{ name: "bound" }]), acquireCluster: vi.fn(),
+    const broker = { ...legacyBroker,refreshClusters: vi.fn().mockResolvedValue([{ name: "bound" }]), acquireCluster: vi.fn(),
       ensureCluster: vi.fn().mockResolvedValue({ path: "/tmp/actor-config", meta: { debug_image: "registry.internal/reviewed-debug@sha256:fixed" } }) };
     spawnAsync.mockResolvedValue({ stdout: "node/node-a", stderr: "" });
     ensureDebugPodReady.mockResolvedValue({ podName: "helper", namespace: "sicore-test" });

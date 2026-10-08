@@ -27,6 +27,38 @@ const start = (cwd: string, command: string, processId = "process-1") => ({
 });
 
 describe("Codex native executor policy", () => {
+  it("reads only a selected Skill link without opening private native home", () => {
+    const { root, read, write, denied } = fixture();
+    const home = path.join(write, "private-native-home"), target = path.join(read, "selected-skill");
+    fs.mkdirSync(path.join(home, "skills"), { recursive: true }); fs.mkdirSync(target);
+    fs.writeFileSync(path.join(target, "SKILL.md"), "Selected instructions");
+    const alias = path.join(home, "skills", "selected"); fs.symlinkSync(target, alias);
+    const policy = new CodexExecutorPolicy({ readRoots: [read], writeRoots: [write], deniedRoots: [denied, home],
+      executionRoots: [write], allowCommands: false, allowFileCommands: true, production: false,
+      skillReadAliases: [{ alias, target }] });
+    expect(policy.authorize("fs/readFile", { path: uri(path.join(alias, "SKILL.md")) }).params.path).toBe(uri(fs.realpathSync(path.join(target, "SKILL.md"))));
+    expect(policy.authorize("process/start", start(write, `cat ${path.join(alias, "SKILL.md")}`)).params.argv)
+      .toEqual(["/bin/bash", "-c", `'cat' '${fs.realpathSync(path.join(target, "SKILL.md"))}'`]);
+    for (const location of [home, path.join(home, "config.toml"), path.join(home, "skills"), path.join(home, "auth.json")]) {
+      expect(() => policy.authorize("fs/readFile", { path: uri(location) })).toThrow();
+    }
+    expect(() => policy.authorize("fs/writeFile", { path: uri(path.join(alias, "SKILL.md")) })).toThrow();
+    fs.symlinkSync(denied, path.join(target, "escape"));
+    expect(() => policy.authorize("fs/readFile", { path: uri(path.join(alias, "escape", "key")) })).toThrow();
+    fs.unlinkSync(alias); fs.symlinkSync(read, alias);
+    expect(() => policy.authorize("fs/readFile", { path: uri(path.join(alias, "selected-skill", "SKILL.md")) })).toThrow();
+  });
+  it("selected Skill aliases cannot create canonical read authority or override credential denies", () => {
+    const { root, read, write, denied } = fixture();
+    const home = path.join(write, "private"), alias = path.join(home, "selected"); fs.mkdirSync(home);
+    fs.symlinkSync(denied, alias); fs.writeFileSync(path.join(denied, "key"), "synthetic");
+    const policy = new CodexExecutorPolicy({ readRoots: [read], writeRoots: [write], deniedRoots: [home, denied],
+      allowCommands: false, production: false, skillReadAliases: [{ alias, target: denied }] });
+    expect(() => policy.authorize("fs/readFile", { path: uri(path.join(alias, "key")) })).toThrow();
+    const isolated = new CodexExecutorPolicy({ readRoots: [], writeRoots: [], deniedRoots: [home],
+      allowCommands: false, production: false, skillReadAliases: [{ alias, target: denied }] });
+    expect(() => isolated.authorize("fs/readFile", { path: uri(path.join(alias, "key")) })).toThrow();
+  });
   it("allows only this session's immutable input mount when general file tools are disabled", () => {
     const { root, read } = fixture();
     const inputs = path.join(root, "inputs"), own = path.join(inputs, "own"), other = path.join(inputs, "other");

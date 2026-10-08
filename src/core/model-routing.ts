@@ -486,7 +486,9 @@ function candidateInputSet(candidate: ModelRouteCandidate): Set<string> {
 
 export function requiredInputsForPromptMedia(media?: PromptMedia, engine?: BrainType): string[] {
   const required: string[] = [];
-  if (media?.images && media.images.length > 0) required.push("image");
+  // Codex owns its model catalog/modalities and validates native image input.
+  // A legacy Pi descriptor must not reject that input before app-server sees it.
+  if (engine !== "codex" && media?.images && media.images.length > 0) required.push("image");
   if (engine !== "codex" && media?.files?.some(file => file.mimeType === "application/pdf")) required.push("pdf");
   return required;
 }

@@ -60,6 +60,30 @@ function setup(promptDone: boolean) {
 }
 
 describe("notifyParent", () => {
+  it("persists native recovery as an internal input before execution and announces its lifecycle", async () => {
+    const { mgr, brain, managed } = setup(true);
+    const send = vi.fn(async (_event: any) => ({ ok: true, id: "row" }));
+    mgr.gatewayClient = { sendDelegationPersistenceEvent: send }; mgr.agentId = "agent-1";
+    let listener: ((event: any) => void) | undefined;
+    brain.subscribe.mockImplementation((cb: any) => { listener = cb; return () => {}; });
+    brain.prompt.mockImplementation(async (text: string) => {
+      const input = send.mock.calls.find(([e]: any[]) => e.message?.role === "user")?.[0] as any;
+      expect(input?.message.metadata).toEqual({ kind: "task_notification" });
+      expect(send.mock.calls.some(([e]: any[]) => e.event?.type === "background_turn_start")).toBe(true);
+      expect((managed as any)._apiRequestId).toBe("original-receipt");
+      expect(text).toContain("Continue the SAME request");
+      listener?.({ type: "message_end", message: { role: "user", content: text } });
+      listener?.({ type: "message_end", message: { role: "assistant", content: "native final report" } });
+    });
+    mgr.queueParentNotification(managed, { taskId: "native-scope", status: "done", summary: "Native children ended", nativeChild: true }, "original-receipt");
+    await flushCoalesce();
+    expect(brain.prompt).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls.filter(([e]: any[]) => e.message?.role === "user")).toHaveLength(1);
+    expect(send.mock.calls.some(([e]: any[]) => e.message?.content === "native final report")).toBe(true);
+    expect(send.mock.calls.some(([e]: any[]) => e.event?.type === "background_turn_done" && e.event.outcome === "completed")).toBe(true);
+    expect(brain.followUp).not.toHaveBeenCalled();
+  });
+
   it("recovers attached late/unread children, coalesces them and does not repeat consumed mail", async () => {
     const { mgr, managed, brain } = setup(false);
     const turn = mgr.beginBackgroundWorkTurn(managed);

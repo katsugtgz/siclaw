@@ -37,11 +37,12 @@ export class CodexExecutorRelay {
   private backend?: { child: ChildProcessWithoutNullStreams; url: string; token: string };
   private startingBackend?: Promise<NonNullable<CodexExecutorRelay["backend"]>>;
   private closing = false;
+  private launchesPaused = false;
   private readonly sessions = new Map<string, Connection>();
   private websocket?: WebSocketServer;
   private address?: string;
-  private readonly tickets = new Map<string, { operation: InfrastructureOperation; connection: Connection; expiresAt: number }>();
-  private readonly infrastructureRuns = new Map<Connection, Set<AbortController>>();
+  private readonly tickets = new Map<string, { operation: InfrastructureOperation; connection: Connection; processId: string; abort: AbortController; expiresAt: number }>();
+  private readonly infrastructureRuns = new Map<Connection, Map<string, AbortController>>();
 
   constructor(private readonly options: {
     executable: string;
@@ -56,6 +57,18 @@ export class CodexExecutorRelay {
   }
   get bearerToken(): string { return this.token; }
 
+  /** Product Stop is stronger than interrupting a model's write_stdin wait.
+   * Native yielded processes otherwise intentionally survive between turns. */
+  cancelProcesses(): void {
+    this.launchesPaused = true;
+    for (const connection of this.connections) {
+      for (const processId of [...this.infrastructureRuns.get(connection)?.keys() ?? []]) this.stopInfrastructure(connection, processId);
+      connection.policy.stopAll();
+    }
+  }
+
+  resumeProcesses(): void { this.launchesPaused = false; }
+
   async start(): Promise<void> {
     if (this.http) return;
     this.closing = false;
@@ -64,13 +77,11 @@ export class CodexExecutorRelay {
       const ticket = request.headers.authorization?.replace(/^Bearer /i, "") ?? "";
       const entry = this.tickets.get(ticket);
       if (request.method !== "POST" || request.url !== "/infrastructure" || !entry || entry.expiresAt < Date.now() ||
-          entry.connection.disposed) {
+          entry.connection.disposed || entry.abort.signal.aborted) {
         response.writeHead(403).end(); return;
       }
       this.tickets.delete(ticket);
-      const abort = new AbortController();
-      const running = this.infrastructureRuns.get(entry.connection) ?? new Set<AbortController>();
-      this.infrastructureRuns.set(entry.connection, running); running.add(abort);
+      const { abort } = entry;
       response.once("close", () => { if (!response.writableEnded) abort.abort(); });
       let keepAlive: NodeJS.Timeout | undefined;
       try {
@@ -98,7 +109,11 @@ export class CodexExecutorRelay {
         await send({ exitCode: result.exitCode });
         response.end();
       } catch { response.destroy(); }
-      finally { if (keepAlive) clearInterval(keepAlive); running.delete(abort); }
+      finally {
+        if (keepAlive) clearInterval(keepAlive);
+        const running = this.infrastructureRuns.get(entry.connection);
+        if (running?.get(entry.processId) === abort) running.delete(entry.processId);
+      }
     });
     const websocket = new WebSocketServer({ noServer: true, maxPayload: 2 * 1024 * 1024 });
     http.on("upgrade", (request, socket, head) => {
@@ -195,21 +210,30 @@ export class CodexExecutorRelay {
         } else if (message.method === "initialize") throw new Error("Native executor is already initialized");
         if (socket.readyState !== WebSocket.OPEN || connection.disposed) return;
         if (message.id !== undefined && connection.pending.has(message.id)) throw new Error("Duplicate native executor request id");
+        if (message.method === "process/start" && this.launchesPaused) throw new Error("Native execution is stopped until the next user request");
+        if (message.method === "process/start") await this.options.grants.validateChannelPolicy?.();
         const authorized = connection.policy.authorize(message.method, message.params ?? {});
         const processId = typeof authorized.params.processId === "string" ? authorized.params.processId : undefined;
         if (message.method === "process/start") {
-          for (const [ticket, entry] of this.tickets) if (entry.expiresAt < Date.now()) this.tickets.delete(ticket);
+          for (const entry of this.tickets.values()) if (entry.expiresAt < Date.now()) this.stopInfrastructure(entry.connection, entry.processId);
           if (this.tickets.size >= 64) throw new Error("Native execution launch capacity exceeded");
           const ticket = randomBytes(32).toString("hex");
           const operation: InfrastructureOperation = authorized.infrastructure ?? {
             kind: "local-command", command: authorized.command!.text, security: authorized.command!.security,
             cwd: String(authorized.params.cwd), environment: authorized.params.env as Record<string, string>, production: this.options.grants.production,
           };
-          this.tickets.set(ticket, { operation, connection, expiresAt: Date.now() + 15_000 });
+          const abort = new AbortController();
+          const running = this.infrastructureRuns.get(connection) ?? new Map<string, AbortController>();
+          this.infrastructureRuns.set(connection, running); running.set(String(authorized.params.processId), abort);
+          this.tickets.set(ticket, { operation, connection, processId: String(authorized.params.processId), abort, expiresAt: Date.now() + 15_000 });
           const helper = fileURLToPath(new URL("./codex-infrastructure-client.js", import.meta.url));
           const endpoint = this.address!.replace(/^ws:/, "http:").replace(/\/executor$/, "/infrastructure");
           connection.policy.setTransportCommand(authorized.params, [process.execPath, helper, endpoint, ticket].map(shellEscape).join(" "));
         }
+        // Native termination can finish the local client before its HTTP close
+        // is observed (or without a close at all). Cancel the sealed operation
+        // by its already-authorized native identity, never another task's work.
+        if (processId && ["process/signal", "process/terminate"].includes(message.method)) this.stopInfrastructure(connection, processId);
         if (message.id !== undefined) connection.pending.set(message.id, { method: message.method, processId });
         connection.backend.send(JSON.stringify({ ...message, params: authorized.params }));
       } catch (error) {
@@ -237,15 +261,27 @@ export class CodexExecutorRelay {
     if (connection.detached) clearTimeout(connection.detached);
     if (connection.sessionId) this.sessions.delete(connection.sessionId);
     for (const [ticket, entry] of this.tickets) if (entry.connection === connection) this.tickets.delete(ticket);
-    for (const abort of this.infrastructureRuns.get(connection) ?? []) abort.abort();
+    for (const abort of this.infrastructureRuns.get(connection)?.values() ?? []) abort.abort();
     this.infrastructureRuns.delete(connection);
     connection.policy.stopAll(); connection.backend.close(); connection.socket.close(1000);
     this.connections.delete(connection);
   }
 
+  private stopInfrastructure(connection: Connection, processId: string): void {
+    const running = this.infrastructureRuns.get(connection);
+    running?.get(processId)?.abort();
+    running?.delete(processId);
+    for (const [ticket, entry] of this.tickets) {
+      if (entry.connection === connection && entry.processId === processId) this.tickets.delete(ticket);
+    }
+  }
+
   private backendMessage(connection: Connection, message: JsonObject): void {
     if (!object(message)) throw new Error("Invalid native executor response");
     if (["process/output", "process/exited", "process/closed"].includes(message.method)) {
+      if (message.method !== "process/output" && typeof message.params?.processId === "string") {
+        this.stopInfrastructure(connection, message.params.processId);
+      }
       // The fixed transport client's stdout/stderr already passed the security
       // gate. Preserve upstream sequence numbers and lifecycle unchanged.
       this.send(connection, message);
@@ -256,6 +292,7 @@ export class CodexExecutorRelay {
     if (!pending) throw new Error("Native executor response has no owning request");
     connection.pending.delete(message.id);
     if (message.error && pending.method === "process/start" && pending.processId) {
+      this.stopInfrastructure(connection, pending.processId);
       connection.policy.releaseProcess(pending.processId);
     }
     if (!message.error && pending.method === "initialize") {

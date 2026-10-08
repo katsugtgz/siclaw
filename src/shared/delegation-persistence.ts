@@ -152,6 +152,8 @@ export interface DelegationEventPayload {
 
 export interface ChannelDeliverMessagePayload {
   sessionId: string;
+  /** Host-captured persisted input identity, never a model tool argument. */
+  requestId?: string;
   kind: "milestone" | "final" | "artifact";
   text: string;
   fromAgentId?: string | null;

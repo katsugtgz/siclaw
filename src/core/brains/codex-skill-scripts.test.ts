@@ -73,8 +73,9 @@ describe("native Skill assets at the execution boundary", () => {
   });
   it("separates script capabilities from ordinary commands on all three remote targets", () => {
     const { file, grants, cwd } = fixture();
-    const cluster = { kind: "cluster" as const, name: "bound", broker: {} as any, userId: "user", allowApi: false, allowPod: false, allowNode: false };
-    const host = { kind: "ssh" as const, broker: {} as any, allowCommands: false };
+    const broker={getChannelPolicy:()=>undefined,requireChannelOperation:()=>{}};
+    const cluster = { kind: "cluster" as const, name: "bound", broker: broker as any, userId: "user", allowApi: false, allowPod: false, allowNode: false };
+    const host = { kind: "ssh" as const, broker: broker as any, allowCommands: false };
     for (const command of [`kubectl exec pod-a -- bash ${file}`, `kubectl debug node/node-a -- bash ${file}`]) {
       expect(authorizeInfrastructureCommand(command, cluster, grants, cwd)?.script?.path).toBe(file);
     }

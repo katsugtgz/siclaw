@@ -51,6 +51,12 @@ export class CodexMcpGateway {
     return [...this.upstreams.values()].filter(entry => !entry.local).flatMap(entry => entry.tools.map(tool => ({ server: entry.name, tool })));
   }
 
+  /** Match native item arguments against the exact sanitized product input. */
+  projectProductArguments(args: Record<string, unknown>): Record<string, unknown> {
+    const security = new McpModelSecurity(this.secrets, this.privateRoots);
+    return redactModelJson(args, text => security.text(text));
+  }
+
   /** Reviewed product service, independently implemented from Pi ToolDefinitions. */
   registerKnowledge(tool: Tool, call: NonNullable<Upstream["local"]>): void {
     this.registerService("siclaw_knowledge", [tool], call);
@@ -201,7 +207,7 @@ export class CodexMcpGateway {
       let execution: "not_dispatched" | "unknown" | "finished" = "not_dispatched";
       try {
         const approved = upstream.local ? args : authorizeMcpArguments(upstream.policy.toolRules?.get(name), args);
-        const safeArgs = upstream.local ? redactModelJson(approved, text => upstream.security.text(text))
+        const safeArgs = upstream.local ? this.projectProductArguments(approved)
           : upstream.policy.trustedRenderer ? JSON.parse(upstream.security.text(JSON.stringify(approved))) : approved;
         const signal = AbortSignal.any([extra.signal, controller.signal, this.stopping.signal, AbortSignal.timeout(65_000)]);
         const operation: McpOperation = { server: upstream.name, kind: "tool", name, arguments: safeArgs,

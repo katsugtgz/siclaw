@@ -73,6 +73,15 @@ beforeEach(() => {
 // ── Tests ──────────────────────────────────────────────
 
 describe("consumeAgentSse — empty stream", () => {
+  it("persists and relays structured native question identity for history rendering", async () => {
+    const nativeUserInput = { engine: "codex", requestId: "4c943852-3db6-44bb-a8a5-89dd451f0543",
+      questions: [{ id: "format", header: "Format", question: "Which format?", options: [{ label: "Detailed", description: "Two sentences" }] }] };
+    const onEvent = vi.fn();
+    await consumeAgentSse({ client: mkClient([{ type: "message_end", message: { role: "assistant", stopReason: "stop",
+      nativeUserInput, content: [{ type: "text", text: "Which format?" }] } }]), sessionId: "s", userId: "u", persistMessages: true, onEvent });
+    expect(appendCalls.some(row => row.metadata?.native_user_input?.requestId === nativeUserInput.requestId)).toBe(true);
+    expect(onEvent.mock.calls.some(([event]) => event.nativeUserInput?.requestId === nativeUserInput.requestId)).toBe(true);
+  });
   it("returns zero eventCount and empty strings", async () => {
     const result = await consumeAgentSse({ client: mkClient([]), sessionId: "s", userId: "u" });
     expect(result.eventCount).toBe(0);

@@ -56,7 +56,7 @@ async function bootRuntime() {
       getAsync: vi.fn(), getOrCreate: vi.fn(), list: vi.fn(async () => []), cleanup: vi.fn(async () => {}),
     } as any,
     frontendClient: { request: vi.fn(async () => ({})), onCommand: vi.fn(), emitEvent: vi.fn(), close: vi.fn() } as any,
-    credentialService: {} as any,
+    credentialService: { attachGrants: () => {}, resolveActorResources: async () => ({ clusters: [], hosts: [] }) } as any,
   });
 }
 

@@ -95,7 +95,7 @@ describe("capability.testSessions", () => {
       agentBoxManager: manager,
       // Memory-cold: the run only lives in the store, with a compile profile.
       frontendClient: fakeFrontendClient("kb-compile"),
-      credentialService: {} as any,
+      credentialService: { attachGrants: () => {}, resolveActorResources: async () => ({ clusters: [], hosts: [] }) } as any,
     });
 
     const list = server.rpcMethods.get("capability.testSessions")!;
@@ -127,7 +127,7 @@ describe("capability.testSessions", () => {
       config: { port: 0, internalPort: 0, host: "127.0.0.1", serverUrl: "", portalSecret: "" } as any,
       agentBoxManager: fakeAgentBoxManager(null),
       frontendClient: fakeFrontendClient(),
-      credentialService: {} as any,
+      credentialService: { attachGrants: () => {}, resolveActorResources: async () => ({ clusters: [], hosts: [] }) } as any,
     });
     try {
       const list = server.rpcMethods.get("capability.testSessions")!;
@@ -146,7 +146,7 @@ describe("capability.testSessions", () => {
       config: { port: 0, internalPort: 0, host: "127.0.0.1", serverUrl: "", portalSecret: "" } as any,
       agentBoxManager: manager,
       frontendClient: fakeFrontendClient(),
-      credentialService: {} as any,
+      credentialService: { attachGrants: () => {}, resolveActorResources: async () => ({ clusters: [], hosts: [] }) } as any,
     });
 
     const list = server.rpcMethods.get("capability.testSessions")!;
@@ -161,7 +161,7 @@ describe("capability.testSessions", () => {
       config: { port: 0, internalPort: 0, host: "127.0.0.1", serverUrl: "", portalSecret: "" } as any,
       agentBoxManager: manager,
       frontendClient: fakeFrontendClient(),
-      credentialService: {} as any,
+      credentialService: { attachGrants: () => {}, resolveActorResources: async () => ({ clusters: [], hosts: [] }) } as any,
     });
 
     const list = server.rpcMethods.get("capability.testSessions")!;

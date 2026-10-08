@@ -32,6 +32,14 @@ beforeEach(() => {
 });
 
 describe("checkNodeReady", () => {
+  it("propagates Stop to the node readiness query and avoids a pre-aborted launch", async () => {
+    const stop = new AbortController(); mockExecFile.mockResolvedValueOnce({ stdout: "True" });
+    expect(await checkNodeReady("node-1", undefined, "/private/broker.kubeconfig", stop.signal)).toBeNull();
+    expect(mockExecFile.mock.calls[0][2]).toMatchObject({ signal: stop.signal });
+    mockExecFile.mockClear(); stop.abort();
+    expect(await checkNodeReady("node-1", undefined, undefined, stop.signal)).toBe("Aborted.");
+    expect(mockExecFile).not.toHaveBeenCalled();
+  });
   it("returns null when status is True", async () => {
     mockExecFile.mockResolvedValueOnce({ stdout: "True" });
     expect(await checkNodeReady("node-1")).toBeNull();

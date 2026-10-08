@@ -1,4 +1,7 @@
 import { ConversationClient, supportsConversations } from "../conversation-client.js";
+import { channelExecutionContext, executionAuditUser } from "../../shared/execution-context.js";
+import { openExecutionGrant } from "../execution-grants.js";
+import { ChannelAcceptanceReception, type ChannelAcceptanceScope } from "../channel-acceptance-scope.js";
 /**
  * Lark (飞书) channel handler.
  *
@@ -386,6 +389,7 @@ export function createLarkHandler(
   agentBoxManager: AgentBoxManager,
   tlsOptions?: { cert: string; key: string; ca: string },
   frontendClient?: FrontendWsClient,
+  acceptanceScope?: ChannelAcceptanceScope,
 ): ChannelHandler {
   const channelId: string = channel.id;
   const config: LarkChannelConfig =
@@ -394,6 +398,7 @@ export function createLarkHandler(
       : channel.config;
 
   let wsClient: { close(params?: { force?: boolean }): void } | null = null;
+  const reception = acceptanceScope ? new ChannelAcceptanceReception(acceptanceScope) : undefined;
 
   return {
     async start() {
@@ -457,6 +462,11 @@ export function createLarkHandler(
         // immediately and kick the actual work onto a detached task so the
         // ACK ships in <1ms and redelivery never triggers.
         "im.message.receive_v1": (data: any) => {
+          if (reception && !reception.allowsMessage(data)) {
+            const candidate = reception.groupProbeCandidate(data);
+            if (candidate) console.log(`[lark] Acceptance group candidate channel=${channelId} chat=${candidate}`);
+            return Promise.resolve();
+          }
           setImmediate(() => {
             handleLarkMessage(data, larkClient, channelId, agentBoxManager, tlsOptions, frontendClient, localeForDomain(config.domain), config, botOpenId)
               .catch((err) => {
@@ -471,6 +481,7 @@ export function createLarkHandler(
         // handler to stay well within Feishu's ~3s callback window (see the
         // handleLarkCardAction doc comment / the 200671 fix).
         "card.action.trigger": (data: any) => {
+          if (reception && !reception.allowsCard(data)) return undefined;
           try {
             return handleLarkCardAction(data, larkClient, frontendClient, agentBoxManager, tlsOptions);
           } catch (err) {
@@ -1963,14 +1974,20 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
     console.log(`[lark] Binding disappeared before queued run channel=${channelId} chat=${chatId} route=${route}`);
     return;
   }
-  if (!binding.createdBy) {
-    await replyToLark(larkClient, messageId, MISSING_OWNER_NOTICE_BY_LOCALE[locale], replyInThread);
+  let execution: import("../../shared/execution-context.js").ExecutionContext;
+  try { execution = channelExecutionContext(binding, frontendClient?.consumerDeclares?.("executionIdentity") === true); }
+  catch {
+    await replyToLark(larkClient, messageId, binding.identity || frontendClient?.consumerDeclares?.("executionIdentity") === true
+      ? AGENT_ERROR_NOTICE_BY_LOCALE[locale] : MISSING_OWNER_NOTICE_BY_LOCALE[locale], replyInThread);
     return;
   }
+  const auditUserId = executionAuditUser(execution, binding.createdBy) || senderOpenId;
+  if (!auditUserId) { await replyToLark(larkClient, messageId, AGENT_ERROR_NOTICE_BY_LOCALE[locale], replyInThread); return; }
+  const sessionOrigin = binding.origin ?? "channel";
 
   const agentId = binding.agentId;
   const sessionId = binding.sessionId;
-  sessionRegistry.remember(sessionId, binding.createdBy, agentId);
+  sessionRegistry.remember(sessionId, auditUserId, agentId);
   // Channel audit actor (NOT runtime identity — that stays `createdBy` via
   // remember() above). The sender's raw open_id is the "same person" key for
   // channel audit; it is stamped on the SESSION (chat_sessions), never falls
@@ -1985,7 +2002,8 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
   const persistedText = redactImageUrlsInText(effectiveText);
   let promptMessageId: string;
   try {
-    await ensureChatSession(sessionId, agentId, binding.createdBy, persistedText, persistedText, "channel", undefined, { senderExternalId, channelId, senderType });
+    await ensureChatSession(sessionId, agentId, auditUserId, persistedText, persistedText, sessionOrigin, undefined,
+      { senderExternalId, channelId, senderType, ...(binding.identity ? { identity: execution.identity, sender: execution.sender } : {}) });
     promptMessageId = await appendMessage({
       sessionId,
       role: "user",
@@ -2071,7 +2089,7 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
     if (milestones.length > MILESTONE_CAP) milestones.shift();
     return flushMilestoneCard();
   };
-  registerBackgroundChannelDelivery(sessionId, async (backgroundMessage) => {
+  const clearDelivery = registerBackgroundChannelDelivery(sessionId, async (backgroundMessage) => {
     if ("text" in backgroundMessage) {
       const display = stripVisualBlocks(backgroundMessage.text, { stripSourceBlocks: true })
         || (backgroundMessage.kind === "final" ? EMPTY_RESULT_NOTICE_BY_LOCALE[locale] : "");
@@ -2100,7 +2118,7 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
     // A synchronous request owns its answer stream. Detached assistant rows
     // remain history; they must not replace its card or start a second reply.
     return false;
-  });
+  }, undefined, promptMessageId);
 
   // One turn at a time for this session. The AgentBox's own 409 only sees its own
   // sessions, so once an agent runs more than one box two messages could be dispatched to
@@ -2120,7 +2138,8 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
     if (!remoteConversation) releaseTurn = await sessionTurnLocks.acquireRequest(sessionId, "sync");
     let client: Pick<AgentBoxClient, "prompt" | "streamEvents">;
     if (remoteConversation && frontendClient) {
-      client = new ConversationClient(frontendClient, { agentId, userId: binding.createdBy, sessionId, userMessageId: promptMessageId, origin: "channel" });
+      client = new ConversationClient(frontendClient, { agentId, userId: auditUserId, sessionId, userMessageId: promptMessageId,
+        origin: sessionOrigin, identity: execution.identity, sender: execution.sender });
     } else {
       const handle = await agentBoxManager.getOrCreate(agentId, undefined, sessionId);
       sessionTurnLocks.noteBox(sessionId, handle.boxId, handle.endpoint);
@@ -2159,6 +2178,11 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
       ? { discussion: drained.lines, truncated: drained.truncated, asker: senderLabel(senderOpenId) }
       : undefined;
     const promptOpts: PromptOptions = {
+      userId: auditUserId,
+      origin: sessionOrigin,
+      identity: execution.identity,
+      sender: execution.sender,
+      channelDeliveryId: promptMessageId,
       requestMode: "sync",
       text: buildChannelTurnPrompt(promptText, sharedContext),
       agentId,
@@ -2175,6 +2199,7 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
       ...(images.length ? { images } : {}),
     };
     // queue-until-idle: wait out a busy session instead of dumping a raw 409.
+    if (!remoteConversation) promptOpts.grantId = await openExecutionGrant(agentId, sessionId, execution.identity, execution.sender);
     const promptResult = remoteConversation ? await client.prompt(promptOpts) : await promptWithBusyRetry(client, promptOpts);
     void bindMessageTraceId(promptMessageId, promptResult.sessionId, promptResult.traceId).catch((bindErr) => {
       warnTraceBindFailure("lark prompt", promptResult.sessionId, promptMessageId, bindErr);
@@ -2207,6 +2232,7 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
       console.error(`[lark] Agent execution failed for session=${sessionId}:`, agentError);
     }
   } finally {
+    clearDelivery();
     releaseTurn?.();
   }
 
@@ -3387,6 +3413,12 @@ export async function collectChannelResponse(
   try {
     for await (const event of channelExecutionEvents(client.streamEvents(sessionId), client.conversationEvents)) {
       const ev = event as Record<string, any>;
+      if (ev.type === "native_subagent_progress" && options.onActivity &&
+          Number.isInteger(ev.total) && Number.isInteger(ev.done) && ev.total > 0 && ev.done >= 0 && ev.done <= ev.total) {
+        options.onActivity(ev.done === ev.total
+          ? options.locale === "en-US" ? "Combining sub-task results" : "正在汇总子任务结果"
+          : options.locale === "en-US" ? `Sub-tasks: ${ev.done}/${ev.total} finished` : `子任务：${ev.done}/${ev.total} 已结束`);
+      }
       if (ev.type === "agent_switch") {
         flushPendingNarration();
         const name = ev.toAgentName || ev.toAgentId;

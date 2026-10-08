@@ -18,8 +18,11 @@
 
 import type { JobStatus } from "./job-registry.js";
 import type { GroupItemStatus, SubagentGroupReport } from "./tool-registry.js";
+import { NATIVE_CHILD_SYNTHESIS_PROMPT } from "./brains/codex-request-work.js";
 
 export interface TaskNotification {
+  /** Runtime-only notice: the result remains in the owned native conversation. */
+  nativeChild?: boolean;
   taskId: string;
   /** Present for background bash; the model reads it with the built-in `read` tool. */
   outputFile?: string;
@@ -82,6 +85,9 @@ export function buildTaskNotificationText(n: TaskNotification): string {
  * one job.
  */
 export function buildNotificationBatch(notifications: TaskNotification[]): string {
+  if (notifications.some(n => n.nativeChild)) return NATIVE_CHILD_SYNTHESIS_PROMPT + "\n" +
+    JSON.stringify({ nativeCompletions: notifications.filter(n => n.nativeChild).map(n => ({ id: n.taskId, status: n.status })),
+      otherResults: notifications.filter(n => !n.nativeChild) });
   if (notifications.length <= 1) return buildTaskNotificationText(notifications[0]);
   const blocks = notifications.map(buildNotificationBlock).join("\n");
   return (

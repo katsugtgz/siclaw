@@ -17,6 +17,7 @@ import {
 } from "./background-delivery.js";
 import { sessionRegistry } from "../session-registry.js";
 import { resetFeedbackEchoForTest } from "./lark-card.js";
+import { parseChannelAcceptanceScope } from "../channel-acceptance-scope.js";
 
 const supportsConversationsMock = vi.hoisted(() => vi.fn());
 vi.mock("../conversation-client.js", async (original) => ({
@@ -116,6 +117,18 @@ vi.mock("../chat-repo.js", () => ({
 // ── Event transport has a channel lifetime, not a provider/request lifetime ─
 
 describe("createLarkHandler — independent transport lifetime", () => {
+  it("acceptance fence drops unselected group events and callbacks before any RPC or task", async () => {
+    const agentId = "79068105-473b-4417-8935-b4f11c16c5b3";
+    const scope = parseChannelAcceptanceScope(JSON.stringify({ agent_id: agentId, group_ids: ["oc_allowed"] }))!;
+    const handler = createLarkHandler({ id: "test-only", config: { app_id: "test", app_secret: "test", group_channel_id: "test-only", personal_bot: { agent_id: agentId, access_mode: "granted" } } },
+      makeAgentBoxManager(agentId) as any, undefined, {} as any, scope);
+    await handler.start();
+    await larkSdk.handlers["im.message.receive_v1"](makeTextEvent("PAIR ABC123", { chat_type: "group", chat_id: "oc_not_allowed" }));
+    expect(larkSdk.handlers["card.action.trigger"]({ context: { open_chat_id: "oc_not_allowed" }, action: { value: { kind: "feedback" } } })).toBeUndefined();
+    expect(resolveBindingMock).not.toHaveBeenCalled(); expect(handlePairingCodeMock).not.toHaveBeenCalled();
+    expect(promptMock).not.toHaveBeenCalled(); expect(recordChannelFeedbackMock).not.toHaveBeenCalled();
+    await handler.stop();
+  });
   it("closes the event transport only when the channel is stopped", async () => {
     const handler = createLarkHandler(
       { id: "c1", config: { app_id: "x", app_secret: "y" } },
@@ -992,7 +1005,7 @@ describe("handleLarkMessage — routing to AgentBox", () => {
     sessionRegistry.forget("session-agent-7");
   });
 
-  it("does not pass userId into the AgentBox prompt payload", async () => {
+  it("passes attribution separately from the execution identity", async () => {
     // (keep this one near the bottom — it's the same shape as above)
     resolveBindingMock.mockResolvedValue(makeBinding({ agentId: "a" }));
     promptMock.mockResolvedValue({ sessionId: "s" });
@@ -1008,7 +1021,8 @@ describe("handleLarkMessage — routing to AgentBox", () => {
     );
 
     const promptArg = promptMock.mock.calls[0][0];
-    expect(promptArg).not.toHaveProperty("userId");
+    expect(promptArg.userId).toBe("user-1");
+    expect(promptArg.identity).toEqual({ kind: "user", id: "user-1" });
   });
 
   it("passes the resolved agent model binding into the AgentBox prompt payload", async () => {
@@ -1180,6 +1194,19 @@ describe("handleLarkMessage — routing to AgentBox", () => {
       "open_id:ou_user_2",
       "open_id:ou_user_2",
     ]);
+  });
+
+  it("runs a dedicated group with its binding identity and no legacy creator", async () => {
+    const binding = makeBinding({ createdBy: "" });
+    resolveBindingMock.mockResolvedValue({ ...binding, identity: { kind: "binding", id: binding.bindingId },
+      sender: { userId: "alice", openId: "ou_user_1", member: true }, origin: "channel" });
+    promptMock.mockResolvedValue({ sessionId: "session-fixed" });
+    streamEventsMock.mockImplementation(async function* () {});
+    await handleLarkMessage(makeTextEvent("count resources"), makeLarkClient(), "lark",
+      makeAgentBoxManager("a1") as any, undefined, {} as any);
+    expect(promptMock).toHaveBeenCalledTimes(1);
+    expect(promptMock.mock.calls[0][0]).toMatchObject({ userId: "alice", identity: { kind: "binding", id: binding.bindingId } });
+    expect(ensureChatSessionMock.mock.calls[0][7]).toMatchObject({ identity: { kind: "binding", id: binding.bindingId }, sender: { userId: "alice" } });
   });
 
   it("rejects legacy bindings without an owner instead of writing lark chat ids as users", async () => {
@@ -3034,6 +3061,7 @@ describe("handleLarkMessage — streaming card flow", () => {
       await expect(deliverChannelVisibleMessage({
         sessionId,
         kind: "final",
+        requestId: promptMock.mock.calls[0][0].channelDeliveryId,
         text: '```visual-card\n{"type":"report","title":"legacy"}\n```',
       })).resolves.toBe(true);
 
@@ -3078,6 +3106,7 @@ describe("handleLarkMessage — streaming card flow", () => {
         sessionId,
         kind: "milestone",
         text: "```mermaid\nflowchart TD\nA --> B\n```",
+        requestId: promptMock.mock.calls[0][0].channelDeliveryId,
       })).resolves.toBe(true);
       expect(lark.cardkit.v1.cardElement.content.mock.calls).toHaveLength(updatesBeforeMilestone);
 
@@ -3246,16 +3275,19 @@ describe("handleLarkMessage — streaming card flow", () => {
         sessionId,
         kind: "milestone",
         text: "里程碑 1：已拿到节点列表。",
+        requestId: promptMock.mock.calls[0][0].channelDeliveryId,
       })).resolves.toBe(true);
       await expect(deliverChannelVisibleMessage({
         sessionId,
         kind: "artifact",
         text: "产物提示：已生成诊断草稿。",
+        requestId: promptMock.mock.calls[0][0].channelDeliveryId,
       })).resolves.toBe(true);
       await expect(deliverChannelVisibleMessage({
         sessionId,
         kind: "milestone",
         text: "这条应该被 Gateway 策略压掉。",
+        requestId: promptMock.mock.calls[0][0].channelDeliveryId,
       })).resolves.toBe(true);
 
       const inFlightContentCalls = lark.cardkit.v1.cardElement.content.mock.calls;
@@ -4135,6 +4167,20 @@ describe("collectResponse — SSE event flattening", () => {
     expect(text).toBe("Hello! How can I help?");
   });
 
+  it("keeps native child progress inside the same channel stream until parent synthesis", async () => {
+    const activity = vi.fn();
+    const events = [
+      { type: "native_subagent_progress", total: 2, done: 0 },
+      { type: "message_end", awaitingSubagents: true, message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Waiting for checks" }] } },
+      { type: "agent_end", awaitingSubagents: true },
+      { type: "native_subagent_progress", total: 2, done: 1 },
+      { type: "native_subagent_progress", total: 2, done: 2 },
+      { type: "message_end", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "PARENT_FINAL_REPORT" }] } },
+    ];
+    const result = await collectChannelResponse(fakeClient(events), "native-progress", "lark", { onActivity: activity, locale: "zh-CN" });
+    expect(result.text).toBe("PARENT_FINAL_REPORT");
+    expect(activity.mock.calls.map(([text]) => text)).toEqual(["子任务：0/2 已结束", "子任务：1/2 已结束", "正在汇总子任务结果"]);
+  });
   it("appends registered knowledge sources to a Feishu answer", async () => {
     const events = [
       { type: "knowledge_sources", sources: [{ title: "GPU Runbook", url: "https://docs.feishu.cn/wiki/a" }] },

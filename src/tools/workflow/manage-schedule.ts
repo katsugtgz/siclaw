@@ -9,6 +9,7 @@ import type { KubeconfigRef } from "../../core/types.js";
 export function createManageScheduleTool(
   kubeconfigRef?: KubeconfigRef,
   sessionIdRef?: { current: string },
+  executionClient?: import("../../agentbox/gateway-client.js").GatewayClient,
 ): ToolDefinition {
   return {
     name: "manage_schedule",
@@ -88,13 +89,13 @@ Common cron patterns:
     async execute(_toolCallId, rawParams) {
       const params = rawParams as ManageScheduleParams;
 
-      return manageSchedule(params, sessionIdRef?.current);
+      return manageSchedule(params, sessionIdRef?.current, executionClient);
     },
   };
 }
 
 export const registration: ToolEntry = {
   category: "workflow",
-  create: (refs) => createManageScheduleTool(refs.kubeconfigRef, refs.sessionIdRef),
+  create: (refs) => createManageScheduleTool(refs.kubeconfigRef, refs.sessionIdRef, refs.executionClient),
   modes: ["web", "channel"],
 };

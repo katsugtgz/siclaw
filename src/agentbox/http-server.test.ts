@@ -265,6 +265,7 @@ function makeFakeSessionManager(ledgerDir = fs.mkdtempSync(path.join(os.tmpdir()
     lateResults: vi.fn(),
     beginBackgroundWorkTurn(managed: any, requestMode = "async") {
       managed._requestMode = requestMode;
+      managed.brain.beginRequest?.(requestMode);
       const turn = new BackgroundWorkTurn(n => this.lateResults(n));
       managed._backgroundWorkTurn = turn;
       managed.brain.setMailbox?.(turn.mailbox);

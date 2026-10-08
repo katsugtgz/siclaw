@@ -17,7 +17,9 @@ export async function checkNodeReady(
   node: string,
   env?: NodeJS.ProcessEnv,
   kubeconfigPath?: string,
+  signal?: AbortSignal,
 ): Promise<string | null> {
+  if (signal?.aborted) return "Aborted.";
   try {
     const { stdout } = await execFileAsync(
       "kubectl",
@@ -29,7 +31,7 @@ export async function checkNodeReady(
         "-o",
         "jsonpath={.status.conditions[?(@.type==\"Ready\")].status}",
       ],
-      { timeout: KUBECTL_TIMEOUT, env },
+      { timeout: KUBECTL_TIMEOUT, env, signal },
     );
     const status = stdout.trim();
     if (status !== "True") {

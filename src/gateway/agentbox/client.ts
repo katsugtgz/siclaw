@@ -16,6 +16,7 @@ import { modelOptionsSupportImageInput, type ModelRoutePolicy } from "../../core
 import type { OriginKind } from "../../core/types.js";
 import { enrichImagesFromText, redactImageUrlsInText } from "./image-url-ingest.js";
 import { RpcResponseError, wrapRpcError } from "../../lib/error-envelope.js";
+import type { NativeUserInputRequest, NativeUserInputAnswer, NativeUserInputAcceptance } from "../../shared/native-user-input.js";
 
 export interface AgentBoxTlsOptions {
   cert: string;
@@ -24,6 +25,10 @@ export interface AgentBoxTlsOptions {
 }
 
 export interface PromptOptions {
+  identity?: import("../../shared/execution-identity.js").ExecutionIdentity;
+  sender?: import("../../shared/execution-context.js").ExecutionSender;
+  grantId?: string;
+  channelDeliveryId?: string;
   /** Opaque control-plane dispatch receipt; never a credential. */
   apiRequestId?: string;
   requestMode?: import("../../shared/request-mode.js").RequestMode;
@@ -442,6 +447,17 @@ export class AgentBoxClient {
    */
   async sessionStatus(sessionId: string): Promise<{ running: boolean }> {
     const resp = await this.fetch(`/api/sessions/${sessionId}/status`);
+    return resp.json();
+  }
+
+  async getUserInput(sessionId: string): Promise<{ nativeUserInput: NativeUserInputRequest | null }> {
+    const resp = await this.fetch(`/api/sessions/${sessionId}/user-input`);
+    return resp.json();
+  }
+  async submitUserInput(sessionId: string, answer: NativeUserInputAnswer, prepare = false): Promise<NativeUserInputAcceptance & { traceId?: string }> {
+    const resp = await this.fetch(`/api/sessions/${sessionId}/user-input${prepare ? "/prepare" : ""}`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(answer),
+    });
     return resp.json();
   }
 

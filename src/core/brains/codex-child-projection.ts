@@ -4,6 +4,7 @@ import { appendKnowledgeSourceCitations, knowledgeCitationsMetadata, type Knowle
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import type { UsageObservation, UsageSink } from "../../shared/model-usage.js";
+import type { NativeChildExecution, NativeChildExecutionObserver } from "./codex-request-work.js";
 
 type ObjectValue = Record<string, unknown>;
 const object = (v: unknown): v is ObjectValue => !!v && typeof v === "object" && !Array.isArray(v);
@@ -63,13 +64,17 @@ export class CodexChildProjection {
   private error?: Error;
   private readonly file: string;
   private readonly knowledgeSources = new Map<string, KnowledgeSourceCitation[]>();
+  private readonly executions = new Map<string, { id: string; observer?: NativeChildExecutionObserver }>();
+  private readonly prepared = new Map<string, { parentThreadId: string; parentTurnId?: string; id: string }>();
+  private readonly preparedItems = new Set<string>();
 
   constructor(directory: string, private readonly root: () => string | undefined,
     private readonly context: () => ReturnType<UsageSink["context"]>,
     private readonly model: () => { id: string; provider: string },
     private readonly usage: (child: Child, params: ObjectValue, callId: string) => UsageObservation | undefined,
     private readonly inspect?: (threadId: string, parentThreadId: string) => Promise<string>,
-    private readonly redact?: (text: string) => string) {
+    private readonly redact?: (text: string) => string,
+    private readonly executionStarted?: (execution: NativeChildExecution) => NativeChildExecutionObserver | undefined) {
     this.file = path.join(directory, "codex-children.json");
     if (fs.existsSync(this.file)) {
       const saved = JSON.parse(fs.readFileSync(this.file, "utf8")) as Journal;
@@ -87,7 +92,10 @@ export class CodexChildProjection {
     this.startDrain();
   }
 
-  ownsActive(threadId: string): boolean { return this.children.get(threadId)?.active === true; }
+  ownsActive(threadId: string, turnId?: string): boolean {
+    const child = this.children.get(threadId);
+    return child?.active === true && (turnId === undefined || child.turnId === turnId);
+  }
   setKnowledgeSources(threadId: string, sources: KnowledgeSourceCitation[]): void {
     if (this.ownsActive(threadId)) this.knowledgeSources.set(threadId, sources);
   }
@@ -102,29 +110,37 @@ export class CodexChildProjection {
       if (item.type === "collabAgentToolCall") {
         const receivers = Array.isArray(item.receiverThreadIds) ? item.receiverThreadIds : [];
         if (item.tool === "spawnAgent" && item.status !== "failed") {
-          for (const id of receivers) if (text(id)) this.anchor(text(id), threadId, text(item.id), text(item.prompt), text(item.model));
+          for (const id of receivers) if (text(id)) this.anchor(text(id), threadId, text(item.id), text(item.prompt), text(item.model), text(event.params.turnId));
         }
         for (const id of receivers) {
           const child = this.children.get(text(id));
           if (!child) continue;
           if (["sendInput", "followupTask", "resumeAgent"].includes(text(item.tool)) && item.status !== "failed") {
-            child.context = { ...(this.children.get(threadId)?.context ?? this.context()) };
+            this.prepareExecution(child.threadId, threadId, text(event.params.turnId), text(item.id));
+            if (!this.executionStarted) child.context = { ...(this.children.get(threadId)?.context ?? this.context()) };
             this.save(); // Capture before the native child can complete its first response.
           }
           const states = object(item.agentsStates) ? item.agentsStates : {};
           const value = states[text(id)];
           const state = object(value) ? value : {};
+          if (this.executions.get(child.threadId)?.observer?.acceptsParent?.(threadId, text(event.params.turnId)) === false) continue;
           if (state.status === "completed") this.status(child, "done", text(state.message), text(item.id));
           else if (state.status === "errored") this.status(child, "failed", text(state.message), text(item.id));
           else if (item.tool === "closeAgent" && child.active) this.status(child, "cancelled", child.summary, text(item.id));
         }
       } else if (item.type === "subAgentActivity") {
         const id = text(item.agentThreadId);
-        if (item.kind === "started" && id) this.anchor(id, threadId, text(item.id), text(item.agentPath), "");
+        if (item.kind === "started" && id) this.anchor(id, threadId, text(item.id), text(item.agentPath), "", text(event.params.turnId));
         const child = this.children.get(id);
-        if (child && item.kind === "interacted") child.context = { ...this.context() };
-        if (child && item.kind === "completed") this.status(child, "done", child.summary, text(item.id));
-        if (child && item.kind === "interrupted") this.status(child, "cancelled", child.summary, text(item.id));
+        if (child && item.kind === "interacted") {
+          if (!this.executionStarted) child.context = { ...this.context() };
+          this.prepareExecution(id, threadId, text(event.params.turnId), text(item.id));
+        }
+        const accepts = this.executions.get(id)?.observer?.acceptsParent?.(threadId, text(event.params.turnId)) !== false;
+        const completedTurn = text(item.id).startsWith("subagent-completed-") ? text(item.id).slice("subagent-completed-".length) : "";
+        if (child && accepts && item.kind === "completed" && (!completedTurn || !child.turnId || completedTurn === child.turnId))
+          this.status(child, "done", child.summary, text(item.id));
+        if (child && accepts && item.kind === "interrupted") this.status(child, "cancelled", child.summary, text(item.id));
       }
     }
     if (threadId === this.root()) return;
@@ -155,7 +171,7 @@ export class CodexChildProjection {
       scope: child.title, status: child.active ? "launched" : child.lastStatus ?? "done" };
   }
 
-  private anchor(threadId: string, parentThreadId: string, delegationId: string, title: string, modelId: string): void {
+  private anchor(threadId: string, parentThreadId: string, delegationId: string, title: string, modelId: string, parentTurnId?: string): void {
     if (!delegationId || threadId === this.root() || this.children.has(threadId)) return;
     const parent = this.children.get(parentThreadId);
     const child: Child = { sessionId: randomUUID(), parentSessionId: parent?.sessionId,
@@ -164,6 +180,7 @@ export class CodexChildProjection {
       context: { ...(parent?.context ?? this.context()) },
       active: false, totalTokens: 0, summary: "" };
     this.children.set(threadId, child);
+    this.beginExecution(child, { parentThreadId, parentTurnId, id: delegationId });
     this.enqueue(child, "ensure", { type: "ensure" });
     this.status(child, "running", "", "spawn");
     const buffered = this.early.get(threadId) ?? [];
@@ -179,6 +196,12 @@ export class CodexChildProjection {
     if (event.method === "turn/started") {
       this.knowledgeSources.delete(child.threadId);
       child.turnId = text(turn.id);
+      if (!this.executions.has(child.threadId)) {
+        const prepared = this.prepared.get(child.threadId);
+        if (prepared) this.beginExecution(child, prepared);
+      }
+      this.prepared.delete(child.threadId);
+      this.executions.get(child.threadId)?.observer?.started(child.turnId);
       this.status(child, "running", "", child.turnId);
     } else if (event.method === "item/completed" && object(p.item)) {
       const item = p.item;
@@ -219,6 +242,7 @@ export class CodexChildProjection {
         this.save();
       }
     } else if (event.method === "turn/completed") {
+      if (child.turnId && child.turnId !== text(turn.id)) return;
       child.turnId = undefined;
       this.status(child, turn.status === "failed" ? "failed" : turn.status === "interrupted" ? "cancelled" : "done",
         child.summary, text(turn.id));
@@ -227,10 +251,27 @@ export class CodexChildProjection {
 
   private status(child: Child, status: "running" | "done" | "failed" | "cancelled", summary: string, eventId: string): void {
     const running = status === "running";
+    if (!running) {
+      this.executions.get(child.threadId)?.observer?.finished(status);
+      this.executions.delete(child.threadId);
+    }
     if (child.active !== running) { child.active = running; this.sink?.activity(child.sessionId, running); }
     if (child.lastStatus === status) return;
     child.lastStatus = status;
     this.enqueue(child, `status:${eventId}:${status}`, { type: "status", status, summary });
+  }
+
+  private beginExecution(child: Child, prepared: { parentThreadId: string; parentTurnId?: string; id: string }): void {
+    const execution = { id: nativeProjectionKey(`${child.threadId}:execution:${prepared.id}`),
+      threadId: child.threadId, parentThreadId: prepared.parentThreadId, parentTurnId: prepared.parentTurnId };
+    const observer = this.executionStarted?.(execution);
+    if (observer?.context) child.context = { ...observer.context };
+    this.executions.set(child.threadId, { id: execution.id, observer });
+  }
+  private prepareExecution(threadId: string, parentThreadId: string, parentTurnId: string, id: string): void {
+    if (!id || this.preparedItems.has(id)) return;
+    this.preparedItems.add(id);
+    this.prepared.set(threadId, { parentThreadId, parentTurnId, id });
   }
 
   private enqueue(child: Child, key: string, value: WithoutEnvelope<NativeChildOperation>): void {

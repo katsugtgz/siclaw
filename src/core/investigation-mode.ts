@@ -60,4 +60,3 @@ export function countToolCallsSinceVisibleAssistant(messages: any[]): number {
   }
   return count;
 }
-

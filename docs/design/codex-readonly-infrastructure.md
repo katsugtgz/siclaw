@@ -17,6 +17,40 @@ transport infrastructure and remain independent from the agent engine.
   authentication are resolved internally. The model cannot supply SSH options,
   identities, credentials or forwarding.
 
+### Host tools in a Pod network namespace
+
+Native execution also admits these logical selectors:
+
+```text
+exec_command(environment_id="cluster:<bound-name>", cmd="kubectl -n <namespace> debug pod/<pod> [-c <container>] -- <approved diagnostic command>")
+exec_command(environment_id="siclaw", cmd="ssh <bound-host> --pod <pod> --namespace <namespace> [--container <container>] -- <approved diagnostic command>")
+```
+
+The cluster form requires **node diagnostics**, not ordinary Pod exec/API access.
+It reuses Siclaw's Pod-to-node/CRI netns resolver and the operator-owned node
+helper; it never adds an ephemeral container to the target Pod. The SSH form
+requires host diagnostics; the bound host must run the selected Pod and its
+account must permit CRI/netns access. Names and optional container selectors are
+validated before transport. CRI name/namespace regex filters match exact names.
+The selected container is checked on the cluster path; the netns itself belongs
+to the Pod sandbox, shared by all containers.
+
+Only the backend supplies `ip netns exec` and the resolved namespace name.
+Model-authored raw netns/nsenter commands, helper images, credentials, transport
+options and inline code remain denied by the existing policy. Resolution errors,
+host-network Pods, stopped turns and revoked bindings fail closed; they never
+silently run the diagnostic in the host namespace. Node helper setup and
+resolution retain the prepared-namespace and host-root/cwd restrictions.
+The process-group record stays in the host namespace so native Stop can reap
+the selected command without needing a model-supplied netns handle.
+
+Reviewed immutable node/host Skill scripts support the same selectors with
+their separate script grants and sealed stdin; no free Python/Bash code is
+enabled. Adapter instructions advertise these selectors without editing
+`src/core/prompt.ts`. Component/SSH protocol fixture checks are distinct from
+real Linux Pod-netns deployment acceptance; earlier live infrastructure evidence
+below does not certify this new path.
+
 ## Authorization
 
 Capability booleans come from the current Agent harness. API, node, Pod and SSH
@@ -75,6 +109,26 @@ a namespace. An explicit operator `SICLAW_DEBUG_IMAGE` pin takes precedence over
 the bound cluster's diagnostic image and the default image. The model cannot
 override either. Node commands enter the host's root and cwd as well as its
 mount/UTS/IPC/network/PID namespaces.
+
+Infrastructure cancellation is bound to the native process ID within its
+owning executor connection. After policy admission, `process/signal` and
+`process/terminate` abort that sealed operation directly; native exited/closed
+notifications also terminate any still-running transport work. HTTP disconnect
+remains a complementary trigger, not the only one. A stopped, unclaimed ticket
+is invalidated before it can launch. This keeps reconnect ownership unchanged
+and stores no process output or second job ledger. Fresh remote session cleanup
+still uses the existing broker-owned SSH/Kubernetes transport and exact PGID
+record; unavailable transports remain a best-effort reaping limitation.
+
+Product Stop additionally cancels every active sealed operation in that
+public conversation's Brain-owned relays, including its native children and
+already-yielded process handles. Upstream turn interruption alone only cancels
+the model/polling wait and is not this guarantee. Stop pauses new native
+process launches, invalidates pending tickets and reaps owned local sessions;
+only a newly admitted user prompt reopens launches. Other public conversations
+have separate relays/credentials and are not affected. Silent SSH cancellation
+also destroys local output readers and releases the SSH chain without requiring
+the peer's channel-close acknowledgement.
 
 Pi's existing namespace initialization also accepts a prepared namespace when
 creation is forbidden but its existence can be verified by GET. If neither

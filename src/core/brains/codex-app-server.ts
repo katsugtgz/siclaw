@@ -3,6 +3,7 @@ import { createInterface } from "node:readline";
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { CodexStreamReceipts } from "./codex-stream-receipts.js";
 
 type JsonObject = Record<string, unknown>;
 type Notification = { method: string; params: JsonObject };
@@ -43,6 +44,7 @@ export class CodexAppServer {
   private readonly failureListeners = new Set<(error: Error) => void>();
   private userInputHandler?: (params: JsonObject) => Promise<JsonObject>;
   private closing = false;
+  private readonly streamReceipts = new CodexStreamReceipts();
 
   constructor(
     private readonly codexHome: string,
@@ -189,6 +191,8 @@ export class CodexAppServer {
       return;
     }
     const event = { method: message.method, params: (message.params ?? {}) as JsonObject };
+    const receipts = this.streamReceipts.observe(event.method, event.params);
+    if (receipts) console.info("[codex-text-receipts]", JSON.stringify(receipts));
     for (const listener of this.listeners) listener(event);
   }
 

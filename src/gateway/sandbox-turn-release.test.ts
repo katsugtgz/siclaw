@@ -11,7 +11,7 @@ it.each(["web","api"])("strict %s persistence failure releases its registered tu
   const runtime=await startRuntime({
     config:{port:0,internalPort:0,host:"127.0.0.1",serverUrl:"",portalSecret:""} as any,
     agentBoxManager:{setCertManager:vi.fn(),setSpawnEnvResolver:vi.fn(),setPersistenceResolver:vi.fn(),setTurnTerminator:vi.fn(),getOrCreate:vi.fn(),list:()=>[],cleanup:vi.fn(async()=>{})} as any,
-    frontendClient:frontend as any,credentialService:{} as any,
+    frontendClient:frontend as any,credentialService:{attachGrants:()=>{},resolveActorResources:async()=>({clusters:[],hosts:[]})} as any,
   });
   try{
     await expect(runtime.rpcMethods.get("chat.send")!({agentId:"a",userId:"u",text:"fixture",sessionId:"review-session",origin,requireSessionPersistence:true},{sendEvent:vi.fn()})).rejects.toThrow("durably persist");

@@ -7,6 +7,7 @@ import type {
   BrainContextPreflightResult, PromptMedia, PromptRequirements, BrainToolDefinition,
 } from "../brain-session.js";
 import { CodexAppServer } from "./codex-app-server.js";
+import { codexHomeOwnerKey, restoreCodexHomeForSession, type CodexHomeOwner } from "./codex-home.js";
 import { CodexExecutorRelay } from "./codex-executor-relay.js";
 import { CodexMcpGateway } from "./codex-mcp-gateway.js";
 import { buildMcpToolName, type McpServerConfig } from "../mcp-client.js";
@@ -17,8 +18,10 @@ import type { McpOperationAuthorizer } from "../../shared/mcp-authorization.js";
 import { createModelOutputRedactor, type SensitiveValueSource } from "../../shared/model-output-redactor.js";
 import { redactDataDocument } from "../../tools/infra/kubectl-sanitize.js";
 import { projectCodexMcpResult } from "./codex-mcp-result.js";
-import { CodexWorkflow } from "./codex-workflow.js";
+import { CodexWorkflow, type CodexWorkflowConfig } from "./codex-workflow.js";
 import { CodexUserInput } from "./codex-user-input.js";
+import { NativeUserInputError, type NativeUserInputRequest, type NativeUserInputAnswer,
+  type NativeUserInputAcceptance } from "../../shared/native-user-input.js";
 import { materializePromptFiles } from "../prompt-attachments.js";
 import { DP_ACTIVATION_PROMPT, stripChipMarker, countToolCallsSinceVisibleAssistant,
   DP_TOOL_CALLS_BEFORE_CHECKPOINT, INVESTIGATION_CHECKPOINT_BLOCK_REASON } from "../investigation-mode.js";
@@ -30,6 +33,8 @@ import type { AgentMailbox } from "../agent-mailbox.js";
 import type { LlmCallPromptBoundary } from "../llm-call-recorder.js";
 import type { UsageIdentity, UsageSink } from "../../shared/model-usage.js";
 import { CodexChildProjection, type NativeChildSink } from "./codex-child-projection.js";
+import { CodexRequestWork, NATIVE_CHILD_SYNTHESIS_PROMPT, type NativeChildExecution } from "./codex-request-work.js";
+import type { RequestMode } from "../../shared/request-mode.js";
 
 type JsonObject = Record<string, unknown>;
 type CodexEvent = { method: string; params: JsonObject };
@@ -169,14 +174,24 @@ export class CodexAgentBrain implements BrainSession {
   private abortPending = false;
   private mailbox: AgentMailbox | undefined;
   private lastTurnHadContent = false;
+  private requestMode?: RequestMode;
+  private requestWork?: CodexRequestWork;
+  private readonly requestScopes = new Set<CodexRequestWork>();
+  private readonly rootTurnOwners = new Map<string, CodexRequestWork>();
+  private readonly childTurnOwners = new Map<string, CodexRequestWork>();
+  private readonly childInterrupts = new Map<string, Promise<void>>();
+  private nativeChildRecovery?: (scopeId: string) => void;
+  private logicalRequestOpen = false;
   private retryWake: (() => void) | undefined;
 
   private constructor(
     private readonly sessionManager: SessionManager,
     private readonly native: { grants: CodexExecutorGrants; mcpServers?: Record<string, McpServerConfig>; sensitiveValues?: SensitiveValueSource; allowSubagents?: boolean; codexHome?: string;
+      codexHomeScope?: CodexHomeOwner & { userDataDir: string };
       authorizeMcp?: McpOperationAuthorizer;
       environments?: Array<{ id: string; grants: CodexExecutorGrants }>;
-      workflow?: { schedule: boolean; report: boolean; sessionId: () => string };
+      workflow?: CodexWorkflowConfig;
+      defaultRequestMode?: RequestMode;
       userQuestions?: { emit: (event: Record<string, unknown>) => void; waitForAnswer?: boolean };
       dpStateRef?: MutableDpStateRef;
       knowledge?: { directory: string; emit: (event: { type: "knowledge_sources"; sources: KnowledgeSourceCitation[] }) => void } },
@@ -190,7 +205,7 @@ export class CodexAgentBrain implements BrainSession {
     const sessionDir = sessionManager.getSessionDir();
     this.mcpAuthorization = new CodexMcpAuthorization({ authorize: native.authorizeMcp,
       owns: (id, turnId) => !this.closed && !this.abortPending && (id === this.threadId
-        ? !!this.active && this.active.id === turnId : this.children?.ownsActive(id) === true),
+        ? !!this.active && this.active.id === turnId : this.children?.ownsActive(id, turnId) === true),
       projectArguments: (server, name, args) => {
         const config = native.mcpServers?.[server];
         if (!config) throw new Error("MCP server is not selected");
@@ -224,19 +239,23 @@ export class CodexAgentBrain implements BrainSession {
     native.grants = { ...native.grants, inputRoots: [this.inputDirectory], deniedRoots: [...native.grants.deniedRoots, path.join(cwd, ".attachments")], redactOutput: outputGate, sensitiveValues };
     native.environments = native.environments?.map(environment => ({ ...environment,
       grants: { ...environment.grants, inputRoots: [this.inputDirectory], deniedRoots: [...environment.grants.deniedRoots, path.join(cwd, ".attachments")], redactOutput: outputGate, sensitiveValues } }));
-    if (native.workflow && (native.workflow.schedule || native.workflow.report)) {
-      this.workflow = new CodexWorkflow({ ...native.workflow, active: () => this.active?.id && this.threadId
-        ? { threadId: this.threadId, turnId: this.active.id } : undefined });
-      this.mcpGateway.registerService("siclaw_workflow", this.workflow.tools,
+    if (native.workflow) {
+      this.workflow = new CodexWorkflow({ ...native.workflow, cwd: this.cwd,
+        active: () => !this.closed && !this.abortPending && this.active?.id && this.threadId
+          ? { threadId: this.threadId, turnId: this.active.id } : undefined,
+        ownsRead: (id, turnId) => !this.closed && !this.abortPending && this.children?.ownsActive(id, turnId) === true,
+        projectArguments: args => this.mcpGateway.projectProductArguments(args),
+        canFinalize: () => !this.requestWork?.pending });
+      if (this.workflow.tools.length) this.mcpGateway.registerService("siclaw_workflow", this.workflow.tools,
         (args, id, signal, name) => this.workflow!.call(args, id, signal, name));
     }
     if (native.userQuestions) this.userInput = new CodexUserInput({
       active: () => this.active?.id && this.threadId ? { threadId: this.threadId, turnId: this.active.id } : undefined,
-      redact: outputGate, waitForAnswer: native.userQuestions.waitForAnswer, show: (text, questions) => {
-        const message = this.assistantMessage(text, "stop");
+      redact: outputGate, waitForAnswer: native.userQuestions.waitForAnswer, show: (text, questions, nativeUserInput) => {
+        const message = { ...this.assistantMessage(text, "stop"), nativeUserInput };
         this.emit({ type: "message_start", message }); this.emit({ type: "message_end", message }); this.appendCache(message);
         if (this.active) this.active.assistantHadContent = true;
-        native.userQuestions!.emit({ type: "input_required", question: text, questions });
+        native.userQuestions!.emit({ type: "input_required", question: text, questions, nativeUserInput });
         if (native.userQuestions!.waitForAnswer === false && this.active?.id) void this.client?.request("turn/steer", {
           threadId: this.threadId, expectedTurnId: this.active.id,
           input: [{ type: "text", text: "The question was delivered to the external caller. End this turn now; their answer will arrive as the next message in this conversation." }],
@@ -262,7 +281,18 @@ export class CodexAgentBrain implements BrainSession {
           throw new Error("Native child ancestry or model identity is unavailable");
         }
         return string(thread.model);
-      }, outputGate);
+      }, outputGate, execution => {
+        const owner = execution.parentThreadId === this.threadId
+          ? this.rootTurnOwners.get(execution.parentTurnId ?? "") : this.childTurnOwners.get(`${execution.parentThreadId}:${execution.parentTurnId}`);
+        if (!owner) return;
+        const observer = owner.register(execution);
+        return { context: owner.context, acceptsParent: (id, turnId) => (id === this.threadId
+          ? this.rootTurnOwners.get(turnId ?? "") : this.childTurnOwners.get(`${id}:${turnId}`)) === owner,
+        started: turnId => {
+          this.childTurnOwners.set(`${execution.threadId}:${turnId}`, owner);
+          observer.started(turnId);
+        }, finished: observer.finished };
+      });
     if (native.knowledge) {
       this.knowledge = new CodexKnowledge({ knowledgeDir: native.knowledge.directory,
         redact: outputGate, sensitiveValues,
@@ -277,26 +307,41 @@ export class CodexAgentBrain implements BrainSession {
       .filter((entry) => entry.type === "message")
       .map((entry) => entry.message);
     if (fs.existsSync(this.marker)) {
+      let saved: { threadId?: unknown; lastTurnId?: unknown; rolloutPath?: unknown; home?: unknown; ownerKey?: unknown } | undefined;
       try {
-        const saved = JSON.parse(fs.readFileSync(this.marker, "utf8")) as { threadId?: unknown; lastTurnId?: unknown; rolloutPath?: unknown };
+        saved = JSON.parse(fs.readFileSync(this.marker, "utf8"));
+      } catch {
+        // Only malformed metadata is recoverable. An ownership/path refusal
+        // below must preserve the sidecar and fail closed, not start a new thread.
+        fs.rmSync(this.marker, { force: true });
+      }
+      if (saved && record(saved)) {
         this.threadId = string(saved.threadId) || undefined;
         this.lastTurnId = string(saved.lastTurnId) || undefined;
         this.rolloutPath = string(saved.rolloutPath) || undefined;
-        // Existing native SQLite history stays in its original home. New
-        // conversations use the owner-scoped home; never copy a live DB.
-        if (this.threadId && fs.existsSync(legacyHome)) this.home = legacyHome;
-      } catch {
-        // A corrupt sidecar must not make a recoverable Pi transcript unusable.
-        fs.rmSync(this.marker, { force: true });
+        if (this.threadId && native.codexHomeScope) {
+          const scope = native.codexHomeScope;
+          if (saved.ownerKey !== undefined && saved.ownerKey !== codexHomeOwnerKey(scope))
+            throw new Error("Native conversation belongs to a different owner");
+          if (saved.home !== legacyHome) {
+            const recovered = restoreCodexHomeForSession(scope.userDataDir, scope, saved);
+            if (recovered) this.home = recovered;
+            else if (fs.existsSync(legacyHome)) this.home = legacyHome;
+          } else if (fs.existsSync(legacyHome)) this.home = legacyHome;
+        } else if (this.threadId && fs.existsSync(legacyHome)) this.home = legacyHome;
       }
     }
+    const selectedSkillAliases = skillPaths.filter(skill => /^[a-zA-Z0-9_-]+$/.test(skill.name))
+      .map(skill => ({ alias: path.join(this.home, "skills", skill.name), target: path.dirname(skill.filePath) }));
+    const withSkillAliases = (grants: CodexExecutorGrants): CodexExecutorGrants => ({ ...grants,
+      skillReadAliases: [...(grants.skillReadAliases ?? []), ...selectedSkillAliases] });
     this.executor = new CodexExecutorRelay({ executable: process.env.SICLAW_CODEX_BIN || "codex",
-      home: path.join(this.home, "executor"), cwd, grants: native.grants ?? {
+      home: path.join(this.home, "executor"), cwd, grants: withSkillAliases(native.grants ?? {
         readRoots: [], writeRoots: [], deniedRoots: [], allowCommands: false, production: false,
-      } });
+      }) });
     for (const [index, environment] of (native.environments ?? []).entries()) {
       this.clusterExecutors.set(environment.id, new CodexExecutorRelay({ executable: process.env.SICLAW_CODEX_BIN || "codex",
-        home: path.join(this.home, `executor-${index}`), cwd, grants: environment.grants }));
+        home: path.join(this.home, `executor-${index}`), cwd, grants: withSkillAliases(environment.grants) }));
     }
 
   }
@@ -304,19 +349,21 @@ export class CodexAgentBrain implements BrainSession {
   static async create(options: {
     sessionManager: SessionManager; systemPrompt: string; grants: CodexExecutorGrants;
     mcpServers?: Record<string, McpServerConfig>; sensitiveValues?: SensitiveValueSource; allowSubagents?: boolean; codexHome?: string;
+    codexHomeScope?: CodexHomeOwner & { userDataDir: string };
     authorizeMcp?: McpOperationAuthorizer;
     environments?: Array<{ id: string; grants: CodexExecutorGrants }>;
     toolsetsByName: ReadonlyMap<string, string>;
     cwd: string; skillPaths: Array<{ name: string; filePath: string }>;
     nativePlanEnabled?: boolean; onPlanUpdate?: (plan: unknown) => void;
-    workflow?: { schedule: boolean; report: boolean; sessionId: () => string };
+    workflow?: CodexWorkflowConfig;
+    defaultRequestMode?: RequestMode;
     userQuestions?: { emit: (event: Record<string, unknown>) => void; waitForAnswer?: boolean };
     dpStateRef?: MutableDpStateRef;
     knowledge?: { directory: string; emit: (event: { type: "knowledge_sources"; sources: KnowledgeSourceCitation[] }) => void };
   }): Promise<CodexAgentBrain> {
     const brain = new CodexAgentBrain(options.sessionManager,
       { grants: options.grants, mcpServers: options.mcpServers, authorizeMcp: options.authorizeMcp, sensitiveValues: options.sensitiveValues, allowSubagents: options.allowSubagents,
-        environments: options.environments, codexHome: options.codexHome, knowledge: options.knowledge, workflow: options.workflow, userQuestions: options.userQuestions, dpStateRef: options.dpStateRef }, options.systemPrompt,
+        environments: options.environments, codexHome: options.codexHome, codexHomeScope: options.codexHomeScope, knowledge: options.knowledge, workflow: options.workflow, defaultRequestMode: options.defaultRequestMode, userQuestions: options.userQuestions, dpStateRef: options.dpStateRef }, options.systemPrompt,
       options.toolsetsByName, options.cwd, options.skillPaths,
       options.nativePlanEnabled, options.onPlanUpdate);
     fs.mkdirSync(brain.home, { recursive: true, mode: 0o700 });
@@ -338,6 +385,14 @@ export class CodexAgentBrain implements BrainSession {
   }
 
   setNativeChildSink(sink: NativeChildSink): void { this.children.setSink(sink); }
+  setRequestMode(mode: RequestMode): void { this.requestMode = mode; }
+  beginRequest(mode: RequestMode): void {
+    this.endRequest(); this.requestMode = mode; this.logicalRequestOpen = true;
+  }
+  endRequest(): void {
+    this.requestWork?.finish(); this.requestWork = undefined; this.logicalRequestOpen = false;
+  }
+  setNativeChildRecovery(recover: (scopeId: string) => void): void { this.nativeChildRecovery = recover; }
 
   getConversationMessages(): readonly unknown[] { return this.messages; }
   getTools(): BrainToolDefinition[] {
@@ -473,6 +528,12 @@ export class CodexAgentBrain implements BrainSession {
     if (!this.model) throw new Error("Codex model is not bound");
     this.promptInFlight = true;
     this.abortPending = false;
+    const recovery = this.nativeChildRecovery;
+    const work: CodexRequestWork = this.logicalRequestOpen && this.requestWork ? this.requestWork : new CodexRequestWork(this.requestMode ?? this.native?.defaultRequestMode ?? "async", snapshot => {
+      if (this.requestWork === work && !this.abortPending)
+        this.emit({ type: "native_subagent_progress", requestScope: work.id, ...snapshot });
+    }, execution => this.interruptChild(execution), () => recovery?.(work.id), this.llmCalls?.captureContext());
+    this.requestWork = work; this.requestScopes.add(work);
     try {
       const transformed = await this.transformInput(text, media, "interactive");
       if (!transformed) return;
@@ -482,9 +543,11 @@ export class CodexAgentBrain implements BrainSession {
       if (this.abortPending) return;
       const input: JsonObject[] = [{ type: "text", text }];
       for (const image of media?.images ?? []) input.push({ type: "image", url: `data:${image.mimeType};base64,${image.data}` });
-      const content = media?.images?.length
-        ? [{ type: "text", text }, ...media.images.map((image) => ({ type: "image", data: image.data, mimeType: image.mimeType }))]
-        : text;
+      // Native input/history owns the original images. The framework echo is
+      // public (SSE, trace and shared history); never duplicate binary data here.
+      const content = text;
+      this.executor.resumeProcesses();
+      for (const executor of this.clusterExecutors.values()) executor.resumeProcesses();
       await this.runTurn(input, { role: "user", content, timestamp: Date.now() }, false);
       for (let attempt = 1; !this.lastTurnHadContent && !this.abortPending && attempt <= 2; attempt++) {
         const delayMs = 2_000 * attempt;
@@ -502,6 +565,22 @@ export class CodexAgentBrain implements BrainSession {
         }
       }
       if (this.abortPending) return;
+      const logicalTools = new Set(this.lastToolNames);
+      if (work.mode === "sync") {
+        let syntheses = 0;
+        while (!this.abortPending && !work.cancelled && (work.pending || work.needsReport)) {
+          while (work.pending && !work.cancelled) await work.wait();
+          if (this.abortPending || work.cancelled) return;
+          await this.children.flush();
+          if (!work.needsReport) break;
+          if (++syntheses > 2) throw new Error("Native children ended without a final parent report");
+          await this.runTurn([{ type: "text", text: NATIVE_CHILD_SYNTHESIS_PROMPT }],
+            { role: "custom", customType: "native_child_synthesis", content: NATIVE_CHILD_SYNTHESIS_PROMPT,
+              display: false, timestamp: Date.now() }, true);
+          for (const tool of this.lastToolNames) logicalTools.add(tool);
+        }
+        this.lastToolNames = logicalTools;
+      }
       if (requirements?.requiredResultToolName && !this.lastToolNames.has(requirements.requiredResultToolName)) {
         const repair = `The previous turn omitted the required result tool ${requirements.requiredResultToolName}. Call that exact tool now with the final structured result.`;
         await this.runTurn([{ type: "text", text: repair }], { role: "user", content: repair, timestamp: Date.now() }, true);
@@ -516,6 +595,13 @@ export class CodexAgentBrain implements BrainSession {
     } catch (error) {
       throw this.safeError(error);
     } finally {
+      if (!this.logicalRequestOpen) work.finish();
+      for (const scope of this.requestScopes) if (scope !== work && !scope.pending) {
+        this.requestScopes.delete(scope);
+        for (const [id, owner] of this.rootTurnOwners) if (owner === scope) this.rootTurnOwners.delete(id);
+        for (const [id, owner] of this.childTurnOwners) if (owner === scope) this.childTurnOwners.delete(id);
+      }
+      if (!this.logicalRequestOpen && this.requestWork === work) this.requestWork = undefined;
       this.promptInFlight = false;
       this.abortPending = false;
       this.rejectPendingSteers(new Error("Codex turn ended before steering was accepted"));
@@ -523,6 +609,20 @@ export class CodexAgentBrain implements BrainSession {
   }
 
   private lastToolNames = new Set<string>();
+  getPendingUserInput(): NativeUserInputRequest | undefined {
+    return !this.closed && !this.abortPending ? this.userInput?.snapshot() : undefined;
+  }
+  prepareUserInput(answer: NativeUserInputAnswer): NativeUserInputAcceptance {
+    if (this.closed || this.abortPending || !this.userInput) throw new NativeUserInputError("USER_INPUT_EXPIRED", "The native question is no longer active");
+    return this.userInput.prepare(answer);
+  }
+  submitUserInput(answer: NativeUserInputAnswer): NativeUserInputAcceptance {
+    if (this.closed || this.abortPending || !this.userInput) throw new NativeUserInputError("USER_INPUT_EXPIRED", "The native question is no longer active");
+    const result = this.userInput.submit(answer);
+    // Runtime persists the accepted human reply. No second SSE user echo/row.
+    if (!result.alreadyAccepted) this.appendCache({ role: "user", content: result.text, timestamp: Date.now() });
+    return result;
+  }
   async steer(text: string, media?: PromptMedia): Promise<void> {
     if (!media?.images?.length && !media?.files?.length && this.userInput?.answer(text)) {
       this.appendCache({ role: "user", content: this.native.grants.redactOutput?.(text) ?? text, timestamp: Date.now() });
@@ -550,18 +650,36 @@ export class CodexAgentBrain implements BrainSession {
     return { steering, followUp };
   }
   async abort(): Promise<void> {
+    this.executor.cancelProcesses();
+    for (const executor of this.clusterExecutors.values()) executor.cancelProcesses();
     this.userInput?.cancel();
+    this.workflow?.cancel();
     this.mcpAuthorization?.cancel();
     this.mcpGateway?.cancelRequests();
     if (this.promptInFlight) this.abortPending = true;
     this.retryWake?.();
     this.rejectPendingSteers(new Error("Codex turn aborted"));
+    const stopping = [...this.requestScopes].map(scope => scope.cancel());
     const active = this.active;
     if (active) {
       active.abortRequested = true;
-      await this.interruptActive(active);
+      stopping.push(this.interruptActive(active));
     }
     this.followUps.length = 0;
+    const stopped = await Promise.allSettled(stopping);
+    if (stopped.some(result => result.status === "rejected")) throw new Error("Native child cancellation is incomplete");
+  }
+
+  private interruptChild(execution: NativeChildExecution): Promise<void> {
+    if (!execution.turnId || !this.client) return Promise.resolve();
+    const key = `${execution.threadId}:${execution.turnId}`;
+    const prior = this.childInterrupts.get(key); if (prior) return prior;
+    const pending = this.client.request("turn/interrupt", { threadId: execution.threadId, turnId: execution.turnId })
+      .then(() => {}, error => {
+        if (!(error instanceof Error) || !/no active turn to interrupt/i.test(error.message)) throw error;
+      });
+    this.childInterrupts.set(key, pending);
+    return pending;
   }
 
   private async interruptActive(active: PendingTurn): Promise<void> {
@@ -624,6 +742,8 @@ export class CodexAgentBrain implements BrainSession {
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
+    await Promise.allSettled([...this.requestScopes].map(scope => scope.cancel()));
+    this.workflow?.close();
     this.mcpAuthorization.close();
     this.knowledge?.close();
     this.active?.mailboxStop?.abort();
@@ -641,6 +761,9 @@ export class CodexAgentBrain implements BrainSession {
 
   private async transformInput(text: string, media: PromptMedia | undefined, _source: "interactive" | "rpc",
     _streamingBehavior?: "steer"): Promise<{ text: string; media: PromptMedia | undefined } | undefined> {
+    if(this.native?.grants.channelPolicy && !this.native.grants.channelPolicy.attachments &&
+       (media?.images?.length||media?.files?.length)) throw new Error("Attachments are not authorized for this channel");
+    await this.native?.grants.validateChannelPolicy?.();
     const state = this.native?.dpStateRef;
     if (text.startsWith("[DP_EXIT]\n") || text.trim() === "[DP_EXIT]") {
       if (state?.active) { state.active = false; this.sessionManager.appendCustomEntry("dp-mode", { active: false }); }
@@ -685,6 +808,7 @@ export class CodexAgentBrain implements BrainSession {
       this.loadedThreadId = undefined;
       this.userInput?.cancel();
       this.active?.reject(this.safeError(error));
+      for (const scope of this.requestScopes) if (scope.pending) scope.fail(this.safeError(error));
     });
     this.client = client;
     try {
@@ -749,7 +873,7 @@ export class CodexAgentBrain implements BrainSession {
     if (this.threadId && this.loadedThreadId === this.threadId) return;
     const existing = this.threadId;
     const result = await client.request(existing ? "thread/resume" : "thread/start", {
-      ...(existing ? { threadId: existing, ...(this.rolloutPath ? {path:this.rolloutPath} : {}) } : {}),
+      ...(existing ? { threadId: existing } : {}),
       model: this.model?.id, modelProvider: "siclaw_model", config: this.codexConfig(),
       cwd: this.cwd, sandbox: "read-only", approvalPolicy: "never",
       developerInstructions: this.systemPrompt,
@@ -895,6 +1019,12 @@ export class CodexAgentBrain implements BrainSession {
     const turn = record(params.turn) ? params.turn : undefined;
     const item = record(params.item) ? params.item : undefined;
     const active = this.active;
+    const eventTurnId = string(params.turnId) || string(turn?.id);
+    if (eventTurnId && event.method !== "thread/tokenUsage/updated") {
+      const owner = this.rootTurnOwners?.get(eventTurnId);
+      if (owner && this.requestWork && owner !== this.requestWork) return;
+      if (event.method !== "turn/started" && active?.id && eventTurnId !== active.id) return;
+    }
     if (event.method === "item/completed" && item && this.native?.dpStateRef?.active && active?.id && !this.checkpointRequested &&
         countToolCallsSinceVisibleAssistant(this.messages as any[]) >= DP_TOOL_CALLS_BEFORE_CHECKPOINT) {
       this.checkpointRequested = true;
@@ -904,6 +1034,7 @@ export class CodexAgentBrain implements BrainSession {
     if (event.method === "turn/started") {
       if (active && turn) {
         active.id = string(turn.id);
+        if (this.requestWork) this.rootTurnOwners.set(active.id, this.requestWork);
         active.started = true;
         this.watchMailbox(active);
         void this.flushSteers();
@@ -918,6 +1049,7 @@ export class CodexAgentBrain implements BrainSession {
           ...(active.internal ? { internalMessage: true } : {}) });
       }
     } else if (event.method === "item/started" && item) {
+      if (item.type === "agentMessage") this.requestWork?.startReport(string(item.id));
       if (item.type === "agentMessage") {
         if (active) active.assistantHadContent = false;
         this.assistantTexts.set(string(item.id), "");
@@ -947,6 +1079,7 @@ export class CodexAgentBrain implements BrainSession {
       if (item.type === "agentMessage") {
         const id = string(item.id);
         const output = string(item.text) || this.assistantTexts.get(id) || "";
+        this.requestWork?.finishReport(id, !!output.trim() && item.phase !== "commentary");
         if (item.delivery === "async" && Array.isArray(item.questions) && this.native.userQuestions) {
           this.native.userQuestions.emit({ type: "input_required", question: output, questions: item.questions });
         }
@@ -1079,13 +1212,17 @@ export class CodexAgentBrain implements BrainSession {
   private persistThread(): void {
     if (!this.threadId) return;
     const tmp = `${this.marker}.${randomUUID()}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify({ threadId: this.threadId, lastTurnId: this.lastTurnId, rolloutPath:this.rolloutPath }), { mode: 0o600 });
+    fs.writeFileSync(tmp, JSON.stringify({ threadId: this.threadId, lastTurnId: this.lastTurnId, rolloutPath:this.rolloutPath,
+      home: this.home, ...(this.native?.codexHomeScope ? { ownerKey: codexHomeOwnerKey(this.native.codexHomeScope) } : {}) }), { mode: 0o600 });
     fs.renameSync(tmp, this.marker);
   }
 
   private syncSkills(): void {
     const root = path.join(this.home, "skills");
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+    if (fs.lstatSync(root).isSymbolicLink() || !fs.statSync(root).isDirectory() ||
+        fs.realpathSync(root) !== path.join(fs.realpathSync(this.home), "skills"))
+      throw new Error("Native Skill projection is redirected");
     for (const skill of this.skillPaths) {
       if (!/^[a-zA-Z0-9_-]+$/.test(skill.name)) continue;
       const link = path.join(root, skill.name);
@@ -1099,6 +1236,10 @@ export class CodexAgentBrain implements BrainSession {
   }
 
   private emit(event: unknown): void {
-    for (const listener of this.listeners) listener(event);
+    const internal = record(event) && record(event.message) && event.message.customType === "native_child_synthesis";
+    const output = record(event) ? { ...event, ...(internal ? { internalMessage: true } : {}),
+      ...(this.requestWork?.mode === "sync" && (this.requestWork.pending || this.requestWork.needsReport)
+        ? { awaitingSubagents: true, awaitingBackgroundJobs: true } : {}) } : event;
+    for (const listener of this.listeners) listener(output);
   }
 }

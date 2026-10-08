@@ -7,9 +7,10 @@ import { authorizeInfrastructureCommand, type CodexInfrastructureTarget } from "
 
 const contexts = ["pod", "node", "host"] as const;
 type Context = typeof contexts[number];
-const cluster: CodexInfrastructureTarget = { kind: "cluster", name: "bound", broker: {} as any,
+const legacyBroker = {getChannelPolicy:()=>undefined,requireChannelOperation:()=>{}};
+const cluster: CodexInfrastructureTarget = { kind: "cluster", name: "bound", broker: legacyBroker as any,
   userId: "user", allowApi: true, allowPod: true, allowNode: true };
-const ssh: CodexInfrastructureTarget = { kind: "ssh", broker: {} as any };
+const ssh: CodexInfrastructureTarget = { kind: "ssh", broker: legacyBroker as any };
 
 // These options are the existing Pi pod_exec/node_exec/host_exec contract.
 function piSecurity(command: string, context: Context) {

@@ -13,20 +13,30 @@ type ControlPlane = { request(method: string, params: Record<string, unknown>, t
  * Version 1 never issues write authority or falls back to a cached grant. */
 export class NativeMcpAuthorization {
   constructor(private readonly control: ControlPlane,
-    private readonly currentUser: (sessionId: string, agentId: string) => string) {}
+    private readonly currentUser: (sessionId: string, agentId: string) => string,
+    private readonly executionGrant?: (certificate: CertificateIdentity, sessionId: string, grantId: string) => import("./execution-grants.js").ExecutionGrant) {}
 
-  async authorize(identity: CertificateIdentity, sessionId: string, operation: McpOperation, signal: AbortSignal): Promise<McpAuthorizationPermit> {
-    const userId = this.currentUser(sessionId, identity.agentId);
+  async authorize(identity: CertificateIdentity, sessionId: string, operation: McpOperation, signal: AbortSignal, grantId?: string): Promise<McpAuthorizationPermit> {
+    if (this.executionGrant && !grantId) throw new Error("MCP execution authorization required");
+    const grant = grantId ? this.executionGrant?.(identity, sessionId, grantId) : undefined;
+    if (grantId && !grant) throw new Error("MCP execution authorization required");
+    if (grant && !grant.resources.policy && (grant.actor.kind === "none" || grant.actor.kind !== "user" && !grant.resources.clusters.length && !grant.resources.hosts.length))
+      throw new Error("MCP identity has no authorized resources");
+    const userId = grant ? grant.sender?.userId || (grant.actor.kind === "user" ? grant.actor.id : grant.resources.policy ? grant.sender?.openId || grant.actor.id : grant.actorUserId) : this.currentUser(sessionId, identity.agentId);
     if (!userId || !matchesPrivateUser(identity.privateUserId, userId)) throw new Error("Active MCP caller required");
     const checkCaller = () => {
       signal.throwIfAborted();
-      if (this.currentUser(sessionId, identity.agentId) !== userId) throw new Error("MCP caller changed");
+      if (grantId) {
+        if (this.executionGrant?.(identity, sessionId, grantId) !== grant) throw new Error("MCP execution authorization changed");
+      } else if (this.currentUser(sessionId, identity.agentId) !== userId) throw new Error("MCP caller changed");
     };
     checkCaller();
-    const owner = await this.control.request("sandbox.resolve", {
-      agent_id: identity.agentId, session_id: sessionId, source: "", name: "",
-    }, 10_000);
-    if (!record(owner) || owner.user_id !== userId) throw new Error("MCP session authorization denied");
+    if (!grant) {
+      const owner = await this.control.request("sandbox.resolve", {
+        agent_id: identity.agentId, session_id: sessionId, source: "", name: "",
+      }, 10_000);
+      if (!record(owner) || owner.user_id !== userId) throw new Error("MCP session authorization denied");
+    }
     checkCaller();
     const resources = await this.control.request("config.getResources", { agentId: identity.agentId }, 5000);
     // No tenant rows is normal for published/preview inherited MCPs. Preserve
@@ -37,6 +47,20 @@ export class NativeMcpAuthorization {
     checkCaller();
     if (!record(selected) || !record(selected.mcpServers) || !Object.hasOwn(selected.mcpServers, operation.server)) throw new Error("MCP binding revoked");
     const config = selected.mcpServers[operation.server] as McpServerConfig;
+    if (grant?.resources.policy) {
+      const scope=grant.resources.policy;
+      if(!scope.operations.includes("mcp")) throw new Error("Channel MCP operation is not authorized");
+      const fresh=await this.control.request("channel.policy.resolve",{agentId:identity.agentId,sessionId,
+        identity:{kind:grant.actor.kind,id:grant.actor.id},sender:grant.sender},5000);
+      if(!record(fresh)||!record(fresh.policy)||fresh.policy.fingerprint!==scope.fingerprint) throw new Error("Channel MCP policy changed or was revoked");
+      const rule=scope.mcp.find(rule=>rule.serverId===config.siclawId);
+      if(!rule || !(operation.kind==="tool"?rule.tools:operation.kind==="resource"?rule.resources:rule.prompts).includes(operation.name)) throw new Error("Channel MCP tool/resource is not selected");
+      if(operation.kind==="tool") for(const [path,values]of Object.entries(rule.arguments)){
+        let value:unknown=operation.arguments;
+        for(const key of path.split(".")) value=record(value)&&Object.hasOwn(value,key)?value[key]:undefined;
+        if(typeof value!=="string"||!values.includes(value))throw new Error("Channel MCP argument scope denied");
+      }
+    }
     if (mcpConfigurationDigest(config) !== operation.configurationDigest) throw new Error("MCP configuration changed; rebuild the session");
     const policy = resolveMcpReadOnlyPolicy(config);
     let policyValue: unknown;
@@ -72,7 +96,8 @@ export class NativeMcpAuthorization {
         chunks.push(Buffer.from(chunk));
       }
       const body: unknown = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-      if (!record(body) || Object.keys(body).some(key => !["session_id", "operation"].includes(key)) || !identifier(body.session_id) || !record(body.operation)) throw new Error("Invalid MCP authorization request");
+      if (!record(body) || Object.keys(body).some(key => !["session_id", "operation", "grant_id", "channel_policy_v1"].includes(key)) || !identifier(body.session_id) || !record(body.operation)
+          || body.grant_id !== undefined && !identifier(body.grant_id)) throw new Error("Invalid MCP authorization request");
       const raw = body.operation;
       if (Object.keys(raw).some(key => !["server", "kind", "name", "arguments", "callId", "configurationDigest"].includes(key)) ||
           typeof raw.server !== "string" || !raw.server || raw.server.length > 256 || /[\x00-\x1f]/.test(raw.server) || !["tool", "resource", "prompt"].includes(String(raw.kind)) ||
@@ -80,7 +105,8 @@ export class NativeMcpAuthorization {
           typeof raw.callId !== "string" || !raw.callId || raw.callId.length > 256 ||
           typeof raw.configurationDigest !== "string" || !/^[a-f0-9]{64}$/.test(raw.configurationDigest)) throw new Error("Invalid MCP operation");
       operation = raw as unknown as McpOperation; sessionId = body.session_id;
-      const permit = await this.authorize(identity, sessionId, operation, controller.signal);
+      if(body.grant_id && this.executionGrant?.(identity,sessionId,body.grant_id as string).resources.policy && body.channel_policy_v1!==true) throw new Error("AgentBox policy enforcement required");
+      const permit = await this.authorize(identity, sessionId, operation, controller.signal, body.grant_id as string | undefined);
       send(200, permit);
       console.info(JSON.stringify({ event: "native_mcp_authorization", decision: "allow", effect: permit.effect,
         agentId: permit.agentId, userId: permit.userId, sessionId, server: operation.server, kind: operation.kind,

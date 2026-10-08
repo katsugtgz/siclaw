@@ -29,7 +29,9 @@ export class ConversationClient {
 
   constructor(private frontend: FrontendWsClient, private entry: {
     agentId: string; userId: string; sessionId: string; userMessageId: string;
-    origin: "channel" | "task";
+    origin: "channel" | "dm" | "task";
+    identity?: import("../shared/execution-identity.js").ExecutionIdentity;
+    sender?: import("../shared/execution-context.js").ExecutionSender;
   }) {}
 
   async prompt(options: PromptOptions): Promise<PromptResponse> {

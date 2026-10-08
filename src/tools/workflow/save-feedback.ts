@@ -1,6 +1,7 @@
 import type { ToolEntry } from "../../core/tool-registry.js";
 /**
- * save_feedback tool — persists structured session feedback to Gateway DB
+ * save_feedback tool — saves a structured report in this session's records.
+ * This is independent of human thumbs-up/down votes and memory.
  */
 
 import { Type } from "@sinclair/typebox";
@@ -8,20 +9,12 @@ import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { loadConfig } from "../../core/config.js";
 import { GatewayClient } from "../../agentbox/gateway-client.js";
 
-const MAX_CONVERSATION_BYTES = 100 * 1024; // 100KB
+import { saveSessionFeedback, type SessionFeedbackParams, type SessionFeedbackContext } from "../../core/session-feedback-service.js";
 
-interface SaveFeedbackParams {
-  overallRating: number;
-  summary: string;
-  decisionPoints?: string;
-  strengths?: string;
-  improvements?: string;
-  tags?: string;
-  feedbackConversation?: string;
-}
 
 export function createSaveFeedbackTool(
   sessionIdRef: { current: string },
+  context?: Omit<SessionFeedbackContext, "sessionId">,
 ): ToolDefinition {
   return {
     name: "save_feedback",
@@ -54,96 +47,20 @@ The report includes overall rating, decision point evaluations, strengths, impro
         description: "JSON summary of the feedback dialogue (optional)",
       })),
     }),
-    async execute(_toolCallId, rawParams) {
-      const params = rawParams as SaveFeedbackParams;
-
+    async execute(_toolCallId, rawParams, signal) {
+      signal?.throwIfAborted();
       const cfg = loadConfig();
-      const gatewayUrl = cfg.server.gatewayUrl || `http://localhost:${cfg.server.port}`;
-      const userId = cfg.userId;
-      const sessionId = sessionIdRef.current;
-      const agentId = process.env.SICLAW_AGENT_ID;
-
-      if (!userId) {
-        return {
-          content: [{ type: "text", text: "Cannot save feedback: userId not configured." }],
-          details: { error: true },
-        };
-      }
-      if (!sessionId) {
-        return {
-          content: [{ type: "text", text: "Cannot save feedback: session ID not available." }],
-          details: { error: true },
-        };
-      }
-
-      // Parse JSON string fields independently — valid fields are saved even if one fails
-      let decisionPoints: unknown;
-      let strengths: unknown;
-      let improvements: unknown;
-      let tags: unknown;
-      let feedbackConversation: unknown;
-      let conversationOmitted = false;
-      const parseErrors: string[] = [];
-
-      const tryParse = (name: string, value: string | undefined): unknown => {
-        if (!value) return undefined;
-        try { return JSON.parse(value); }
-        catch { parseErrors.push(name); return undefined; }
-      };
-
-      decisionPoints = tryParse("decisionPoints", params.decisionPoints);
-      strengths = tryParse("strengths", params.strengths);
-      improvements = tryParse("improvements", params.improvements);
-      tags = tryParse("tags", params.tags);
-
-      if (params.feedbackConversation) {
-        try {
-          const parsed = JSON.parse(params.feedbackConversation);
-          const serialized = JSON.stringify(parsed);
-          if (serialized.length <= MAX_CONVERSATION_BYTES) {
-            feedbackConversation = parsed;
-          } else {
-            conversationOmitted = true;
-          }
-        } catch {
-          parseErrors.push("feedbackConversation");
-        }
-      }
-
-      try {
-        const gatewayClient = new GatewayClient({ gatewayUrl });
-        const result = await gatewayClient.toClientLike().request(
-          "/api/internal/feedback",
-          "POST",
-          {
-            sessionId,
-            userId,
-            agentId,
-            overallRating: params.overallRating,
-            summary: params.summary,
-            decisionPoints,
-            strengths,
-            improvements,
-            tags,
-            feedbackConversation,
-          },
-        ) as { ok: boolean; id: string };
-
-        return {
-          content: [{ type: "text", text: `Feedback saved successfully (id: ${result.id}).${conversationOmitted ? " Note: conversation transcript omitted (exceeded size limit)." : ""}${parseErrors.length > 0 ? ` Warning: failed to parse ${parseErrors.join(", ")} (saved without these fields).` : ""}` }],
-          details: { id: result.id, sessionId },
-        };
-      } catch (err) {
-        return {
-          content: [{ type: "text", text: `Failed to save feedback: ${err instanceof Error ? err.message : String(err)}` }],
-          details: { error: true },
-        };
-      }
+      return saveSessionFeedback(rawParams as SessionFeedbackParams, { sessionId: sessionIdRef.current,
+        userId: context?.userId ?? cfg.userId ?? "", agentId: context?.agentId ?? process.env.SICLAW_AGENT_ID,
+        persist: context?.persist ?? (async report => {
+          const client = new GatewayClient({ gatewayUrl: cfg.server.gatewayUrl || `http://localhost:${cfg.server.port}` });
+          return client.toClientLike().request("/api/internal/feedback", "POST", report) as Promise<{ id: string }>;
+        }) });
     },
   };
 }
 
 export const registration: ToolEntry = {
   category: "workflow",
-  create: (refs) => createSaveFeedbackTool(refs.sessionIdRef),
+  create: (refs) => createSaveFeedbackTool(refs.sessionIdRef, refs.feedbackContext),
 };

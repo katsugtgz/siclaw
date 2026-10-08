@@ -15,6 +15,7 @@ import type { MetricsFlushPayload } from "../shared/metrics-types.js";
 import { SESSION_HISTORY_PATH, type SessionHistoryResponse } from "../shared/session-history.js";
 import { HANDOFF_TARGETS_PATH, HANDOFF_SEARCH_PATH, type HandoffSearchQuery, type HandoffSearchResponse, type HandoffTargetsResponse } from "../shared/agent-handoff.js";
 import { certificateHasExpired, readCertificateNotAfter } from "../shared/cert-validity.js";
+import type { ChannelExecutionPolicy } from "../shared/channel-execution-policy.js";
 
 export interface GatewayClientOptions {
   gatewayUrl: string;
@@ -43,6 +44,26 @@ export interface AgentTask {
 }
 
 export class GatewayClient {
+  private grantId?: string;
+  private authorizationLive?: () => boolean;
+  private channelPolicy?: ChannelExecutionPolicy;
+
+  forExecutionGrant(grantId: string, sessionId: string, live: () => boolean, policy?: ChannelExecutionPolicy): GatewayClient {
+    const client = new GatewayClient({ gatewayUrl: this.gatewayUrl, sessionId });
+    client.tlsOptions = this.tlsOptions;
+    client.grantId = grantId;
+    client.authorizationLive = live;
+    client.channelPolicy=policy;
+    return client;
+  }
+
+  async renewExecutionGrant(grantId: string, sessionId: string): Promise<any> {
+    try { return await this.request("/api/internal/execution-grant/renew", "POST", { grant_id: grantId, session_id: sessionId, channel_policy_v1: true }); }
+    catch (error) {
+      if (/Gateway returned (401|403|404):/.test(error instanceof Error ? error.message : "")) return { ok: false, reason: "revoked" };
+      throw error;
+    }
+  }
   readonly sandboxInvocations = new SandboxInvocations();
   private gatewayUrl: string;
   private tlsOptions: https.RequestOptions | null = null;
@@ -254,6 +275,19 @@ export class GatewayClient {
    * Make HTTP(S) request to Gateway with mTLS authentication
    */
   private request(path: string, method: "GET" | "POST" | "PUT" | "DELETE" = "GET", body?: any, timeoutMs = 5000, signal?: AbortSignal): Promise<any> {
+    const protectedRequest = /^\/api\/internal\/(credential-list|credential-request|mcp-authorize|agent-tasks)(?:[/?]|$)/.test(path);
+    if(this.channelPolicy && /^\/api\/internal\/agent-tasks(?:[/?]|$)/.test(path) && !this.channelPolicy.reports)
+      return Promise.reject(new Error("Channel report/task operation is not authorized"));
+    if (this.grantId && protectedRequest) {
+      if (!this.authorizationLive?.()) return Promise.reject(new Error("Execution authorization ended"));
+      if (method === "GET" || method === "DELETE") {
+        const parsed = new URL(path, "http://runtime");
+        parsed.searchParams.set("grant_id", this.grantId);
+        parsed.searchParams.set("session_id", this.sessionId!);
+        parsed.searchParams.set("channel_policy_v1","true");
+        path = parsed.pathname + parsed.search;
+      } else body = { ...body, grant_id: this.grantId, session_id: this.sessionId, channel_policy_v1: true };
+    }
     return new Promise((resolve, reject) => {
       const url = new URL(path, this.gatewayUrl);
       const isHttps = url.protocol === "https:";
@@ -285,6 +319,9 @@ export class GatewayClient {
         });
 
         res.on("end", () => {
+          if (this.grantId && protectedRequest && !this.authorizationLive?.()) {
+            reject(new Error("Execution authorization ended before delivery")); return;
+          }
           if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
             if (res.statusCode === 204 || !data) {
               resolve(undefined);

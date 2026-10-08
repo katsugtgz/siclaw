@@ -14,14 +14,14 @@ export interface ManageScheduleParams {
 }
 
 /** Shared product operation; Runtime owns task authorization and persistence. */
-export async function manageSchedule(params: ManageScheduleParams, sessionId?: string) {
+export async function manageSchedule(params: ManageScheduleParams, sessionId?: string, executionClient?: GatewayClient) {
   const cfg = loadConfig();
   const gatewayUrl = cfg.server.gatewayUrl || `http://localhost:${cfg.server.port}`;
   // Thread current chat sessionId so the Gateway can resolve the task
   // owner (userId) via sessionRegistry. Without this, task rows land
   // with empty created_by and downstream cron-task notifications
   // silently drop at Upstream's TaskNotify (empty-userID guard).
-  const client = new GatewayClient({ gatewayUrl, sessionId });
+  const client = executionClient ?? new GatewayClient({ gatewayUrl, sessionId });
 
   const fail = (msg: string) => ({
     content: [{ type: "text" as const, text: JSON.stringify({ error: msg }) }],

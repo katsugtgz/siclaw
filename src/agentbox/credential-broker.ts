@@ -31,6 +31,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { load as loadYaml, JSON_SCHEMA } from "js-yaml";
 import { ConcurrencyLimiter } from "../core/concurrency-limiter.js";
+import { ChannelKubernetesProxy } from "./channel-kubernetes-proxy.js";
+import { requireChannelOperation, type ChannelExecutionPolicy } from "../shared/channel-execution-policy.js";
 import type {
   CredentialTransport,
   ClusterMeta,
@@ -348,6 +350,8 @@ class ResourceRegistry<TMeta extends { name: string }> {
 // ---------------------------------------------------------------------------
 
 export class CredentialBroker {
+  private readonly channelProxies = new Map<string, ChannelKubernetesProxy>();
+  private readonly ownedCleanups = new Set<() => void>();
   private readonly directory: string;
   // Keep rotated/revoked values until this owner is disposed: older tool
   // artifacts and upstream error messages can still echo those credentials.
@@ -372,6 +376,7 @@ export class CredentialBroker {
   constructor(
     private readonly transport: CredentialTransport,
     credentialsDir?: string,
+    private readonly channel?: { policy: ChannelExecutionPolicy; validate: () => Promise<void> },
   ) {
     const dir = credentialsDir || path.resolve(process.cwd(), ".siclaw/credentials");
     this.directory = path.resolve(dir);
@@ -455,6 +460,7 @@ export class CredentialBroker {
     purpose: string,
     options: { bypassCache?: boolean } = {},
   ): Promise<CredentialResponse> {
+    await this.validateChannelPolicy();
     const cached = this.clusters.get(sourceId);
     if (
       !options.bypassCache &&
@@ -465,8 +471,17 @@ export class CredentialBroker {
       return reconstructClusterResponse(cached);
     }
 
-    const response = await this.transport.getClusterCredential(sourceId, purpose);
+    let response = await this.transport.getClusterCredential(sourceId, purpose);
     this.rememberSensitiveValues(response);
+    if (this.channel) {
+      const file = response.credential.files.find(file => file.name.endsWith("kubeconfig")) ?? response.credential.files[0];
+      if (!file) throw new Error("Missing scoped Kubernetes credential");
+      let proxy = this.channelProxies.get(response.credential.name);
+      if (!proxy) { proxy = new ChannelKubernetesProxy(this.channel.policy, this.channel.validate); this.channelProxies.set(response.credential.name, proxy); }
+      const scoped = await proxy.configure(file.content);
+      response = { ...response, credential: { ...response.credential, files: [{ name: "kubeconfig", content: scoped }] } };
+      this.rememberSensitiveValues(response);
+    }
     const meta = mergeClusterMeta(cached?.meta, response);
     const ttlMs = (response.credential.ttl_seconds ?? 300) * 1000;
     const filePaths = this.clusters.setMaterialized(response.credential.name, meta, response.credential.files, ttlMs);
@@ -660,6 +675,8 @@ export class CredentialBroker {
     purpose: string,
     _options: { bypassCache?: boolean } = {},
   ): Promise<CredentialResponse> {
+    this.requireChannelOperation(purpose.includes("script") ? "scripts" : "ssh_exec");
+    await this.validateChannelPolicy();
     const response = await this.transport.getHostCredential(sourceId, purpose);
     this.rememberSensitiveValues(response);
     const cached = this.hosts.get(sourceId);
@@ -721,6 +738,10 @@ export class CredentialBroker {
 
   dispose(): void {
     clearInterval(this.cleanupTimer);
+    for (const proxy of this.channelProxies.values()) proxy.dispose();
+    this.channelProxies.clear();
+    for (const cleanup of [...this.ownedCleanups].reverse()) cleanup();
+    this.ownedCleanups.clear();
     this.clusters.dispose();
     this.hosts.dispose();
     this.sensitiveValues.clear();
@@ -728,6 +749,16 @@ export class CredentialBroker {
 
   /** Private backend redaction source, never a tool response or sync payload. */
   getSensitiveValues(): readonly string[] { return [...this.sensitiveValues]; }
+  getChannelPolicy(): ChannelExecutionPolicy | undefined { return this.channel?.policy; }
+  /** Trusted factory-owned resources, never a model tool or arbitrary path. */
+  registerOwnedCleanup(cleanup: () => void): void { this.ownedCleanups.add(cleanup); }
+  requireChannelOperation(operation: string): void { requireChannelOperation(this.channel?.policy, operation); }
+  async validateChannelPolicy(): Promise<void> { if (this.channel) await this.channel.validate(); }
+  registerChannelPodTransport(cluster:string,namespace:string,pod:string,container:string,args:readonly string[],script:boolean,cleanupArgs:readonly string[]){
+    if(!this.channel)return undefined;
+    const proxy=this.channelProxies.get(cluster);if(!proxy)throw new Error("Scoped cluster transport is unavailable");
+    return proxy.registerPodTransport(namespace,pod,container,args,script,cleanupArgs);
+  }
   /** Backend policy metadata only; never expose this through a model tool. */
   getPrivateDirectory(): string { return this.directory; }
 

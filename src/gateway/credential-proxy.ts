@@ -16,6 +16,8 @@ import type { Identity } from "../shared/credential-types.js";
 import { CredentialService, CredentialNotFoundError, SessionOwnershipError } from "./credential-service.js";
 
 interface CredentialRequestBody {
+  grant_id?: string;
+  channel_policy_v1?: boolean;
   source?: string;
   source_id?: string;
   purpose?: string;
@@ -23,6 +25,8 @@ interface CredentialRequestBody {
 }
 
 interface CredentialListBody {
+  channel_policy_v1?: boolean;
+  grant_id?: string;
   kind?: string;
   session_id?: string;
   /** Host search (kind="host"): server-side filter + pagination. Absent = full list. */
@@ -49,17 +53,20 @@ function assertSafeIdField(value: string, field: string): void {
  * attached by the caller so the runtime can resolve it to an actual user
  * for audit attribution before calling Upstream.
  */
-function toIdentity(cert: CertificateIdentity, sessionId?: string): Identity {
+function toIdentity(cert: CertificateIdentity, sessionId?: string, grantId?: string, policyCapable?: boolean): Identity {
   assertSafeIdField(cert.agentId, "agentId");
   if (cert.orgId) assertSafeIdField(cert.orgId, "orgId");
   if (cert.boxId) assertSafeIdField(cert.boxId, "boxId");
   if (sessionId) assertSafeIdField(sessionId, "sessionId");
+  if (grantId) assertSafeIdField(grantId, "grantId");
   return {
     agentId: cert.agentId,
     privateUserId: cert.privateUserId,
     orgId: cert.orgId,
     boxId: cert.boxId,
     sessionId,
+    ...(grantId ? { grantId } : {}),
+    channelPolicyV1: policyCapable === true,
   };
 }
 
@@ -107,7 +114,7 @@ export async function handleCredentialRequest(
   }
 
   try {
-    const id = toIdentity(identity, body.session_id);
+    const id = toIdentity(identity, body.session_id, body.grant_id, body.channel_policy_v1);
     const payload = body.source === "cluster"
       ? await service.getClusterCredential(id, body.source_id, body.purpose ?? "")
       : await service.getHostCredential(id, body.source_id, body.purpose ?? "");
@@ -147,7 +154,7 @@ export async function handleCredentialList(
   }
 
   try {
-    const id = toIdentity(identity, body.session_id);
+    const id = toIdentity(identity, body.session_id, body.grant_id, body.channel_policy_v1);
     if (body.kind === "cluster") {
       const clusters = await service.listClusters(id);
       sendJson(res, 200, { clusters });

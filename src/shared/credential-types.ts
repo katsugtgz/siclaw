@@ -10,6 +10,9 @@
  */
 
 export interface Identity {
+  channelPolicyV1?: boolean;
+  /** Runtime-issued immutable authorization, never an actor supplied by code. */
+  grantId?: string;
   privateUserId?: string;
   agentId: string;
   orgId?: string;

@@ -38,7 +38,14 @@ exec_command(environment_id="cluster:<bound-name>", cmd="python3 /app/.siclaw/sk
 exec_command(environment_id="cluster:<bound-name>", cmd="kubectl -n <ns> exec <pod> -c <container> -- bash <local-skill-script-path> <args>")
 exec_command(environment_id="cluster:<bound-name>", cmd="kubectl debug node/<node> -- python3 <local-skill-script-path> <args>")
 exec_command(environment_id="siclaw", cmd="ssh <bound-host> -- bash <local-skill-script-path> <args>")
+exec_command(environment_id="cluster:<bound-name>", cmd="kubectl -n <ns> debug pod/<pod> -- python3 <local-skill-script-path> <args>")
+exec_command(environment_id="siclaw", cmd="ssh <bound-host> --pod <pod> --namespace <ns> -- bash <local-skill-script-path> <args>")
 ```
+
+The last two forms run host tools/scripts in the selected Pod's network
+namespace. They require the node/host script grant respectively, not the Pod
+script grant. Netns discovery/switching remains backend-owned; failures never
+fall back to the host namespace. See [Controlled infrastructure execution](codex-readonly-infrastructure.md#host-tools-in-a-pod-network-namespace).
 
 There is no adapter runtime deadline. An optional `timeout <positive integer seconds>`
 before the interpreter sets an explicit caller-selected deadline; e.g. remote

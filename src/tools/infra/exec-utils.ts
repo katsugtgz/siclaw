@@ -262,7 +262,9 @@ export async function resolveContainerNetns(
   namespace: string,
   container: string | undefined,
   env: ExecEnv,
+  signal?: AbortSignal,
 ): Promise<{ nodeName: string; containerID: string } | { error: string }> {
+  if (signal?.aborted) return { error: "Aborted." };
   // Step 1: Get pod phase + node
   let nodeName: string;
   try {
@@ -275,6 +277,7 @@ export async function resolveContainerNetns(
       ],
       10_000,
       env.childEnv,
+      signal,
     );
     const parts = result.stdout.trim().split(",");
     const phase = parts[0];
@@ -300,14 +303,18 @@ export async function resolveContainerNetns(
   }
 
   // Step 2: Check node is Ready
+  if (signal?.aborted) return { error: "Aborted." };
+  const invalidNode = validateNodeName(nodeName);
+  if (invalidNode) return { error: invalidNode };
   const nodeCheckErr = await checkNodeReady(
-    nodeName, env.childEnv, env.kubeconfigPath ?? undefined,
+    nodeName, env.childEnv, env.kubeconfigPath ?? undefined, signal,
   );
   if (nodeCheckErr) {
     return { error: nodeCheckErr };
   }
 
   // Step 3: Get container ID
+  if (signal?.aborted) return { error: "Aborted." };
   try {
     const jsonpathExpr = container?.trim()
       ? `{.status.containerStatuses[?(@.name=="${container.trim()}")].containerID}`
@@ -321,6 +328,7 @@ export async function resolveContainerNetns(
       ],
       10_000,
       env.childEnv,
+      signal,
     );
     let containerID = result.stdout.trim();
     if (!containerID) {

@@ -1,4 +1,16 @@
 import { matchesSessionPrincipal, matchesPrivateUser } from "./security/session-principal.js";
+import { executionGrantForRequest } from "./execution-grants.js";
+
+async function taskExecutionAttribution(sessionId: string | undefined, certificate: CertificateIdentity, grantId?: string) {
+  try {
+    const grant = executionGrantForRequest(certificate, grantId, sessionId);
+    if(grant?.resources.policy && !grant.resources.policy.reports) return {userId:"",ok:false,authorization:{}};
+    if (!grant) return { ...await resolveUserForIdentity(sessionId, certificate), authorization: {} };
+    const userId = grant.sender?.userId || (grant.actor.kind === "user" ? grant.actor.id : "");
+    if (!userId) return { userId: "", ok: false, authorization: {} };
+    return { userId, ok: true, authorization: { identity: { kind: grant.actor.kind, id: grant.actor.id }, sender: grant.sender,session_id:grant.sessionId } };
+  } catch { return { userId: "", ok: false, authorization: {} }; }
+}
 /**
  * Internal API handlers for AgentBox consumption (Port 3002 mTLS).
  *
@@ -486,9 +498,11 @@ export async function handleAgentTasksList(
   try {
     // Session may be threaded via query param for GET; resolve → userId for audit.
     const sessionId = new URL(req.url || "/", "http://_").searchParams.get("session_id") ?? "";
-    const { userId, ok } = await resolveUserForIdentity(sessionId, identity);
+    const { userId, ok, authorization } = await taskExecutionAttribution(sessionId, identity,
+      new URL(req.url || "/", "http://_").searchParams.get("grant_id") ?? undefined);
     if (!ok) { sendJson(res, 403, { error: "session ownership mismatch" }); return; }
     const data = await frontendClient.request("task.list", {
+      ...authorization,
       agent_id: identity.agentId,
       user_id: userId,
     });
@@ -532,6 +546,7 @@ export async function handleAgentTasksCreate(
       prompt?: string;
       status?: "active" | "paused";
       session_id?: string;
+      grant_id?: string;
     };
     if (!body.name || !body.schedule || !body.prompt) {
       sendJson(res, 400, { error: "name, schedule, prompt are required" });
@@ -540,9 +555,10 @@ export async function handleAgentTasksCreate(
     const invalid = validateSchedule(body.schedule);
     if (invalid) { sendJson(res, 400, { error: invalid }); return; }
 
-    const { userId, ok } = await resolveUserForIdentity(body.session_id, identity);
+    const { userId, ok, authorization } = await taskExecutionAttribution(body.session_id, identity, body.grant_id);
     if (!ok) { sendJson(res, 403, { error: "session ownership mismatch" }); return; }
     const data = await frontendClient.request("task.create", {
+      ...authorization,
       id: randomUUID(),
       agent_id: identity.agentId,
       user_id: userId,
@@ -580,9 +596,11 @@ export async function handleAgentTasksUpdate(
     }
 
     const sessionId = typeof body.session_id === "string" ? body.session_id : undefined;
-    const { userId, ok } = await resolveUserForIdentity(sessionId, identity);
+    const { userId, ok, authorization } = await taskExecutionAttribution(sessionId, identity,
+      typeof body.grant_id === "string" ? body.grant_id : undefined);
     if (!ok) { sendJson(res, 403, { error: "session ownership mismatch" }); return; }
     const data = await frontendClient.request("task.update", {
+      ...authorization,
       task_id: taskId,
       agent_id: identity.agentId,
       user_id: userId,
@@ -611,9 +629,11 @@ export async function handleAgentTasksDelete(
 ): Promise<void> {
   try {
     const sessionId = new URL(req.url || "/", "http://_").searchParams.get("session_id") ?? "";
-    const { userId, ok } = await resolveUserForIdentity(sessionId, identity);
+    const { userId, ok, authorization } = await taskExecutionAttribution(sessionId, identity,
+      new URL(req.url || "/", "http://_").searchParams.get("grant_id") ?? undefined);
     if (!ok) { sendJson(res, 403, { error: "session ownership mismatch" }); return; }
     const data = await frontendClient.request("task.delete", {
+      ...authorization,
       task_id: taskId,
       agent_id: identity.agentId,
       user_id: userId,

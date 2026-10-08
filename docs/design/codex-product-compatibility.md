@@ -31,14 +31,42 @@ Checkpoint rollback restores the mode and the current transcript branch.
 `item/tool/requestUserInput` is the only admitted server request. Questions are
 matched to the active root turn, bounded, sanitized and rejected for secret
 input. Existing chat/steer delivers answers to native RPC, including numbered
-answers for multiple questions. Existing suggested-reply chips display options.
-Stop/close/turn completion cancels pending questions. An opted-in external caller
+answers for multiple questions. Text-only surfaces preserve their existing
+question rendering. Codex console/self-service WebChat exposes a structured
+Question card directly above the composer, without a modal overlay or duplicate
+suggested-reply chips. It supports selected/custom answers, multi-question
+navigation, explicit Send, close/reopen and Skip
+through owner-scoped pending-input and answer RPCs. Each request has an adapter
+UUID; answers match the current request/question IDs, persist before native
+resolution and never fall back to starting a new prompt. Pi, shared Analysis,
+embed and Feishu retain their existing text-answer contracts. Refresh restores
+only a live pending request; stopped/expired requests are refused.
+Skip resolves the exact request with empty native answers without selecting an
+option or stopping the turn. Closing the card only hides it; Stop, executor
+close and turn completion cancel pending questions. No countdown is invented
+without a native timeout contract. An opted-in external caller
 receives the existing `input_required` event and answers on its next turn.
 Native async message/question items retain native behavior and projection.
 Question answers never authorize execution; approval and credential requests
 remain rejected, and the whitelist remains authoritative.
 
 ## Attachments
+
+Codex user images use native app-server `turn/start`/`turn/steer` image inputs.
+Runtime advertises `agentEngine=codex` and `nativeImageInput=true` through the
+existing `chat.capabilities` RPC. SiCore reuses its existing images transport,
+not OCR, for upload/steer and authorized first-party URL inputs. Pi's routing
+and PDF extraction remain separate. Public framework user echoes contain text
+only; original images remain in the private native conversation. This does not
+enable arbitrary filesystem image reads or opaque external MCP image results.
+The legacy Pi media-candidate filter must not reject Codex input before the
+native app-server/model validates its own modalities. The image-input
+source-built smoke exercises that framework routing layer, actual Responses
+image parts and the absence of image bytes in public events/shared history.
+Real visual acceptance is separate from that deterministic protocol check:
+the 2026-10-07 browser run correctly reads the unique heading and all three
+colored shapes without a tool call; the independent API's OCR attempt counter
+remains zero. This does not certify every catalog model's vision capability.
 
 Pi and Codex share attachment validation/text extraction. SiCore forwards UTF-8
 TXT/LOG/Markdown/JSON/YAML/CSV/XML files over the existing files contract and
@@ -53,6 +81,39 @@ capability. Missing OCR fails explicitly for raw PDF input. Caller-side OCR
 continues to work as before.
 
 ## Connections and models
+
+### Native children and synchronous IM requests
+
+Native `wait_agent` remains the normal orchestration path. Its V1 result may
+cover only the first terminal target; V2 wakes on mailbox updates or timeout.
+Neither tool is a mandatory all-children completion switch. Siclaw therefore
+uses an execution-only fence around the accepted logical request. The fence
+spans provider attempts and native parent turns; it stores no second child
+transcript or Pi job. Native spawn/turn/terminal events establish frozen request
+ownership, including descendants and reused child execution rounds.
+
+If the parent reports after all owned child executions end, no extra model turn
+is added. An early parent return keeps the same sync request/SSE consumer open.
+After native children end, the same native parent thread receives a bounded
+continuation instruction and produces the final report using its native result
+context. A draft started before the last child finishes is not retroactively
+accepted as the final report. Native connection loss fails the fence; Stop
+interrupts owned native execution turns and latches late starts. Old-request
+completion cannot finish or steer a new request. Async results retain an
+owner-captured, coalesced late-result recovery path. Final task reports and
+`channel_update(kind=final)` are denied while owned children remain running.
+
+Feishu and scheduled tasks request sync admission. Feishu updates one card with
+native child counts and a synthesis phase; only the logical terminal finalizes
+it. Explicit progress delivery uses the existing persisted input/message ID,
+forwarded through Runtime and AgentBox. Registrations are isolated by session
+AND request ID; unscoped/stale updates cannot hit a newer request's card, and an
+older cleanup cannot remove a newer registration. No SiCore schema, additional
+controller, provider credential or native Rust change is required.
+
+Local regressions and pinned source-built deterministic protocol tests are not
+real Feishu acceptance. Deployment and a human-triggered slow-child/channel
+case must be recorded separately before claiming the channel path accepted.
 
 The official authenticated exec-server WebSocket daemon owns native session
 IDs, processes, sequence numbers and output retention. The adapter retains only
@@ -70,6 +131,46 @@ protocol; explicit header-only/no-auth configuration is supported. Native model
 context and reasoning configuration remain native.
 
 ## Verification
+
+### Native fleet and product services
+
+Capability-selected `cluster_list` and `host_list` now use the same business
+services as Pi through the intrinsic `siclaw_workflow` MCP endpoint. They do not
+require `exec_command`. Cluster discovery keeps name filtering, administrator
+metadata and kube-contexts; native calls refresh current bindings. Host discovery
+keeps server-side name/IP/description search, bounded pages, `total` and
+`next_cursor`. Neither default lookup acquires credentials or contacts a target.
+`probe=true` requires the API command capability independently of metadata access.
+
+Native `skill_preview` preserves the existing UI `skillPreview` metadata and
+package limits. Its drafts root is session-scoped inside the authorized workspace.
+Only that draft is collected and removed; links and out-of-scope directories are
+rejected. Preview does not publish, approve, load or execute generated scripts.
+Native application instructions identify this root without editing `prompt.ts`.
+
+`save_feedback` records a structured product report in the framework session's
+custom entries and the ordinary tool-history result. Actor/session attribution is
+host-supplied. It is separate from human thumbs-up/down records and native memory.
+The legacy empty feedback HTTP ACK is not a valid storage receipt. No new table,
+memory index, production dependency or additional resource store is introduced.
+
+`channel_update` calls the existing session-bound channel executor. Gateway retains
+recipient selection, coalescing and delivery policy. Feedback, draft cleanup,
+channel delivery and schedule management require an active root turn; attributed
+native children may read inventory only. Native call identity, arguments, single
+use and cancellation are validated before dispatch and before returning results.
+
+Examples in native JavaScript (exact callable names follow the pinned catalog):
+
+```js
+text(await tools.mcp__siclaw_workflow__cluster_list({ name: "prod" }));
+text(await tools.mcp__siclaw_workflow__host_list({ query: "gpu", limit: 20 }));
+text(await tools.mcp__siclaw_workflow__host_list({ cursor: previous.next_cursor, limit: 20 }));
+```
+
+The last pagination example assumes `previous` is a successfully parsed first-page
+result in the same cell or explicitly stored across cells. Code Mode globals do
+not carry ordinary JavaScript variables into the next cell.
 
 - Component, full TypeScript/Vitest and build checks are required.
 - Source-built product smoke covers attachment reads, native question answers,

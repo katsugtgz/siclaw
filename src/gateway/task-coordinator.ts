@@ -15,6 +15,8 @@ import { ConversationClient, supportsConversations } from "./conversation-client
  */
 
 import crypto from "node:crypto";
+import { parseWireIdentity, userIdentity, type ExecutionIdentity } from "../shared/execution-identity.js";
+import { openExecutionGrant } from "./execution-grants.js";
 import { CronScheduler, type CronJobRow } from "../cron/cron-scheduler.js";
 import type { RuntimeConfig } from "./config.js";
 import type { AgentBoxManager } from "./agentbox/manager.js";
@@ -29,6 +31,7 @@ import { sessionRegistry } from "./session-registry.js";
 
 /** Row shape needed by the scheduler — carries the task prompt out-of-band. */
 interface AgentTaskDbRow {
+  identity?: ExecutionIdentity;
   id: string;
   agent_id: string | null;
   name: string;
@@ -92,6 +95,7 @@ export class TaskCoordinator {
   private onTaskCompleted?: TaskCompletedHandler;
 
   private readonly jobPrompts = new Map<string, string>();
+  private readonly jobIdentities = new Map<string, ExecutionIdentity>();
   private readonly executing = new Set<string>();
   private readonly manualRunCooldownSec: number;
 
@@ -176,6 +180,11 @@ export class TaskCoordinator {
     for (const row of rows) {
       activeIds.add(row.id);
       this.jobPrompts.set(row.id, row.prompt);
+      const actor = parseWireIdentity(row.identity);
+      if (row.identity !== undefined && !actor) throw new Error("Malformed task execution identity");
+      if (!actor && this.frontendClient.consumerDeclares?.("executionIdentity") === true)
+        throw new Error("Task execution identity is required");
+      this.jobIdentities.set(row.id, actor ?? userIdentity(row.created_by ?? ""));
       const cronJob: CronJobRow = {
         id: row.id,
         userId: row.created_by ?? "",
@@ -225,6 +234,9 @@ export class TaskCoordinator {
   ): Promise<void> {
     const startTime = Date.now();
     const prompt = this.jobPrompts.get(job.id);
+    // Freeze before the status lookup/await: a later scheduler refresh cannot
+    // change the identity held by an already-dispatched run.
+    const executionActor = { ...this.jobIdentities.get(job.id) ?? userIdentity(job.userId || "") };
     if (!prompt) {
       console.error(`[task-coordinator] No prompt for task ${job.id} (${job.name}), skipping`);
       return;
@@ -277,7 +289,8 @@ export class TaskCoordinator {
         await ensureChatSession(sessionId, agentId, userId, job.name, prompt, "task");
         const userMessageId = await appendMessage({ sessionId, role: "user", content: prompt });
         await incrementMessageCount(sessionId);
-        const client = new ConversationClient(this.frontendClient, { agentId, userId, sessionId, userMessageId, origin: "task" });
+        const client = new ConversationClient(this.frontendClient, { agentId, userId, sessionId, userMessageId,
+          origin: "task", identity: executionActor, sender: { userId } });
         let timedOut = false;
         const timer = setTimeout(() => {
           timedOut = true;
@@ -285,7 +298,7 @@ export class TaskCoordinator {
         }, this.executionTimeoutMs);
         timer.unref();
         try {
-          await client.prompt({ sessionId, agentId, userId, text: prompt, mode: "task", subagentTiers: undefined });
+          await client.prompt({ sessionId, agentId, userId, text: prompt, mode: "task", requestMode: "sync", subagentTiers: undefined });
           const consumed = await consumeAgentSse({ client, sessionId, userId, persistMessages: false });
           if (timedOut) throw new Error("Scheduled conversation timed out; cancellation requested");
           if (consumed.errorMessage) throw new Error(consumed.errorMessage);
@@ -305,6 +318,9 @@ export class TaskCoordinator {
         const client = new AgentBoxClient(handle.endpoint, 30_000, this.tlsOptions);
 
         const promptOpts: PromptOptions = {
+          identity: executionActor,
+          sender: { userId },
+          requestMode: "sync",
           sessionId,
           userId,
           text: prompt,
@@ -319,6 +335,7 @@ export class TaskCoordinator {
           subagentTiers: binding.subagentTiers,
           systemPromptTemplate: binding.systemPrompt ?? undefined,
         };
+        promptOpts.grantId = await openExecutionGrant(agentId, sessionId, executionActor, { userId });
         const promptResult = await client.prompt(promptOpts);
         // Cross-process trace ids are gated at ingestion (see chat-repo.validTraceId):
         // stamping rows with an id the bind/link boundaries would reject strands them
@@ -436,6 +453,10 @@ export class TaskCoordinator {
 
       const row = result.task as AgentTaskDbRow & { last_manual_run_at: Date | null };
       this.jobPrompts.set(taskId, row.prompt);
+      const actor = parseWireIdentity(row.identity);
+      if (row.identity !== undefined && !actor || !actor && this.frontendClient.consumerDeclares?.("executionIdentity") === true)
+        throw new Error("Task execution identity is required");
+      this.jobIdentities.set(taskId, actor ?? userIdentity(row.created_by ?? ""));
 
       const cronJob: CronJobRow = {
         id: row.id,

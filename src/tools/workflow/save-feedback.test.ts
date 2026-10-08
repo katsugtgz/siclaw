@@ -71,6 +71,13 @@ describe("save_feedback tool", () => {
     expect(body.strengths).toEqual(["clear"]);
   });
 
+  it("does not report a legacy empty ACK as saved feedback", async () => {
+    mockRequest.mockResolvedValue({ ok: true });
+    const result = await makeTool().execute("id", { overallRating: 5, summary: "not persisted" });
+    expect(result.details).toHaveProperty("error", true);
+    expect(result.content[0].text).not.toContain("saved successfully");
+  });
+
   it("parses valid fields, reports warnings for invalid JSON", async () => {
     mockRequest.mockResolvedValue({ ok: true, id: "fb-2" });
     const tool = makeTool();
@@ -104,7 +111,8 @@ describe("save_feedback tool", () => {
     const tool = makeTool();
     const res = await tool.execute("id", { overallRating: 4, summary: "ok" });
     expect(res.content[0].text).toContain("Failed to save feedback");
-    expect(res.content[0].text).toContain("500 internal");
+    expect(res.content[0].text).not.toContain("500 internal");
+    expect(res.content[0].text).toContain("Do not automatically retry");
     expect((res.details as any).error).toBe(true);
   });
 

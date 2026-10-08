@@ -13,6 +13,7 @@
  */
 
 import type { LlmCallPromptBoundary } from "./llm-call-recorder.js";
+import type { NativeUserInputRequest, NativeUserInputAnswer, NativeUserInputAcceptance } from "../shared/native-user-input.js";
 
 export type BrainType = "pi-agent" | "codex";
 
@@ -216,6 +217,10 @@ export interface BrainSession {
 
   /** Interrupt mid-run and inject a user message. */
   steer(text: string, media?: PromptMedia): Promise<void>;
+  /** Codex-only structured user questions. Never grants execution permission. */
+  getPendingUserInput?(): NativeUserInputRequest | undefined;
+  prepareUserInput?(answer: NativeUserInputAnswer): NativeUserInputAcceptance;
+  submitUserInput?(answer: NativeUserInputAnswer): NativeUserInputAcceptance;
 
   /**
    * Queue a message delivered only after the agent finishes its current run (no
@@ -242,6 +247,12 @@ export interface BrainSession {
    * on the llm.call generation. Absent → no tool definitions are recorded.
    */
   getTools?(): BrainToolDefinition[];
+  /** Business request mode; native engines retain their own child orchestration. */
+  setRequestMode?(mode: import("../shared/request-mode.js").RequestMode): void;
+  setNativeChildRecovery?(recover: (scopeId: string) => void): void;
+  /** One accepted request can span provider retries and native parent turns. */
+  beginRequest?(mode: import("../shared/request-mode.js").RequestMode): void;
+  endRequest?(): void;
 
   /** Switch to a different model. */
   setModel(model: BrainModelInfo): Promise<void>;

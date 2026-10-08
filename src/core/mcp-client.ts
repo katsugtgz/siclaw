@@ -21,6 +21,7 @@ import { redactModelJson, type SensitiveValueSource } from "../shared/model-outp
 // ---------------------------------------------------------------------------
 
 export interface McpStdioServerConfig {
+  siclawId?: string;
   transport: "stdio";
   command: string;
   args?: string[];
@@ -30,6 +31,7 @@ export interface McpStdioServerConfig {
 }
 
 export interface McpSseServerConfig {
+  siclawId?: string;
   transport: "sse";
   url: string;
   headers?: Record<string, string>;
@@ -40,6 +42,7 @@ export interface McpSseServerConfig {
 }
 
 export interface McpStreamableHttpServerConfig {
+  siclawId?: string;
   transport: "streamable-http";
   url: string;
   headers?: Record<string, string>;

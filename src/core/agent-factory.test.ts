@@ -10,7 +10,8 @@ describe("agent-factory", () => {
     // in the unit workspace (see above), so pin the conflict-sensitive wiring
     // structurally: a bad resolution that restores the shared root goes red.
     const source = fs.readFileSync(path.resolve(__dirname, "agent-factory.ts"), "utf8");
-    expect(source).toMatch(/const knowledgeDir = opts\?\.knowledgeDir\s*\?\?/);
+    expect(source).toMatch(/const originalKnowledgeDir = opts\?\.knowledgeDir\s*\?\?/);
+    expect(source).toContain("createChannelKnowledgeView(originalKnowledgeDir,channelPolicy)");
     expect(source).toMatch(/createKnowledgeCitationSupport\(\{\s*knowledgeDir,/);
     expect(source).toMatch(/buildKnowledgeCitationSystemPrompt\(knowledgeDir(?:,|\))/);
     expect(source).toMatch(/captureMount\(\)[\s\S]*?fsReadFile\(p\)[\s\S]*?noteRead\(p,/);
