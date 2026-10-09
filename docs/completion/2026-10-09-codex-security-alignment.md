@@ -84,6 +84,26 @@ and its rollout remained present at completion (03:45:52 UTC). This is real
 Feishu-to-native-to-cluster positive/negative namespace evidence, not fixture
 or operator-only evidence. No Secret read or production write was requested.
 
+## Real group Feishu acceptance
+
+Two group Pod-query turns at 2026-10-09 03:58:52 and 04:00:36 UTC passed under
+published r6 / group revision 2. Both use group binding identity
+`d8be79b2-01f6-42d7-b759-3f40d95f0fbc` and the same group session
+`cdcc6b1b-0f0b-4bee-8719-a70f5906149b`, distinct from the private DM session.
+The first message reused `FEISHU_DM_POLICY_R2`; its test marker does not change
+its actual group route. The second uses `FEISHU_GROUP_POLICY_R2`. Both persisted
+native exec_command positive queries returned nine Running/Ready Pods, and both
+exact default test-Pod queries returned the proxy's static scoped refusal.
+Traces: `6c1564b77b9b0963ae06f09f257b63ea` and
+`65f8f2b243be451fb0648b506e088445`. The group native thread's completion marker
+advanced at 04:00:46 UTC with its rollout still present. Current group policy
+remains topic, query/logs and sicore-test only.
+
+No new group resource-list R1 message or cluster_list/host_list tool call was
+observed in these turns. Do not substitute the private R1 or count repeated
+group R2 as R1. Group resource-list R1, different-member admission/equal rights,
+cross-group scope isolation and separate-topic isolation retain their live gates.
+
 ## Shared Pi/native security repairs
 
 Three more issues were first reproduced with failing synthetic regressions:
@@ -133,5 +153,6 @@ enforcement of reviewed arguments; names/effect declarations do not certify code
 No upstream patch, dependency, production-write approval, native-memory redesign
 or incremental >8 MiB redaction was added. PTY/unreviewed scripts, unsupported
 providers, Cross-Agent handoff and Portal acceptance retain their existing
-restrictions/deferred status. Real private R1/R2 passed; new-policy group inbound remains pending;
+restrictions/deferred status. Real private R1/R2 and group R2 passed; the other
+group gates above remain pending;
 do not call the whole deployment production-certified from this review/fixtures.
