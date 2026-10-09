@@ -284,8 +284,10 @@ default Pods, Secrets, Pod create/delete and Pod exec. Its Role remains only Pod
 get/list/watch. Group policy r6/r2 is unchanged. API generation 23 is Ready at
 digest ac28b9f921b9425254d2cc46d0639b8f179de1b37837066ad9e26fa8fb20c2b7;
 Runtime and AgentBox selection are unchanged, and no production/main update
-occurred. A separate Web-only temporary Agent for live remaining targets awaits
-user approval; the existing group is not expanded for acceptance.
+occurred at that checkpoint. The user subsequently approved an independent
+Web-only Agent; real target results, the native knowledge repair and completed
+cleanup are recorded in [isolated Web security acceptance](2026-10-09-isolated-web-security.md).
+The existing group was not expanded for acceptance.
 
 This is not proof that arbitrary approved code is read-only. Fixed reviewed Skill
 assets retain Pi's trusted-program boundary; least-privilege target credentials

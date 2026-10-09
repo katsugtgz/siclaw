@@ -94,6 +94,12 @@ commands use a literal read-only argv grammar and authorized paths. Native
 process stop/connection close invoke the existing sandbox session reaper.
 
 Interactive stdin/PTY and file streaming remain disabled and fail closed.
+Bound knowledge is a selected local text mount, not an MCP resource catalogue.
+Native-only guidance names its selected index and directs verified reads of
+referenced library pages through the authorized executor. Empty MCP resource
+discovery does not establish knowledge availability; actual refused/missing
+reads stop the lookup. Citation registration is separate from page reading.
+This guidance neither grants new read paths nor changes core/upstream prompts.
 Executor reconnect reuses the official authenticated exec-server session and
 replay contract; see [Product contracts](codex-product-compatibility.md).
 Native long processes, continuation and output budgets remain owned by

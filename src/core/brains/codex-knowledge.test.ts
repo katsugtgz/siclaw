@@ -2,11 +2,28 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { CodexKnowledge } from "./codex-knowledge.js";
+import { CodexKnowledge, buildCodexKnowledgeReadInstructions } from "./codex-knowledge.js";
 import { KNOWLEDGE_CITATION_MANIFEST } from "../knowledge-citation-service.js";
 import { createModelOutputRedactor } from "../../shared/model-output-redactor.js";
 
 const roots: string[] = [];
+
+it("directs native knowledge reads to the selected local navigation, not MCP discovery", () => {
+  const text = buildCodexKnowledgeReadInstructions("/selected knowledge/mount");
+  expect(text).toContain(JSON.stringify("/selected knowledge/mount/index.md"));
+  expect(text).toContain("native exec_command in the siclaw environment");
+  expect(text).toContain("not MCP resources");
+  expect(text).toContain("Do not use list_mcp_resources or list_mcp_resource_templates");
+  expect(text).toContain("do not require the user to provide a filesystem path");
+  expect(text).toContain("read is refused or missing");
+  expect(text).toContain("not the page-reading tool");
+});
+
+it("quotes a selected directory without injecting raw newlines into instructions", () => {
+  const text = buildCodexKnowledgeReadInstructions("/selected\nknowledge/mount");
+  expect(text).toContain(JSON.stringify("/selected\nknowledge/mount/index.md"));
+  expect(text).not.toContain("/selected\nknowledge");
+});
 afterEach(() => roots.splice(0).forEach(root => fs.rmSync(root, { recursive: true, force: true })));
 function fixture() {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "native-cite-"))); roots.push(root);

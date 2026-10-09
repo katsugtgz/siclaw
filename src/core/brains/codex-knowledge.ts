@@ -8,6 +8,19 @@ import { isSensitiveDataKey, redactDataDocument } from "../../tools/infra/kubect
 import type { KnowledgeSourceCitation } from "../../shared/knowledge-citations.js";
 
 export const CODEX_KNOWLEDGE_SERVER = "siclaw_knowledge";
+
+/** Knowledge is a selected local mount, not an external MCP resource catalogue. */
+export function buildCodexKnowledgeReadInstructions(knowledgeDir: string): string {
+  const index = JSON.stringify(path.join(knowledgeDir, "index.md"));
+  return "Bound Siclaw knowledge bases are mounted local text files, not MCP resources. " +
+    "Do not use list_mcp_resources or list_mcp_resource_templates to determine whether knowledge is available. " +
+    `Use native exec_command in the siclaw environment to read the complete knowledge navigation file at ${index}, ` +
+    "then read only the referenced pages for the requested bound library, following their relative links. " +
+    "Use the navigation/library title to locate a requested knowledge base; do not require the user to provide a filesystem path. " +
+    "Do not infer unavailability from an empty MCP catalogue. If the actual file read is refused or missing, report that result and stop; " +
+    "do not guess, enumerate private directories or read credential/configuration files. " +
+    "knowledge_cite registers citations after a verified page read; it is not the page-reading tool.";
+}
 type Scope = { threadId: string; turnId: string; service: ReturnType<typeof createKnowledgeCitationService>; bytes: number; unsafe: boolean };
 type Read = { scope: Scope; receipt: KnowledgeMountReceipt; files: Array<{ path: string; raw: string }> };
 

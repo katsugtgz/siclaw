@@ -44,6 +44,7 @@ import deepInvestigationExtension from "./extensions/deep-investigation.js";
 import { PiAgentBrain } from "./brains/pi-agent-brain.js";
 import { CodexAgentBrain } from "./brains/codex-agent-brain.js";
 import { projectCodexPlan } from "./brains/codex-plan.js";
+import { buildCodexKnowledgeReadInstructions } from "./brains/codex-knowledge.js";
 import { resolveSessionThinkingLevel } from "./session-thinking.js";
 import type { BrainSession } from "./brain-session.js";
 import { createPiExecutionSession } from "./pi-execution.js";
@@ -1120,6 +1121,7 @@ export async function createSiclawSession(
       sessionManager, systemPrompt: [compiledContext.systemPrompt,
         ...buildAppendSystemPrompt(memoryEnabled ? memoryDir : null, knowledgeDir,
           nativeKnowledgeEnabled, compiledContext.harness.includeOperationalSafety, "mcp__siclaw_knowledge.knowledge_cite", !channelPolicy),
+        nativeKnowledgeEnabled ? buildCodexKnowledgeReadInstructions(knowledgeDir) : "",
         environments.length ? "Authorized read-only infrastructure execution environments: " +
           environments.map((entry) => entry.id).join(", ") +
           ". Select environment_id in native exec_command. cluster: environments support read-only kubectl queries; " +
