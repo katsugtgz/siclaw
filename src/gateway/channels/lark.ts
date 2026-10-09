@@ -168,12 +168,20 @@ const GROUP_IDENTITY_NOTICE_BY_LOCALE = {
   "en-US": "🔒 This group requires a linked SiCore identity before you can submit requests.",
 } as const;
 const GROUP_IDENTITY_LINK_HINT_BY_LOCALE = {
-  "zh-CN": "点击共享入口，登录你自己的 SiCore 账号并验证自己的飞书身份，再回到本话题重试。每位成员均可重复使用这个入口；群权限由管理员统一配置，不需要个人 Agent 授权。",
-  "en-US": "Open the shared entry, sign in with your own SiCore account and verify your own Feishu identity. Every member can reuse this entry. Group permissions are configured separately; no personal Agent grant is needed.",
+  "zh-CN": "请点击“绑定我的身份”，登录你自己的 SiCore 账号并验证飞书身份。完成后，回到本话题重新发送消息。",
+  "en-US": "Select “Link my identity”, sign in with your own SiCore account and verify your Feishu identity. Then return to this topic and resend your message.",
 } as const;
 const GROUP_IDENTITY_UNAVAILABLE_BY_LOCALE = {
-  "zh-CN": "共享身份绑定入口尚未配置，请管理员设置群成员可访问的 HTTPS 测试地址；不需要私聊申请权限。",
-  "en-US": "The shared identity entry is not configured. Ask the administrator for a reachable HTTPS address; no private access request is required.",
+  "zh-CN": "身份绑定暂不可用，本次请求未执行。请联系机器人管理员恢复绑定入口；恢复后，在群里重新 @我即可获取绑定按钮。",
+  "en-US": "Identity linking is temporarily unavailable; your request was not run. Ask the bot administrator to restore it, then mention me in the group again to get the linking button.",
+} as const;
+const PERSONAL_IDENTITY_LINK_HINT_BY_LOCALE = {
+  "zh-CN": "请点击“绑定我的身份”，登录你自己的 SiCore 账号并验证飞书身份。完成后，回到这里重新发送消息。",
+  "en-US": "Select “Link my identity”, sign in with your own SiCore account and verify your Feishu identity. Then return here and resend your message.",
+} as const;
+const PERSONAL_IDENTITY_UNAVAILABLE_BY_LOCALE = {
+  "zh-CN": "身份绑定暂不可用，本次请求未执行。请联系机器人管理员恢复绑定入口；恢复后，重新发送消息即可获取绑定按钮。",
+  "en-US": "Identity linking is temporarily unavailable; your request was not run. Ask the bot administrator to restore it, then resend your message to get the linking button.",
 } as const;
 // /apikey: the frontend RPC threw (transport down, or a frontend that doesn't
 // implement it at all). The user is waiting on a pickup link, so say something —
@@ -1356,13 +1364,13 @@ export async function handleLarkMessage(
         return;
       }
       if (senderType !== "user" || frontendClient?.consumerDeclares?.("channelPolicyV1") !== true) {
-        await replyToLark(larkClient, messageId, GROUP_IDENTITY_UNAVAILABLE_BY_LOCALE[locale]);
+        await replyToLark(larkClient, messageId, PERSONAL_IDENTITY_UNAVAILABLE_BY_LOCALE[locale]);
         return;
       }
       try {
         const { denied } = await resolvePersonalBinding(personalChannelId, senderOpenId, frontendClient, senderType, true);
         if (denied?.reason === "shared_identity_entry") {
-          await deliverSharedIdentityEntry(larkClient,messageId,locale,denied.actionUrl);
+          await deliverSharedIdentityEntry(larkClient, messageId, locale, denied.actionUrl, "personal", denied.identityLinkLocalTest === true);
         } else if (denied?.reason === "identity_linked") {
           await replyToLark(larkClient, messageId, PERSONAL_DENIAL_COPY_BY_LOCALE[locale].get("identity_linked")!);
         } else if (denied?.reason === "identity_link_required" && rendersActionLink(denied, locale)) {
@@ -1371,13 +1379,13 @@ export async function handleLarkMessage(
             title: PERSONAL_DENIAL_TITLE_BY_LOCALE[locale].get(denied.reason),
             buttonLabel: PERSONAL_DENIAL_BUTTON_BY_LOCALE[locale].get(denied.reason)!,
             url: denied.actionUrl!, expiresAtMs: denied.expiresAtMs, ttlMinutes: denied.ttlMinutes,
-          }, formatPersonalDenialReply(denied, locale) ?? GROUP_IDENTITY_UNAVAILABLE_BY_LOCALE[locale]);
+          }, formatPersonalDenialReply(denied, locale) ?? PERSONAL_IDENTITY_UNAVAILABLE_BY_LOCALE[locale]);
         } else {
-          await replyToLark(larkClient, messageId, GROUP_IDENTITY_UNAVAILABLE_BY_LOCALE[locale]);
+          await replyToLark(larkClient, messageId, PERSONAL_IDENTITY_UNAVAILABLE_BY_LOCALE[locale]);
         }
       } catch {
         console.warn("[lark] System identity linking unavailable");
-        await replyToLark(larkClient, messageId, GROUP_IDENTITY_UNAVAILABLE_BY_LOCALE[locale]);
+        await replyToLark(larkClient, messageId, PERSONAL_IDENTITY_UNAVAILABLE_BY_LOCALE[locale]);
       }
       return;
     }
@@ -1600,7 +1608,7 @@ export async function handleLarkMessage(
     const { binding, denied } = await resolvePersonalBinding(personalChannelId, senderOpenId, frontendClient!, senderType ?? undefined);
     if (!binding) {
       if (denied?.reason === "shared_identity_entry") {
-        await deliverSharedIdentityEntry(larkClient,messageId,locale,denied.actionUrl);
+        await deliverSharedIdentityEntry(larkClient, messageId, locale, denied.actionUrl, "personal", denied.identityLinkLocalTest === true);
         return;
       }
       // The frontend owns the admission decision; the runtime's whole gate is "did a binding come
@@ -2683,7 +2691,7 @@ function formatGroupAccessDeniedReply(
     if (denied.reason !== "unbound") return locale === "zh-CN"
       ? "🔒 当前身份不符合本群的准入要求，请联系管理员检查身份状态。"
       : "🔒 This identity does not meet the group's admission requirements. Contact the administrator.";
-    const next = denied.identityLinkingEnabled === true && isSharedIdentityEntryUrl(denied.identityLinkUrl)
+    const next = denied.identityLinkingEnabled === true && isSharedIdentityEntryUrl(denied.identityLinkUrl, denied.identityLinkLocalTest === true)
       ? GROUP_IDENTITY_LINK_HINT_BY_LOCALE[locale] : GROUP_IDENTITY_UNAVAILABLE_BY_LOCALE[locale];
     return `${GROUP_IDENTITY_NOTICE_BY_LOCALE[locale]}\n${next}`;
   }
@@ -2714,25 +2722,55 @@ function formatGroupAccessDeniedReply(
     : `${base}\n${GROUP_ACCESS_ADMIN_HINT_BY_LOCALE[locale]}`;
 }
 
-function isSharedIdentityEntryUrl(value: unknown): value is string {
+function isSharedIdentityEntryUrl(value: unknown, allowLocal = false): value is string {
   if (typeof value !== "string") return false;
-  try { const u=new URL(value); return u.protocol==="https:" && !u.username && !u.password && !u.search && !u.hash
-    && !["localhost","127.0.0.1","[::1]"].includes(u.hostname.toLowerCase()) && !u.hostname.endsWith(".localhost")
-    && /^\/siclaw\/channel-identity\/[A-Za-z0-9_-]+$/.test(u.pathname); } catch { return false; }
+  try {
+    const u = new URL(value);
+    const host = u.hostname.toLowerCase();
+    const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(host);
+    const allowedOrigin = loopback
+      ? allowLocal && (u.protocol === "http:" || u.protocol === "https:")
+      : u.protocol === "https:" && !host.endsWith(".localhost");
+    return allowedOrigin && !u.username && !u.password && !u.search && !u.hash
+      && /^\/siclaw\/channel-identity\/[A-Za-z0-9_-]+$/.test(u.pathname);
+  } catch {
+    return false;
+  }
 }
 
-async function deliverSharedIdentityEntry(client:any,messageId:string,locale:LarkLocale,url:unknown):Promise<void>{
-  if(!isSharedIdentityEntryUrl(url)){await replyToLark(client,messageId,GROUP_IDENTITY_UNAVAILABLE_BY_LOCALE[locale]);return;}
-  const body=GROUP_IDENTITY_LINK_HINT_BY_LOCALE[locale];
-  const sent=await sendLinkActionCard(client,messageId,{body,title:locale==="zh-CN"?"绑定自己的身份":"Link your own identity",
-    note:locale==="zh-CN"?"共享入口可重复使用 · 每人仅绑定自己的身份":"Reusable entry · each person links only their own identity",
-    buttonLabel:locale==="zh-CN"?"绑定我的身份":"Link my identity",url});
-  if(!sent)await replyToLark(client,messageId,`${body}\n${url}`);
+async function deliverSharedIdentityEntry(
+  client: any,
+  messageId: string,
+  locale: LarkLocale,
+  url: unknown,
+  context: "group" | "personal" = "group",
+  allowLocal = false,
+): Promise<void> {
+  const personal = context === "personal";
+  if (!isSharedIdentityEntryUrl(url, allowLocal)) {
+    const notice = personal ? PERSONAL_IDENTITY_UNAVAILABLE_BY_LOCALE : GROUP_IDENTITY_UNAVAILABLE_BY_LOCALE;
+    await replyToLark(client, messageId, notice[locale]);
+    return;
+  }
+  const body = (personal ? PERSONAL_IDENTITY_LINK_HINT_BY_LOCALE : GROUP_IDENTITY_LINK_HINT_BY_LOCALE)[locale];
+  const note = allowLocal
+    ? (locale === "zh-CN" ? "本机测试链接：请在运行端口转发的这台电脑上打开。" : "Local test link: open it on the computer running the port forward.")
+    : personal
+      ? (locale === "zh-CN" ? "请使用自己的账号完成绑定。" : "Use your own account to complete the link.")
+      : (locale === "zh-CN" ? "群成员可重复使用这个按钮，各自绑定自己的身份。" : "Every group member can reuse this button to link their own identity.");
+  const sent = await sendLinkActionCard(client, messageId, {
+    body,
+    title: locale === "zh-CN" ? "绑定自己的身份" : "Link your own identity",
+    note,
+    buttonLabel: locale === "zh-CN" ? "绑定我的身份" : "Link my identity",
+    url,
+  });
+  if (!sent) await replyToLark(client, messageId, `${body}\n${note}\n${url}`);
 }
 
 async function deliverGroupAccessDenied(client:any,messageId:string,denied:ChannelAccessDenied,locale:LarkLocale,personalBot:LarkChannelConfig["personal_bot"]):Promise<void>{
-  if(denied.identityLinkOnly===true&&denied.reason==="unbound"&&denied.identityLinkingEnabled===true&&isSharedIdentityEntryUrl(denied.identityLinkUrl)){
-    await deliverSharedIdentityEntry(client,messageId,locale,denied.identityLinkUrl);return;
+  if(denied.identityLinkOnly===true&&denied.reason==="unbound"&&denied.identityLinkingEnabled===true&&isSharedIdentityEntryUrl(denied.identityLinkUrl,denied.identityLinkLocalTest===true)){
+    await deliverSharedIdentityEntry(client,messageId,locale,denied.identityLinkUrl,"group",denied.identityLinkLocalTest===true);return;
   }
   await replyToLark(client,messageId,formatGroupAccessDeniedReply(denied,locale,denied.identityLinkOnly===true?Boolean(personalBot):dmCanResolveAccess(personalBot)));
 }

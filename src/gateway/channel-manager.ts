@@ -75,6 +75,8 @@ export interface ChannelAccessDenied {
   identityLinkingEnabled?: boolean;
   /** Reusable entry; contains no requester identity or invitation token. */
   identityLinkUrl?: string;
+  /** Trusted control-plane opt-in for the isolated operator's loopback test. */
+  identityLinkLocalTest?: boolean;
 }
 
 export function isChannelAccessDenied(
@@ -116,6 +118,7 @@ export interface PersonalAccessDenied {
   reason?: string;
   /** Single-use next step (link/apply). Absent when the tier accepts no self-service. */
   actionUrl?: string;
+  identityLinkLocalTest?: boolean;
   /** Epoch ms the `actionUrl` dies. Use for EXPIRY checks — not for the displayed duration. */
   expiresAtMs?: number;
   /**
@@ -318,6 +321,7 @@ export function normalizeDenied(raw: unknown): { denied: PersonalAccessDenied } 
   const denied: PersonalAccessDenied = {
     ...(str(src.reason) ? { reason: str(src.reason) } : {}),
     ...(str(src.actionUrl) ? { actionUrl: str(src.actionUrl) } : {}),
+    ...(src.identityLinkLocalTest === true ? { identityLinkLocalTest: true } : {}),
     ...(str(src.message) ? { message: str(src.message) } : {}),
     ...(typeof src.expiresAtMs === "number" && Number.isFinite(src.expiresAtMs)
       ? { expiresAtMs: src.expiresAtMs }

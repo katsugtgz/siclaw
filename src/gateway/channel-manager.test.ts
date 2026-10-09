@@ -182,6 +182,15 @@ describe("personal binding RPC wrappers", () => {
     expect(result.denied?.ttlMinutes).toBe(10);
   });
 
+  it("preserves only a boolean trusted local identity-entry opt-in", async () => {
+    for (const value of [true, false, "true", 1, null]) {
+      frontend.responses.set("channel.resolvePersonalBinding", {binding:null,
+        denied:{reason:"shared_identity_entry", actionUrl:"http://127.0.0.1:30105/siclaw/channel-identity/a1",identityLinkLocalTest:value}});
+      const result = await resolvePersonalBinding("pb1", "ou_1", frontend as unknown as FrontendWsClient);
+      expect(result.denied?.identityLinkLocalTest).toBe(value === true ? true : undefined);
+    }
+  });
+
   it("drops a nonsensical ttlMinutes rather than printing it", async () => {
     // Same rule as every other field here: wrong-typed is dropped, not coerced. A zero or negative
     // TTL would render as "valid for 0 minutes" on a link that actually works.

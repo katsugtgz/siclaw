@@ -30,6 +30,14 @@ the same entry; it is not a group prerequisite. Missing reachable HTTPS frontend
 configuration produces an administrator setup hint, not a private ticket or
 loopback link. Real external OAuth acceptance is a separate deployment gate.
 
+For the explicitly requested local acceptance, the control plane can opt in one
+exact non-production Agent to the operator's loopback origin. Start/callback/
+confirmation recheck that setting and current production status. The trusted
+RPC boolean permits only exact loopback in Runtime URL validation, never remote
+HTTP; absence or wrong-typed values fail closed. The card names the forwarding
+computer and gives direct sign-in/verify/confirm/resend instructions. DM copy
+does not describe group permissions. This is not external-member acceptance.
+
 ## Native boundary
 
 - Native JS orchestrates atomic capabilities. It cannot receive raw Kubernetes,

@@ -224,6 +224,35 @@ and environment access, MCP admission/configuration rotation, owner-scoped secre
 sources, streaming/previews/artifacts/history/logging and child/task attribution.
 Reproduce issues with synthetic credential canaries before changing shared paths.
 
+### Actionable local identity acceptance correction
+
+The unbound group screenshot verifies refusal, not usability. Four owned group
+model histories lacked FEISHU_SHARED_IDENTITY_R1. The missing self-service URL
+and DM's group-configuration copy were defects. The user chose local acceptance
+on the existing port forward; a new control-plane opt-in is limited to that exact
+non-production Agent and exact loopback. Runtime accepts its local URL only with
+the trusted boolean flag; wrong-typed flags, remote HTTP and default loopback
+remain refused. The API rechecks local eligibility at start/callback/confirmation.
+
+Group/DM cards and the real Web page now give sign-in/verify/confirm/resend steps.
+Local cards name the forwarding computer, and DM copy no longer describes group
+permissions. DM-only identity linking works independently of group admission.
+Real browser entry at 30105 displays the test account and its verification
+button; normal API initiation returns 200 with browser proof and the exact
+loopback callback. The agent did not perform provider consent or identity binding.
+Actual provider allowlist, human confirmation and subsequent Feishu continuation
+remain pending; no fixture or negative case substitutes for them.
+
+Verification: 9,009 Runtime tests, 337 focused routing tests, 3,906 Web tests
+(three existing skips), strict types/build and OAS generation passed; Linux
+services and real MySQL passed. A sandbox-restricted full run hung and was stopped;
+the supported Node 24 run with loopback access is the passing evidence.
+Final test Runtime digest is 7d6ce34cff1a5febf76ab3a378a83e50aefe78517444dcc4fdcfe1b2aa36ed24,
+API digest d6a187ddac5fa32614a1a0529154186d9558cffe9fc7ac7fdff79f3697600b66.
+Published policy r6/group r2/AgentBox/resources remain unchanged. The requested
+own identity unlink is retained for the user's self-test; no automatic rebind,
+network exposure, main merge/push or production change was performed.
+
 | Boundary | Verified implementation/retained gate |
 |---|---|
 | Cluster | Shared owner broker; shell has no credential group; setgid kubectl uses authorized cache. Scoped native config substitutes loopback HTTPS, keeping upstream auth private. |
