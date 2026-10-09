@@ -99,10 +99,15 @@ Traces: `6c1564b77b9b0963ae06f09f257b63ea` and
 advanced at 04:00:46 UTC with its rollout still present. Current group policy
 remains topic, query/logs and sicore-test only.
 
-No new group resource-list R1 message or cluster_list/host_list tool call was
-observed in these turns. Do not substitute the private R1 or count repeated
-group R2 as R1. Group resource-list R1, different-member admission/equal rights,
-cross-group scope isolation and separate-topic isolation retain their live gates.
+The initial two turns did not include resource-list R1. The user subsequently
+sent `FEISHU_GROUP_POLICY_R1` at 2026-10-09 04:12:47 UTC in the same group
+session. Persisted cluster_list and host_list calls succeeded at 04:12:55 UTC
+under trace `47de99d83dad35d8df082576480611aa`. The cluster result contains one
+entry; the host result explicitly reports no hosts. The final answer reports
+1/0 and the requested marker. This is a separate real group R1 acceptance,
+not a private-history substitution or a duplicate Pod test. Different-member
+admission/equal rights, cross-group scope isolation and separate-topic isolation
+retain their live gates.
 
 ## Shared Pi/native security repairs
 
@@ -153,6 +158,6 @@ enforcement of reviewed arguments; names/effect declarations do not certify code
 No upstream patch, dependency, production-write approval, native-memory redesign
 or incremental >8 MiB redaction was added. PTY/unreviewed scripts, unsupported
 providers, Cross-Agent handoff and Portal acceptance retain their existing
-restrictions/deferred status. Real private R1/R2 and group R2 passed; the other
+restrictions/deferred status. Real private R1/R2 and group R1/R2 passed; the other
 group gates above remain pending;
 do not call the whole deployment production-certified from this review/fixtures.
