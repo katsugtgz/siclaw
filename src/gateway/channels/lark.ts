@@ -168,12 +168,12 @@ const GROUP_IDENTITY_NOTICE_BY_LOCALE = {
   "en-US": "🔒 This group requires a linked SiCore identity before you can submit requests.",
 } as const;
 const GROUP_IDENTITY_LINK_HINT_BY_LOCALE = {
-  "zh-CN": "请私聊我发送 /link，按提示绑定你自己的 SiCore 账号，再回到本话题重试。群内操作使用管理员配置的群权限，不需要申请个人 Agent 权限。",
-  "en-US": "DM me with /link to link your own SiCore account, then retry in this topic. Group operations use the configured group policy; no personal Agent access request is needed.",
+  "zh-CN": "点击共享入口，登录你自己的 SiCore 账号并验证自己的飞书身份，再回到本话题重试。每位成员均可重复使用这个入口；群权限由管理员统一配置，不需要个人 Agent 授权。",
+  "en-US": "Open the shared entry, sign in with your own SiCore account and verify your own Feishu identity. Every member can reuse this entry. Group permissions are configured separately; no personal Agent grant is needed.",
 } as const;
 const GROUP_IDENTITY_UNAVAILABLE_BY_LOCALE = {
-  "zh-CN": "身份绑定入口暂不可用，请联系管理员处理。",
-  "en-US": "Identity linking is unavailable. Contact the administrator.",
+  "zh-CN": "共享身份绑定入口尚未配置，请管理员设置群成员可访问的 HTTPS 测试地址；不需要私聊申请权限。",
+  "en-US": "The shared identity entry is not configured. Ask the administrator for a reachable HTTPS address; no private access request is required.",
 } as const;
 // /apikey: the frontend RPC threw (transport down, or a frontend that doesn't
 // implement it at all). The user is waiting on a pickup link, so say something —
@@ -1361,7 +1361,9 @@ export async function handleLarkMessage(
       }
       try {
         const { denied } = await resolvePersonalBinding(personalChannelId, senderOpenId, frontendClient, senderType, true);
-        if (denied?.reason === "identity_linked") {
+        if (denied?.reason === "shared_identity_entry") {
+          await deliverSharedIdentityEntry(larkClient,messageId,locale,denied.actionUrl);
+        } else if (denied?.reason === "identity_linked") {
           await replyToLark(larkClient, messageId, PERSONAL_DENIAL_COPY_BY_LOCALE[locale].get("identity_linked")!);
         } else if (denied?.reason === "identity_link_required" && rendersActionLink(denied, locale)) {
           await deliverSingleUseLink(larkClient, messageId, locale, {
@@ -1597,6 +1599,10 @@ export async function handleLarkMessage(
 
     const { binding, denied } = await resolvePersonalBinding(personalChannelId, senderOpenId, frontendClient!, senderType ?? undefined);
     if (!binding) {
+      if (denied?.reason === "shared_identity_entry") {
+        await deliverSharedIdentityEntry(larkClient,messageId,locale,denied.actionUrl);
+        return;
+      }
       // The frontend owns the admission decision; the runtime's whole gate is "did a binding come
       // back". All that is left is telling the sender what to do next.
       const deniedReply = denied ? formatPersonalDenialReply(denied, locale) : null;
@@ -1739,8 +1745,7 @@ export async function handleLarkMessage(
     );
     if (isChannelAccessDenied(modeBinding)) {
       if (modeExistingOnly) return;
-      await replyToLark(larkClient, messageId, formatGroupAccessDeniedReply(modeBinding, locale,
-        modeBinding.identityLinkOnly === true ? Boolean(personalBot) : dmCanResolveAccess(personalBot)));
+      await deliverGroupAccessDenied(larkClient,messageId,modeBinding,locale,personalBot);
       return;
     }
     if (!modeBinding) {
@@ -1852,8 +1857,7 @@ export async function handleLarkMessage(
     if (unmentionedGroupMessage) return;
     // Gated group: this sender isn't allowed. The message is either an explicit @ or a follow-up
     // in a previously established bot topic, so a single short hint is appropriate.
-    await replyToLark(larkClient, messageId, formatGroupAccessDeniedReply(binding, locale,
-      binding.identityLinkOnly === true ? Boolean(personalBot) : dmCanResolveAccess(personalBot)));
+    await deliverGroupAccessDenied(larkClient,messageId,binding,locale,personalBot);
     return;
   }
   if (!binding) {
@@ -2679,7 +2683,7 @@ function formatGroupAccessDeniedReply(
     if (denied.reason !== "unbound") return locale === "zh-CN"
       ? "🔒 当前身份不符合本群的准入要求，请联系管理员检查身份状态。"
       : "🔒 This identity does not meet the group's admission requirements. Contact the administrator.";
-    const next = hasPersonalBot && denied.identityLinkingEnabled === true
+    const next = denied.identityLinkingEnabled === true && isSharedIdentityEntryUrl(denied.identityLinkUrl)
       ? GROUP_IDENTITY_LINK_HINT_BY_LOCALE[locale] : GROUP_IDENTITY_UNAVAILABLE_BY_LOCALE[locale];
     return `${GROUP_IDENTITY_NOTICE_BY_LOCALE[locale]}\n${next}`;
   }
@@ -2708,6 +2712,29 @@ function formatGroupAccessDeniedReply(
   return notLinked && denied.authorizeUrl
     ? `${base}\n${GROUP_ACCESS_SELF_SERVE_HINT_BY_LOCALE[locale]}\n${denied.authorizeUrl}`
     : `${base}\n${GROUP_ACCESS_ADMIN_HINT_BY_LOCALE[locale]}`;
+}
+
+function isSharedIdentityEntryUrl(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  try { const u=new URL(value); return u.protocol==="https:" && !u.username && !u.password && !u.search && !u.hash
+    && !["localhost","127.0.0.1","[::1]"].includes(u.hostname.toLowerCase()) && !u.hostname.endsWith(".localhost")
+    && /^\/siclaw\/channel-identity\/[A-Za-z0-9_-]+$/.test(u.pathname); } catch { return false; }
+}
+
+async function deliverSharedIdentityEntry(client:any,messageId:string,locale:LarkLocale,url:unknown):Promise<void>{
+  if(!isSharedIdentityEntryUrl(url)){await replyToLark(client,messageId,GROUP_IDENTITY_UNAVAILABLE_BY_LOCALE[locale]);return;}
+  const body=GROUP_IDENTITY_LINK_HINT_BY_LOCALE[locale];
+  const sent=await sendLinkActionCard(client,messageId,{body,title:locale==="zh-CN"?"绑定自己的身份":"Link your own identity",
+    note:locale==="zh-CN"?"共享入口可重复使用 · 每人仅绑定自己的身份":"Reusable entry · each person links only their own identity",
+    buttonLabel:locale==="zh-CN"?"绑定我的身份":"Link my identity",url});
+  if(!sent)await replyToLark(client,messageId,`${body}\n${url}`);
+}
+
+async function deliverGroupAccessDenied(client:any,messageId:string,denied:ChannelAccessDenied,locale:LarkLocale,personalBot:LarkChannelConfig["personal_bot"]):Promise<void>{
+  if(denied.identityLinkOnly===true&&denied.reason==="unbound"&&denied.identityLinkingEnabled===true&&isSharedIdentityEntryUrl(denied.identityLinkUrl)){
+    await deliverSharedIdentityEntry(client,messageId,locale,denied.identityLinkUrl);return;
+  }
+  await replyToLark(client,messageId,formatGroupAccessDeniedReply(denied,locale,denied.identityLinkOnly===true?Boolean(personalBot):dmCanResolveAccess(personalBot)));
 }
 
 async function handleNewCommand(

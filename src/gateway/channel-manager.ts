@@ -73,6 +73,8 @@ export interface ChannelAccessDenied {
   /** Published group admission needs identity only, never a personal grant. */
   identityLinkOnly?: boolean;
   identityLinkingEnabled?: boolean;
+  /** Reusable entry; contains no requester identity or invitation token. */
+  identityLinkUrl?: string;
 }
 
 export function isChannelAccessDenied(

@@ -171,40 +171,52 @@ human retry and must not be called complete from fixtures.
 Published group admission now has a dedicated server path. It never reads or
 mutates private access_mode; active identified organization members run under
 the common group policy without personal grants. Public/disabled group modes
-remain independent. The private /link system command bypasses only private
-conversation admission, creates no model session, API key or webchat link, and
-accepts confirmed human sender provenance only. One-time URLs remain private.
-The identity-only claim/UI confirm identity rather than private conversation
-eligibility and never offer an Agent approval form. Private conversations retain
-their own admission checks; legacy un-published paths retain compatibility.
+remain independent. The initial private `/link` implementation was insufficient
+and is superseded: the group/Topic now carries one reusable public entry at
+`/siclaw/channel-identity/<agentId>`. It contains no sender identity or personal
+ticket. Each visitor logs into their own active organization account and
+independently verifies their own Feishu identity before authenticated confirmation.
+Per-person OAuth state/browser proof/verification handles are never group links.
+The compatibility `/link` command returns this same entry. No personal Agent
+grant, model session, API key or WebChat link is created, and OAuth tokens are
+not retained. Private conversations still enforce their own admission checks;
+unpublished legacy paths retain compatibility.
 
 Identity-invite consumption now reads and deletes through the caller's
 transaction and rechecks expiry on deletion. Six personal-channel RPCs now
 resolve owning Agent metadata before dispatch and enforce Runtime ownership;
-foreign probes and an owner cold-start control pass. Existing legacy group
-pair/reset/meta RPCs still carry their named ScopeUnauthorized audit gate;
-this fix does not certify every older Channel RPC or production deployment.
+foreign probes and an owner cold-start control pass. The remaining legacy group
+pair/reset/meta RPCs now resolve their normalized binding/code owner, enforce
+Runtime ownership and constrain mutations by the expected Agent. Published
+Channel policies reject PAIR. `TestNoUnauthorizedRPCScopeRemains` rejects any
+handler retaining the unchecked audit scope. This is not production acceptance
+or a guarantee against arbitrary administrative database races.
 
-Verification: 329 focused Runtime tests, 9,001 full Siclaw tests, strict
-types/build; 3,903 Web tests passed (three existing skips), strict types and
+Verification: 9,002 full Siclaw tests, strict types/build; 3,906 Web tests passed
+(three existing skips), strict types and
 webpack production build. Linux access/Channel/adapter/identity/ws packages and
-real MySQL migration/CAS pass. Browser synthetic preview/claim shows only
-identity confirmation and success, with no approval form, real binding or
-personal grant writes. Existing permissions/version-publication guard assertions
+real MySQL migration/CAS pass. Two synthetic browser users reused the same public
+entry and each confirmed their own identity: two mappings, zero personal grants,
+zero production requests. This is not real external OAuth/human acceptance.
+Wrong account/browser, replay, revoked policy and identity theft are refused in
+service tests. Existing permissions/version-publication guard assertions
 were retained and aligned to their already implemented behavior; no security
 guard or test was disabled. System Node 25 storage/loopback-test restrictions
 are not counted as application regressions; supported Node 24 ran the Web suite.
 
 Only isolated test API/Runtime were updated:
-- Runtime generation 45: sha256:f06aa1ca04c9efd2d8b8c7789d3ad79e191747ddc02b77a0d0fa9c8aaace736d.
-- API generation 19: sha256:c7673de07b79fa4ddb280c24d46fff614d78a0a29e2daa7e27eb2cd878cdb431.
+- Runtime generation 46: sha256:5ad2fa40c01089953c1e4c906a186dfaa5e7829095f6f2bf6644116493e32975.
+- API generation 20: sha256:6740e8a3af0493d3fa9175ce194a52d5d7d12584f86ddcb7dcea3cd14b624ef3.
 - AgentBox remains sha256:020a158eb19e624a54f341be1d4252fdaa52f189c1153629ae29a2c0d4f5cc37.
-- API source c7f8c2682dc0e009ba05927db9e44d232ebd1ab1596c0fe830d559b4387ddf24;
-  Runtime source bed88420643cf1458add293a75f00928eb8fd3c213fcebbfa94c517d7999768f.
+- API source 2b0d1bd9ecdbe3d5f248e1934f6d3b6ec277b08ab00c1c824e3d74ab04f2c47a;
+  Runtime source 7fe8f6dd94722f1fd48cad423b4268e857911a5e798f112367bc5c30646ee247.
 - Published policy r6 and group r2/resources/operations were unchanged. Binding
-  callbacks now target matching loopback Web 30105; original 30104 remains.
-  A colleague must use their own account on a machine with that test forwarding,
-  never the operator's account. No real credentials went to the build host.
+  Web preview remains on loopback 30105; original 30104 is untouched.
+  There is no member-reachable HTTPS Web origin/Ingress in this test namespace.
+  Loopback origins deliberately produce no shared URL; an administrator setup
+  hint replaces private tickets. A reachable HTTPS origin and the App's exact
+  OAuth callback allowlist remain required for real colleague acceptance.
+  No network exposure was added and no real credentials went to the build host.
 
 Compare Pi/native authorization before dispatch and delivery, production command
 whitelists and immutable scripts, namespace/resource limits, raw credential file

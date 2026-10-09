@@ -19,6 +19,17 @@ is immutable audit/admission provenance, never a source of personal group rights
 DM member rights additionally intersect their own resource scope. Public users
 get only explicitly selected policy resources; no creator fallback.
 
+## Shared group identity entry
+
+Published groups never use private `access_mode` for admission. An identified
+group shares `/siclaw/channel-identity/<agentId>` with all members; this reusable
+URL contains no person or proof. Each person signs in and independently verifies
+their own provider identity before confirming the mapping. Binding does not
+create personal Agent/infra grants. The optional legacy `/link` command returns
+the same entry; it is not a group prerequisite. Missing reachable HTTPS frontend
+configuration produces an administrator setup hint, not a private ticket or
+loopback link. Real external OAuth acceptance is a separate deployment gate.
+
 ## Native boundary
 
 - Native JS orchestrates atomic capabilities. It cannot receive raw Kubernetes,

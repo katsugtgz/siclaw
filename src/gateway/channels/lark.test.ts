@@ -844,24 +844,37 @@ describe("handleLarkMessage — routing to AgentBox", () => {
 
   it.each(["zh-CN", "en-US"] as const)("published group requests identity linking, never private authorization (%s)", async (locale) => {
     resolveBindingMock.mockResolvedValue({ walled: true, reason: "unbound", identityLinkOnly: true, identityLinkingEnabled: true,
-      authorizeUrl: "https://console.example/unused" });
+      identityLinkUrl: "https://console.example/siclaw/channel-identity/a1", authorizeUrl: "https://console.example/unused" });
     const lark = makeLarkClient();
     const mgr = makeAgentBoxManager();
     await handleLarkMessage(makeTextEvent("hi"), lark, "lark-runtime", mgr as any, undefined, {} as any, locale,
       { app_id: "cli_x", app_secret: "secret", group_channel_id: "lark:personal:pb-1",
         personal_bot: { channel_id: "pb-1", agent_id: "a1", access_mode: "public", owner_user_id: "owner-1" } });
     const text = JSON.parse(lark.im.message.reply.mock.calls[0][0].data.content).text as string;
-    expect(text).toContain("/link");
-    expect(text).not.toMatch(/完成授权|申请权限|grant access|Request access/i);
-    expect(text).not.toContain("http");
+    expect(text).toContain("/siclaw/channel-identity/a1");
+    expect(text).not.toMatch(/完成授权|申请权限|DM me|\/link|Request access/i);
+    expect(text).not.toContain("/agent-access/");
     expect(mgr.getOrCreate).not.toHaveBeenCalled();
     expect(promptMock).not.toHaveBeenCalled();
   });
 
+  it("all group members get the same reusable identity card with no one-time ticket", async () => {
+    resolveBindingMock.mockResolvedValue({ walled: true, reason: "unbound", identityLinkOnly: true, identityLinkingEnabled: true,
+      identityLinkUrl: "https://console.example/siclaw/channel-identity/a1" });
+    const lark = makeLarkClient(); lark.cardkit = { v1: { card: { create: vi.fn().mockResolvedValue({ data: { card_id: "shared-card" } }) } } };
+    const config={app_id:"cli_x",app_secret:"synthetic",group_channel_id:"lark:personal:pb-1",personal_bot:{channel_id:"pb-1",agent_id:"a1",access_mode:"granted"}};
+    await handleLarkMessage(makeTextEvent("request", {}, "ou_A", "user"),lark,"lark-runtime",makeAgentBoxManager() as any,undefined,{} as any,"zh-CN",config);
+    await handleLarkMessage(makeTextEvent("request", {message_id:"mid-2"}, "ou_B", "user"),lark,"lark-runtime",makeAgentBoxManager() as any,undefined,{} as any,"zh-CN",{...config,personal_bot:{...config.personal_bot,access_mode:"public"}});
+    const cards=lark.cardkit.v1.card.create.mock.calls.map(c=>String(c[0].data.data));
+    expect(cards).toHaveLength(2);expect(cards[0]).toBe(cards[1]);
+    expect(cards[0]).toContain("绑定我的身份");expect(cards[0]).toContain("共享入口可重复使用");
+    expect(cards[0]).not.toMatch(/ou_A|ou_B|agent-access|一次|10 分钟|\/link/);
+    expect(promptMock).not.toHaveBeenCalled();expect(resolvePersonalBindingMock).not.toHaveBeenCalled();
+  });
+
   it.each(["public", "disabled", "granted"])("/link is system-only, independent of private admission %s", async (mode) => {
-    resolvePersonalBindingMock.mockResolvedValue({ binding: null, denied: { reason: "identity_link_required",
-      actionUrl: "https://console.example/siclaw/agent-access/synthetic-test-token",
-      expiresAtMs: Date.now() + 600_000, ttlMinutes: 10 } });
+    resolvePersonalBindingMock.mockResolvedValue({ binding: null, denied: { reason: "shared_identity_entry",
+      actionUrl: "https://console.example/siclaw/channel-identity/a1" } });
     const lark = makeLarkClient(); const mgr = makeAgentBoxManager();
     lark.cardkit = { v1: { card: { create: vi.fn().mockResolvedValue({ data: { card_id: "identity-test-card" } }) } } };
     await handleLarkMessage(makeTextEvent("/link", { chat_type: "p2p" }, "ou_user_1", "user"), lark,
@@ -869,7 +882,7 @@ describe("handleLarkMessage — routing to AgentBox", () => {
       { app_id: "cli_x", app_secret: "secret", personal_bot: { channel_id: "pb-1", agent_id: "a1", access_mode: mode } });
     expect(resolvePersonalBindingMock).toHaveBeenCalledWith("pb-1", "ou_user_1", expect.anything(), "user", true);
     const content = String(lark.cardkit.v1.card.create.mock.calls[0][0].data.data);
-    expect(content).toContain("绑定身份");
+    expect(content).toContain("绑定我的身份");
     expect(content).not.toContain("申请权限");
     expect(mgr.getOrCreate).not.toHaveBeenCalled(); expect(promptMock).not.toHaveBeenCalled();
     expect(issuePersonalApiKeyMock).not.toHaveBeenCalled(); expect(issuePersonalWebChatLinkMock).not.toHaveBeenCalled();
