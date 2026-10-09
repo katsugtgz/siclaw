@@ -69,8 +69,20 @@ projected from the operator config; its admin identity was not transferred.
 Before storage, direct requests using the new reader token returned 200 for
 `sicore-test` Pod list and 403 for the exact nonexistent `default` test Pod.
 This establishes new credential validity and target RBAC, not successful
-Feishu/native namespace-proxy acceptance. The human-triggered R2 retry remains
-pending; the old credential's expiration was not independently confirmed.
+Feishu/native namespace-proxy acceptance. The old credential's expiration was
+not independently confirmed.
+
+The human-triggered R2 retry at 2026-10-09 03:45:33 UTC passed. In the same
+`origin=dm` session under published policy r6, native `exec_command` queried
+`sicore-test` Pod names/status successfully (nine Pods, all Running). The exact
+`default/codex-policy-probe-nonexistent` query returned `Forbidden: Scoped
+Kubernetes operation denied`, the broker proxy's static refusal, rather than
+upstream authentication failure or NotFound. Both persisted tool results share
+trace `f8373da6acb8201f9f9d68d639630115`; the final answer includes
+`FEISHU_DM_POLICY_R2`. The existing native thread's last-turn marker advanced
+and its rollout remained present at completion (03:45:52 UTC). This is real
+Feishu-to-native-to-cluster positive/negative namespace evidence, not fixture
+or operator-only evidence. No Secret read or production write was requested.
 
 ## Shared Pi/native security repairs
 
@@ -121,5 +133,5 @@ enforcement of reviewed arguments; names/effect declarations do not certify code
 No upstream patch, dependency, production-write approval, native-memory redesign
 or incremental >8 MiB redaction was added. PTY/unreviewed scripts, unsupported
 providers, Cross-Agent handoff and Portal acceptance retain their existing
-restrictions/deferred status. Real R2 Feishu/native retry and group inbound remain pending;
+restrictions/deferred status. Real private R1/R2 passed; new-policy group inbound remains pending;
 do not call the whole deployment production-certified from this review/fixtures.
