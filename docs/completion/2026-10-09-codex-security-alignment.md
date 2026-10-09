@@ -60,6 +60,18 @@ changed, and no Secret was read during this diagnostic pass. Real target
 acceptance remains blocked on restoring valid test authentication and retrying.
 Protocol fixtures are not a substitute for it.
 
+At 2026-10-09 03:37:22 UTC, following explicit user authorization, the existing
+reader credential was updated through the normal encrypted SiCore API with a
+new 1,800-second ServiceAccount token (expires 04:07:21 UTC). The existing
+ServiceAccount, Pod get/list/watch Role, RoleBinding, Agent resource bindings
+and published policy r6 were unchanged. Only public cluster CA material was
+projected from the operator config; its admin identity was not transferred.
+Before storage, direct requests using the new reader token returned 200 for
+`sicore-test` Pod list and 403 for the exact nonexistent `default` test Pod.
+This establishes new credential validity and target RBAC, not successful
+Feishu/native namespace-proxy acceptance. The human-triggered R2 retry remains
+pending; the old credential's expiration was not independently confirmed.
+
 ## Shared Pi/native security repairs
 
 Three more issues were first reproduced with failing synthetic regressions:
@@ -109,5 +121,5 @@ enforcement of reviewed arguments; names/effect declarations do not certify code
 No upstream patch, dependency, production-write approval, native-memory redesign
 or incremental >8 MiB redaction was added. PTY/unreviewed scripts, unsupported
 providers, Cross-Agent handoff and Portal acceptance retain their existing
-restrictions/deferred status. Real R2 target authentication repair/retry and group inbound remain pending;
+restrictions/deferred status. Real R2 Feishu/native retry and group inbound remain pending;
 do not call the whole deployment production-certified from this review/fixtures.
