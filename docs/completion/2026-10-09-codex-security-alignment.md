@@ -109,6 +109,25 @@ not a private-history substitution or a duplicate Pod test. Different-member
 admission/equal rights, cross-group scope isolation and separate-topic isolation
 retain their live gates.
 
+### Topic continuity/isolation probe (partial)
+
+The user's pure-conversation probes at 2026-10-09 04:24 UTC used no tools.
+Topic A seed and follow-up share session c79a75ed-3982-4d65-9a6e-761c6d3c2551
+and native thread 01a11ee7-77f7-7022-a482-5486a7469afb. Its native history contains
+the supplied synthetic marker in the first user message and both separate turns.
+Topic B uses distinct session 539d4051-01ca-49b9-859a-4c2b962d3cce and native
+thread 01a11ee8-21be-78a1-8d26-02129ff4a966, with no A marker in its user history;
+it answered UNKNOWN and FEISHU_TOPIC_B_R1. Both retain the same authorized group
+binding and current topic policy. Routing/thread separation and this negative
+cross-topic observation pass; this is not a universal memory-isolation proof.
+
+The positive A recall is not passed: both the persisted answer and the native
+assistant response contain only FEISHU_TOPIC_A_R1, omitting the supplied marker.
+The omission already exists in the native output, not solely in Feishu rendering.
+Do not infer a lost thread from it: the same native thread retains the seed and
+follow-up. A focused recall retry is needed before closing the full Topic test;
+no production configuration or deferred native-memory design was changed.
+
 ## Shared Pi/native security repairs
 
 Three more issues were first reproduced with failing synthetic regressions:
