@@ -44,7 +44,21 @@ actually running AgentBox. API and Agent resource policy are unchanged.
 - AgentBox digest: `sha256:c6a1e54ed79c0e513526504d2124b436ea0d878c19d117f385394b1ececca9de`.
 - Source snapshot: `f7baa014101ff8f6061a480180cb29cfbe048f23b462a0a660cf246d0c30bb66`.
 
-Real R2 re-send remains pending. Protocol fixtures are not a substitute for it.
+Real R2 re-send at 2026-10-09 02:53:05 UTC completed on the final security image,
+but did not pass. Both commands reached Kubernetes discovery and returned HTTP
+authentication-required errors, rather than the earlier local file permission
+error. The allowed query returned no Pod data; the denied query did not reach a
+demonstrated namespace-policy rejection. Do not record either as positive policy
+acceptance or infer a namespace bypass from discovery authentication failure.
+
+The bound credential is `Native Codex namespace reader 2026-10-06`, last updated
+2026-10-07 10:03:17 UTC. Its normal management API exposes metadata only, not
+authentication material or expiration. The existing ServiceAccount and binding
+remain present; its namespace Role permits only Pod get/list/watch. Expiration
+is a hypothesis, not a verified cause. No credential, Role or binding was
+changed, and no Secret was read during this diagnostic pass. Real target
+acceptance remains blocked on restoring valid test authentication and retrying.
+Protocol fixtures are not a substitute for it.
 
 ## Shared Pi/native security repairs
 
@@ -95,5 +109,5 @@ enforcement of reviewed arguments; names/effect declarations do not certify code
 No upstream patch, dependency, production-write approval, native-memory redesign
 or incremental >8 MiB redaction was added. PTY/unreviewed scripts, unsupported
 providers, Cross-Agent handoff and Portal acceptance retain their existing
-restrictions/deferred status. Real R2 re-send and group inbound remain pending;
+restrictions/deferred status. Real R2 target authentication repair/retry and group inbound remain pending;
 do not call the whole deployment production-certified from this review/fixtures.
