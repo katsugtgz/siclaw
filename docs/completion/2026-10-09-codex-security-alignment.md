@@ -262,6 +262,31 @@ network exposure, main merge/push or production change was performed.
 | Output/storage | Live owner secret sources, sanitize before model/previews/artifacts; invalid/oversized/opaque content has no raw fallback. |
 | Children/tasks | Frozen audience/original sender and expiring grants; per-holder cache, not later-speaker authority. |
 
+### Security round two
+
+The paired SiCore resolver omitted the identified-group organization-membership
+check on revalidation, despite checking it at ingress. Two failing regressions
+proved a foreign linked account and a removed original task sender retained
+authority. The resolver now returns the closed policy after membership removal;
+public groups and private admission are unchanged. Linux service/MySQL regression
+passes. No real membership was removed for testing.
+
+Fresh targeted Runtime tests passed: 110 grant/broker/proxy and 660 MCP/secret/
+output/command-parity/OS/cancellation tests. Six independent Linux containers
+using current compiled code and the fixed Codex/Code Mode base passed scoped
+kubectl, SSH/Pod-netns protocol, reviewed Skills, MCP parent/child/resume,
+native JS scope/no-host-I/O and UID 1001 cancellation. MCP's 13 deterministic
+Responses bodies contain no canary credentials; upstream write executions are
+zero. These use synthetic upstreams, not real Channel target acceptance.
+
+The actual test reader's permission reviews allow sicore-test Pod reads but deny
+default Pods, Secrets, Pod create/delete and Pod exec. Its Role remains only Pod
+get/list/watch. Group policy r6/r2 is unchanged. API generation 23 is Ready at
+digest ac28b9f921b9425254d2cc46d0639b8f179de1b37837066ad9e26fa8fb20c2b7;
+Runtime and AgentBox selection are unchanged, and no production/main update
+occurred. A separate Web-only temporary Agent for live remaining targets awaits
+user approval; the existing group is not expanded for acceptance.
+
 This is not proof that arbitrary approved code is read-only. Fixed reviewed Skill
 assets retain Pi's trusted-program boundary; least-privilege target credentials
 and asset review are required. Operator-controlled diagnostic helper lifecycle is
