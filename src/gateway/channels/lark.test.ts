@@ -842,6 +842,45 @@ describe("handleLarkMessage — routing to AgentBox", () => {
     expect(promptMock).not.toHaveBeenCalled();
   });
 
+  it.each(["zh-CN", "en-US"] as const)("published group requests identity linking, never private authorization (%s)", async (locale) => {
+    resolveBindingMock.mockResolvedValue({ walled: true, reason: "unbound", identityLinkOnly: true, identityLinkingEnabled: true,
+      authorizeUrl: "https://console.example/unused" });
+    const lark = makeLarkClient();
+    const mgr = makeAgentBoxManager();
+    await handleLarkMessage(makeTextEvent("hi"), lark, "lark-runtime", mgr as any, undefined, {} as any, locale,
+      { app_id: "cli_x", app_secret: "secret", group_channel_id: "lark:personal:pb-1",
+        personal_bot: { channel_id: "pb-1", agent_id: "a1", access_mode: "public", owner_user_id: "owner-1" } });
+    const text = JSON.parse(lark.im.message.reply.mock.calls[0][0].data.content).text as string;
+    expect(text).toContain("/link");
+    expect(text).not.toMatch(/完成授权|申请权限|grant access|Request access/i);
+    expect(text).not.toContain("http");
+    expect(mgr.getOrCreate).not.toHaveBeenCalled();
+    expect(promptMock).not.toHaveBeenCalled();
+  });
+
+  it.each(["public", "disabled", "granted"])("/link is system-only, independent of private admission %s", async (mode) => {
+    resolvePersonalBindingMock.mockResolvedValue({ binding: null, denied: { reason: "identity_link_required",
+      actionUrl: "https://console.example/siclaw/agent-access/synthetic-test-token",
+      expiresAtMs: Date.now() + 600_000, ttlMinutes: 10 } });
+    const lark = makeLarkClient(); const mgr = makeAgentBoxManager();
+    lark.cardkit = { v1: { card: { create: vi.fn().mockResolvedValue({ data: { card_id: "identity-test-card" } }) } } };
+    await handleLarkMessage(makeTextEvent("/link", { chat_type: "p2p" }, "ou_user_1", "user"), lark,
+      "lark-runtime", mgr as any, undefined, { consumerDeclares: () => true } as any, "zh-CN",
+      { app_id: "cli_x", app_secret: "secret", personal_bot: { channel_id: "pb-1", agent_id: "a1", access_mode: mode } });
+    expect(resolvePersonalBindingMock).toHaveBeenCalledWith("pb-1", "ou_user_1", expect.anything(), "user", true);
+    const content = String(lark.cardkit.v1.card.create.mock.calls[0][0].data.data);
+    expect(content).toContain("绑定身份");
+    expect(content).not.toContain("申请权限");
+    expect(mgr.getOrCreate).not.toHaveBeenCalled(); expect(promptMock).not.toHaveBeenCalled();
+    expect(issuePersonalApiKeyMock).not.toHaveBeenCalled(); expect(issuePersonalWebChatLinkMock).not.toHaveBeenCalled();
+  });
+
+  it("malformed /link never reaches a model or issues an identity token", async () => {
+    await handleLarkMessage(makeTextEvent("/link admin", { chat_type: "p2p" }, "ou_user_1", "user"),
+      makeLarkClient(), "lark-runtime", makeAgentBoxManager() as any, undefined, {} as any, "zh-CN", makePersonalConfig("public"));
+    expect(resolvePersonalBindingMock).not.toHaveBeenCalled(); expect(promptMock).not.toHaveBeenCalled();
+  });
+
   it("group-only channel does NOT offer the linking page to an already-linked sender", async () => {
     // reason "denied" = linked but lacks agent access. Telling them to "complete authorization" on
     // the linking page points at something they already did — the same loop, different path.

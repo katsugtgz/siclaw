@@ -163,6 +163,18 @@ const GROUP_ACCESS_ADMIN_HINT_BY_LOCALE = {
   "zh-CN": "请联系管理员授权。",
   "en-US": "Ask an admin to grant access.",
 } as const;
+const GROUP_IDENTITY_NOTICE_BY_LOCALE = {
+  "zh-CN": "🔒 本群要求绑定 SiCore 身份，你尚未完成绑定，暂时不能发起请求。",
+  "en-US": "🔒 This group requires a linked SiCore identity before you can submit requests.",
+} as const;
+const GROUP_IDENTITY_LINK_HINT_BY_LOCALE = {
+  "zh-CN": "请私聊我发送 /link，按提示绑定你自己的 SiCore 账号，再回到本话题重试。群内操作使用管理员配置的群权限，不需要申请个人 Agent 权限。",
+  "en-US": "DM me with /link to link your own SiCore account, then retry in this topic. Group operations use the configured group policy; no personal Agent access request is needed.",
+} as const;
+const GROUP_IDENTITY_UNAVAILABLE_BY_LOCALE = {
+  "zh-CN": "身份绑定入口暂不可用，请联系管理员处理。",
+  "en-US": "Identity linking is unavailable. Contact the administrator.",
+} as const;
 // /apikey: the frontend RPC threw (transport down, or a frontend that doesn't
 // implement it at all). The user is waiting on a pickup link, so say something —
 // staying silent here reads as "the bot is broken".
@@ -241,6 +253,8 @@ const PERSONAL_ACCESS_ADMIN_HINT_BY_LOCALE = {
 // very reply this feature exists to deliver).
 const PERSONAL_DENIAL_COPY_BY_LOCALE: Record<LarkLocale, Map<string, string>> = {
   "zh-CN": new Map([
+    ["identity_link_required", "请绑定你自己的 SiCore 身份。此步骤只建立身份关联，不授予个人 Agent 或资源权限。完成后返回原群话题重试。"],
+    ["identity_linked", "你的 SiCore 身份已绑定，可以返回原群话题重试。私聊对话仍遵循单独配置的准入策略。"],
     // Not yet linked: send them to link, once.
     ["binding_required", "使用这个助手需要先关联你的 Sicore 账号。关联完回到这里，重新发送刚才那条消息即可。"],
     // ALREADY linked but unauthorized — must not say "go link", they did that.
@@ -249,6 +263,8 @@ const PERSONAL_DENIAL_COPY_BY_LOCALE: Record<LarkLocale, Map<string, string>> = 
     ["access_denied", "你没有这个助手的使用权限，请联系该助手的负责人开通。"],
   ]),
   "en-US": new Map([
+    ["identity_link_required", "Link your own SiCore identity. This step does not grant personal Agent or resource access. Return to the original group topic afterwards."],
+    ["identity_linked", "Your SiCore identity is linked. Return to the original group topic. Private conversations remain subject to their separate admission policy."],
     ["binding_required", "Using this assistant needs your Sicore account linked. Once linked, come back here and resend your message."],
     ["access_request_required", "You don't have access to this assistant yet — submit a request. Once it is approved, come back and resend your message."],
     ["access_denied", "You don't have access to this assistant. Ask its owner to grant it."],
@@ -259,10 +275,12 @@ const PERSONAL_DENIAL_COPY_BY_LOCALE: Record<LarkLocale, Map<string, string>> = 
 // it there would read as a stutter ("需要先关联账号。使用这个助手需要先关联…").
 const PERSONAL_DENIAL_TITLE_BY_LOCALE: Record<LarkLocale, Map<string, string>> = {
   "zh-CN": new Map([
+    ["identity_link_required", "绑定 SiCore 身份"],
     ["binding_required", "需要先关联账号"],
     ["access_request_required", "需要申请使用权限"],
   ]),
   "en-US": new Map([
+    ["identity_link_required", "Link SiCore identity"],
     ["binding_required", "Link your account first"],
     ["access_request_required", "Access request needed"],
   ]),
@@ -293,10 +311,12 @@ const PERSONAL_DENIAL_LINK_HINT_BY_LOCALE: Record<LarkLocale, (minutes: number |
 // gets a usable button rather than falling back to raw text.
 const PERSONAL_DENIAL_BUTTON_BY_LOCALE: Record<LarkLocale, Map<string, string>> = {
   "zh-CN": new Map([
+    ["identity_link_required", "绑定身份"],
     ["binding_required", "关联账号"],
     ["access_request_required", "申请权限"],
   ]),
   "en-US": new Map([
+    ["identity_link_required", "Link identity"],
     ["binding_required", "Link account"],
     ["access_request_required", "Request access"],
   ]),
@@ -1329,6 +1349,36 @@ export async function handleLarkMessage(
       return;
     }
     const pairMatch = text.match(/^PAIR\s+([A-Z0-9]{6})$/i);
+    // System-only identity linking never starts a model or consults private admission.
+    if (/^\/link(?:\s|$)/i.test(text.trim())) {
+      if (text.trim().toLowerCase() !== "/link") {
+        await replyToLark(larkClient, messageId, locale === "zh-CN" ? "身份绑定命令：/link" : "Identity linking command: /link");
+        return;
+      }
+      if (senderType !== "user" || frontendClient?.consumerDeclares?.("channelPolicyV1") !== true) {
+        await replyToLark(larkClient, messageId, GROUP_IDENTITY_UNAVAILABLE_BY_LOCALE[locale]);
+        return;
+      }
+      try {
+        const { denied } = await resolvePersonalBinding(personalChannelId, senderOpenId, frontendClient, senderType, true);
+        if (denied?.reason === "identity_linked") {
+          await replyToLark(larkClient, messageId, PERSONAL_DENIAL_COPY_BY_LOCALE[locale].get("identity_linked")!);
+        } else if (denied?.reason === "identity_link_required" && rendersActionLink(denied, locale)) {
+          await deliverSingleUseLink(larkClient, messageId, locale, {
+            body: PERSONAL_DENIAL_COPY_BY_LOCALE[locale].get(denied.reason)!,
+            title: PERSONAL_DENIAL_TITLE_BY_LOCALE[locale].get(denied.reason),
+            buttonLabel: PERSONAL_DENIAL_BUTTON_BY_LOCALE[locale].get(denied.reason)!,
+            url: denied.actionUrl!, expiresAtMs: denied.expiresAtMs, ttlMinutes: denied.ttlMinutes,
+          }, formatPersonalDenialReply(denied, locale) ?? GROUP_IDENTITY_UNAVAILABLE_BY_LOCALE[locale]);
+        } else {
+          await replyToLark(larkClient, messageId, GROUP_IDENTITY_UNAVAILABLE_BY_LOCALE[locale]);
+        }
+      } catch {
+        console.warn("[lark] System identity linking unavailable");
+        await replyToLark(larkClient, messageId, GROUP_IDENTITY_UNAVAILABLE_BY_LOCALE[locale]);
+      }
+      return;
+    }
     if (pairMatch) {
       // Gate on OPEN-ness, not on the one legacy gated spelling: a bot on any gated tier still
       // needs its pairing code forwarded. Comparing against the one legacy literal told a
@@ -1689,7 +1739,8 @@ export async function handleLarkMessage(
     );
     if (isChannelAccessDenied(modeBinding)) {
       if (modeExistingOnly) return;
-      await replyToLark(larkClient, messageId, formatGroupAccessDeniedReply(modeBinding, locale, dmCanResolveAccess(personalBot)));
+      await replyToLark(larkClient, messageId, formatGroupAccessDeniedReply(modeBinding, locale,
+        modeBinding.identityLinkOnly === true ? Boolean(personalBot) : dmCanResolveAccess(personalBot)));
       return;
     }
     if (!modeBinding) {
@@ -1801,7 +1852,8 @@ export async function handleLarkMessage(
     if (unmentionedGroupMessage) return;
     // Gated group: this sender isn't allowed. The message is either an explicit @ or a follow-up
     // in a previously established bot topic, so a single short hint is appropriate.
-    await replyToLark(larkClient, messageId, formatGroupAccessDeniedReply(binding, locale, dmCanResolveAccess(personalBot)));
+    await replyToLark(larkClient, messageId, formatGroupAccessDeniedReply(binding, locale,
+      binding.identityLinkOnly === true ? Boolean(personalBot) : dmCanResolveAccess(personalBot)));
     return;
   }
   if (!binding) {
@@ -2623,6 +2675,14 @@ function formatGroupAccessDeniedReply(
   locale: "zh-CN" | "en-US",
   hasPersonalBot = false,
 ): string {
+  if (denied.identityLinkOnly === true) {
+    if (denied.reason !== "unbound") return locale === "zh-CN"
+      ? "🔒 当前身份不符合本群的准入要求，请联系管理员检查身份状态。"
+      : "🔒 This identity does not meet the group's admission requirements. Contact the administrator.";
+    const next = hasPersonalBot && denied.identityLinkingEnabled === true
+      ? GROUP_IDENTITY_LINK_HINT_BY_LOCALE[locale] : GROUP_IDENTITY_UNAVAILABLE_BY_LOCALE[locale];
+    return `${GROUP_IDENTITY_NOTICE_BY_LOCALE[locale]}\n${next}`;
+  }
   // Only the explicit not-linked reason claims "you haven't linked yet". Every other value —
   // including one this build has never seen — gets the generic line: it is never wrong, whereas
   // telling an already-linked sender to go link sends them round a loop with no exit.

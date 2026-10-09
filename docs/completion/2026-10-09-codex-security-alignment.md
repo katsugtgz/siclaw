@@ -159,6 +159,53 @@ were updated. API, published policy r6 and production are unchanged.
 
 ## Alignment scope and retained limits
 
+### Group identity admission follow-up
+
+The real unlinked-colleague screenshot exposed the legacy "DM me to get access"
+copy. Its request did not appear in the owned Topic transcript; the transcript
+still ended at the previous recall answer. Human refusals are intentionally not
+listed in the bot allowlist roster, so an empty blocked-senders list is not
+proof of admission. Post-fix real colleague UI/link/continuation still awaits a
+human retry and must not be called complete from fixtures.
+
+Published group admission now has a dedicated server path. It never reads or
+mutates private access_mode; active identified organization members run under
+the common group policy without personal grants. Public/disabled group modes
+remain independent. The private /link system command bypasses only private
+conversation admission, creates no model session, API key or webchat link, and
+accepts confirmed human sender provenance only. One-time URLs remain private.
+The identity-only claim/UI confirm identity rather than private conversation
+eligibility and never offer an Agent approval form. Private conversations retain
+their own admission checks; legacy un-published paths retain compatibility.
+
+Identity-invite consumption now reads and deletes through the caller's
+transaction and rechecks expiry on deletion. Six personal-channel RPCs now
+resolve owning Agent metadata before dispatch and enforce Runtime ownership;
+foreign probes and an owner cold-start control pass. Existing legacy group
+pair/reset/meta RPCs still carry their named ScopeUnauthorized audit gate;
+this fix does not certify every older Channel RPC or production deployment.
+
+Verification: 329 focused Runtime tests, 9,001 full Siclaw tests, strict
+types/build; 3,903 Web tests passed (three existing skips), strict types and
+webpack production build. Linux access/Channel/adapter/identity/ws packages and
+real MySQL migration/CAS pass. Browser synthetic preview/claim shows only
+identity confirmation and success, with no approval form, real binding or
+personal grant writes. Existing permissions/version-publication guard assertions
+were retained and aligned to their already implemented behavior; no security
+guard or test was disabled. System Node 25 storage/loopback-test restrictions
+are not counted as application regressions; supported Node 24 ran the Web suite.
+
+Only isolated test API/Runtime were updated:
+- Runtime generation 45: sha256:f06aa1ca04c9efd2d8b8c7789d3ad79e191747ddc02b77a0d0fa9c8aaace736d.
+- API generation 19: sha256:c7673de07b79fa4ddb280c24d46fff614d78a0a29e2daa7e27eb2cd878cdb431.
+- AgentBox remains sha256:020a158eb19e624a54f341be1d4252fdaa52f189c1153629ae29a2c0d4f5cc37.
+- API source c7f8c2682dc0e009ba05927db9e44d232ebd1ab1596c0fe830d559b4387ddf24;
+  Runtime source bed88420643cf1458add293a75f00928eb8fd3c213fcebbfa94c517d7999768f.
+- Published policy r6 and group r2/resources/operations were unchanged. Binding
+  callbacks now target matching loopback Web 30105; original 30104 remains.
+  A colleague must use their own account on a machine with that test forwarding,
+  never the operator's account. No real credentials went to the build host.
+
 Compare Pi/native authorization before dispatch and delivery, production command
 whitelists and immutable scripts, namespace/resource limits, raw credential file
 and environment access, MCP admission/configuration rotation, owner-scoped secret

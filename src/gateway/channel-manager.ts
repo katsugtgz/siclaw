@@ -70,6 +70,9 @@ export interface ChannelAccessDenied {
   walled: true;
   reason?: string;
   authorizeUrl?: string;
+  /** Published group admission needs identity only, never a personal grant. */
+  identityLinkOnly?: boolean;
+  identityLinkingEnabled?: boolean;
 }
 
 export function isChannelAccessDenied(
@@ -282,12 +285,14 @@ export async function resolvePersonalBinding(
   senderOpenId: string,
   frontendClient: FrontendWsClient,
   senderType?: string,
+  identityLinkOnly = false,
 ): Promise<PersonalBindingResult> {
   const data = await frontendClient.request("channel.resolvePersonalBinding", {
     channel_id: channelId,
     sender_open_id: senderOpenId,
     // Same contract as the group lookup: verbatim, and absent stays absent.
     ...(senderType ? { sender_type: senderType } : {}),
+    ...(identityLinkOnly ? { identity_link_only: true } : {}),
   });
   return {
     binding: data?.binding ?? null,
