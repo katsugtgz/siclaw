@@ -106,10 +106,10 @@ under trace `47de99d83dad35d8df082576480611aa`. The cluster result contains one
 entry; the host result explicitly reports no hosts. The final answer reports
 1/0 and the requested marker. This is a separate real group R1 acceptance,
 not a private-history substitution or a duplicate Pod test. Different-member
-admission/equal rights, cross-group scope isolation and separate-topic isolation
-retain their live gates.
+admission/equal rights and cross-group scope isolation retain their live gates.
+The basic same-sender Topic test is recorded below.
 
-### Topic continuity/isolation probe (partial)
+### Topic continuity/isolation probe
 
 The user's pure-conversation probes at 2026-10-09 04:24 UTC used no tools.
 Topic A seed and follow-up share session c79a75ed-3982-4d65-9a6e-761c6d3c2551
@@ -121,12 +121,18 @@ it answered UNKNOWN and FEISHU_TOPIC_B_R1. Both retain the same authorized group
 binding and current topic policy. Routing/thread separation and this negative
 cross-topic observation pass; this is not a universal memory-isolation proof.
 
-The positive A recall is not passed: both the persisted answer and the native
-assistant response contain only FEISHU_TOPIC_A_R1, omitting the supplied marker.
+The initial positive A recall did not pass: both the persisted answer and the
+native assistant response contained only FEISHU_TOPIC_A_R1, omitting the marker.
 The omission already exists in the native output, not solely in Feishu rendering.
 Do not infer a lost thread from it: the same native thread retains the seed and
-follow-up. A focused recall retry is needed before closing the full Topic test;
-no production configuration or deferred native-memory design was changed.
+follow-up. A focused retry at 2026-10-09 04:29:50 UTC was sent correctly into
+the original A session, without resupplying the marker and without tools. Its
+answer at 04:29:55 UTC is exactly TOPIC_A_X7Q4. Trace:
+`d393bc6b8a225f9a9e118687944a1fc4`. The same A native thread retains this third
+turn and matching assistant output, while B remains a distinct thread. The
+basic same-sender Topic continuity/isolation case now passes; the initial
+omission remains recorded and is not evidence that the history was lost.
+No production configuration or deferred native-memory design was changed.
 
 ## Shared Pi/native security repairs
 
