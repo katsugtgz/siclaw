@@ -19,6 +19,7 @@ interface CredentialRequestBody {
   grant_id?: string;
   channel_policy_v1?: boolean;
   channel_policy_v2?: boolean;
+  channel_agent_scope?: boolean;
   source?: string;
   source_id?: string;
   purpose?: string;
@@ -28,6 +29,7 @@ interface CredentialRequestBody {
 interface CredentialListBody {
   channel_policy_v1?: boolean;
   channel_policy_v2?: boolean;
+  channel_agent_scope?: boolean;
   grant_id?: string;
   kind?: string;
   session_id?: string;
@@ -55,7 +57,7 @@ function assertSafeIdField(value: string, field: string): void {
  * attached by the caller so the runtime can resolve it to an actual user
  * for audit attribution before calling Upstream.
  */
-function toIdentity(cert: CertificateIdentity, sessionId?: string, grantId?: string, policyCapable?: boolean, rulesCapable?:boolean): Identity {
+function toIdentity(cert: CertificateIdentity, sessionId?: string, grantId?: string, policyCapable?: boolean, rulesCapable?:boolean,agentScopeCapable?:boolean): Identity {
   assertSafeIdField(cert.agentId, "agentId");
   if (cert.orgId) assertSafeIdField(cert.orgId, "orgId");
   if (cert.boxId) assertSafeIdField(cert.boxId, "boxId");
@@ -70,6 +72,7 @@ function toIdentity(cert: CertificateIdentity, sessionId?: string, grantId?: str
     ...(grantId ? { grantId } : {}),
     channelPolicyV1: policyCapable === true,
     channelPolicyV2: rulesCapable === true,
+    channelAgentScope: agentScopeCapable === true,
   };
 }
 
@@ -117,7 +120,7 @@ export async function handleCredentialRequest(
   }
 
   try {
-    const id = toIdentity(identity, body.session_id, body.grant_id, body.channel_policy_v1,body.channel_policy_v2);
+    const id = toIdentity(identity, body.session_id, body.grant_id, body.channel_policy_v1,body.channel_policy_v2,body.channel_agent_scope);
     const payload = body.source === "cluster"
       ? await service.getClusterCredential(id, body.source_id, body.purpose ?? "")
       : await service.getHostCredential(id, body.source_id, body.purpose ?? "");
@@ -157,7 +160,7 @@ export async function handleCredentialList(
   }
 
   try {
-    const id = toIdentity(identity, body.session_id, body.grant_id, body.channel_policy_v1,body.channel_policy_v2);
+    const id = toIdentity(identity, body.session_id, body.grant_id, body.channel_policy_v1,body.channel_policy_v2,body.channel_agent_scope);
     if (body.kind === "cluster") {
       const clusters = await service.listClusters(id);
       sendJson(res, 200, { clusters });

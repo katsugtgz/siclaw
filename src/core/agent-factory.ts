@@ -695,7 +695,7 @@ export async function createSiclawSession(
   const allMcpServers = exposeConfiguredMcp && !sandboxOnly ? (opts?.mcpServers ?? config.mcpServers ?? {}) : {};
   const mcpServers = channelPolicy ? Object.fromEntries(Object.entries(allMcpServers).filter(([,server])=>
     channelPolicy.operations.includes("mcp") && typeof server==="object" && server!==null && "siclawId" in server &&
-    channelPolicy.mcp.some(rule=>rule.serverId===server.siclawId))) : allMcpServers;
+    (channelPolicy.version===3||channelPolicy.mcp.some(rule=>rule.serverId===server.siclawId)))) : allMcpServers;
   const sensitiveValues = () => [...Object.values(config.providers).map(provider => provider.apiKey),
     ...mcpSensitiveValues(mcpServers), ...(kubeconfigRef.credentialBroker?.getSensitiveValues() ?? [])];
   const redactModelOutput = createModelOutputRedactor(sensitiveValues);

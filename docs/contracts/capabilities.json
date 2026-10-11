@@ -1,6 +1,7 @@
 {
   "$comment": "Capability names exchanged on `runtime.register`. Authoritative for BOTH control planes: siclaw reads it through src/shared/control-plane-capabilities.ts (control-plane-capabilities.test.ts pins the two agree); sicore keeps a copy under internal/siclaw/adapter/testdata/ and a Go test pins internal/siclaw/ws/connection_map.go against it. A name is a wire identifier: it is spelled exactly like this on both sides, and adding one here without a reader on the other side is a name nobody honours.",
   "runtime": {
+    "channelAgentScope": "Enforces behavior-only channel admission and revocation while inheriting Agent resource capabilities; rejects older AgentBoxes.",
     "$comment": "Advertised BY the Runtime in the `runtime.register` request. Absent reads as not capable — a capability nobody advertised is a capability nobody promised.",
     "channelPolicyV1": "This Runtime rejects legacy boxes for published Channel policies, enforces immutable resource/operation/namespace/MCP constraints, and supports grant revocation.",
     "channelPolicyV2": "This Runtime preserves resource/action rule associations, per-tool MCP constraints and rejects boxes without resource-rule enforcement.",
@@ -10,6 +11,7 @@
     "executionIdentity": "This Runtime reads `identity` / `sender` / `origin` off `channel.resolveBinding` and carries the identity into every credential request; the control plane leaves `createdBy` empty for a non-user identity whether or not this is advertised, so an older Runtime fails closed (design 2026-09-25 §5.1, §10)."
   },
   "controlPlane": {
+    "channelAgentScope": "Publishes behavior-only channel settings and resolves Agent-bound authority without per-user or per-group resource policies.",
     "$comment": "Declared BY the control plane in its `runtime.register` reply. The Runtime keeps them per connection (`consumerDeclares`) and reads a missing declaration as an older control plane.",
     "channelPolicyV1": "The control plane serves channel.policy.resolve with exact session/identity authority and independently enforces DM/group admission and policy publication.",
     "channelPolicyV2": "The control plane validates and publishes versioned resource rules and resolves immutable per-target authority without flattening action scope.",

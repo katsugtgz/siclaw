@@ -63,7 +63,7 @@ export class NativeMcpAuthorization {
           return typeof value==='string'&&values.includes(value);
         });
       });
-      if(!allowed)throw new Error("Channel MCP tool or argument scope denied");
+      if(scope.version!==3&&!allowed)throw new Error("Channel MCP tool or argument scope denied");
     }
     if (mcpConfigurationDigest(config) !== operation.configurationDigest) throw new Error("MCP configuration changed; rebuild the session");
     const policy = resolveMcpReadOnlyPolicy(config);
@@ -100,7 +100,7 @@ export class NativeMcpAuthorization {
         chunks.push(Buffer.from(chunk));
       }
       const body: unknown = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-      if (!record(body) || Object.keys(body).some(key => !["session_id", "operation", "grant_id", "channel_policy_v1", "channel_policy_v2"].includes(key)) || !identifier(body.session_id) || !record(body.operation)
+      if (!record(body) || Object.keys(body).some(key => !["session_id", "operation", "grant_id", "channel_policy_v1", "channel_policy_v2", "channel_agent_scope"].includes(key)) || !identifier(body.session_id) || !record(body.operation)
           || body.grant_id !== undefined && !identifier(body.grant_id)) throw new Error("Invalid MCP authorization request");
       const raw = body.operation;
       if (Object.keys(raw).some(key => !["server", "kind", "name", "arguments", "callId", "configurationDigest"].includes(key)) ||
@@ -111,6 +111,7 @@ export class NativeMcpAuthorization {
       operation = raw as unknown as McpOperation; sessionId = body.session_id;
       if(body.grant_id && this.executionGrant?.(identity,sessionId,body.grant_id as string).resources.policy && body.channel_policy_v1!==true) throw new Error("AgentBox policy enforcement required");
       if(body.grant_id && this.executionGrant?.(identity,sessionId,body.grant_id as string).resources.policy?.version===2 && body.channel_policy_v2!==true) throw new Error("AgentBox resource-rule enforcement required");
+      if(body.grant_id && this.executionGrant?.(identity,sessionId,body.grant_id as string).resources.policy?.version===3 && body.channel_agent_scope!==true) throw new Error("AgentBox Agent-resource enforcement required");
       const permit = await this.authorize(identity, sessionId, operation, controller.signal, body.grant_id as string | undefined);
       send(200, permit);
       console.info(JSON.stringify({ event: "native_mcp_authorization", decision: "allow", effect: permit.effect,

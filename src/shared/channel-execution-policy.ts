@@ -1,6 +1,6 @@
 /** Versioned control-plane authority. Never accepted from model/tool arguments. */
 export interface ChannelExecutionPolicy {
-  version: 1 | 2;
+  version: 1 | 2 | 3;
   revision: string;
   fingerprint: string;
   operations: readonly string[];
@@ -31,7 +31,7 @@ export function parseChannelExecutionPolicy(raw: unknown): ChannelExecutionPolic
 }
 function parsePolicy(raw: unknown, leaf: boolean): ChannelExecutionPolicy | undefined {
   if (raw === undefined || raw === null) return undefined;
-  if (!object(raw) || raw.version !== 1 && raw.version !== 2 || leaf && raw.version !== 1 || typeof raw.revision !== "string" || !raw.revision || raw.revision.length > 256 ||
+  if (!object(raw) || ![1,2,3].includes(raw.version as number) || leaf && raw.version !== 1 || typeof raw.revision !== "string" || !raw.revision || raw.revision.length > 256 ||
       typeof raw.fingerprint !== "string" || !/^[a-f0-9]{64}$/.test(raw.fingerprint) || !strings(raw.operations) ||
       raw.operations.some(op => !OPERATIONS.has(op)) || !strings(raw.namespaces) ||
       raw.namespaces.some(ns => !/^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/.test(ns)) ||
@@ -44,6 +44,7 @@ function parsePolicy(raw: unknown, leaf: boolean): ChannelExecutionPolicy | unde
       throw new Error("Invalid channel MCP policy");
   }
   if(raw.version===1 && raw.rules!==undefined) throw new Error("Resource rules require channel policy version 2");
+  if(raw.version===3 && (raw.rules!==undefined||raw.namespaces.length||raw.mcp.length||raw.operations.length!==OPERATIONS.size||new Set(raw.operations).size!==OPERATIONS.size||raw.reports!==true||raw.attachments!==true))throw new Error("Invalid shared Agent authority");
   if(raw.version===2){
     if(!Array.isArray(raw.rules)||!raw.rules.length||raw.rules.length>32)throw new Error("Invalid resource rules");
     const ids=new Set<string>();
@@ -59,7 +60,7 @@ function parsePolicy(raw: unknown, leaf: boolean): ChannelExecutionPolicy | unde
 }
 
 export function channelPolicyForCluster(policy: ChannelExecutionPolicy, cluster: string): ChannelExecutionPolicy {
-  if(policy.version===1)return policy;
+  if(policy.version!==2)return policy;
   return deepFreeze({...policy,rules:policy.rules!.filter(r=>r.kind==='kubernetes'&&r.clusterNames.includes(cluster))}) as ChannelExecutionPolicy;
 }
 
@@ -86,5 +87,5 @@ export function requireChannelOperation(policy: ChannelExecutionPolicy | undefin
 }
 
 export function requireChannelNamespace(policy: ChannelExecutionPolicy | undefined, namespace: string): void {
-  if (policy && !policy.namespaces.includes(namespace)) throw new Error("Namespace is not authorized by this channel policy");
+  if (policy && policy.version!==3 && !policy.namespaces.includes(namespace)) throw new Error("Namespace is not authorized by this channel policy");
 }

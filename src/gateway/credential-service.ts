@@ -121,6 +121,7 @@ export class CredentialService {
       throw new SessionOwnershipError("execution grant private principal mismatch");
     if (checked.grant.resources.policy && identity.channelPolicyV1 !== true) throw new SessionOwnershipError("AgentBox channel policy enforcement required");
     if (checked.grant.resources.policy?.version===2 && identity.channelPolicyV2!==true) throw new SessionOwnershipError("AgentBox resource-rule enforcement required");
+    if (checked.grant.resources.policy?.version===3 && identity.channelAgentScope!==true) throw new SessionOwnershipError("AgentBox Agent-resource enforcement required");
     return checked.grant;
   }
 

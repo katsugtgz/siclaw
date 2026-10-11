@@ -38,6 +38,11 @@ export function authorizeChannelKubernetesRequest(method: string, raw: string, p
   if (start < 0 || parts.length <= start) throw new Error("Unknown Kubernetes API path");
   const namespaced = parts[start] === "namespaces" && parts.length > start + 2;
   if (!namespaced) {
+    if(policy.version===3){
+      const resource=parts[start];
+      if(method!=="GET"||parts.length>start+2||!["nodes","namespaces","pods","services","endpoints","events","deployments","replicasets","statefulsets","daemonsets","jobs","cronjobs","persistentvolumes","persistentvolumeclaims","storageclasses","ingresses"].includes(resource)||url.searchParams.has("watch")&&!["false","0"].includes(url.searchParams.get("watch")??""))throw new Error("Cluster-wide request is not a permitted read");
+      requireChannelOperation(policy,"query");return "query";
+    }
     // Cluster-wide reads require a separate future reviewed contract. In
     // particular /pods across all namespaces is not a namespaced read.
     throw new Error("Cluster-wide Kubernetes requests are not authorized by a namespace-scoped policy");
@@ -130,7 +135,7 @@ export class ChannelKubernetesProxy {
     if (!address || typeof address === "string") throw new Error("Channel proxy is not listening");
     return dump({ apiVersion: "v1", kind: "Config", "current-context": "scoped",
       clusters: [{ name: "scoped", cluster: { server: `https://127.0.0.1:${address.port}`, "certificate-authority-data":Buffer.from(this.certificate).toString("base64") } }],
-      contexts: [{ name: "scoped", context: { cluster: "scoped", user: "scoped", namespace: this.policy.namespaces[0] ?? "__denied__" } }],
+      contexts: [{ name: "scoped", context: { cluster: "scoped", user: "scoped", namespace: this.policy.namespaces[0] ?? (this.policy.version===3?(config.getContexts().find(context=>context.name===config.getCurrentContext())?.namespace??"default"):"__denied__") } }],
       users: [{ name: "scoped", user: { token: this.token } }] });
   }
 
