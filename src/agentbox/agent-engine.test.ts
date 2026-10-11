@@ -4,6 +4,17 @@ import { AgentBoxSessionManager } from "./session.js";
 
 afterEach(() => vi.unstubAllEnvs());
 
+it("invalidates only the owning Agent's sessions when native memory is toggled",async()=>{
+ const mgr=new AgentBoxSessionManager();mgr.agentId='native';
+ const request=vi.fn(async()=>({agentEngine:'codex',codexMemoryEnabled:false}));
+ mgr.gatewayClient={toClientLike:()=>({request})}as any;
+ (mgr as any).sessions.set('s',{id:'s'});
+ const invalidate=vi.spyOn(mgr,'invalidate').mockImplementation(()=>{});
+ await mgr.resolveAgentEngine();expect(mgr.codexMemoryEnabledState).toBe(false);expect(invalidate).toHaveBeenCalledWith('s');
+ invalidate.mockClear();await mgr.resolveAgentEngine();expect(invalidate).not.toHaveBeenCalled();
+ request.mockResolvedValueOnce({agentEngine:'codex',codexMemoryEnabled:true});await mgr.resolveAgentEngine();expect(mgr.codexMemoryEnabledState).toBe(true);expect(invalidate).toHaveBeenCalledWith('s');
+});
+
 it("resolves two Agent engines concurrently through their own authenticated clients", async () => {
   vi.stubEnv("SICLAW_AGENT_ENGINE", "codex");
   const pi = new AgentBoxSessionManager(), codex = new AgentBoxSessionManager();

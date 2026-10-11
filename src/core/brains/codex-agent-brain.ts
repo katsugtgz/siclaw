@@ -190,6 +190,7 @@ export class CodexAgentBrain implements BrainSession {
     private readonly sessionManager: SessionManager,
     private readonly native: { grants: CodexExecutorGrants; mcpServers?: Record<string, McpServerConfig>; sensitiveValues?: SensitiveValueSource; allowSubagents?: boolean; codexHome?: string;
       webSearchMode?: WebSearchMode;
+      codexMemoryEnabled?: boolean;
       codexHomeScope?: CodexHomeOwner & { userDataDir: string };
       authorizeMcp?: McpOperationAuthorizer;
       environments?: Array<{ id: string; grants: CodexExecutorGrants }>;
@@ -350,6 +351,7 @@ export class CodexAgentBrain implements BrainSession {
   }
 
   static async create(options: {
+    codexMemoryEnabled?: boolean;
     webSearchMode?: WebSearchMode;
     sessionManager: SessionManager; systemPrompt: string; grants: CodexExecutorGrants;
     mcpServers?: Record<string, McpServerConfig>; sensitiveValues?: SensitiveValueSource; allowSubagents?: boolean; codexHome?: string;
@@ -366,7 +368,7 @@ export class CodexAgentBrain implements BrainSession {
     knowledge?: { directory: string; emit: (event: { type: "knowledge_sources"; sources: KnowledgeSourceCitation[] }) => void };
   }): Promise<CodexAgentBrain> {
     const brain = new CodexAgentBrain(options.sessionManager,
-      { grants: options.grants, webSearchMode: resolveWebSearchMode(options.webSearchMode), mcpServers: options.mcpServers, authorizeMcp: options.authorizeMcp, sensitiveValues: options.sensitiveValues, allowSubagents: options.allowSubagents,
+      { grants: options.grants, codexMemoryEnabled:options.codexMemoryEnabled, webSearchMode: resolveWebSearchMode(options.webSearchMode), mcpServers: options.mcpServers, authorizeMcp: options.authorizeMcp, sensitiveValues: options.sensitiveValues, allowSubagents: options.allowSubagents,
         environments: options.environments, codexHome: options.codexHome, codexHomeScope: options.codexHomeScope, knowledge: options.knowledge, workflow: options.workflow, defaultRequestMode: options.defaultRequestMode, userQuestions: options.userQuestions, dpStateRef: options.dpStateRef }, options.systemPrompt,
       options.toolsetsByName, options.cwd, options.skillPaths,
       options.nativePlanEnabled, options.onPlanUpdate);
@@ -843,13 +845,14 @@ export class CodexAgentBrain implements BrainSession {
   private codexConfig(): JsonObject {
     const provider = this.currentProviderConfig();
     return {
-      web_search: resolveWebSearchMode(this.native?.webSearchMode),
+      // Enabled means the upstream default, not an adapter-selected cache/live mode.
+      ...(resolveWebSearchMode(this.native?.webSearchMode)==="enabled"?{}:{web_search:resolveWebSearchMode(this.native?.webSearchMode)}),
       ...(this.model?.contextWindow ? { model_context_window: this.model.contextWindow } : {}),
       // Siclaw supplies its own compiled prompt and scoped skills. Do not
       // prepend an ambient AGENTS.md from the AgentBox working directory.
       project_doc_max_bytes: 0,
       agents: { enabled: this.native?.allowSubagents ?? false },
-      memories: { use_memories: true, dedicated_tools: true,
+      memories: { use_memories: this.native?.codexMemoryEnabled!==false, generate_memories:this.native?.codexMemoryEnabled!==false, dedicated_tools: this.native?.codexMemoryEnabled!==false,
         ...(this.model ? {extract_model:this.model.id, consolidation_model:this.model.id} : {}) },
       tools: { experimental_request_user_input: { enabled: Boolean(this.userInput) },
         update_plan: { enabled: this.nativePlanEnabled } },
@@ -863,7 +866,7 @@ export class CodexAgentBrain implements BrainSession {
       features: { shell_tool: Boolean(this.native?.grants?.inputRoots?.length || this.native?.grants?.allowCommands || this.native?.grants?.allowFileCommands || this.native?.grants?.writeRoots.length || this.native?.grants.infrastructure ||
           this.native?.grants.skillScripts && Object.values(this.native.grants.skillScripts.allowed).some(Boolean) ||
           this.native?.environments?.some(environment => environment.grants.allowCommands)),
-        code_mode_host: true, memories: true, request_permissions_tool: false, send_message_to_user_async: Boolean(this.userInput),
+        code_mode_host: true, memories: this.native?.codexMemoryEnabled!==false, request_permissions_tool: false, send_message_to_user_async: Boolean(this.userInput),
         default_mode_request_user_input: Boolean(this.userInput),
         apps: false, plugins: false, browser_use: false, computer_use: false, image_generation: false,
         multi_agent: this.native?.allowSubagents ?? false,

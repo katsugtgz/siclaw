@@ -11,7 +11,7 @@ let mode="disabled",modelName="gpt-5.5",failure,calls=0,searchCalls=0;
 const server=createServer(async(req,res)=>{try{
  let raw="";for await(const chunk of req)raw+=chunk;const body=JSON.parse(raw);
  if(req.url==="/v1/alpha/search"){
-  assert.notEqual(mode,"disabled");assert.equal(body.settings.external_web_access,mode==="live");
+  assert.notEqual(mode,"disabled");if(mode!=="enabled")assert.equal(body.settings.external_web_access,mode==="live");
   assert.equal(body.commands.search_query[0].q,"Kubernetes documentation");searchCalls++;
   res.writeHead(200,{"content-type":"application/json"}).end(JSON.stringify({output:"Kubernetes docs: https://kubernetes.io/docs/"}));return;
  }
@@ -21,7 +21,7 @@ const server=createServer(async(req,res)=>{try{
  const codeSearch=lite&&JSON.stringify(tools).includes("web__run");
  const search=lite?(directSearch||codeSearch):tools.find(x=>x.type==="web_search");
  assert.equal(Boolean(search),mode!=="disabled",JSON.stringify(tools.map(x=>({type:x.type,name:x.name}))));
- if(search&&!lite)assert.equal(search.external_web_access,mode==="live");
+ if(search&&!lite&&mode!=="enabled")assert.equal(search.external_web_access,mode==="live");
  calls++;
  const message={id:"answer-"+calls,type:"message",role:"assistant",content:[{type:"output_text",text:"See [Kubernetes docs](https://kubernetes.io/docs/).",annotations:[]}]};
  const returned=body.input.some(x=>["function_call_output","custom_tool_call_output"].includes(x.type)&&String(x.call_id).startsWith("search-"));
@@ -43,13 +43,15 @@ const server=createServer(async(req,res)=>{try{
 }catch(error){failure??=error;res.writeHead(500).end("Fixture assertion failed");}});
 await new Promise(r=>server.listen(0,"127.0.0.1",r));
 try{
-for(modelName of ["gpt-5.5","gpt-5.6-luna","gpt-6-astra"])for(mode of ["disabled","cached","live"]){
+for(modelName of ["gpt-5.5","gpt-5.6-luna","gpt-6-astra"])for(mode of ["disabled","enabled","cached","live"]){
  searchCalls=0;const events=[];const cwd=path.join(root,modelName+mode);fs.mkdirSync(cwd,{mode:0o755});
  const brain=await CodexAgentBrain.create({sessionManager:SessionManager.create(cwd,path.join(cwd,"transcripts")),cwd,skillPaths:[],toolsetsByName:new Map(),systemPrompt:"Reply briefly with a public source link.",webSearchMode:mode,
  grants:{readRoots:[],writeRoots:[],deniedRoots:[],allowCommands:false,production:false}});
  try{
  brain.subscribe(e=>events.push(e));brain.registerProvider("fixture",{api:"openai-responses",baseUrl:`http://127.0.0.1:${server.address().port}/v1`,apiKey:"synthetic-only",models:[{id:modelName,api:"openai-responses",contextWindow:128000,maxTokens:1000}]});
- await brain.setModel(brain.findModel("fixture",modelName));try{await brain.prompt("Research Kubernetes docs.");}catch(e){throw failure??e;}
+ await brain.setModel(brain.findModel("fixture",modelName));
+ assert.equal(Object.hasOwn(brain.codexConfig(),"web_search"),mode!=="enabled","Enabled must leave search mode to native Codex");
+ try{await brain.prompt("Research Kubernetes docs.");}catch(e){throw failure??e;}
  if(failure)throw failure;
  assert.equal(events.some(e=>e.type==="tool_execution_end"&&e.toolName==="web_search"),mode!=="disabled");
  assert.ok(JSON.stringify(brain.getConversationMessages()).includes("https://kubernetes.io/docs/"));

@@ -104,6 +104,7 @@ export interface CreateSiclawSessionOpts {
   /** Agent tool allow-list: null is unrestricted only for explicit Custom; built-in types expand their locked groups. */
   allowedTools?: string[] | null;
   webSearchMode?: import("../shared/web-search.js").WebSearchMode;
+  codexMemoryEnabled?: boolean;
   /** Agent kind used by the shared context compiler. Legacy standalone callers default to SRE. */
   agentType?: AgentType;
   /** False when the control plane could not prove the Agent's type/capability policy. */
@@ -1150,6 +1151,7 @@ export async function createSiclawSession(
           : ""].join("\n\n"),
       toolsetsByName, cwd: userDataDir, nativePlanEnabled, grants: nativeGrants, environments,
       webSearchMode: opts?.webSearchMode,
+      codexMemoryEnabled: opts?.codexMemoryEnabled,
       defaultRequestMode: mode === "web" ? "async" : "sync",
       mcpServers: mcpServers as Record<string, McpServerConfig>, sensitiveValues, codexHome,
       codexHomeScope: { userDataDir, agentId, userId: opts?.userId, sessionId: sessionManagerId },

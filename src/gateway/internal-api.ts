@@ -422,8 +422,10 @@ export async function handleToolCapabilities(
     // agentType rides along for capabilities and legacy-row prompt fallback.
     const { resolveAgentEngine } = await import("../shared/agent-engine.js");
     const { resolveWebSearchMode } = await import("../shared/web-search.js");
+    const { resolveCodexMemoryEnabled } = await import("../shared/codex-memory.js");
     sendJson(res, 200, { allowedTools, agentType, subagentTierMenu, agentEngine: resolveAgentEngine(agent?.agent_engine),
-      webSearchMode: resolveWebSearchMode(agent?.web_search_mode) });
+      webSearchMode: resolveWebSearchMode(agent?.web_search_mode),
+      codexMemoryEnabled: resolveAgentEngine(agent?.agent_engine)==="codex" && resolveCodexMemoryEnabled(agent?.codex_memory_enabled) });
   } catch (err) {
     if (err instanceof TicketCapabilitiesError) {
       sendJson(res, err.status, { error: err.toJSON() });

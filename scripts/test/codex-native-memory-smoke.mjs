@@ -29,7 +29,12 @@ const model=createServer(async (request,response)=>{
     const definitions=[...(body.tools??[]),...body.input.filter(x=>x.type==="tool_search_output").flatMap(x=>x.tools)];
     assert.ok(!definitions.flatMap(x=>[x.name,...(x.tools??[]).map(y=>y.name)]).includes("memory_search"));
     let item;
-    if(phase==="legacy"){
+    if(phase==="off"){
+      assert.ok(!memoryTurn,"disabled memory must not start native generation");
+      assert.ok(!JSON.stringify(body.input).includes(marker),"disabled memory must not inject prior notes");
+      if(step===1)item={id:`search-${calls}`,type:"tool_search_call",call_id:"search-off",execution:"client",arguments:{query:"memories add_ad_hoc_note read",limit:5},status:"completed"};
+      else {assert.ok(!definitions.some(x=>x.name==="memories"),"disabled memory tools must not be discoverable");item={id:`off-${calls}`,type:"message",role:"assistant",status:"completed",content:[{type:"output_text",text:"Native memory disabled",annotations:[]}]};}
+    }else if(phase==="legacy"){
       assert.ok(JSON.stringify(body.input).includes("Native legacy history"));
       item={id:`legacy-${calls}`,type:"message",role:"assistant",status:"completed",
         content:[{type:"output_text",text:"Native legacy history preserved",annotations:[]}]};
@@ -65,7 +70,7 @@ await new Promise(resolve=>model.listen(0,"127.0.0.1",resolve));
 let resource;
 async function run(nextPhase,userId,sessionName){
   phase=nextPhase;step=0;
-  resource=await createSiclawSession({agentEngine:"codex",agentType:"custom",harnessResolved:true,
+  resource=await createSiclawSession({agentEngine:"codex",codexMemoryEnabled:nextPhase!=="off",agentType:"custom",harnessResolved:true,
     allowedTools:["read","write","bash"],agentId:"memory-agent",userId,
     sessionManager:SessionManager.create(root,join(root,"transcripts",sessionName))});
   assert.equal(resource.memoryIndexer,undefined);assert.equal(resource.contextManifest.resources.memoryEnabled,false);
@@ -87,6 +92,8 @@ function bind(brain){
 try{
   const first=await run("write","alice","first");
   assert.ok(existsSync(join(first,"memories",notePath)));
+  const disabled=await run("off","alice","disabled");assert.equal(disabled,first);
+  assert.ok(existsSync(join(first,"memories",notePath)),"disabling must preserve existing notes");
   const second=await run("read","alice","second");assert.equal(first,second);
   const other=await run("other","bob","third");assert.notEqual(first,other);
   const legacyDir=join(root,"transcripts","old-private-home");
@@ -101,7 +108,7 @@ try{
     allowedTools:["read"],agentId:"legacy-agent",userId:"legacy-owner",sessionManager:SessionManager.continueRecent(root,legacyDir)});
   await bind(resource.brain);phase="legacy";step=0;await resource.brain.prompt("Continue after moving native storage");
   await resource.brain.close();resource.knowledgeIndexer?.close();resource=undefined;
-  console.log(`Native memory smoke passed: ${calls} model calls, official memories namespace, write/read, cross-conversation persistence, owner isolation, legacy memory switch independence`);
+  console.log(`Native memory smoke passed: ${calls} model calls, official memories namespace, on/off/on persistence, disabled tool and recall checks, owner isolation, legacy memory switch independence`);
 }finally{
   await resource?.brain.close();resource?.knowledgeIndexer?.close();model.closeAllConnections();
   await new Promise(resolve=>model.close(resolve));process.chdir(cwd);rmSync(root,{recursive:true,force:true});

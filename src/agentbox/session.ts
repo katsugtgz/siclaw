@@ -516,19 +516,23 @@ export class AgentBoxSessionManager {
   agentTypeState: string = "custom";
   agentEngineState: import("../shared/agent-engine.js").AgentEngine = "pi-agent";
   webSearchModeState: import("../shared/web-search.js").WebSearchMode = "disabled";
+  codexMemoryEnabledState = true;
 
   /** Refresh via this AgentBox's authenticated client, including in shared-process Local mode. */
   async resolveAgentEngine(): Promise<import("../shared/agent-engine.js").AgentEngine> {
     const { resolveAgentEngine } = await import("../shared/agent-engine.js");
     if (this.gatewayClient && this.agentId) {
-      const payload = await this.gatewayClient.toClientLike().request("/api/internal/tool-capabilities", "GET") as { agentEngine?: unknown; webSearchMode?: unknown };
+      const payload = await this.gatewayClient.toClientLike().request("/api/internal/tool-capabilities", "GET") as { agentEngine?: unknown; webSearchMode?: unknown;codexMemoryEnabled?:unknown };
       if (!payload || typeof payload !== "object") throw new Error("Agent engine configuration unavailable");
       const { resolveWebSearchMode } = await import("../shared/web-search.js");
       const searchMode = resolveWebSearchMode(payload.webSearchMode);
-      if (this.webSearchModeState !== searchMode) {
+      const {resolveCodexMemoryEnabled}=await import("../shared/codex-memory.js");
+      const memoryEnabled=resolveCodexMemoryEnabled(payload.codexMemoryEnabled);
+      if (this.webSearchModeState !== searchMode || this.codexMemoryEnabledState!==memoryEnabled) {
         for (const session of this.sessions.values()) this.invalidate(session.id);
       }
       this.webSearchModeState = searchMode;
+      this.codexMemoryEnabledState = memoryEnabled;
       this.agentEngineState = resolveAgentEngine(payload.agentEngine);
     }
     return this.agentEngineState;
@@ -3749,6 +3753,7 @@ export class AgentBoxSessionManager {
       executionClient: gc,
       agentEngine,
       webSearchMode: this.webSearchModeState,
+      codexMemoryEnabled: agentEngine==="codex" && this.codexMemoryEnabledState,
       scriptExecutor: scriptInfo?.enabled ? (request, _sessionId, signal) => gc!.runScript(request, id, signal) : undefined,
       scriptSandboxInfo: scriptInfo,
       authorizeNativeMcp: gc ? (operation, signal) => gc.authorizeNativeMcp(id, operation, signal, this.agentId ?? undefined) : undefined,

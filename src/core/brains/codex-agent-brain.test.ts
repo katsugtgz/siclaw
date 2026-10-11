@@ -9,11 +9,20 @@ const model = { id: "test", name: "Test", provider: "test", api: "openai-respons
   contextWindow: 8_000, maxTokens: 1_000, reasoning: false };
 
 describe("CodexAgentBrain compatibility", () => {
-  it.each([undefined, "disabled", "cached", "live"])("projects search mode %s independently of shell/network grants", mode => {
+  it.each([true,false,undefined])("projects the native memory toggle %s into generation, recall and tools",enabled=>{
+    const brain=Object.create(CodexAgentBrain.prototype) as any;
+    brain.native={codexMemoryEnabled:enabled,grants:{writeRoots:[],allowCommands:false}};
+    brain.currentProviderConfig=()=>({baseUrl:"http://127.0.0.1:2/v1"});
+    const config=brain.codexConfig();
+    expect(config.features.memories).toBe(enabled!==false);
+    expect(config.memories).toMatchObject({use_memories:enabled!==false,generate_memories:enabled!==false,dedicated_tools:enabled!==false});
+  });
+  it.each([undefined, "disabled", "enabled", "cached", "live"])("projects search mode %s independently of shell/network grants", mode => {
     const brain = Object.create(CodexAgentBrain.prototype) as any;
     brain.native = { webSearchMode: mode, grants: { writeRoots: [], allowCommands: false } };
     brain.currentProviderConfig = () => ({ baseUrl: "http://127.0.0.1:2/v1" });
-    expect(brain.codexConfig().web_search).toBe(mode ?? "disabled");
+    expect(brain.codexConfig().web_search).toBe(mode==="enabled"?undefined:mode??"disabled");
+    if(mode==="enabled")expect(Object.hasOwn(brain.codexConfig(),"web_search")).toBe(false);
     expect(brain.codexConfig().model_providers.siclaw_model.supports_standalone_web_search).toBe(Boolean(mode && mode !== "disabled"));
     expect(brain.codexConfig().features.shell_tool).toBe(false);
     expect(brain.codexConfig().features.browser_use).toBe(false);
