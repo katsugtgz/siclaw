@@ -36,6 +36,7 @@ import { CodexChildProjection, type NativeChildSink } from "./codex-child-projec
 import { CodexRequestWork, NATIVE_CHILD_SYNTHESIS_PROMPT, type NativeChildExecution } from "./codex-request-work.js";
 import type { RequestMode } from "../../shared/request-mode.js";
 import { resolveWebSearchMode, type WebSearchMode } from "../../shared/web-search.js";
+import { nativeCodexModelProvider } from "./codex-model-provider.js";
 
 type JsonObject = Record<string, unknown>;
 type CodexEvent = { method: string; params: JsonObject };
@@ -449,7 +450,7 @@ export class CodexAgentBrain implements BrainSession {
   }
 
   async setModel(model: BrainModelInfo): Promise<void> {
-    if (model.api !== "openai-responses") {
+    if (model.api !== "openai-responses" && model.api !== "openai-codex-responses") {
       throw new Error(`Codex mode requires a Responses-compatible provider; received ${model.api || "unknown"}`);
     }
     const changed = this.model && (this.model.provider !== model.provider || this.model.id !== model.id);
@@ -853,12 +854,10 @@ export class CodexAgentBrain implements BrainSession {
       tools: { experimental_request_user_input: { enabled: Boolean(this.userInput) },
         update_plan: { enabled: this.nativePlanEnabled } },
       model_providers: { siclaw_model: {
-        name: "Siclaw model", base_url: string(provider.baseUrl),
+        ...nativeCodexModelProvider(provider, this.model?.api),
         // Responses Lite cannot carry hosted tools. Its native web.run uses
         // the same trusted provider's /alpha/search endpoint instead.
         supports_standalone_web_search: resolveWebSearchMode(this.native?.webSearchMode) !== "disabled",
-        ...(provider.authHeader === false ? {} : { env_key: "SICLAW_CODEX_MODEL_TOKEN" }),
-        ...(record(provider.headers) ? { http_headers: provider.headers } : {}), wire_api: "responses",
       } },
       mcp_servers: this.nativeMcpServers,
       features: { shell_tool: Boolean(this.native?.grants?.inputRoots?.length || this.native?.grants?.allowCommands || this.native?.grants?.allowFileCommands || this.native?.grants?.writeRoots.length || this.native?.grants.infrastructure ||

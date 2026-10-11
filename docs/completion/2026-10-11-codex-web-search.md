@@ -46,7 +46,7 @@ verification. Synthetic provider success does not establish MaaS availability.
 See `docs/design/codex-web-search.md` for query/context egress and the absence of
 a pre-search Siclaw DLP hook. No production deployment or main merge occurred.
 
-## Real subscription acceptance (continued at user request)
+## Initial local subscription checkpoint
 
 The user's local native Codex login reports ChatGPT authentication. Installed
 `codex-cli 0.162.0-alpha.2` completed a real `gpt-5.6-luna` public Kubernetes
@@ -71,3 +71,58 @@ The `sicore-test` deployment still uses MaaS; its `/alpha/search` 404 remains.
 Subscription success proves the Siclaw/native search path can work with a real
 supported service; it does not retroactively pass the MaaS or subscription-backed
 SiCore Web deployment gate.
+
+## Complete subscription Web acceptance in sicore-test
+
+The user subsequently authorized temporary subscription credentials in the test
+cluster and test-only network changes. Native subscription protocol mapping is
+now implemented in `codex-model-provider.ts`; the current local smoke script uses
+that normal mapping with an access token in host memory, without the initial
+checkpoint's auth link or configuration override. No refresh token was copied.
+
+The existing personal Custom Preview `090af5c5-f8ab-4eb9-8b23-d2a5fdd55602` on
+`native-codex-20261006` temporarily used a write-only encrypted developer Provider
+and model. Direct connections from the Pod to OpenAI/ChatGPT reset while ordinary
+public HTTPS worked. An explicitly authorized disposable CONNECT relay allowed
+only `chatgpt.com:443`, authenticated every tunnel and forwarded opaque TLS
+through the Kubernetes connection and operator workstation. Tests confirmed
+unauthenticated and other-destination CONNECT requests returned 403. This was
+acceptance infrastructure, not a production search fallback or proxy feature.
+
+Observed results on 2026-10-11 (Asia/Shanghai):
+
+- Real pinned-Linux Codex search in SiCore completed in about 12 seconds and
+  persisted a successful `web_search` row and public Kubernetes source links.
+- The native radio-option card appeared, survived a page refresh, and submitting
+  **Detailed** resumed the model normally.
+- A subsequent prompt, refreshed during generation, returned the previously
+  supplied `SUB_CONTEXT_K4` marker and the selected output style.
+- Stop during a network-waiting model call restored the composer and server
+  status became `stopped`. Completed conversation status was `idle`.
+- Transcript persistence had 12 distinct message IDs with no duplicate IDs.
+- Exact-token scans found no bearer in that transcript or the bounded logs of
+  the validation API/Runtime/AgentBox/relay. The API log check was limited to the
+  last 5 MB; this is observed scope, not a claim about all historical logs.
+- Full Runtime regression: **9,079 passed**, zero failures. Strict TypeScript
+  and 25 focused provider/brain tests passed. Pinned Linux search and existing
+  native security/coexistence gates passed again.
+
+Test Runtime generation **53**, Ready 1, image
+`6a7bb1d12d8987f5f6a3d708109fe124460991f9537a62e6c5087edc7dfe63f6`;
+AgentBox image
+`f6daccd06c125cdcfb7efd0d09e7fbcf14d82767c1c267f7b5c72e1a62b78bea`;
+source delta `eedda73412d0747cccc704c70d27ca604e0952470df26c9f13107f4bce80ed17`.
+Primary accepted session: `45c7ded6-7356-4b0e-9f75-760b08f620e1`.
+
+The Preview's effective model, engine and search settings were restored. Its
+normal five-minute idle reclamation policy was retained throughout. The
+temporary bearer was cleared before the model/Provider and managed credential
+were deleted at 15:46; five relay resources, local tunnel and capability file
+were removed by 15:48. Durable history volumes and local subscription login were
+preserved. Preview redeployment created ordinary audit/release history; no claim
+is made that its immutable release ID was rewound.
+
+The subscription-backed SiCore Web path is accepted for this scope. MaaS's
+native search endpoint remains unavailable, and continuing subscription use in
+this cluster requires an operator-managed egress path because the disposable
+relay was removed. Production was not updated and main was not merged.

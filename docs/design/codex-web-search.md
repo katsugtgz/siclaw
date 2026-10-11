@@ -60,3 +60,20 @@ Acceptance covers exact mode validation, per-Agent isolation, next-turn reload,
 native advertised tool modes, real native search events and citations, UI/history
 redaction, unchanged shell/MCP restrictions and a real supported-provider search.
 Synthetic native protocol tests are not evidence of provider search support.
+
+## Subscription authentication
+
+Native Codex also accepts the existing SiCore `openai-codex-responses` binding.
+`codex-model-provider.ts` maps it to the fixed official ChatGPT Codex endpoint,
+passes the bearer only through the app-server's private model-token environment,
+and supplies the account routing header from token metadata. OpenAI verifies
+the bearer; decoded claims are not an authorization decision. Invalid/expired
+metadata and decorated or alternative subscription endpoints are refused.
+The same mapping supports an explicitly configured Responses connection to that
+official endpoint, including temporary access-token-only acceptance fixtures.
+
+SiCore remains responsible for encrypted credential storage and renewal. This
+adapter does not read the operator's auth file, receive refresh tokens, renew the
+subscription or expose credentials to Code Mode/exec-server. The explicitly
+opted-in local test script reads the local access token in host memory and uses
+this normal mapping; it does not require a credential file mount or auth override.
