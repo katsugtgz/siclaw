@@ -420,7 +420,10 @@ export async function handleToolCapabilities(
     // only {tier, whenToUse}. `null` clears whatever the box held.
     const subagentTierMenu = projectTierMenuFromConfig(agent?.subagent_model_tiers, sha256Hex);
     // agentType rides along for capabilities and legacy-row prompt fallback.
-    sendJson(res, 200, { allowedTools, agentType, subagentTierMenu });
+    const { resolveAgentEngine } = await import("../shared/agent-engine.js");
+    const { resolveWebSearchMode } = await import("../shared/web-search.js");
+    sendJson(res, 200, { allowedTools, agentType, subagentTierMenu, agentEngine: resolveAgentEngine(agent?.agent_engine),
+      webSearchMode: resolveWebSearchMode(agent?.web_search_mode) });
   } catch (err) {
     if (err instanceof TicketCapabilitiesError) {
       sendJson(res, err.status, { error: err.toJSON() });

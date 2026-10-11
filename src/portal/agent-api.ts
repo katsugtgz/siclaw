@@ -8,6 +8,8 @@
 import { AGENT_RETIRED_STATUS, agentRetiredDetail } from "../shared/agent-retirement.js";
 
 import crypto from "node:crypto";
+import { resolveAgentEngine } from "../shared/agent-engine.js";
+import { resolveWebSearchMode } from "../shared/web-search.js";
 import { getDb } from "../gateway/db.js";
 import { insertIgnorePrefix, isUniqueViolation } from "../gateway/dialect-helpers.js";
 import {
@@ -128,7 +130,7 @@ export function registerAgentRoutes(
 
     const listParams = [...params, pageSize, offset];
     const listSql = `SELECT a.id, a.name, a.description, a.status, a.model_provider, a.model_id, a.model_routing,
-        a.agent_type, a.is_production, a.idle_timeout_sec, a.replicas, a.icon, a.color, a.created_by, a.created_at, a.updated_at,
+        a.agent_type, a.agent_engine, a.web_search_mode, a.is_production, a.idle_timeout_sec, a.replicas, a.icon, a.color, a.created_by, a.created_at, a.updated_at,
         (SELECT COUNT(*) FROM agent_skills ask WHERE ask.agent_id = a.id) AS skills_count,
         (SELECT COUNT(*) FROM agent_mcp_servers ams WHERE ams.agent_id = a.id) AS mcp_count,
         (SELECT COUNT(*) FROM agent_clusters ac WHERE ac.agent_id = a.id) AS clusters_count,
@@ -183,9 +185,15 @@ export function registerAgentRoutes(
       return;
     }
     const agentType = normalizeAgentType(body.agent_type);
+    let agentEngine;
+    let webSearchMode;
+    try { webSearchMode = resolveWebSearchMode(body.web_search_mode); }
+    catch { sendJson(res, 400, { error: "web_search_mode must be disabled, cached or live" }); return; }
+    try { agentEngine = resolveAgentEngine(body.agent_engine); }
+    catch { sendJson(res, 400, { error: "agent_engine must be pi-agent or codex" }); return; }
     await db.query(
-      `INSERT INTO agents (id, name, description, status, model_provider, model_id, model_routing, tool_capabilities, subagent_models, agent_type, system_prompt, is_production, idle_timeout_sec, replicas, icon, color, created_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO agents (id, name, description, status, model_provider, model_id, model_routing, tool_capabilities, subagent_models, agent_type, agent_engine, web_search_mode, system_prompt, is_production, idle_timeout_sec, replicas, icon, color, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         id,
         body.name,
@@ -197,6 +205,8 @@ export function registerAgentRoutes(
         toolCapabilities ?? null,
         subagentModels ?? null,
         agentType,
+        agentEngine,
+        webSearchMode,
         // Built-in type contracts live in code. Persist only the optional
         // Agent-owned addendum so an edit cannot replace core type behavior.
         agentPromptAddendum(agentType, body.system_prompt) ?? null,
@@ -396,10 +406,18 @@ export function registerAgentRoutes(
       newIdleTimeoutSec = normalizeIdleTimeoutSec(body.idle_timeout_sec);
     }
 
+    if ("agent_engine" in body) {
+      try { body.agent_engine = resolveAgentEngine(body.agent_engine); }
+      catch { sendJson(res, 400, { error: "agent_engine must be pi-agent or codex" }); return; }
+    }
+    if ("web_search_mode" in body) {
+      try { body.web_search_mode = resolveWebSearchMode(body.web_search_mode); }
+      catch { sendJson(res, 400, { error: "web_search_mode must be disabled, cached or live" }); return; }
+    }
     // Build dynamic SET clause
     const fields = [
       "name", "description", "status", "model_provider",
-      "model_id", "system_prompt", "is_production", "idle_timeout_sec", "replicas", "icon", "color", "agent_type",
+      "model_id", "system_prompt", "is_production", "idle_timeout_sec", "replicas", "icon", "color", "agent_type", "agent_engine", "web_search_mode",
     ];
     const setClauses: string[] = [];
     const values: unknown[] = [];
@@ -489,7 +507,7 @@ export function registerAgentRoutes(
     // while the next turn's binding already carries the new candidates. The two
     // revisions then disagree on every spawn and tiering silently stops working
     // until the session happens to die. Reloading `tools` invalidates it.
-    if (toolCapabilitiesChanged || agentTypeChanged || subagentModelsChanged) reloadResources.push("tools");
+    if (toolCapabilitiesChanged || agentTypeChanged || subagentModelsChanged || "agent_engine" in body || "web_search_mode" in body) reloadResources.push("tools");
     if (promptChanged) reloadResources.push("prompt");
     if (reloadResources.length > 0) {
       const payload = { agentId: params.id, resources: reloadResources };
@@ -735,8 +753,8 @@ export function registerAgentRoutes(
       // clone that is BROADER than its source is a privilege bug, not a cosmetic
       // one. Adding a column to `agents` means adding it here too.
       await conn.query(
-        `INSERT INTO agents (id, name, description, status, model_provider, model_id, model_routing, tool_capabilities, subagent_models, agent_type, system_prompt, is_production, icon, color, created_by)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO agents (id, name, description, status, model_provider, model_id, model_routing, tool_capabilities, subagent_models, agent_type, agent_engine, web_search_mode, system_prompt, is_production, icon, color, created_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           newId,
           newName,
@@ -748,6 +766,8 @@ export function registerAgentRoutes(
           source.tool_capabilities,
           source.subagent_models,
           source.agent_type ?? "custom",
+          resolveAgentEngine(source.agent_engine),
+          resolveWebSearchMode(source.web_search_mode),
           source.system_prompt,
           source.is_production,
           source.icon,

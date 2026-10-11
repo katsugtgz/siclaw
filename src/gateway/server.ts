@@ -7,7 +7,7 @@ import { AgentRetiredError } from "../shared/agent-retirement.js";
 import { parseHandoffPolicy } from "../shared/agent-handoff.js";
 import { parseRequestMode } from "../shared/request-mode.js";
 import { createNativeUserInputHandlers } from "./native-user-input.js";
-import { runtimeChatCapabilities } from "../shared/agent-engine.js";
+import { resolveAgentEngine, runtimeChatCapabilities } from "../shared/agent-engine.js";
 /**
  * Siclaw Agent Runtime — stateless execution engine (DB-free).
  *
@@ -713,7 +713,12 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     }
   };
 
-  rpcMethods.set("chat.capabilities", async () => runtimeChatCapabilities());
+  rpcMethods.set("chat.capabilities", async params => {
+    if (typeof params.agentId !== "string" || !params.agentId) return runtimeChatCapabilities();
+    const agent = await frontendClient.request("config.getAgent", { agentId: params.agentId });
+    if (!agent) throw new Error("Agent configuration unavailable");
+    return runtimeChatCapabilities(resolveAgentEngine(agent.agent_engine));
+  });
   rpcMethods.set("channel.policy.invalidate",async params=>{
     const agentId=params.agentId as string;if(!agentId)throw new Error("Agent ID required");
     const revoked=executionGrants.revokeAgent(agentId);

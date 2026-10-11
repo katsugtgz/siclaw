@@ -1,5 +1,6 @@
 import { AGENT_RETIRED_STATUS, agentRetiredDetail } from "../shared/agent-retirement.js";
 import { SandboxToolError } from "../script-sandbox/errors.js";
+import { SessionEngineMismatchError } from "./session-engine.js";
 import { parseHandoffPolicy } from "../shared/agent-handoff.js";
 /**
  * AgentBox HTTP Server
@@ -16,7 +17,6 @@ import fs from "node:fs";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import http from "node:http";
-import { configuredAgentEngine } from "../shared/agent-engine.js";
 import https from "node:https";
 import { isAuthenticatedRuntime } from "./runtime-auth.js";
 import { record } from "../script-sandbox/validation.js";
@@ -441,11 +441,6 @@ function requestBindingCandidate(body: PromptRequestBody): ModelRouteCandidate |
   };
 }
 
-function promptAgentEngine(_body: PromptRequestBody): "pi-agent" | "codex" {
-  // An explicitly selected engine owns this session. Unsupported Responses
-  // bindings fail at model binding rather than silently invoking Pi.
-  return configuredAgentEngine();
-}
 
 /**
  * The binding to actually route this turn on.
@@ -1054,7 +1049,7 @@ export function createHttpServer(
       body.handoffSupported === true,
       parseHandoffPolicy(body.handoffPolicy),
       Boolean(requiredResultToolName),
-      promptAgentEngine(body),
+      await sessionManager.resolveAgentEngine(),
       executionIdentity && body.grantId ? { grantId: body.grantId, identity: executionIdentity, sender: body.sender } : undefined,
     );
     // Still fail closed when a Ticket instance DID declare a contract: a named
@@ -2258,6 +2253,10 @@ export function createHttpServer(
       try {
         await route.handler(req, res, params);
       } catch (err) {
+        if (err instanceof SessionEngineMismatchError) {
+          if (!res.headersSent) sendJson(res, 409, { error: { code: err.code, message: err.message, retriable: false } });
+          return;
+        }
         if (err instanceof HttpRequestError) {
           console.warn(`[agentbox-http] Rejected ${method} ${pathname}: ${err.message}`);
           if (!res.headersSent) {

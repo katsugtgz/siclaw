@@ -35,6 +35,7 @@ import type { UsageIdentity, UsageSink } from "../../shared/model-usage.js";
 import { CodexChildProjection, type NativeChildSink } from "./codex-child-projection.js";
 import { CodexRequestWork, NATIVE_CHILD_SYNTHESIS_PROMPT, type NativeChildExecution } from "./codex-request-work.js";
 import type { RequestMode } from "../../shared/request-mode.js";
+import { resolveWebSearchMode, type WebSearchMode } from "../../shared/web-search.js";
 
 type JsonObject = Record<string, unknown>;
 type CodexEvent = { method: string; params: JsonObject };
@@ -187,6 +188,7 @@ export class CodexAgentBrain implements BrainSession {
   private constructor(
     private readonly sessionManager: SessionManager,
     private readonly native: { grants: CodexExecutorGrants; mcpServers?: Record<string, McpServerConfig>; sensitiveValues?: SensitiveValueSource; allowSubagents?: boolean; codexHome?: string;
+      webSearchMode?: WebSearchMode;
       codexHomeScope?: CodexHomeOwner & { userDataDir: string };
       authorizeMcp?: McpOperationAuthorizer;
       environments?: Array<{ id: string; grants: CodexExecutorGrants }>;
@@ -347,6 +349,7 @@ export class CodexAgentBrain implements BrainSession {
   }
 
   static async create(options: {
+    webSearchMode?: WebSearchMode;
     sessionManager: SessionManager; systemPrompt: string; grants: CodexExecutorGrants;
     mcpServers?: Record<string, McpServerConfig>; sensitiveValues?: SensitiveValueSource; allowSubagents?: boolean; codexHome?: string;
     codexHomeScope?: CodexHomeOwner & { userDataDir: string };
@@ -362,7 +365,7 @@ export class CodexAgentBrain implements BrainSession {
     knowledge?: { directory: string; emit: (event: { type: "knowledge_sources"; sources: KnowledgeSourceCitation[] }) => void };
   }): Promise<CodexAgentBrain> {
     const brain = new CodexAgentBrain(options.sessionManager,
-      { grants: options.grants, mcpServers: options.mcpServers, authorizeMcp: options.authorizeMcp, sensitiveValues: options.sensitiveValues, allowSubagents: options.allowSubagents,
+      { grants: options.grants, webSearchMode: resolveWebSearchMode(options.webSearchMode), mcpServers: options.mcpServers, authorizeMcp: options.authorizeMcp, sensitiveValues: options.sensitiveValues, allowSubagents: options.allowSubagents,
         environments: options.environments, codexHome: options.codexHome, codexHomeScope: options.codexHomeScope, knowledge: options.knowledge, workflow: options.workflow, defaultRequestMode: options.defaultRequestMode, userQuestions: options.userQuestions, dpStateRef: options.dpStateRef }, options.systemPrompt,
       options.toolsetsByName, options.cwd, options.skillPaths,
       options.nativePlanEnabled, options.onPlanUpdate);
@@ -839,7 +842,7 @@ export class CodexAgentBrain implements BrainSession {
   private codexConfig(): JsonObject {
     const provider = this.currentProviderConfig();
     return {
-      web_search: "disabled",
+      web_search: resolveWebSearchMode(this.native?.webSearchMode),
       ...(this.model?.contextWindow ? { model_context_window: this.model.contextWindow } : {}),
       // Siclaw supplies its own compiled prompt and scoped skills. Do not
       // prepend an ambient AGENTS.md from the AgentBox working directory.
@@ -851,6 +854,9 @@ export class CodexAgentBrain implements BrainSession {
         update_plan: { enabled: this.nativePlanEnabled } },
       model_providers: { siclaw_model: {
         name: "Siclaw model", base_url: string(provider.baseUrl),
+        // Responses Lite cannot carry hosted tools. Its native web.run uses
+        // the same trusted provider's /alpha/search endpoint instead.
+        supports_standalone_web_search: resolveWebSearchMode(this.native?.webSearchMode) !== "disabled",
         ...(provider.authHeader === false ? {} : { env_key: "SICLAW_CODEX_MODEL_TOKEN" }),
         ...(record(provider.headers) ? { http_headers: provider.headers } : {}), wire_api: "responses",
       } },
@@ -1061,9 +1067,9 @@ export class CodexAgentBrain implements BrainSession {
         this.toolItems.set(string(item.id), { name, args: item.arguments ?? {} });
         this.emit({ type: "tool_execution_start", toolCallId: string(item.id), toolName: name,
           args: item.arguments ?? {}, toolset: this.toolsetsByName.get(name), startedAt: Date.now() });
-      } else if (["commandExecution", "fileChange", "collabAgentToolCall"].includes(string(item.type)) ||
+      } else if (["commandExecution", "fileChange", "collabAgentToolCall", "webSearch"].includes(string(item.type)) ||
           item.type === "subAgentActivity" && item.kind === "started") {
-        const name = item.type === "commandExecution" ? "exec_command"
+        const name = item.type === "webSearch" ? "web_search" : item.type === "commandExecution" ? "exec_command"
           : item.type === "fileChange" ? "apply_patch" : item.type === "subAgentActivity" ? "spawn_agent" : string(item.tool);
         const args = this.toolItemForUI(item);
         this.toolItems.set(string(item.id), { name, args });
@@ -1111,12 +1117,12 @@ export class CodexAgentBrain implements BrainSession {
         this.appendCache(toolResult);
         this.emit({ type: "message_start", message: toolResult });
         this.emit({ type: "message_end", message: toolResult });
-      } else if (["commandExecution", "fileChange", "collabAgentToolCall"].includes(string(item.type)) ||
+      } else if (["commandExecution", "fileChange", "collabAgentToolCall", "webSearch"].includes(string(item.type)) ||
           item.type === "subAgentActivity" && item.kind === "started") {
         const id = string(item.id);
         const started = this.toolItems.get(id);
         this.toolItems.delete(id);
-        const name = started?.name ?? (item.type === "commandExecution" ? "exec_command"
+        const name = started?.name ?? (item.type === "webSearch" ? "web_search" : item.type === "commandExecution" ? "exec_command"
           : item.type === "fileChange" ? "apply_patch" : item.type === "subAgentActivity" ? "spawn_agent" : string(item.tool));
         const isError = item.status === "failed" || item.status === "declined" ||
           (typeof item.exitCode === "number" && item.exitCode !== 0);
@@ -1162,6 +1168,16 @@ export class CodexAgentBrain implements BrainSession {
       this.contextTokens = number(last.totalTokens);
       this.contextWindow = number(usage.modelContextWindow) || this.model?.contextWindow || 0;
     } else if (event.method === "turn/completed" && turn && active) {
+      // A failed provider search can emit start without completion. Close its
+      // visible activity honestly instead of leaving an eternal spinner.
+      for (const [id, tool] of this.toolItems ?? []) {
+        if (tool.name !== "web_search") continue;
+        const result = { content: [{ type: "text", text: "Web search did not complete. The selected provider must support native search." }] };
+        this.emit({ type: "tool_execution_end", toolCallId: id, toolName: tool.name, args: tool.args,
+          result, isError: true, endedAt: Date.now() });
+        this.appendCache({ role: "toolResult", toolCallId: id, toolName: tool.name, ...result, isError: true, timestamp: Date.now() });
+        this.toolItems.delete(id);
+      }
       active.mailboxStop?.abort();
       this.lastTurnId = string(turn.id);
       this.persistThread();
@@ -1199,6 +1215,14 @@ export class CodexAgentBrain implements BrainSession {
   }
 
   private toolItemForUI(item: JsonObject): JsonObject {
+    // Provider-owned search has already happened. This protects UI/history,
+    // not an interception or authorization gate before the external query.
+    if (item.type === "webSearch") {
+      const text = JSON.stringify({ id: item.id, type: item.type, status: item.status, query: item.query, action: item.action });
+      if (text.length > 16384) return { type: "webSearch", summary: "Search metadata omitted (size limit)" };
+      try { return JSON.parse(this.native.grants.redactOutput?.(text) ?? text); }
+      catch { return { type: "webSearch", summary: "Search metadata unavailable" }; }
+    }
     if (item.type !== "collabAgentToolCall" && item.type !== "subAgentActivity") return item;
     return { id: item.id, type: item.type, tool: item.tool, kind: item.kind, prompt: item.prompt,
       model: item.model, status: item.status, ...this.children.details(item) };

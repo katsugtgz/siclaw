@@ -271,6 +271,8 @@ function makeFakeSessionManager(ledgerDir = fs.mkdtempSync(path.join(os.tmpdir()
       managed.brain.setMailbox?.(turn.mailbox);
       return turn;
     },
+    agentEngineState: "pi-agent" as "pi-agent" | "codex",
+    async resolveAgentEngine() { return this.agentEngineState; },
     getOrCreate: async (
       id?: string,
       _mode?: unknown,
@@ -646,8 +648,14 @@ describe("http-server — sub-agent tier turn state", () => {
 });
 
 describe("http-server — prompt + session lifecycle", () => {
-  it("keeps an explicitly selected Codex engine instead of silently falling back to Pi", async () => {
+  it("does not let global env or a chat payload override the Agent engine", async () => {
     process.env.SICLAW_AGENT_ENGINE = "codex";
+    sm.agentEngineState = "pi-agent";
+    await getJson(port, "/api/prompt", "POST", { text: "hello", sessionId: "engine-spoof", agentEngine: "codex", agent_engine: "codex" });
+    expect(sm.getOrCreateCalls.at(-1)?.agentEngine).toBe("pi-agent");
+  });
+  it("keeps an explicitly selected Codex engine instead of silently falling back to Pi", async () => {
+    sm.agentEngineState = "codex";
     const responses = { ...modelConfigWithInput(["text"]), api: "openai-responses", authHeader: true };
     await getJson(port, "/api/prompt", "POST", {
       text: "inspect", sessionId: "codex-compatible", modelProvider: "openai", modelId: "gpt-4",

@@ -215,6 +215,8 @@ describe("createToolsHandler", () => {
       allowedToolsState: ["read", "grep"],
       harnessResolvedState: true,
       agentTypeState: "product_support",
+      agentEngineState: "pi-agent",
+      webSearchModeState: "disabled",
       subagentTierMenuState: null,
     });
   });

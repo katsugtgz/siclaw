@@ -248,6 +248,8 @@ describe("handleToolCapabilities", () => {
       allowedTools: null,
       agentType: "custom",
       subagentTierMenu: null,
+      agentEngine: "pi-agent",
+      webSearchMode: "disabled",
     });
   });
 
@@ -261,6 +263,8 @@ describe("handleToolCapabilities", () => {
       allowedTools: null,
       agentType: "custom",
       subagentTierMenu: null,
+      agentEngine: "pi-agent",
+      webSearchMode: "disabled",
     });
   });
 

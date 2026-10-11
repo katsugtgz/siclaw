@@ -42,6 +42,8 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     model_routing TEXT,
     tool_capabilities TEXT,
     agent_type VARCHAR(32) NOT NULL DEFAULT 'custom',
+    agent_engine VARCHAR(16) NOT NULL DEFAULT 'pi-agent',
+    web_search_mode VARCHAR(16) NOT NULL DEFAULT 'disabled',
     system_prompt TEXT,
     is_production TINYINT(1) NOT NULL DEFAULT 1,
     idle_timeout_sec INT NOT NULL DEFAULT 300,
@@ -640,6 +642,8 @@ export async function runPortalMigrations(): Promise<void> {
   // plane's own storage and this column stays NULL.
   await safeAlterTable(db, "agents", "subagent_models", "TEXT DEFAULT NULL");
   await safeAlterTable(db, "agents", "agent_type", "VARCHAR(32) NOT NULL DEFAULT 'custom'");
+  await safeAlterTable(db, "agents", "agent_engine", "VARCHAR(16) NOT NULL DEFAULT 'pi-agent'");
+  await safeAlterTable(db, "agents", "web_search_mode", "VARCHAR(16) NOT NULL DEFAULT 'disabled'");
   await safeAlterTable(db, "agent_task_runs", "session_id", "CHAR(36) DEFAULT NULL");
   await safeAlterTable(db, "agent_tasks", "last_manual_run_at", "TIMESTAMP NULL DEFAULT NULL");
   await safeAlterTable(db, "model_entries", "vision", "TINYINT(1) NOT NULL DEFAULT 0");

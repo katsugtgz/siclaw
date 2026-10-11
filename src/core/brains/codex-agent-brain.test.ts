@@ -9,6 +9,40 @@ const model = { id: "test", name: "Test", provider: "test", api: "openai-respons
   contextWindow: 8_000, maxTokens: 1_000, reasoning: false };
 
 describe("CodexAgentBrain compatibility", () => {
+  it.each([undefined, "disabled", "cached", "live"])("projects search mode %s independently of shell/network grants", mode => {
+    const brain = Object.create(CodexAgentBrain.prototype) as any;
+    brain.native = { webSearchMode: mode, grants: { writeRoots: [], allowCommands: false } };
+    brain.currentProviderConfig = () => ({ baseUrl: "http://127.0.0.1:2/v1" });
+    expect(brain.codexConfig().web_search).toBe(mode ?? "disabled");
+    expect(brain.codexConfig().model_providers.siclaw_model.supports_standalone_web_search).toBe(Boolean(mode && mode !== "disabled"));
+    expect(brain.codexConfig().features.shell_tool).toBe(false);
+    expect(brain.codexConfig().features.browser_use).toBe(false);
+  });
+  it("projects native search metadata through redaction into both live events and history", () => {
+    const brain = Object.create(CodexAgentBrain.prototype) as any;
+    const events: any[] = [], history: any[] = [];
+    brain.threadId = "root"; brain.active = { toolNames: new Set() }; brain.toolItems = new Map();
+    brain.listeners = new Set([(e: any) => events.push(e)]); brain.appendCache = (m: any) => history.push(m);
+    brain.native = { grants: { redactOutput: (s: string) => s.replaceAll("canary-secret", "[REDACTED]") } };
+    const item = { id: "search-1", type: "webSearch", query: "kubernetes canary-secret", action: { type: "search", query: "canary-secret" } };
+    brain.handleEvent({ method: "item/started", params: { threadId: "root", item } });
+    brain.handleEvent({ method: "item/completed", params: { threadId: "root", item: { ...item, status: "completed" } } });
+    expect(events.filter(e => e.type.startsWith("tool_execution_"))).toHaveLength(2);
+    expect(events.at(-1).toolName).toBe("web_search");
+    expect(JSON.stringify([events, history])).not.toContain("canary-secret");
+    expect(history.at(-1).toolName).toBe("web_search");
+  });
+  it("ends unfinished search activity as an error when the native turn fails", () => {
+    const brain = Object.create(CodexAgentBrain.prototype) as any;
+    const events: any[] = [], history: any[] = [];
+    brain.threadId = "root"; brain.active = { id: "turn", reject: vi.fn(), resolve: vi.fn() };
+    brain.toolItems = new Map([["search-1", { name: "web_search", args: {} }]]);
+    brain.listeners = new Set([(e: any) => events.push(e)]); brain.appendCache = (m: any) => history.push(m);
+    brain.native = { grants: { redactOutput: (s: string) => s } }; brain.persistThread = vi.fn();
+    brain.handleEvent({ method: "turn/completed", params: { threadId: "root", turn: { id: "turn", status: "failed", error: { message: "Search endpoint unavailable" } } } });
+    expect(events.find(e => e.type === "tool_execution_end")).toMatchObject({ toolName: "web_search", isError: true });
+    expect(brain.toolItems.size).toBe(0); expect(history[0].isError).toBe(true);
+  });
   it.each([true, false])("Stop cancels owned executor handles, not only model waiting (active turn: %s)", async active => {
     const brain = Object.create(CodexAgentBrain.prototype) as any;
     const order: string[] = [];

@@ -1,5 +1,6 @@
 import { UsageOutbox } from "./usage-outbox.js";
 import { BoxExecutionGrants, type BoxExecutionGrant } from "./execution-grants.js";
+import { claimSessionEngine } from "./session-engine.js";
 import type { ExecutionAuthorization } from "../shared/execution-context.js";
 import { createNativeChildSink } from "./native-child-persistence.js";
 /**
@@ -513,6 +514,25 @@ export class AgentBoxSessionManager {
   /** Agent type, fetched alongside allowedTools.
    *  Drives capabilities and the legacy-row prompt fallback. */
   agentTypeState: string = "custom";
+  agentEngineState: import("../shared/agent-engine.js").AgentEngine = "pi-agent";
+  webSearchModeState: import("../shared/web-search.js").WebSearchMode = "disabled";
+
+  /** Refresh via this AgentBox's authenticated client, including in shared-process Local mode. */
+  async resolveAgentEngine(): Promise<import("../shared/agent-engine.js").AgentEngine> {
+    const { resolveAgentEngine } = await import("../shared/agent-engine.js");
+    if (this.gatewayClient && this.agentId) {
+      const payload = await this.gatewayClient.toClientLike().request("/api/internal/tool-capabilities", "GET") as { agentEngine?: unknown; webSearchMode?: unknown };
+      if (!payload || typeof payload !== "object") throw new Error("Agent engine configuration unavailable");
+      const { resolveWebSearchMode } = await import("../shared/web-search.js");
+      const searchMode = resolveWebSearchMode(payload.webSearchMode);
+      if (this.webSearchModeState !== searchMode) {
+        for (const session of this.sessions.values()) this.invalidate(session.id);
+      }
+      this.webSearchModeState = searchMode;
+      this.agentEngineState = resolveAgentEngine(payload.agentEngine);
+    }
+    return this.agentEngineState;
+  }
 
   /**
    * Latest sub-agent tier MENU for this box (credential-free), refreshed by the
@@ -3543,12 +3563,11 @@ export class AgentBoxSessionManager {
     handoffSupported = false,
     handoffPolicy?: import("../shared/agent-handoff.js").HandoffPolicy,
     structuredResultRequired = false,
-    requestedAgentEngine: "pi-agent" | "codex" = "pi-agent",
+    requestedAgentEngine: "pi-agent" | "codex" = this.agentEngineState,
     authorization?: ExecutionAuthorization,
   ): Promise<ManagedSession> {
     const id = sessionId || this.defaultSessionId;
     const effectiveUserId = requestUserId?.trim() || this.userId;
-    const codexMarker = path.join(this.getSessionDir(id), "codex-thread.json");
     const agentEngine = requestedAgentEngine;
     let executionGrant: BoxExecutionGrant | undefined;
     if (authorization) {
@@ -3559,6 +3578,8 @@ export class AgentBoxSessionManager {
       executionGrant = await this.executionGrants.accept(authorization.grantId, id, authorization.identity);
       if (executionGrant.policy && agentEngine !== "codex") throw new Error("Channel policy requires the native Codex enforcement runtime");
     }
+
+    claimSessionEngine(this.getSessionDir(id), this.agentId ?? "", id, agentEngine);
 
     const existing = this.sessions.get(id);
     if (existing) {
@@ -3623,13 +3644,6 @@ export class AgentBoxSessionManager {
 
     // Ensure shared components are ready
     await this.ensureSharedComponents(agentEngine === "pi-agent");
-
-    // An incompatible binding (for example a PDF or a non-Responses model)
-    // switches the session to Pi. Its append-only transcript is the new source
-    // of truth, so a later Codex-compatible request must not revive a stale turn.
-    if (agentEngine === "pi-agent" && requestedAgentEngine === "pi-agent") {
-      fs.rmSync(codexMarker, { force: true });
-    }
 
     const sessionDir = this.getSessionDir(id);
     console.log(`[agentbox-session] Creating session: ${id} in ${sessionDir}`);
@@ -3734,6 +3748,7 @@ export class AgentBoxSessionManager {
     const result = await createSiclawSession({
       executionClient: gc,
       agentEngine,
+      webSearchMode: this.webSearchModeState,
       scriptExecutor: scriptInfo?.enabled ? (request, _sessionId, signal) => gc!.runScript(request, id, signal) : undefined,
       scriptSandboxInfo: scriptInfo,
       authorizeNativeMcp: gc ? (operation, signal) => gc.authorizeNativeMcp(id, operation, signal, this.agentId ?? undefined) : undefined,

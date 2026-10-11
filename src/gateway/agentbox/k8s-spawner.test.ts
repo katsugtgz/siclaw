@@ -308,7 +308,7 @@ describe("K8sSpawner — spawn branches", () => {
     };
     await s.spawn({ agentId: "default" });
     const env = calls.createNamespacedPod[0].body.spec.containers[0].env;
-    expect(env).toContainEqual({ name: "SICLAW_AGENT_ENGINE", value: "codex" });
+    expect(env.some((item: { name: string }) => item.name === "SICLAW_AGENT_ENGINE")).toBe(false);
     expect(env).toContainEqual({ name: "SICLAW_CODEX_BIN", value: "/usr/local/bin/codex" });
   });
 
