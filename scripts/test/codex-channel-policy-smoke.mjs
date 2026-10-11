@@ -26,7 +26,11 @@ const upstream=http.createServer((req,res)=>{
 });
 await new Promise(resolve=>upstream.listen(0,"127.0.0.1",resolve));
 const real=JSON.stringify({apiVersion:"v1",kind:"Config","current-context":"private",clusters:[{name:"private",cluster:{server:`http://127.0.0.1:${upstream.address().port}`,"insecure-skip-tls-verify":true}}],contexts:[{name:"private",context:{cluster:"private",user:"private"}}],users:[{name:"private",user:{token:canary}}]});
-const policy={version:1,revision:"fixture:1",fingerprint:"a".repeat(64),operations:["query"],namespaces:["allowed"],mcp:[],knowledgeIds:[],reports:false,attachments:false};
+const legacyPolicy={version:1,revision:"fixture:1",fingerprint:"a".repeat(64),operations:["query"],namespaces:["allowed"],mcp:[],knowledgeIds:[],reports:false,attachments:false};
+const policy=process.env.SICLAW_TEST_CHANNEL_RULES==='1'?{...legacyPolicy,version:2,operations:['query','logs'],namespaces:['allowed','forbidden'],rules:[
+ {id:'query-allowed',kind:'kubernetes',clusterNames:['fixture'],hostNames:[],hostIds:[],authority:legacyPolicy},
+ {id:'logs-other',kind:'kubernetes',clusterNames:['fixture'],hostNames:[],hostIds:[],authority:{...legacyPolicy,operations:['logs'],namespaces:['forbidden']}},
+]}:legacyPolicy;
 assert.equal(typeof KubeConfig.prototype.applyToHTTPSOptions,"function","Image Kubernetes SDK must match source broker API");
 const validate=async()=>{if(!active)throw new Error("revoked")};
 const credentialRoot=path.join(root,"credentials");fs.mkdirSync(credentialRoot,{mode:0o700});
@@ -77,7 +81,7 @@ try {
  const revoked=await execute("revoked","kubectl get pods -n allowed -o json");assert.ok(revoked.error||revoked.exitCode!==0);assert.equal(paths.length,before);
  const text=events.filter(e=>e.method==="process/output").map(e=>Buffer.from(e.params.chunk,"base64").toString()).join("");
  assert.match(text,/channel-safe/);assert.ok(!text.includes(canary));
- console.log("Channel native smoke passed: real upstream exec-server, scoped kubectl, no raw credential, cross-namespace/all-namespace/write/file-read denial and revocation; fixture API, not production cluster.");
+ console.log(`Channel v${policy.version} native smoke passed: real upstream exec-server, scoped kubectl, no raw credential, namespace/action associations, all-namespace/write/file-read denial and revocation; fixture API, not production cluster.`);
 }finally{
  socket?.close();await relay.close();authority.close();upstream.closeAllConnections();await new Promise(resolve=>upstream.close(resolve));
  // kubectl's cache belongs to sandbox UID 1001. Adjust only this freshly

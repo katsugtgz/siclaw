@@ -257,7 +257,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
 
   const sandboxTurns = new SandboxTurnContext();
   const nativeMcpAuthorization = new NativeMcpAuthorization(frontendClient, (sessionId, agentId) => sandboxTurns.user(sessionId, agentId),
-    (certificate, sessionId, grantId) => credentialService.executionGrant({ ...certificate, sessionId, grantId, channelPolicyV1:true }));
+    (certificate, sessionId, grantId) => credentialService.executionGrant({ ...certificate, sessionId, grantId, channelPolicyV1:true,channelPolicyV2:true }));
   const scriptSandbox = createScriptSandboxApi(spawner?.name ?? "local", frontendClient, async (principal, args, signal, approval) => {
     const handle = await agentBoxManager.getForSession(webExecutionScope(principal.agentId, (await sessionRegistry.get(principal.sessionId))?.userId), principal.sessionId);
     // K8s pool replicas share a certificate whose boxId names the pool, not a Pod.

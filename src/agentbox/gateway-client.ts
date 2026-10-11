@@ -58,7 +58,7 @@ export class GatewayClient {
   }
 
   async renewExecutionGrant(grantId: string, sessionId: string): Promise<any> {
-    try { return await this.request("/api/internal/execution-grant/renew", "POST", { grant_id: grantId, session_id: sessionId, channel_policy_v1: true }); }
+    try { return await this.request("/api/internal/execution-grant/renew", "POST", { grant_id: grantId, session_id: sessionId, channel_policy_v1: true,channel_policy_v2:true }); }
     catch (error) {
       if (/Gateway returned (401|403|404):/.test(error instanceof Error ? error.message : "")) return { ok: false, reason: "revoked" };
       throw error;
@@ -285,8 +285,9 @@ export class GatewayClient {
         parsed.searchParams.set("grant_id", this.grantId);
         parsed.searchParams.set("session_id", this.sessionId!);
         parsed.searchParams.set("channel_policy_v1","true");
+        parsed.searchParams.set("channel_policy_v2","true");
         path = parsed.pathname + parsed.search;
-      } else body = { ...body, grant_id: this.grantId, session_id: this.sessionId, channel_policy_v1: true };
+      } else body = { ...body, grant_id: this.grantId, session_id: this.sessionId, channel_policy_v1: true,channel_policy_v2:true };
     }
     return new Promise((resolve, reject) => {
       const url = new URL(path, this.gatewayUrl);

@@ -7,7 +7,7 @@ import { KubeConfig, Exec } from "@kubernetes/client-node";
 import { dump } from "js-yaml";
 import { parseArgs, shellEscape, isTrustedCommandExecutable, CONTAINER_SENSITIVE_PATHS } from "../tools/infra/command-sets.js";
 import { preExecSecurity } from "../tools/infra/security-pipeline.js";
-import { requireChannelNamespace, requireChannelOperation, type ChannelExecutionPolicy } from "../shared/channel-execution-policy.js";
+import { requireChannelNamespace, requireChannelOperation, requireChannelNamespaceOperation, type ChannelExecutionPolicy } from "../shared/channel-execution-policy.js";
 
 export type KubernetesRequestScope = "discovery" | "query" | "logs" | "pod_exec" | "pod_metadata";
 
@@ -16,6 +16,13 @@ export type KubernetesRequestScope = "discovery" | "query" | "logs" | "pod_exec"
  * namespace discovery or privileged node transport escape this boundary. */
 export function authorizeChannelKubernetesRequest(method: string, raw: string, policy: ChannelExecutionPolicy,
   trustedTransport?: {script:boolean}): KubernetesRequestScope {
+  if(policy.version===2){
+    for(const rule of policy.rules??[]){
+      if(rule.kind!=='kubernetes')continue;
+      try{return authorizeChannelKubernetesRequest(method,raw,rule.authority,trustedTransport);}catch{/* Every target/namespace/action tuple must match one complete rule. */}
+    }
+    throw new Error("Kubernetes request is not authorized by a resource rule");
+  }
   if (!raw.startsWith("/") || raw.startsWith("//") || /[\x00-\x20\\#]/.test(raw)) throw new Error("Invalid Kubernetes request path");
   const url = new URL(raw, "http://broker.invalid");
   const parts = url.pathname.split("/").filter(Boolean).map(value => decodeURIComponent(value));
@@ -234,7 +241,7 @@ export class ChannelKubernetesProxy {
   }
 
   registerPodTransport(namespace:string,pod:string,container:string,args:readonly string[],script:boolean,cleanupArgs:readonly string[]):{finish:()=>void;kill:()=>void}{
-    requireChannelNamespace(this.policy,namespace);requireChannelOperation(this.policy,script?"scripts":"pod_exec");
+    requireChannelNamespaceOperation(this.policy,namespace,script?"scripts":"pod_exec");
     if (this.disposed || !this.target) throw new Error("Scoped cluster transport has ended");
     if (this.transports.size >= 128) throw new Error("Too many scoped Pod transports");
     const config=this.config;let finished=false;

@@ -32,7 +32,7 @@ import path from "node:path";
 import { load as loadYaml, JSON_SCHEMA } from "js-yaml";
 import { ConcurrencyLimiter } from "../core/concurrency-limiter.js";
 import { ChannelKubernetesProxy } from "./channel-kubernetes-proxy.js";
-import { requireChannelOperation, type ChannelExecutionPolicy } from "../shared/channel-execution-policy.js";
+import { requireChannelOperation, channelPolicyForCluster, requireChannelHostOperation, type ChannelExecutionPolicy } from "../shared/channel-execution-policy.js";
 import type {
   CredentialTransport,
   ClusterMeta,
@@ -477,7 +477,7 @@ export class CredentialBroker {
       const file = response.credential.files.find(file => file.name.endsWith("kubeconfig")) ?? response.credential.files[0];
       if (!file) throw new Error("Missing scoped Kubernetes credential");
       let proxy = this.channelProxies.get(response.credential.name);
-      if (!proxy) { proxy = new ChannelKubernetesProxy(this.channel.policy, this.channel.validate); this.channelProxies.set(response.credential.name, proxy); }
+      if (!proxy) { proxy = new ChannelKubernetesProxy(channelPolicyForCluster(this.channel.policy,response.credential.name), this.channel.validate); this.channelProxies.set(response.credential.name, proxy); }
       const scoped = await proxy.configure(file.content);
       response = { ...response, credential: { ...response.credential, files: [{ name: "kubeconfig", content: scoped }] } };
       this.rememberSensitiveValues(response);
@@ -678,6 +678,7 @@ export class CredentialBroker {
     this.requireChannelOperation(purpose.includes("script") ? "scripts" : "ssh_exec");
     await this.validateChannelPolicy();
     const response = await this.transport.getHostCredential(sourceId, purpose);
+    requireChannelHostOperation(this.channel?.policy,typeof response.credential.metadata?.resource_id==='string'?response.credential.metadata.resource_id:'',purpose.includes("script")?"scripts":"ssh_exec");
     this.rememberSensitiveValues(response);
     const cached = this.hosts.get(sourceId);
     const meta = mergeHostMeta(cached?.meta, response, sourceId);
