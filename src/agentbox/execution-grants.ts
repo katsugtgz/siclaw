@@ -7,6 +7,7 @@ import type { GatewayClient } from "./gateway-client.js";
 import { identityKey, parseWireIdentity, type ExecutionIdentity } from "../shared/execution-identity.js";
 import { parseExecutionSender, type ExecutionSender } from "../shared/execution-context.js";
 import { parseChannelExecutionPolicy, type ChannelExecutionPolicy } from "../shared/channel-execution-policy.js";
+import { MAX_GRANT_LEASE_MS } from "../shared/execution-grant-lease.js";
 
 export interface BoxExecutionGrant {
   readonly grantId: string;
@@ -27,27 +28,39 @@ export interface BoxExecutionGrant {
  * credential cache and transport; expiration aborts its owned work locally. */
 export class BoxExecutionGrants {
   private readonly grants = new Map<string, BoxExecutionGrant>();
-  private readonly pending = new Map<string, Promise<BoxExecutionGrant>>();
+  private readonly pending = new Map<string, { promise: Promise<BoxExecutionGrant>; admission: { cancelled: boolean } }>();
   private readonly timers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly expirationTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private closed = false;
   constructor(private readonly gateway: GatewayClient, private readonly root: string) {}
 
   async accept(grantId: string, sessionId: string, expected: ExecutionIdentity): Promise<BoxExecutionGrant> {
+    if (this.closed) throw new Error("Execution authorization manager closed");
     if (!/^[A-Za-z0-9._-]{1,128}$/.test(grantId) || !sessionId) throw new Error("Invalid execution grant");
+    const principal = Object.freeze({ ...expected });
     let pending = this.pending.get(grantId);
     if (!pending) {
-      pending = this.confirm(grantId, sessionId, expected, true).finally(() => this.pending.delete(grantId));
+      const admission = { cancelled: false };
+      pending = { admission, promise: this.confirm(grantId, sessionId, principal, true, admission)
+        .finally(() => this.pending.delete(grantId)) };
       this.pending.set(grantId, pending);
     }
-    const grant = await pending;
-    if (grant.sessionId !== sessionId || identityKey(grant.identity) !== identityKey(expected))
+    const grant = await pending.promise;
+    if (this.closed || grant.ended || Date.now() >= grant.deadline) throw new Error("Execution authorization ended");
+    // A stricter caller may join a confirmation begun by a legacy caller.
+    // Deduplicating the RPC must never deduplicate each waiter's policy check.
+    if (principal.policyRequired && !grant.policy) throw new Error("Required AgentBox channel policy is unavailable");
+    if (grant.sessionId !== sessionId || identityKey(grant.identity) !== identityKey(principal))
       throw new Error("Execution grant context mismatch");
     return grant;
   }
 
-  private async confirm(grantId: string, sessionId: string, expected: ExecutionIdentity, freshDispatch = false): Promise<BoxExecutionGrant> {
+  private async confirm(grantId: string, sessionId: string, expected: ExecutionIdentity, freshDispatch = false,
+    admission?: { cancelled: boolean }): Promise<BoxExecutionGrant> {
+    if (this.closed || admission?.cancelled) throw new Error("Execution authorization ended");
     const started = Date.now();
     const result = await this.gateway.renewExecutionGrant(grantId, sessionId);
+    if (this.closed || admission?.cancelled) throw new Error("Execution authorization ended");
     if (result?.ok === false) {
       const owned = this.grants.get(grantId);
       if (owned) this.end(owned);
@@ -57,8 +70,11 @@ export class BoxExecutionGrants {
     const policy = parseChannelExecutionPolicy(result?.policy);
     if (expected.policyRequired && !policy) throw new Error("Required AgentBox channel policy is unavailable");
     if (result?.ok !== true || !identity || identityKey(identity) !== identityKey(expected)
-        || result.sessionId !== sessionId || !Number.isFinite(result.remainingMs) || result.remainingMs <= 0)
+        || result.sessionId !== sessionId || !Number.isSafeInteger(result.remainingMs)
+        || result.remainingMs <= 0 || result.remainingMs > MAX_GRANT_LEASE_MS)
       throw new Error("Execution grant is unavailable or misbound");
+    const deadline = started + result.remainingMs;
+    if (deadline <= Date.now()) throw new Error("Execution grant confirmation expired");
     let existing = this.grants.get(grantId);
     if (existing?.ended) {
       if (!freshDispatch) throw new Error("Execution grant ended");
@@ -72,7 +88,7 @@ export class BoxExecutionGrants {
       if (existing) this.end(existing);
       if (existing) throw new Error("Execution policy changed");
     }
-    if (existing) { existing.deadline = started + result.remainingMs; this.schedule(existing); return existing; }
+    if (existing) { existing.deadline = deadline; this.schedule(existing); return existing; }
     const grantRoot = path.join(this.root, "execution-grants");
     const principalRoot = path.join(grantRoot, grantId);
     const directory = path.join(principalRoot, randomUUID());
@@ -103,7 +119,7 @@ export class BoxExecutionGrants {
         await this.confirm(grantId, sessionId, expected);
         if (grant.ended) throw new Error("Execution authorization ended");
       } } : undefined),
-      credentialsDir: directory, onEnd: new Set(), busy: new Set(), deadline: started + result.remainingMs, ended: false };
+      credentialsDir: directory, onEnd: new Set(), busy: new Set(), deadline, ended: false };
     this.grants.set(grantId, grant); this.schedule(grant); return grant;
   }
 
@@ -140,6 +156,18 @@ export class BoxExecutionGrants {
     grant.onEnd.clear(); grant.busy.clear(); grant.broker.dispose();
   }
 
-  close(): void { for (const grant of this.grants.values()) this.end(grant); this.grants.clear(); this.timers.clear(); this.expirationTimers.clear(); }
-  revoke(ids:readonly string[]):void{ for(const id of ids){const grant=this.grants.get(id);if(grant)this.end(grant);} }
+  close(): void {
+    this.closed = true;
+    for (const pending of this.pending.values()) pending.admission.cancelled = true;
+    for (const grant of this.grants.values()) this.end(grant);
+    this.grants.clear(); this.timers.clear(); this.expirationTimers.clear();
+  }
+  revoke(ids: readonly string[]): void {
+    for (const id of ids) {
+      const pending = this.pending.get(id);
+      if (pending) pending.admission.cancelled = true;
+      const grant = this.grants.get(id);
+      if (grant) this.end(grant);
+    }
+  }
 }

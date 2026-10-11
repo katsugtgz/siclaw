@@ -72,8 +72,11 @@ Codex configuration contains only the loopback endpoint and private proxy auth.
 The gateway binds `127.0.0.1`, requires a random bearer token, validates Host,
 rejects browser Origins, limits request bodies and session counts, and closes
 its transports with the owning brain. Requests cannot use another server's
-session. It advertises only the authorized tools and explicitly selected text
-resources/prompts. Unknown methods, subscriptions, tasks, sampling and elicitation
+session. It advertises only authorized tools with verified native call attribution.
+External resource/prompt capabilities, catalogues and methods are not exposed,
+even when the shared configuration selects them. Resource/prompt-only server
+configurations do not establish an upstream connection or launch a process.
+Unknown methods, subscriptions, tasks, sampling and elicitation
 are not forwarded. Client progress/tracing metadata is consumed locally.
 HTTP redirects are rejected, including SSE GET and POST requests.
 
@@ -125,8 +128,12 @@ transports as well as permission checks. Each owning gateway allows at most ten
 simultaneous tool calls; this is not a distributed per-target traffic quota.
 
 Only attributable native tool items are supported by this dynamic gate today.
-External resource/prompt reads and non-Web channel/API/task/headless callers
-fail closed until they have their own verified caller/attribution contracts.
+External resource/prompt reads fail locally with MethodNotFound and zero upstream
+dispatch until they have their own verified native caller/attribution contract.
+Allowed tool results may still contain sanitized embedded text resources; that
+does not grant a new `resources/read` operation. Existing shared policy keys and
+Pi behavior are unchanged. Non-Web callers still require their own verified
+caller/admission contract.
 This is an intentional security restriction, not equivalent acceptance of every
 legacy entry point. Intrinsic knowledge/workflow services retain their separate
 owned-turn contracts. Pi remains separately selectable.

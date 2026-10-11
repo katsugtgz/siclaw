@@ -19,6 +19,77 @@ function fixture(initial: Record<string, GrantResources>) {
 }
 
 describe("execution grants", () => {
+  it.each(["actor", "agent"] as const)("refuses a pending initial admission after %s revocation", async reason => {
+    let resolve!: (value: GrantResources) => void;
+    const registry = new ExecutionGrantRegistry(() => new Promise<GrantResources>(yes => { resolve = yes; }));
+    const admission = registry.open("agent", "s", "alice");
+    const refused = expect(admission).rejects.toThrow(/authorization.*changed|revoked/);
+    if (reason === "actor") registry.revokeActor("alice"); else registry.revokeAgent("agent");
+    resolve({ clusters: ["A"], hosts: [] });
+    await refused;
+  });
+  it("does not cancel another actor or agent's pending admission", async () => {
+    let resolve!: (value: GrantResources) => void;
+    const registry = new ExecutionGrantRegistry(() => new Promise<GrantResources>(yes => { resolve = yes; }));
+    const admission = registry.open("agent", "s", "alice");
+    registry.revokeActor("bob"); registry.revokeAgent("other-agent"); registry.revokeActor("alice", "other-agent");
+    resolve({ clusters: ["A"], hosts: [] });
+    const grant = await admission;
+    expect(registry.check(grant.grantId, "agent").ok).toBe(true);
+    expect(grant.resources.clusters).toEqual(["A"]);
+  });
+  it("captures the caller identity before awaiting resource resolution", async () => {
+    let resolve!: (value: GrantResources) => void;
+    const actor = { kind: "user" as const, id: "alice" };
+    const registry = new ExecutionGrantRegistry(() => new Promise<GrantResources>(yes => { resolve = yes; }));
+    const admission = registry.open("agent", "s", actor);
+    actor.id = "bob";
+    resolve({ clusters: ["alice-cluster"], hosts: [] });
+    const grant = await admission;
+    expect(grant.actor).toEqual({ kind: "user", id: "alice" });
+    expect(grant.actorUserId).toBe("alice");
+    expect(Object.isFrozen(grant.actor)).toBe(true);
+  });
+
+  it.each(["actor", "agent", "expiry", "failed-after-revoke"] as const)(
+    "refuses a stale renewal response after %s while resolution is pending", async reason => {
+      let now = 1_000_000, pending = false;
+      let resolve!: (value: GrantResources) => void, reject!: (error: Error) => void;
+      const resources = { clusters: ["A"], hosts: [] };
+      const registry = new ExecutionGrantRegistry(async () => pending
+        ? new Promise<GrantResources>((yes, no) => { resolve = yes; reject = no; }) : resources,
+      { now: () => now });
+      const grant = await registry.open("agent", "s", "alice"), deadline = grant.deadline;
+      pending = true;
+      const renewal = registry.renew(grant.grantId, "agent");
+      if (reason === "expiry") now += 60_001;
+      else if (reason === "agent") registry.revokeAgent("agent");
+      else registry.revokeActor("alice");
+      if (reason === "failed-after-revoke") reject(new Error("control plane unavailable"));
+      else resolve(resources);
+      expect(await renewal).toEqual({ ok: false, reason: reason === "expiry" ? "expired" : "revoked" });
+      expect(grant.deadline).toBe(deadline);
+      expect(registry.check(grant.grantId, "agent").ok).toBe(false);
+    });
+
+  it("caps injected lease options and expires during control-plane loss without a push", async () => {
+    let now = 1_000_000;
+    let unavailable = false;
+    const registry = new ExecutionGrantRegistry(async () => {
+      if (unavailable) throw new Error("control plane unavailable");
+      return { clusters: ["A"], hosts: [] };
+    }, { leaseMs: 3_600_000, now: () => now });
+    const grant = await registry.open("agent", "s", "alice");
+    expect(registry.remainingMs(grant)).toBe(60_000);
+    const deadline = grant.deadline;
+    unavailable = true;
+    now += 30_000;
+    expect((await registry.renew(grant.grantId, "agent")).ok).toBe(true);
+    expect(grant.deadline).toBe(deadline);
+    now += 30_000;
+    expect(registry.check(grant.grantId, "agent")).toEqual({ ok: false, reason: "expired" });
+  });
+
   it("reuses a caller's grant while nothing changed, and issues a new one when their resources do", async () => {
     const f = fixture({ alice: { clusters: ["A"], hosts: [] } });
     const first = await f.registry.open("agent", "s1", "alice");

@@ -63,6 +63,26 @@ command name allow-list. The deployment's additive-only extra-command config
 applies to both engines, including its constraints and built-in collision rules.
 An approved binary still needs to exist on the selected target.
 
+### Execution grant leases
+
+An execution grant cannot remain valid for more than **60 seconds** without a
+fresh authoritative confirmation. `SICLAW_EXECUTION_GRANT_LEASE_MS` accepts
+whole milliseconds from 1,000 through 60,000; larger safe integers are capped
+at 60,000. Unset, malformed, fractional, unsafe-integer or sub-second values use
+the 60,000 ms default. Runtime constructor overrides enforce the same limit.
+This is a revalidation/withdrawal bound, not a timeout for a diagnostic task:
+work may continue while fresh authorization renewals succeed.
+
+AgentBox independently refuses a non-positive, non-integer or greater-than-
+60,000 ms wire duration before creating credentials. An invalid renewal cannot
+extend an existing holder. If the control plane is unavailable or renewal hangs,
+its last confirmed deadline still expires and cancels all owned parent/child
+work. A lost push does not extend the lease. Shorter positive remaining durations
+are valid because they may describe the last milliseconds of an existing grant.
+Upgrade Runtime and AgentBox together; old Runtimes sending oversized leases are
+refused rather than silently trusted. Remote termination still depends on the
+existing transport/process cleanup mechanisms, not an instantaneous global stop.
+
 Whitelist compatibility includes existing Pi network probes and controlled
 benchmarks. These operations can consume resources or generate traffic; the
 shared diagnostic policy is not a guarantee that every permitted operation is

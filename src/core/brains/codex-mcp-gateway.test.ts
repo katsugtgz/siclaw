@@ -19,6 +19,70 @@ const env = { FIXTURE_SECRET: secret, SICLAW_MCP_READ_ONLY_TOOLS: '["read_fixtur
   SICLAW_MCP_READ_ONLY_RESOURCES: '["fixture://read"]', SICLAW_MCP_READ_ONLY_PROMPTS: '["diagnose"]' };
 
 describe("native MCP pre-model security boundary", () => {
+  it("never launches an upstream after the owning gateway has closed", async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "native-mcp-closed-")), started = path.join(directory, "started");
+    const gateway = new CodexMcpGateway({ fixture: { transport: "stdio", command: process.execPath, args: [fixture],
+      env: { ...env, START_FILE: started } } }, () => [secret], () => [], authorizeFixture);
+    try {
+      await gateway.close();
+      await expect(gateway.start()).rejects.toThrow(/closed/);
+      expect(fs.existsSync(started)).toBe(false); expect(gateway.getTools()).toEqual([]);
+    } finally { await gateway.close(); fs.rmSync(directory, { recursive: true, force: true }); }
+  });
+  it("never reopens intrinsic service listeners after closure", async () => {
+    const gateway = new CodexMcpGateway({});
+    gateway.registerService("siclaw_workflow", [], async () => ({ content: [] }));
+    try {
+      await gateway.close();
+      await expect(gateway.start()).rejects.toThrow(/closed/);
+    } finally { await gateway.close(); }
+  });
+
+  it("does not connect or expose a resource/prompt-only server", async () => {
+    const authorize = vi.fn<McpOperationAuthorizer>(authorizeFixture);
+    const gateway = new CodexMcpGateway({ unsupported: { transport: "stdio", command: "must-not-launch", env: {
+      SICLAW_MCP_READ_ONLY_RESOURCES: '["fixture://read"]', SICLAW_MCP_READ_ONLY_PROMPTS: '["diagnose"]',
+    } } }, () => [], () => [], authorize);
+    try {
+      expect(await gateway.start()).toEqual({});
+      expect(gateway.getTools()).toEqual([]); expect(authorize).not.toHaveBeenCalled();
+    } finally { await gateway.close(); }
+  });
+
+  it("advertises only tools and refuses forced resource/prompt methods without contacting the upstream", async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "native-mcp-tool-only-"));
+    const counter = path.join(directory, "calls"), authorize = vi.fn<McpOperationAuthorizer>(authorizeFixture);
+    const gateway = new CodexMcpGateway({ fixture: { transport: "stdio", command: process.execPath, args: [fixture],
+      env: { ...env, COUNTER_FILE: counter } } }, () => [secret], () => [], authorize);
+    const client = new Client({ name: "tool-only-native-test", version: "1" });
+    try {
+      const projected = await gateway.start(), cfg = projected.fixture as { url: string; http_headers: Record<string, string> };
+      const transport = new StreamableHTTPClientTransport(new URL(cfg.url), { requestInit: { headers: cfg.http_headers } });
+      await client.connect(transport);
+      expect(client.getServerCapabilities()).not.toHaveProperty("resources");
+      expect(client.getServerCapabilities()).not.toHaveProperty("prompts");
+      expect((await client.listTools()).tools.map(tool => tool.name)).toEqual(["read_fixture"]);
+      const requests = [
+        { method: "resources/list", params: {} }, { method: "resources/templates/list", params: {} },
+        { method: "resources/read", params: { uri: "fixture://read" } },
+        { method: "resources/subscribe", params: { uri: "fixture://read" } },
+        { method: "prompts/list", params: {} }, { method: "prompts/get", params: { name: "diagnose" } },
+      ];
+      for (const [id, request] of requests.entries()) {
+        const response = await fetch(cfg.url, { method: "POST", headers: { ...cfg.http_headers, "Content-Type": "application/json", Accept: "application/json, text/event-stream",
+          "mcp-session-id": transport.sessionId!, "mcp-protocol-version": "2025-11-25" },
+          body: JSON.stringify({ jsonrpc: "2.0", id, ...request }) });
+        const result = await response.json();
+        expect(result.error?.code, request.method).toBe(-32601);
+        expect(JSON.stringify(result)).not.toContain(secret);
+      }
+      expect(authorize).not.toHaveBeenCalled(); expect(fs.existsSync(counter)).toBe(false);
+      expect((await client.callTool({ name: "read_fixture", arguments: {} })).isError).not.toBe(true);
+      expect(authorize).toHaveBeenCalledTimes(2);
+      expect(fs.readFileSync(counter, "utf8").trim()).toBe("read_fixture");
+    } finally { await client.close(); await gateway.close(); fs.rmSync(directory, { recursive: true, force: true }); }
+  });
+
   it("checks effective injected arguments before native authorization and upstream dispatch",async()=>{
     const directory=fs.mkdtempSync(path.join(os.tmpdir(),"siclaw-native-fixed-path-"));const counter=path.join(directory,"calls");
     const authorize=vi.fn<McpOperationAuthorizer>(authorizeFixture);
@@ -32,7 +96,7 @@ describe("native MCP pre-model security boundary", () => {
       expect(result.isError).toBe(true);expect(authorize).not.toHaveBeenCalled();expect(fs.existsSync(counter)).toBe(false);
     }finally{await client.close();await gateway.close();fs.rmSync(directory,{recursive:true,force:true});}
   });
-  it("uses native MCP with explicit read-only admission and sanitizes discovery, results, resources and prompts", async () => {
+  it("uses native MCP with explicit read-only admission and sanitizes discovery, results and embedded text resources", async () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "siclaw-mcp-security-"));
     const counter = path.join(directory, "calls");
     const gateway = new CodexMcpGateway({ fixture: { transport: "stdio", command: process.execPath,
@@ -59,14 +123,13 @@ describe("native MCP pre-model security boundary", () => {
       expect(wire).not.toContain("tiny"); expect(wire).toContain("healthy"); expect(wire).toContain("REDACTED");
       expect(result).not.toHaveProperty("_meta");
       expect(result.content.every(block => block.type === "text" || block.type === "resource")).toBe(true);
+      expect(result.content.some(block => block.type === "resource")).toBe(true);
       const error = await client.callTool({ name: "read_fixture", arguments: { mode: "error" } });
       expect(JSON.stringify(error)).not.toContain(secret); expect(error.isError).toBe(true);
-      const resource = await client.readResource({ uri: "fixture://read" });
-      expect(JSON.stringify(resource)).not.toContain(secret); expect(JSON.stringify(resource)).toContain("REDACTED");
-      await expect(client.readResource({ uri: "fixture://private" })).rejects.toThrow(/not authorized/);
-      const prompt = await client.getPrompt({ name: "diagnose" });
-      expect(JSON.stringify(prompt)).not.toContain(secret); expect(JSON.stringify(prompt)).toContain("REDACTED");
-      await expect(client.getPrompt({ name: "mutate" })).rejects.toThrow(/not authorized/);
+      await expect(client.readResource({ uri: "fixture://read" })).rejects.toThrow();
+      await expect(client.readResource({ uri: "fixture://private" })).rejects.toThrow();
+      await expect(client.getPrompt({ name: "diagnose" })).rejects.toThrow();
+      await expect(client.getPrompt({ name: "mutate" })).rejects.toThrow();
       const unauthorized = await fetch(cfg.url, { method: "POST", headers: { "Content-Type": "application/json" }, body: '{}' });
       expect(unauthorized.status).toBe(403);
       const crossOrigin = await fetch(cfg.url, { method: "POST", headers: { ...cfg.http_headers, Origin: "https://attacker.invalid" }, body: '{}' });

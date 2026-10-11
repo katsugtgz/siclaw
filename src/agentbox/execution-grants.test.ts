@@ -32,6 +32,78 @@ describe("immutable box execution authorization", () => {
     await vi.advanceTimersByTimeAsync(60001);
     expect(grant.ended).toBe(true); expect(cancel).toHaveBeenCalledTimes(1);
   });
+  it("rejects an already elapsed initial confirmation before creating a broker", async () => {
+    vi.useFakeTimers();
+    const { manager, gateway } = fixture();
+    let resolve!: (value: { ok: boolean; remainingMs: number; identity: typeof actor; sessionId: string }) => void;
+    gateway.renewExecutionGrant.mockImplementation(() => new Promise(yes => { resolve = yes; }));
+    const accepting = manager.accept("delayed-grant", "s", actor);
+    const rejected = expect(accepting).rejects.toThrow(/unavailable|expired/);
+    await vi.advanceTimersByTimeAsync(60_001);
+    resolve({ ok: true, remainingMs: 60_000, identity: actor, sessionId: "s" });
+    await rejected;
+    expect(gateway.forExecutionGrant).not.toHaveBeenCalled();
+  });
+  it.each(["close", "revoke"] as const)("does not materialize a pending admission after %s", async action => {
+    const { manager, gateway } = fixture();
+    let resolve!: (value: { ok: boolean; remainingMs: number; identity: typeof actor; sessionId: string }) => void;
+    gateway.renewExecutionGrant.mockImplementation(() => new Promise(yes => { resolve = yes; }));
+    const accepting = manager.accept("pending-grant", "s", actor);
+    const rejected = expect(accepting).rejects.toThrow(/ended|closed|cancelled/);
+    if (action === "close") manager.close(); else manager.revoke(["pending-grant"]);
+    resolve({ ok: true, remainingMs: 60_000, identity: actor, sessionId: "s" });
+    await rejected;
+    expect(gateway.forExecutionGrant).not.toHaveBeenCalled();
+  });
+  it("refuses a fresh admission after the manager has been closed", async () => {
+    const { manager, gateway } = fixture(); manager.close();
+    await expect(manager.accept("after-close", "s", actor)).rejects.toThrow(/closed|ended/);
+    expect(gateway.renewExecutionGrant).not.toHaveBeenCalled();
+  });
+  it("captures required policy enforcement before awaiting a confirmation", async () => {
+    const { manager, gateway } = fixture();
+    let resolve!: (value: { ok: boolean; remainingMs: number; identity: typeof actor; sessionId: string }) => void;
+    gateway.renewExecutionGrant.mockImplementation(() => new Promise(yes => { resolve = yes; }));
+    const expected = { ...actor, policyRequired: true };
+    const admission = manager.accept("policy-required", "s", expected);
+    const refused = expect(admission).rejects.toThrow(/Required.*policy/);
+    expected.policyRequired = false;
+    resolve({ ok: true, remainingMs: 60_000, identity: actor, sessionId: "s" });
+    await refused;
+    expect(gateway.forExecutionGrant).not.toHaveBeenCalled();
+  });
+  it("checks policy requirements for each caller sharing a pending confirmation", async () => {
+    const { manager, gateway } = fixture();
+    let resolve!: (value: { ok: boolean; remainingMs: number; identity: typeof actor; sessionId: string }) => void;
+    gateway.renewExecutionGrant.mockImplementation(() => new Promise(yes => { resolve = yes; }));
+    const ordinary = manager.accept("shared-pending", "s", actor);
+    const required = manager.accept("shared-pending", "s", { ...actor, policyRequired: true });
+    const denied = expect(required).rejects.toThrow(/Required.*policy/);
+    resolve({ ok: true, remainingMs: 60_000, identity: actor, sessionId: "s" });
+    expect((await ordinary).ended).toBe(false); await denied;
+    expect(gateway.renewExecutionGrant).toHaveBeenCalledTimes(1);
+  });
+  it.each([60_001, 3_600_000, Number.MAX_SAFE_INTEGER + 1, 1.5, 0, -1, NaN, Infinity])(
+    "refuses an invalid remaining lease %s before materializing credentials", async remainingMs => {
+      const { manager, gateway } = fixture();
+      gateway.renewExecutionGrant.mockResolvedValue({ ok: true, remainingMs, identity: actor, sessionId: "s", sender: { userId: "alice" } });
+      await expect(manager.accept("invalid-lease", "s", actor)).rejects.toThrow(/unavailable|misbound/);
+      expect(gateway.forExecutionGrant).not.toHaveBeenCalled();
+    });
+  it("never extends an old holder on an oversized renewal and cancels all owned work on expiry", async () => {
+    vi.useFakeTimers();
+    const { manager, gateway } = fixture();
+    const grant = await manager.accept("bounded-grant", "s", actor);
+    const deadline = grant.deadline;
+    const parentCancel = vi.fn(), childCancel = vi.fn();
+    grant.onEnd.add(parentCancel); grant.onEnd.add(childCancel); grant.busy.add(() => true);
+    gateway.renewExecutionGrant.mockResolvedValue({ ok: true, remainingMs: 3_600_000, identity: actor, sessionId: "s", sender: { userId: "alice" } });
+    await vi.advanceTimersByTimeAsync(30_001);
+    expect(grant.deadline).toBe(deadline);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(grant.ended).toBe(true);
+    expect(parentCancel).toHaveBeenCalledTimes(1); expect(childCancel).toHaveBeenCalledTimes(1);
+  });
   it("ends owned work immediately on authoritative revocation", async () => {
     vi.useFakeTimers(); const { manager, gateway } = fixture();
     const grant = await manager.accept("grant-a", "s", actor); const cancel = vi.fn();

@@ -28,7 +28,7 @@
 
 import crypto from "node:crypto";
 import { parseChannelExecutionPolicy, type ChannelExecutionPolicy } from "../shared/channel-execution-policy.js";
-import { DEFAULT_GRANT_LEASE_MS, grantLeaseMs } from "../shared/execution-grant-lease.js";
+import { DEFAULT_GRANT_LEASE_MS, grantLeaseMs, normalizeGrantLeaseMs } from "../shared/execution-grant-lease.js";
 import { identityKey, isNoneIdentity, userIdentity, type ExecutionIdentity } from "../shared/execution-identity.js";
 
 export { DEFAULT_GRANT_LEASE_MS, grantLeaseMs };
@@ -141,6 +141,7 @@ export type GrantCheck =
 
 export class ExecutionGrantRegistry {
   private readonly grants = new Map<string, ExecutionGrant>();
+  private readonly pendingAdmissions = new Set<{ agentId: string; actorKey: string; cancelled: boolean }>();
   /** The grant each (agent, session, identity) is currently using, for reuse by its next turn. */
   private readonly current = new Map<string, string>();
 
@@ -149,7 +150,9 @@ export class ExecutionGrantRegistry {
     private readonly opts: { leaseMs?: number; now?: () => number } = {},
   ) {}
 
-  private get leaseMs(): number { return this.opts.leaseMs ?? grantLeaseMs(); }
+  private get leaseMs(): number {
+    return this.opts.leaseMs === undefined ? grantLeaseMs() : normalizeGrantLeaseMs(this.opts.leaseMs);
+  }
   private now(): number { return (this.opts.now ?? Date.now)(); }
 
   private static key(agentId: string, sessionId: string, actor: ExecutionIdentity): string {
@@ -168,12 +171,18 @@ export class ExecutionGrantRegistry {
    * refused request.
    */
   async open(agentId: string, sessionId: string, actor: GrantActor, sender?: GrantSender): Promise<ExecutionGrant> {
-    const identity = asIdentity(actor);
+    const identity = Object.freeze({ ...asIdentity(actor) });
     const turnSender = normalizeGrantSender(sender);
     if (!agentId || !sessionId || !identity || (!isNoneIdentity(identity) && !identity.id)) {
       throw new Error("execution grant needs agent, session and actor");
     }
-    const resources = isNoneIdentity(identity) ? EMPTY_RESOURCES : await this.resolve(agentId, identity, sessionId,turnSender);
+    const admission = { agentId, actorKey: identityKey(identity), cancelled: false };
+    this.pendingAdmissions.add(admission);
+    let resources: GrantResources;
+    try {
+      resources = isNoneIdentity(identity) ? EMPTY_RESOURCES : await this.resolve(agentId, identity, sessionId, turnSender);
+      if (admission.cancelled) throw new Error("Execution authorization changed during admission");
+    } finally { this.pendingAdmissions.delete(admission); }
     const fingerprint = resourceFingerprint(resources);
     const key = ExecutionGrantRegistry.key(agentId, sessionId, identity);
     const existing = this.grants.get(this.current.get(key) ?? "");
@@ -185,7 +194,7 @@ export class ExecutionGrantRegistry {
     const grant: ExecutionGrant = {
       grantId: crypto.randomUUID(),
       agentId, sessionId,
-      actor: { ...identity },
+      actor: identity,
       actorUserId: identity.kind === "user" ? identity.id : "",
       ...(turnSender ? { sender: turnSender } : {}),
       resources: {
@@ -237,8 +246,13 @@ export class ExecutionGrantRegistry {
     } catch {
       // Not knowing is not "still granted". The grant keeps its deadline and
       // lapses on its own if the control plane stays unreachable.
-      return { ok: true, grant };
+      return this.check(grantId, agentId);
     }
+    // The lookup may outlive a push or the last confirmed deadline. A late
+    // success must not acknowledge (or revive) an ended grant.
+    const currentGrant = this.check(grantId, agentId);
+    if (!currentGrant.ok) return currentGrant;
+    if (currentGrant.grant !== grant) return { ok: false, reason: "unknown" };
     if (!stillCovers(grant.resources, current)) {
       grant.state = "revoked";
       return { ok: false, reason: "revoked" };
@@ -255,6 +269,9 @@ export class ExecutionGrantRegistry {
   /** Revoke every grant of an identity (optionally on one agent) — the push path. */
   revokeActor(actor: GrantActor, agentId?: string): ExecutionGrant[] {
     const key = identityKey(asIdentity(actor));
+    for (const admission of this.pendingAdmissions) {
+      if (admission.actorKey === key && (!agentId || admission.agentId === agentId)) admission.cancelled = true;
+    }
     const revoked: ExecutionGrant[] = [];
     for (const grant of this.grants.values()) {
       if (identityKey(grant.actor) !== key) continue;
@@ -268,6 +285,7 @@ export class ExecutionGrantRegistry {
 
   /** Drop records that can no longer answer anything but "refused". */
   revokeAgent(agentId: string): ExecutionGrant[] {
+    for (const admission of this.pendingAdmissions) if (admission.agentId === agentId) admission.cancelled = true;
     const revoked:ExecutionGrant[]=[];
     for(const grant of this.grants.values()) if(grant.agentId===agentId && this.liveState(grant)==="active"){
       grant.state="revoked";revoked.push(grant);

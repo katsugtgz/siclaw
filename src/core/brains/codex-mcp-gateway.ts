@@ -7,8 +7,7 @@ import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { CallToolRequestSchema, ListToolsRequestSchema, ListResourcesRequestSchema, ReadResourceRequestSchema,
-  ListPromptsRequestSchema, GetPromptRequestSchema, McpError, ErrorCode, type Tool } from "@modelcontextprotocol/sdk/types.js";
+import { CallToolRequestSchema, ListToolsRequestSchema, McpError, ErrorCode, type Tool } from "@modelcontextprotocol/sdk/types.js";
 import { mergeMcpStdioEnv, type McpServerConfig } from "../mcp-client.js";
 import { McpModelSecurity, resolveMcpReadOnlyPolicy, mcpTransportEnv, mcpSensitiveValues, type McpReadOnlyPolicy } from "../mcp-security.js";
 import { redactModelJson, type SensitiveValueSource } from "../../shared/model-output-redactor.js";
@@ -68,12 +67,14 @@ export class CodexMcpGateway {
   }
 
   async start(): Promise<Record<string, unknown>> {
+    if (this.closed) throw new Error("MCP security gateway is closed");
     if (!Object.keys(this.configs).length && !this.intrinsic.size) return {};
     try {
       for (const [index, [name, config]] of Object.entries(this.configs).entries()) {
         const policy = resolveMcpReadOnlyPolicy(config);
-        // No authorized operation means no connection, process launch or auth.
-        if (!policy.tools.size && !policy.resources.size && !policy.prompts.size) continue;
+        // Only native tool items have verified call attribution. Resource/prompt
+        // policy alone must not launch a process, authenticate or expose a server.
+        if (!policy.tools.size) continue;
         const client = new Client({ name: "siclaw-mcp-security", version: "1.0.0" }, { capabilities: {} });
         const security = new McpModelSecurity(() => [...mcpSensitiveValues(this.configs), ...this.secrets()], this.privateRoots);
         if (security.redact(name) !== name) throw new Error("MCP server names must not contain credentials");
@@ -186,8 +187,9 @@ export class CodexMcpGateway {
   }
 
   private async createSession(route: string, upstream: Upstream): Promise<Session> {
-    const server = new Server({ name: "siclaw-readonly-mcp", version: "1.0.0" }, { capabilities: {
-      tools: {}, ...(upstream.policy.resources.size ? { resources: {} } : {}), ...(upstream.policy.prompts.size ? { prompts: {} } : {}) } });
+    // Match the owned-item authorization contract; never advertise unusable
+    // resource/prompt methods or permit them through a permissive callback.
+    const server = new Server({ name: "siclaw-readonly-mcp", version: "1.0.0" }, { capabilities: { tools: {} } });
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: randomUUID, enableJsonResponse: true,
       onsessioninitialized: id => { this.pendingSessions.delete(session); this.sessions.set(id, session); } });
     const session: Session = { server, transport, route };
@@ -236,45 +238,9 @@ export class CodexMcpGateway {
         return { isError: true, content: [{ type: "text", text: message }] };
       } finally { this.activeCalls--; this.activeRequests.delete(controller); }
     });
-    // Never relay upstream capabilities, notifications, sampling, elicitation,
-    // subscriptions or arbitrary methods. Explicitly selected text resources
-    // and prompts retain native Codex support through the same result gate.
-    if (upstream.policy.resources.size) {
-      server.setRequestHandler(ListResourcesRequestSchema, async () => ({ resources: [...upstream.policy.resources].map(uri => ({ uri, name: "Authorized resource" })) }));
-      server.setRequestHandler(ReadResourceRequestSchema, async (request, extra) => {
-        if (!upstream.policy.resources.has(request.params.uri)) throw new McpError(ErrorCode.InvalidParams, "MCP resource is not authorized");
-        upstream.security.arguments({ uri: request.params.uri });
-        try {
-          const operation: McpOperation = { server: upstream.name, kind: "resource", name: request.params.uri, arguments: {},
-            callId: typeof request.params._meta?.siclawNativeCallId === "string" ? request.params._meta.siclawNativeCallId : "", configurationDigest: upstream.configurationDigest! };
-          const permit = validateMcpPermit(await this.requireAuthorizer()(operation, extra.signal, "before"), operation);
-          const result = await upstream.client!.readResource({ uri: request.params.uri }, { signal: extra.signal, timeout: 30_000 });
-          const current = validateMcpPermit(await this.requireAuthorizer()(operation, extra.signal, "after"), operation);
-          if (mcpDigest(current) !== mcpDigest(permit)) throw new Error("MCP authorization changed");
-          const safe = upstream.security.result({ content: result.contents.map(resource => ({ type: "resource", resource })) });
-          return { contents: safe.content.map(block => block.type === "resource" ? block.resource
-            : { uri: request.params.uri, text: block.type === "text" ? block.text : "Resource suppressed" }) };
-        } catch { throw new McpError(ErrorCode.InternalError, "MCP resource read failed"); }
-      });
-    }
-    if (upstream.policy.prompts.size) {
-      server.setRequestHandler(ListPromptsRequestSchema, async () => ({ prompts: [...upstream.policy.prompts].map(name => ({ name })) }));
-      server.setRequestHandler(GetPromptRequestSchema, async (request, extra) => {
-        if (!upstream.policy.prompts.has(request.params.name)) throw new McpError(ErrorCode.InvalidParams, "MCP prompt is not authorized");
-        upstream.security.arguments(request.params.arguments ?? {});
-        try {
-          const operation: McpOperation = { server: upstream.name, kind: "prompt", name: request.params.name, arguments: request.params.arguments ?? {},
-            callId: typeof request.params._meta?.siclawNativeCallId === "string" ? request.params._meta.siclawNativeCallId : "", configurationDigest: upstream.configurationDigest! };
-          const permit = validateMcpPermit(await this.requireAuthorizer()(operation, extra.signal, "before"), operation);
-          const result = await upstream.client!.getPrompt({ name: request.params.name, arguments: request.params.arguments }, { signal: extra.signal, timeout: 30_000 });
-          const current = validateMcpPermit(await this.requireAuthorizer()(operation, extra.signal, "after"), operation);
-          if (mcpDigest(current) !== mcpDigest(permit)) throw new Error("MCP authorization changed");
-          if (JSON.stringify(result).length > 8 * 1024 * 1024 || result.messages.length > 1000) throw new Error("Oversized prompt");
-          return { messages: result.messages.map(message => ({ role: message.role,
-            content: upstream.security.result({ content: [message.content] }).content[0] })) };
-        } catch { throw new McpError(ErrorCode.InternalError, "MCP prompt read failed"); }
-      });
-    }
+    // Unsupported resource/prompt methods keep the SDK's local MethodNotFound
+    // refusal. Embedded text resources in allowed tool results still sanitize
+    // through the existing result gate; they grant no resource-read authority.
     await server.connect(transport);
     return session;
   }
