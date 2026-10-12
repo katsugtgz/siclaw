@@ -25,6 +25,7 @@ export interface AgentBoxTlsOptions {
 }
 
 export interface PromptOptions {
+  requiredAgentEngine?: "codex";
   identity?: import("../../shared/execution-identity.js").ExecutionIdentity;
   sender?: import("../../shared/execution-context.js").ExecutionSender;
   grantId?: string;
@@ -141,6 +142,7 @@ export interface PromptResponse {
 
 export interface SteerResponse {
   ok: boolean;
+  deliveryTracked?: boolean;
   /** Trace of the active prompt that accepted this additional user input. */
   traceId?: string;
 }
@@ -152,6 +154,7 @@ export interface SessionInfo {
 }
 
 export interface HealthResponse {
+  inputDeliveryVersion?: number;
   requestModes?: Array<"sync" | "async">;
   status: string;
   sessions: number;
@@ -184,6 +187,9 @@ function agentBoxResponseError(status: number, body: string): RpcResponseError {
   let structuredMessage: string | undefined;
   try {
     const parsed = JSON.parse(body) as Record<string, unknown>;
+    // The pre-prompt busy gate uses a legacy string error; preserve its exact
+    // 409 reason for safe queue retries, without changing other HTTP errors.
+    if (status === 409 && typeof parsed.error === "string" && parsed.error.trim()) structuredMessage = parsed.error;
     const nested = parsed?.error && typeof parsed.error === "object"
       ? parsed.error as Record<string, unknown>
       : parsed;
@@ -305,6 +311,9 @@ export class AgentBoxClient {
    * Send a prompt
    */
   async prompt(opts: PromptOptions): Promise<PromptResponse> {
+    if (opts.requiredAgentEngine && (await this.health()).inputDeliveryVersion !== 1) {
+      throw new Error("AgentBox does not support durable input engine fencing");
+    }
     if (opts.requestMode === "sync" && !supportsRequestMode((await this.health()).requestModes, "sync")) {
       throw new Error("AgentBox does not support requestMode=sync; deploy matching Runtime and AgentBox versions");
     }
@@ -371,7 +380,7 @@ export class AgentBoxClient {
   /**
    * Send a steer instruction (inserts a user message after interrupting the current tool)
    */
-  async steerSession(sessionId: string, text: string, media?: PromptMediaOptions): Promise<SteerResponse> {
+  async steerSession(sessionId: string, text: string, media?: PromptMediaOptions, deliveryMessageId?: string): Promise<SteerResponse> {
     const images = media?.images;
     const files = media?.files;
     const resp = await this.fetch(`/api/sessions/${sessionId}/steer`, {
@@ -379,6 +388,7 @@ export class AgentBoxClient {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         text,
+        ...(deliveryMessageId ? { deliveryMessageId } : {}),
         ...(images && images.length > 0 ? { images } : {}),
         ...(files && files.length > 0 ? { files } : {}),
       }),

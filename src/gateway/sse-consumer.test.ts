@@ -1605,6 +1605,19 @@ describe("consumeAgentSse — redaction and abort", () => {
 // ── onEvent callback ───────────────────────────────────
 
 describe("consumeAgentSse — onEvent callback", () => {
+  it("relays native input identity and prompt/steer kind separately from acknowledgement", async () => {
+    const seen: Array<{ id?: string; kind?: unknown }> = [];
+    const consumed = vi.fn(async (_text: string, id?: string) => ({ messageId: id ?? "prompt-row", kind: id ? "steer" as const : "prompt" as const }));
+    await consumeAgentSse({
+      client: mkClient([
+        { type: "message_start", message: { role: "user", content: "same" } },
+        { type: "message_start", inputMessageId: "steer-row", message: { role: "user", content: [{type:"text",text:"same"}] } },
+      ]), sessionId: "s", userId: "u", onUserMessageStarted: consumed,
+      onEvent: (evt, _type, extras) => seen.push({id:extras.dbMessageId,kind:(evt as Record<string,unknown>).inputMessageKind}),
+    });
+    expect(consumed.mock.calls).toEqual([["same"],["same","steer-row"]]);
+    expect(seen).toEqual([{id:"prompt-row",kind:"prompt"},{id:"steer-row",kind:"steer"}]);
+  });
   it("invokes onEvent for each event with the dbMessageId when one was inserted", async () => {
     const seen: Array<{ type: string; dbMessageId: string | undefined }> = [];
     const events = [

@@ -115,7 +115,7 @@ export interface ConsumeAgentSseOptions {
    * leave every question ordered before every answer. Fired for the turn's opening prompt
    * as well as for each steer, so one rule covers every user row.
    */
-  onUserMessageStarted?: (echoedText: string) => void | Promise<void>;
+  onUserMessageStarted?: (echoedText: string, inputMessageId?: string) => void | string | {messageId:string;kind:"prompt"|"steer"} | Promise<void | string | {messageId:string;kind:"prompt"|"steer"}>;
   /** Abort signal — breaks the loop when triggered. */
   signal?: AbortSignal;
   /**
@@ -905,10 +905,13 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
             ? (message.content as Array<{ type?: string; text?: string }>)
                 .filter((part) => part?.type === "text" && typeof part.text === "string")
                 .map((part) => part.text as string).join("")
-            : "";
+            : typeof message.content === "string" ? message.content : "";
           // Never let bookkeeping break the stream the user is watching.
           try {
-            await onUserMessageStarted(echoed);
+            const consumedId = typeof evt.inputMessageId === "string"
+              ? await onUserMessageStarted(echoed, evt.inputMessageId) : await onUserMessageStarted(echoed);
+            if (typeof consumedId === "string") dbMessageId = consumedId;
+            else if (consumedId) { dbMessageId=consumedId.messageId;evt.inputMessageKind=consumedId.kind; }
           } catch (err) {
             console.warn(`[sse-consumer] ${userId}: failed to mark user message as started:`, err);
           }

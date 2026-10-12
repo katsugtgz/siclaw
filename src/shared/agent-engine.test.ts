@@ -7,12 +7,13 @@ describe("trusted native input capabilities", () => {
     vi.stubEnv("SICLAW_AGENT_ENGINE", "codex");
     expect(resolveAgentEngine("codex")).toBe("codex");
     expect(resolveAgentEngine("pi-agent")).toBe("pi-agent");
-    expect(runtimeChatCapabilities("codex")).toEqual({ requestModes: ["sync", "async"], agentEngine: "codex", nativeImageInput: true });
+    expect(runtimeChatCapabilities("codex")).toEqual({ requestModes: ["sync", "async"], agentEngine: "codex", nativeImageInput: true, inputDeliveryVersion:1,deliveryModes:["steer","queue"] });
   });
   it.each([undefined, null, "", "pi-agent"])("preserves Pi defaults independent of env for %s", (engine) => {
     vi.stubEnv("SICLAW_AGENT_ENGINE", "codex");
     expect(resolveAgentEngine(engine)).toBe("pi-agent");
     expect(runtimeChatCapabilities().nativeImageInput).toBe(false);
+    expect(runtimeChatCapabilities().deliveryModes).toEqual(["steer"]);
   });
   it("refuses invalid stored engines instead of silently falling back", () => {
     expect(() => resolveAgentEngine("unrecognized")).toThrow();

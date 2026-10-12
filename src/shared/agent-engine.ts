@@ -9,5 +9,6 @@ export function resolveAgentEngine(value: unknown): AgentEngine {
 
 /** Input transport support, not permission to read images from files or MCP. */
 export function runtimeChatCapabilities(agentEngine: AgentEngine = "pi-agent") {
-  return { requestModes: ["sync", "async"], agentEngine, nativeImageInput: agentEngine === "codex" };
+  return { requestModes: ["sync", "async"], agentEngine, nativeImageInput: agentEngine === "codex",
+    inputDeliveryVersion: 1, deliveryModes: agentEngine === "codex" ? ["steer", "queue"] : ["steer"] };
 }

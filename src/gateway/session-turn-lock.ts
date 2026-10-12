@@ -81,8 +81,8 @@ export class SessionTurnLocks {
   isManaged(sessionId: string): boolean { return this.held.get(sessionId)?.managed === true; }
 
   /** Only async -> async may degrade to steer; all other combinations queue. */
-  acquireRequest(sessionId: string, requestMode: RequestMode, signal?: AbortSignal, managed = false): Promise<() => void> {
-    const waitMs = requestMode === "sync" || !this.canSteer(sessionId) ? REQUEST_QUEUE_TIMEOUT_MS : DEFAULT_WAIT_MS;
+  acquireRequest(sessionId: string, requestMode: RequestMode, signal?: AbortSignal, managed = false, queued = false): Promise<() => void> {
+    const waitMs = queued || requestMode === "sync" || !this.canSteer(sessionId) ? REQUEST_QUEUE_TIMEOUT_MS : DEFAULT_WAIT_MS;
     return this.acquire(sessionId, waitMs, { requestMode, signal, managed, protectSync: true });
   }
 

@@ -21,6 +21,7 @@ const MAX_PENDING_PER_SESSION = 200;
 
 interface PendingRow {
   messageId: string;
+  kind: "prompt" | "steer";
   /** What was written, used only to reject an echo that clearly is not this row. */
   text: string;
 }
@@ -36,9 +37,9 @@ export class PendingUserRows {
    * let the next echo claim it, giving it a place in the conversation it never occupied
    * and leaving the message actually being answered without one.
    */
-  push(sessionId: string, messageId: string, text: string): void {
+  push(sessionId: string, messageId: string, text: string, kind: "prompt" | "steer" = "prompt"): void {
     const queue = this.bySession.get(sessionId) ?? [];
-    queue.push({ messageId, text });
+    queue.push({ messageId, text, kind });
     // A turn that ends with steers still queued leaves them here; bound the damage
     // rather than growing without limit on a session someone hammers.
     if (queue.length > MAX_PENDING_PER_SESSION) queue.splice(0, queue.length - MAX_PENDING_PER_SESSION);
@@ -55,13 +56,17 @@ export class PendingUserRows {
    * ordering a steer the box has not consumed yet.
    */
   claim(sessionId: string, echoedText?: string): string | undefined {
+    return this.claimInput(sessionId, echoedText)?.messageId;
+  }
+
+  claimInput(sessionId: string, echoedText?: string): PendingRow | undefined {
     const queue = this.bySession.get(sessionId);
     if (!queue || queue.length === 0) return undefined;
     const head = queue[0];
     if (echoedText !== undefined && head.text.length > 0 && !echoedText.includes(head.text)) return undefined;
     queue.shift();
     if (queue.length === 0) this.bySession.delete(sessionId);
-    return head.messageId;
+    return head;
   }
 
   /**

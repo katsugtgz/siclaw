@@ -8,6 +8,55 @@ import { CodexAgentBrain } from "./codex-agent-brain.js";
 const model = { id: "test", name: "Test", provider: "test", api: "openai-responses",
   contextWindow: 8_000, maxTokens: 1_000, reasoning: false };
 
+function steerFixture() {
+ const brain=Object.create(CodexAgentBrain.prototype) as any;
+ const events:any[]=[];
+ Object.assign(brain,{threadId:"root",active:{id:"turn",userMessage:{role:"user",content:"initial"}},promptInFlight:true,
+  pendingSteers:[],injectedSteers:[],consumedUserItems:new Set(),steeringFlush:false,messages:[],
+  client:{request:vi.fn().mockResolvedValue({})},sessionManager:{appendMessage:vi.fn()},
+  emit:(event:any)=>events.push(event),watchMailbox:vi.fn(),transformInput:async(text:string,media:any)=>({text,media})});
+ const consume=(id:string,text:string,threadId="root",turnId="turn",method="item/started")=>brain.handleEvent({method,params:{threadId,turnId,item:{type:"userMessage",id,content:[{type:"text",text}]}}});
+ return {brain,events,consume};
+}
+
+describe("native steer consumption receipts",()=>{
+ it("correlates batched identical native inputs and suppresses late events after Stop",async()=>{
+  const {brain,events,consume}=steerFixture();consume("original","initial");
+  await brain.steer("same",undefined,{messageId:"row-a"});await brain.steer("same",undefined,{messageId:"row-b"});
+  const params={threadId:"root",turnId:"turn",item:{type:"userMessage",id:"batch",content:[{type:"text",text:"same"},{type:"text",text:"same"}]}};
+  brain.handleEvent({method:"item/started",params});brain.handleEvent({method:"item/completed",params});
+  expect(events.filter(e=>e.type==="message_start").map(e=>e.inputMessageId)).toEqual(["row-a","row-b"]);
+  await brain.steer("late",undefined,{messageId:"row-late"});brain.abortPending=true;consume("late","late");
+  expect(events.filter(e=>e.type==="message_start")).toHaveLength(2);
+ });
+ it("does not claim consumption on acknowledgement and emits once per native item",async()=>{
+  const {brain,events,consume}=steerFixture();consume("initial","initial");
+  await brain.steer("next",undefined,{messageId:"row-1"});expect(events).toEqual([]);
+  consume("item-1","next");consume("item-1","next","root","turn","item/completed");
+  expect(events.filter(e=>e.type==="message_start")).toEqual([expect.objectContaining({inputMessageId:"row-1",message:{role:"user",content:[{type:"text",text:"next"}],timestamp:expect.any(Number)}})]);
+ });
+ it("keeps identical steers distinct and ignores the original, foreign and stale events",async()=>{
+  const {brain,events,consume}=steerFixture();
+  await brain.steer("initial",undefined,{messageId:"row-a"});await brain.steer("initial",undefined,{messageId:"row-b"});
+  consume("original","initial");consume("foreign","initial","other");consume("stale","initial","root","old");
+  expect(events).toHaveLength(0);
+  consume("a","initial");consume("b","initial");
+  expect(events.filter(e=>e.type==="message_start").map(e=>e.inputMessageId)).toEqual(["row-a","row-b"]);
+ });
+ it("recognizes consumption before a lost acknowledgement without inviting a retry",async()=>{
+  const {brain,events,consume}=steerFixture();consume("original","initial");
+  brain.client.request=vi.fn(async()=>{consume("a","next");throw new Error("ack lost")});
+  await expect(brain.steer("next",undefined,{messageId:"row-a"})).resolves.toBeUndefined();
+  expect(events.filter(e=>e.type==="message_start")).toHaveLength(1);
+ });
+ it("does not retain refused inputs or claim that clearing an accepted steer retracts it",async()=>{
+  const {brain,events}=steerFixture();brain.client.request.mockRejectedValueOnce(new Error("turn ended"));
+  await expect(brain.steer("refused")).rejects.toThrow("turn ended");expect(brain.injectedSteers).toHaveLength(0);
+  await brain.steer("accepted");brain.followUps=[];
+  expect(brain.clearQueue()).toEqual({steering:[],followUp:[]});expect(events).toHaveLength(0);
+ });
+});
+
 describe("CodexAgentBrain compatibility", () => {
   it.each([true,false,undefined])("projects the native memory toggle %s into generation, recall and tools",enabled=>{
     const brain=Object.create(CodexAgentBrain.prototype) as any;

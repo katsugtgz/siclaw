@@ -42,9 +42,9 @@ type JsonObject = Record<string, unknown>;
 type CodexEvent = { method: string; params: JsonObject };
 type PendingTurn = { resolve: () => void; reject: (error: Error) => void; id?: string;
   toolNames: Set<string>; userMessage: JsonObject; internal: boolean; assistantHadContent: boolean;
-  abortRequested?: boolean; interruptSent?: boolean; started?: boolean;
+  abortRequested?: boolean; interruptSent?: boolean; started?: boolean; initialUserItemSeen?: boolean;
   mailboxStop?: AbortController };
-type PendingSteer = { text: string; input: JsonObject[]; resolve: () => void; reject: (error: Error) => void };
+type PendingSteer = { text: string; input: JsonObject[]; messageId?: string; consumed?: boolean; turnId?: string; resolve: () => void; reject: (error: Error) => void };
 
 function record(value: unknown): value is JsonObject {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -164,6 +164,8 @@ export class CodexAgentBrain implements BrainSession {
   private reasoningEffort: string | undefined;
   private followUps: string[] = [];
   private pendingSteers: PendingSteer[] = [];
+  private injectedSteers: PendingSteer[] = [];
+  private consumedUserItems = new Set<string>();
   private steeringFlush = false;
   private assistantTexts = new Map<string, string>();
   private toolItems = new Map<string, { name: string; args: unknown }>();
@@ -629,11 +631,12 @@ export class CodexAgentBrain implements BrainSession {
     if (!result.alreadyAccepted) this.appendCache({ role: "user", content: result.text, timestamp: Date.now() });
     return result;
   }
-  async steer(text: string, media?: PromptMedia): Promise<void> {
+  async steer(text: string, media?: PromptMedia, delivery?: { messageId: string }): Promise<void> {
     if (!media?.images?.length && !media?.files?.length && this.userInput?.answer(text)) {
       this.appendCache({ role: "user", content: this.native.grants.redactOutput?.(text) ?? text, timestamp: Date.now() });
-      this.emit({ type: "message_start", message: this.messages.at(-1) });
-      this.emit({ type: "message_end", message: this.messages.at(-1) });
+      const correlation = delivery?.messageId ? { inputMessageId: delivery.messageId } : {};
+      this.emit({ type: "message_start", message: this.messages.at(-1), ...correlation });
+      this.emit({ type: "message_end", message: this.messages.at(-1), ...correlation });
       return;
     }
     const transformed = await this.transformInput(text, media, "interactive", "steer");
@@ -641,10 +644,11 @@ export class CodexAgentBrain implements BrainSession {
     text = transformed.text;
     media = transformed.media;
     if (!this.promptInFlight) throw new Error("No active Codex turn to steer");
+    if (this.pendingSteers.length + (this.injectedSteers?.length ?? 0) >= 200) throw new Error("Too many pending Codex inputs");
     const input: JsonObject[] = [{ type: "text", text }];
     for (const image of media?.images ?? []) input.push({ type: "image", url: `data:${image.mimeType};base64,${image.data}` });
     return new Promise<void>((resolve, reject) => {
-      this.pendingSteers.push({ text, input, resolve, reject });
+      this.pendingSteers.push({ text, input, messageId: delivery?.messageId, resolve, reject });
       void this.flushSteers();
     });
   }
@@ -656,6 +660,7 @@ export class CodexAgentBrain implements BrainSession {
     return { steering, followUp };
   }
   async abort(): Promise<void> {
+    this.injectedSteers = [];
     this.executor.cancelProcesses();
     for (const executor of this.clusterExecutors.values()) executor.cancelProcesses();
     this.userInput?.cancel();
@@ -723,6 +728,8 @@ export class CodexAgentBrain implements BrainSession {
         const active = this.active;
         if (!active?.id || !this.threadId || !this.client) return;
         const pending = this.pendingSteers.shift()!;
+        pending.turnId = active.id;
+        (this.injectedSteers ??= []).push(pending);
         try {
           await this.client.request("turn/steer", { threadId: this.threadId,
             expectedTurnId: active.id, input: pending.input });
@@ -731,7 +738,13 @@ export class CodexAgentBrain implements BrainSession {
           this.watchMailbox(active);
           pending.resolve();
         } catch (error) {
-          pending.reject(error instanceof Error ? error : new Error(String(error)));
+          // A verified native consumption event is stronger evidence than a
+          // lost RPC acknowledgement. Never ask the caller to duplicate it.
+          if (pending.consumed) pending.resolve();
+          else {
+            this.injectedSteers = this.injectedSteers.filter(item => item !== pending);
+            pending.reject(error instanceof Error ? error : new Error(String(error)));
+          }
         }
       }
     } finally {
@@ -1033,6 +1046,10 @@ export class CodexAgentBrain implements BrainSession {
       if (owner && this.requestWork && owner !== this.requestWork) return;
       if (event.method !== "turn/started" && active?.id && eventTurnId !== active.id) return;
     }
+    if ((event.method === "item/started" || event.method === "item/completed") && item?.type === "userMessage" && active?.id) {
+      this.consumeNativeUserItem(item, active);
+      return;
+    }
     if (event.method === "item/completed" && item && this.native?.dpStateRef?.active && active?.id && !this.checkpointRequested &&
         countToolCallsSinceVisibleAssistant(this.messages as any[]) >= DP_TOOL_CALLS_BEFORE_CHECKPOINT) {
       this.checkpointRequested = true;
@@ -1170,6 +1187,7 @@ export class CodexAgentBrain implements BrainSession {
       this.contextTokens = number(last.totalTokens);
       this.contextWindow = number(usage.modelContextWindow) || this.model?.contextWindow || 0;
     } else if (event.method === "turn/completed" && turn && active) {
+      this.injectedSteers = (this.injectedSteers ?? []).filter(item => item.turnId !== active.id);
       // A failed provider search can emit start without completion. Close its
       // visible activity honestly instead of leaving an eternal spinner.
       for (const [id, tool] of this.toolItems ?? []) {
@@ -1233,6 +1251,35 @@ export class CodexAgentBrain implements BrainSession {
   private appendCache(message: JsonObject): void {
     this.messages.push(message);
     this.sessionManager.appendMessage(message as unknown as Parameters<SessionManager["appendMessage"]>[0]);
+  }
+
+  private consumeNativeUserItem(item: JsonObject, active: PendingTurn): void {
+    if (this.abortPending) return;
+    const id = string(item.id);
+    if (!id) return;
+    this.consumedUserItems ??= new Set();
+    if (this.consumedUserItems.has(id)) return;
+    const texts = Array.isArray(item.content) ? item.content.filter(record)
+      .filter(part => part.type === "text").map(part => string(part.text)) : [];
+    // turn/started already projected the original user message. The first
+    // native item for that input is not a second steer, even for identical text.
+    for (const text of texts) {
+      if (!active.initialUserItemSeen && text === active.userMessage?.content) {
+        active.initialUserItemSeen = true;
+        this.consumedUserItems.add(id);
+        continue;
+      }
+      const pending = this.injectedSteers?.find(candidate => !candidate.consumed && candidate.turnId === active.id && candidate.text === text);
+      if (!pending) continue;
+      pending.consumed = true;
+      this.consumedUserItems.add(id);
+      const message = { role: "user", content: [{ type: "text", text: pending.text }], timestamp: Date.now() };
+      const correlation = pending.messageId ? { inputMessageId: pending.messageId } : {};
+      this.emit({ type: "message_start", message, ...correlation });
+      this.emit({ type: "message_end", message, ...correlation });
+      this.injectedSteers = this.injectedSteers.filter(candidate => candidate !== pending);
+    }
+    if (this.consumedUserItems.size > 1024) this.consumedUserItems.delete(this.consumedUserItems.values().next().value!);
   }
 
   private persistThread(): void {

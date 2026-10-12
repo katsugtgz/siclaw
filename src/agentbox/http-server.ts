@@ -149,6 +149,7 @@ interface PromptRequestBody {
   turnId?: string;
   /** Trusted control-plane contract for one required structured result tool. */
   requiredResultToolName?: string;
+  requiredAgentEngine?: "codex";
   toolPolicy?: "ticket_fill_once";
 }
 
@@ -882,6 +883,7 @@ export function createHttpServer(
     sendJson(res, 200, {
       status: "ok",
       requestModes: ["sync", "async"],
+      inputDeliveryVersion: 1,
       sessions: sessionManager.list().length,
       timestamp: new Date().toISOString(),
     });
@@ -966,6 +968,7 @@ export function createHttpServer(
       return;
     }
     const requiredResultToolName = body.requiredResultToolName?.trim() || undefined;
+    if (body.requiredAgentEngine !== undefined && body.requiredAgentEngine !== "codex") { sendJson(res,400,{error:"Invalid required execution engine"});return; }
     if (body.toolPolicy !== undefined && (body.toolPolicy !== "ticket_fill_once" || !requiredResultToolName)) {
       logPromptResponse(400, "rejected", "Invalid tool policy");
       sendJson(res, 400, { error: "toolPolicy requires ticket_fill_once and a result tool" });
@@ -1058,6 +1061,9 @@ export function createHttpServer(
     // Scoped to Ticket as before — other types may also carry a result contract
     // through a custom harness, and whether an unavailable tool should stop them
     // is a separate question this change does not answer.
+    if (body.requiredAgentEngine && managed.brain.brainType !== body.requiredAgentEngine) {
+      sendJson(res,409,{error:"Queued input requires Codex; the execution engine changed",code:"QUEUE_ENGINE_CHANGED"});return;
+    }
     if (sessionManager.agentTypeState === "ticket" && requiredResultToolName
         && !managed.toolNames.includes(requiredResultToolName)) {
       logPromptResponse(400, "rejected", "Ticket result tool is unavailable", managed.id);
@@ -1759,7 +1765,10 @@ export function createHttpServer(
       return;
     }
 
-    const body = (await parseJsonBody(req)) as { text?: string; images?: PromptImage[]; files?: PromptFile[] };
+    const body = (await parseJsonBody(req)) as { text?: string; images?: PromptImage[]; files?: PromptFile[]; deliveryMessageId?: string };
+    if (body.deliveryMessageId !== undefined && (typeof body.deliveryMessageId !== "string" || !/^[a-zA-Z0-9_-]{1,128}$/.test(body.deliveryMessageId))) {
+      sendJson(res, 400, { error: "Invalid delivery message ID" }); return;
+    }
     const promptMediaValidation = validatePromptMedia(body.images, body.files);
     if (promptMediaValidation.error) {
       sendJson(res, 400, { error: promptMediaValidation.error });
@@ -1784,12 +1793,14 @@ export function createHttpServer(
     // addition to that active prompt, so it inherits this existing trace.
     const traceId = tracingRecorder.getRootTraceId(sessionId);
     try {
-      if (promptMedia) {
+      if (body.deliveryMessageId && managed.brain.brainType === "codex") {
+        await managed.brain.steer(steerText, promptMedia, { messageId: body.deliveryMessageId });
+      } else if (promptMedia) {
         await managed.brain.steer(steerText, promptMedia);
       } else {
         await managed.brain.steer(steerText);
       }
-      sendJson(res, 200, { ok: true, traceId });
+      sendJson(res, 200, { ok: true, traceId, deliveryTracked: managed.brain.brainType === "codex" && !!body.deliveryMessageId });
     } catch (err) {
       console.error(`[agentbox-http] Steer error for session ${sessionId}:`, err);
       const message = err instanceof Error ? err.message : "Steer failed";

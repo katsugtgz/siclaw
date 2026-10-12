@@ -216,7 +216,7 @@ export interface BrainSession {
   reload(): Promise<void>;
 
   /** Interrupt mid-run and inject a user message. */
-  steer(text: string, media?: PromptMedia): Promise<void>;
+  steer(text: string, media?: PromptMedia, delivery?: { messageId: string }): Promise<void>;
   /** Codex-only structured user questions. Never grants execution permission. */
   getPendingUserInput?(): NativeUserInputRequest | undefined;
   prepareUserInput?(answer: NativeUserInputAnswer): NativeUserInputAcceptance;
