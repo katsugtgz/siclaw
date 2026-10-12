@@ -63,3 +63,23 @@ Feishu WebSocket kept alive across both continued execution and failed delivery.
 The latter is a deterministic adapter test, not evidence that a real Feishu event
 subscription, card permission, or callback is configured correctly. Real IM
 acceptance remains a separate, user-triggered case.
+
+## Isolated channel acceptance reception
+
+The operator may set `SICLAW_CHANNEL_ACCEPTANCE_SCOPE` on an independent test
+Runtime to JSON with `agent_id`, explicit `group_ids`, and an optional
+`probe_nonce`. The normal default is unset, preserving existing channel behavior.
+Malformed scopes fail closed. The test Runtime starts only that Agent's
+personal Feishu channel, not shared or other Agent applications; direct handler
+starts use the same selection fence. Message/card callbacks outside the selected
+groups and observed private chats are ACKed without authorization RPC, binding,
+persistence, reply or task execution. Existing SiCore identity/RBAC remains
+authoritative for admitted messages; this fence never grants resources.
+
+An optional exact text probe (allowing the SDK's @-mention marker) logs only a
+candidate group's chat ID. It does not authorize that group or execute/reply.
+The operator must confirm the human-selected target and explicitly update
+`group_ids` before group acceptance. Private callback knowledge is per-handler,
+bounded, and discarded on restart: send a DM before using an old DM card again.
+This is a test deployment restriction, not a replacement for Agent-owned
+encrypted credentials, access tiers, group execution identity or write approval.

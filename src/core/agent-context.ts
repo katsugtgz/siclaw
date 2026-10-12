@@ -5,6 +5,7 @@ import {
   effectiveCapabilityKeys,
   requireAgentType,
   resolveAgentPromptLayers,
+  TICKET_RESULT_CONTRACT,
   type AgentType,
 } from "./agent-types.js";
 import { buildSystemPromptAssembly, type PromptAssembly } from "./prompt.js";
@@ -45,9 +46,21 @@ export interface CompileAgentContextInput {
   /** Child execution role is separate from the Agent's inherited business policy. */
   subagentPrompt?: string;
   isSubagent?: boolean;
+  /** Codex supplies update_plan itself; omit Pi task-tool instructions. */
+  nativePlanning?: boolean;
+  /** Codex owns its child-agent schema and instructions. */
+  nativeSubagents?: boolean;
+  /** Hosting application supplies native environment guidance, not Pi tool names. */
+  nativeInfrastructure?: boolean;
   interactiveProgress?: boolean;
   /** A conversation owner has a control emitter and an authorized handoff roster. */
   handoffAvailable?: boolean;
+  /**
+   * This dispatch carries a Ticket result contract. Absent means the instance
+   * defines no structured result, which is a legitimate Ticket configuration —
+   * an assistant that answers over many turns rather than closing one out.
+   */
+  structuredResultRequired?: boolean;
   handoffPolicy?: import("../shared/agent-handoff.js").HandoffPolicy;
   systemPromptTemplate?: string;
 }
@@ -163,14 +176,17 @@ export function resolveAgentHarness(
       (agentType === "knowledge_qa" || hasAnyTool(allowedTools, ["write", "edit", "skill_preview"])),
     includePlanningGuidance:
       !input.isSubagent &&
+      !input.nativePlanning &&
       resolution === "resolved" &&
       hasAnyTool(allowedTools, ["task_create", "task_update", "task_list", "task_get"]),
     includeSubagentGuidance:
+      !input.nativeSubagents &&
       !input.isSubagent &&
       resolution === "resolved" &&
       (input.mode === undefined || input.mode === "web" || input.mode === "channel") &&
       hasAnyTool(allowedTools, ["spawn_subagent"]),
     includeInfrastructureGuidance:
+      !input.nativeInfrastructure &&
       resolution === "resolved" &&
       (agentType === "sre" || agentType === "custom") &&
       hasAnyTool(allowedTools, ["cluster_list", "host_list"]),
@@ -207,11 +223,12 @@ export function compileAgentContext(input: CompileAgentContextInput): CompiledAg
       "explain the concrete limitation and ask for specific missing information or access. Do not claim " +
       "success, repeat failed checks without a new basis, or bypass this limit with another execution path."
     : undefined;
+  const resultContract = input.structuredResultRequired ? TICKET_RESULT_CONTRACT : undefined;
   const promptAssembly = buildSystemPromptAssembly({
     mode: input.mode,
     interactiveProgress: input.interactiveProgress ?? (input.mode === "web"),
     templateOverride: input.systemPromptTemplate,
-    agentTypePrompt: [agentPrompt.typeContract, handoffContract, handoffClosure].filter(Boolean).join("\n\n") || undefined,
+    agentTypePrompt: [agentPrompt.typeContract, resultContract, handoffContract, handoffClosure].filter(Boolean).join("\n\n") || undefined,
     agentAddendum: [agentPrompt.addendum, input.isSubagent ? input.subagentPrompt : undefined].filter(Boolean).join("\n\n"),
     memoryEnabled: harness.memoryEnabled,
     includeInfrastructureGuidance: harness.includeInfrastructureGuidance,

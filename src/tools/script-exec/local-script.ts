@@ -1,3 +1,4 @@
+import { argumentPathSecurityError } from "../infra/argument-path-security.js";
 import { BACKGROUND_EXEC_DESCRIPTION } from "../cmd-exec/background-launch.js";
 import type { ToolEntry, BackgroundExecWiring } from "../../core/tool-registry.js";
 import { Type } from "@sinclair/typebox";
@@ -102,6 +103,11 @@ Read the skill's SKILL.md first to understand required parameters and usage.`,
     }),
     async execute(toolCallId, rawParams, signal) {
       const params = rawParams as RunSkillParams;
+      const privateDirectory = kubeconfigRef?.credentialBroker?.getPrivateDirectory?.();
+      const argumentError = argumentPathSecurityError(parseArgs(params.args ?? ""), {
+        privateRoots: privateDirectory ? [privateDirectory] : [],
+      });
+      if (argumentError) return { content: [{ type: "text" as const, text: argumentError }], details: { error: true } };
       const skill = params.skill?.trim();
       const script = params.script?.trim();
 

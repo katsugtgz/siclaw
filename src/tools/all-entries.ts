@@ -5,6 +5,7 @@
  * Kept consistent with the original agent-factory.ts registration order.
  */
 
+
 import type { ToolEntry } from "../core/tool-registry.js";
 
 // cmd-exec

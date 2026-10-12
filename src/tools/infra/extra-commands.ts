@@ -10,6 +10,7 @@
  */
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
+import path from "node:path";
 import {
   ALL_COMMAND_CATEGORIES,
   ALL_EXEC_CONTEXTS,
@@ -72,7 +73,7 @@ const INTERPRETER_VERSION_PATTERN =
   /^(sh|bash|dash|ash|zsh|ksh|csh|tcsh|fish|python|perl|ruby|node|deno|bun|lua|php|tclsh|awk|gawk|sed)[0-9]/;
 
 const ALLOWED_ENTRY_KEYS = new Set([
-  "category", "description", "contexts",
+  "category", "description", "contexts", "executablePaths",
   "allowedFlags", "blockedFlags", "allowedSubcommands", "positionals", "requiredFlags",
   "credentialFreeSubcommands",
 ]);
@@ -138,6 +139,15 @@ function parseEntry(source: string, name: string, raw: unknown): CommandDef {
       fail(source, `"${name}".contexts must be a non-empty array drawn from: ${ALL_EXEC_CONTEXTS.join(", ")}`);
     }
     def.contexts = raw as string[];
+  }
+
+  if (entry.executablePaths !== undefined) {
+    const paths = entry.executablePaths;
+    if (!Array.isArray(paths) || paths.length === 0 || paths.some(value => typeof value !== "string" ||
+      !/^\/(?:usr|opt)\/[a-zA-Z0-9_./+-]+$/.test(value) || path.posix.normalize(value) !== value || path.posix.basename(value) !== name)) {
+      fail(source, `"${name}".executablePaths must list canonical absolute /usr or /opt paths whose basename is "${name}"`);
+    }
+    def.executablePaths = paths;
   }
 
   if (entry.allowedFlags !== undefined) def.allowedFlags = checkFlagArray(source, name, "allowedFlags", entry.allowedFlags);

@@ -8,6 +8,7 @@
  */
 
 import http from "node:http";
+import { resolveAgentEngine } from "../../shared/agent-engine.js";
 import path from "node:path";
 import type { BoxSpawner } from "./spawner.js";
 import type { AgentBoxConfig, AgentBoxHandle, AgentBoxInfo } from "./types.js";
@@ -141,9 +142,9 @@ export class LocalSpawner implements BoxSpawner {
     try {
       const db = getDb();
       const [rows] = await db.query(
-        "SELECT tool_capabilities, agent_type, subagent_models FROM agents WHERE id = ?",
+        "SELECT tool_capabilities, agent_type, agent_engine, web_search_mode, subagent_models FROM agents WHERE id = ?",
         [agentId],
-      ) as [Array<{ tool_capabilities?: unknown; agent_type?: unknown; subagent_models?: unknown }>, unknown];
+      ) as [Array<{ tool_capabilities?: unknown; agent_type?: unknown; agent_engine?: unknown; web_search_mode?: unknown; subagent_models?: unknown }>, unknown];
       if (rows.length !== 1) {
         throw new Error(`Expected exactly one agent row, got ${rows.length}`);
       }
@@ -151,6 +152,9 @@ export class LocalSpawner implements BoxSpawner {
       const agentType = requireAgentType(rows[0].agent_type);
       sessionManager.allowedToolsState = resolveCapabilities(effectiveCapabilityKeys(agentType, groupKeys));
       sessionManager.agentTypeState = agentType;
+      sessionManager.agentEngineState = resolveAgentEngine(rows[0].agent_engine);
+      const { resolveWebSearchMode } = await import("../../shared/web-search.js");
+      sessionManager.webSearchModeState = resolveWebSearchMode(rows[0].web_search_mode);
       sessionManager.harnessResolvedState = true;
 
       // Sub-agent tier MENU, resolved here for the same reason the capabilities are:

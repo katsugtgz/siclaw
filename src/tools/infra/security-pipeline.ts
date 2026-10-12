@@ -16,7 +16,8 @@ import {
 } from "./output-sanitizer.js";
 import { processToolOutput, sanitizeOutput } from "./tool-render.js";
 import { getCommandBinary, parseArgs } from "./command-sets.js";
-import { detectSensitiveResource, redactDocument, REDACTION_NOTICE, kubectlSubcommand } from "./kubectl-sanitize.js";
+import { detectSensitiveResource, redactDocument, redactDataDocument, REDACTION_NOTICE, kubectlSubcommand } from "./kubectl-sanitize.js";
+import { currentToolOutputContext } from "../../core/tool-output-context.js";
 
 // ── Pre-exec ────────────────────────────────────────────────────────
 
@@ -137,12 +138,25 @@ export function postExecSecurity(
   // it and suppress the result — dropping the exit code and stderr that are the
   // only evidence of what went wrong.
   let sanitized = stdout;
+  let documentRedacted = false;
   if (stdout.trim()) {
     sanitized = applySanitizer(sanitized, action, report);
     if (opts?.hasSensitiveKubectl) {
       sanitized = redactSensitiveContent(sanitized, report);
     }
+    // Generic diagnostics (curl, cat, zgrep) can print secrets without a
+    // command-specific output rule. Apply the complete-document policy before
+    // projection, artifact capture or delivery to either engine.
+    if (!action && !opts?.hasSensitiveKubectl) {
+      const document = redactDataDocument(sanitized);
+      sanitized = document.text;
+      documentRedacted = document.redacted;
+      if (documentRedacted) report?.(REDACTION_NOTICE.trim());
+    }
   }
+
+  const redact = currentToolOutputContext()?.redactOutput;
+  if (redact) sanitized = redact(sanitized);
 
   // Projection sits between sanitization and our own literals: it must see the command's document
   // and nothing we appended to it.
@@ -158,7 +172,7 @@ export function postExecSecurity(
     if (opts.notes) report!(redactDocument(opts.notes).text.trim());
     const data = {
       text: sanitizeOutput(sanitized),
-      stderr: sanitizeOutput(stderr.text),
+      stderr: sanitizeOutput(redact ? redact(stderr.text) : stderr.text),
       notices: notices.map(sanitizeOutput),
     };
     opts.onOutputData?.(data);
@@ -190,13 +204,14 @@ export function postExecSecurity(
   // about prose argues against it.
   if (opts?.stderr) {
     const { text: safeStderr, redacted: stderrRedacted } = redactDocument(opts.stderr);
-    combined += `\n\nSTDERR:\n${safeStderr}`;
+    combined += `\n\nSTDERR:\n${redact ? redact(safeStderr) : safeStderr}`;
     // Announce it once: the structural sanitizers above append their own notice, and two identical
     // warnings read as a bug. A secret found ONLY in stderr still has to be announced.
     if (stderrRedacted && !combined.includes(REDACTION_NOTICE.trim())) {
       combined += REDACTION_NOTICE;
     }
   }
+  if (documentRedacted && !combined.includes(REDACTION_NOTICE.trim())) combined += REDACTION_NOTICE;
   return processToolOutput(combined);
 }
 

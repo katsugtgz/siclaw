@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # AgentBox Docker Image — multi-stage build
 # Stage 1: build (tsc)
 # Stage 2: production runtime
@@ -49,6 +50,25 @@ COPY src/portal/cli-snapshot-types.ts ./src/portal/
 # Backend build (agentbox-specific tsconfig, excludes gateway server/portal/channel code)
 RUN npx tsc -p tsconfig.agentbox.json
 
+# Build Codex from Siclaw's reviewed main branch in the internal upstream mirror.
+FROM rust:1.95-bookworm AS codex-builder
+ARG CODEX_COMMIT=d4684bba63aba4c941d5a251054609e722b64779
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git openssh-client ca-certificates pkg-config libcap-dev clang make \
+    && rm -rf /var/lib/apt/lists/*
+COPY docker/gitlab-known-hosts /etc/ssh/ssh_known_hosts
+RUN --mount=type=ssh,required=true git init /src/codex \
+    && git -C /src/codex remote add origin git@gitlab.scitix-inner.ai:aiops/codex.git \
+    && git -C /src/codex fetch --depth 1 origin refs/heads/main \
+    && git -C /src/codex checkout --detach FETCH_HEAD \
+    && test "$(git -C /src/codex rev-parse HEAD)" = "${CODEX_COMMIT}"
+RUN cd /src/codex/codex-rs && cargo build --release --locked -p codex-cli --bin codex \
+    && target/release/codex --version
+RUN apt-get update && apt-get install -y --no-install-recommends curl python3 \
+    && rm -rf /var/lib/apt/lists/*
+COPY docker/build-codex-code-mode-host.sh /usr/local/bin/build-codex-code-mode-host.sh
+RUN bash /usr/local/bin/build-codex-code-mode-host.sh /src/codex
+
 # ── Production stage ─────────────────────────────────────────────
 FROM node:22.19-slim
 
@@ -59,6 +79,8 @@ FROM node:22.19-slim
 # context for restricted-bash only — node_exec resolves binaries in the node's namespaces and
 # pod_exec inside the target container, so neither gains anything from this layer.
 #   bsdextrautils — provides `column` (moved out of bsdmainutils on bookworm)
+#   ripgrep       — the `grep` tool runs `rg`; without it pi downloads the latest release from
+#                   GitHub at call time, which fails offline and otherwise runs an unreviewed binary
 #   yq            — mikefarah/yq, installed as a WRAPPER; see the yq layer below
 #   git           — NOT for the shell (it is not in the command whitelist and stays out of it):
 #                   the node process runs it, argv-only, against the read-only bare mirrors for
@@ -70,10 +92,18 @@ FROM node:22.19-slim
 # `latest` means the same source commit builds a different, unreviewed executable every time.
 ARG YQ_VERSION=v4.53.3
 ARG YQ_SHA256=fa52a4e758c63d38299163fbdd1edfb4c4963247918bf9c1c5d31d84789eded4
+#
+# kubectl is pinned and must prove it runs. Resolving "latest" at build time and saving whatever
+# came back once shipped a 239-byte object-store error page as /usr/local/bin/kubectl: the version
+# lookup failed on the build host, the URL lost its version segment, and curl without -f stored the
+# NoSuchKey XML. Every cluster read in the box then died before reaching an API server.
+ARG KUBECTL_VERSION=v1.36.4
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl jq python3 ca-certificates sudo fonts-noto-cjk chromium bsdextrautils git \
-    && curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" \
-    && chmod +x kubectl && mv kubectl /usr/local/bin/ \
+    curl jq python3 ca-certificates sudo fonts-noto-cjk chromium bsdextrautils git ripgrep libcap2 bubblewrap \
+    && curl -fsSL --retry 3 -o /usr/local/bin/kubectl \
+       "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" \
+    && chmod +x /usr/local/bin/kubectl \
+    && /usr/local/bin/kubectl version --client \
     && rm -rf /var/lib/apt/lists/*
 
 # yq: real binary under a name the command whitelist does not admit, reached only through a wrapper
@@ -112,6 +142,11 @@ COPY package*.json ./
 COPY patches/ ./patches/
 COPY scripts/install/ ./scripts/install/
 RUN npm ci --omit=dev
+
+# Copy only the binary from the official source build, never an npm wrapper.
+COPY --from=codex-builder /src/codex/codex-rs/target/release/codex /usr/local/bin/codex
+COPY --from=codex-builder /src/codex/codex-rs/target/release/codex-code-mode-host /usr/local/bin/codex-code-mode-host
+RUN codex --version && codex-code-mode-host --help >/dev/null && bwrap --version
 
 # Copy compiled JS + skills + entrypoint (knowledge synced at runtime via bundle API)
 COPY --from=builder /app/dist/ ./dist/

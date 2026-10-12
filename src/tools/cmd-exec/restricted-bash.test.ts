@@ -18,6 +18,14 @@ import {
 import { extractPipeline } from "../infra/command-validator.js";
 import { preExecSecurity } from "../infra/security-pipeline.js";
 
+it("rejects model overrides of the trusted delivery credential path before prefetch", async () => {
+  const tool = createRestrictedBashTool();
+  const result = await tool.execute("override", {
+    command: "SIFORGECTL_CREDENTIAL_FILE=/other/grant/credential.json echo denied",
+  }, undefined, undefined, {} as never);
+  expect(JSON.stringify(result)).toContain("delivery credential path is owned by the execution grant");
+});
+
 function expectAllowedByRestrictedBashGate(command: string) {
   const pre = preExecSecurity(command, {
     context: "local",
@@ -1937,6 +1945,7 @@ describe("restricted_bash — siforgectl delivery credential", () => {
     const calls: string[] = [];
     const broker = {
       ensureDevopsCredential: async (purpose: string) => { calls.push(purpose); return ensure(); },
+      getDevopsCredentialPath: () => "/tmp/does-not-matter/devops/siforge.json",
     };
     const tool = createRestrictedBashTool({
       credentialsDir: "/tmp/does-not-matter",
@@ -1947,8 +1956,9 @@ describe("restricted_bash — siforgectl delivery credential", () => {
 
   it("asks the broker before running siforgectl", async () => {
     const { tool, calls } = toolWithBroker(async () => {});
-    await tool.execute!("t1", { command: "siforgectl describe" }, undefined as any);
+    const result = await tool.execute!("t1", { command: "siforgectl describe" }, undefined as any);
     expect(calls).toEqual(["restricted_bash"]);
+    expect(result.details?.reason).not.toBe("devops_credential_unavailable");
   });
 
   it("does not ask for a command that does not use it", async () => {

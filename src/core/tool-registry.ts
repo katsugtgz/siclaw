@@ -424,6 +424,11 @@ export type SessionEventEmitter = (event: Record<string, unknown>) => void;
 
 /** All dependencies shared by tool factory functions. */
 export interface ToolRefs {
+  executionClient?: import("../agentbox/gateway-client.js").GatewayClient;
+  /** Production API probing is distinct from read-only fleet metadata. */
+  allowClusterProbe?: boolean;
+  /** Product feedback persistence belongs to this framework session, not memory. */
+  feedbackContext?: Omit<import("./session-feedback-service.js").SessionFeedbackContext, "sessionId">;
   scriptExecutor?: import("../script-sandbox/types.js").ScriptExecutor;
   scriptSandboxInfo?: import("../script-sandbox/types.js").ScriptSandboxInfo;
   kubeconfigRef: KubeconfigRef;

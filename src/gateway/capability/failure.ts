@@ -7,6 +7,7 @@
  */
 
 import type { CapabilityRunFailure } from "./contract.js";
+import { RpcResponseError } from "../../lib/error-envelope.js";
 
 /** Safe short-reason cap persisted in the opaque checkpoint / logs. */
 export const FAILURE_MESSAGE_MAX = 256;
@@ -117,4 +118,33 @@ export function structuredBoxFailure(evt: BoxErrorLike): CapabilityRunFailure {
     exception_class: exceptionClass,
     message,
   })!;
+}
+
+/** The code a compile box answers when it can never accept a session's configuration. */
+export const BOX_SESSION_CONFIG_INVALID = "session_config_invalid";
+
+/**
+ * Classify a `capability.start` failure. Only a box that explicitly refuses its
+ * session configuration ends the run as `spawn_config_refused`, which consumers
+ * treat as terminal instead of retrying the same frozen configuration. Other
+ * 4xx answers (a client-certificate rejection, an oversized body) default to
+ * non-retriable by status alone and say nothing about the configuration, so
+ * they, like everything else, stay `start_failed`.
+ */
+export function capabilityStartFailure(err: unknown): CapabilityRunFailure {
+  const exceptionClass = err instanceof Error ? asFailureToken(err.name) : undefined;
+  if (err instanceof RpcResponseError && err.code === BOX_SESSION_CONFIG_INVALID && err.retriable === false) {
+    return {
+      code: "spawn_config_refused",
+      stage: "capability_start",
+      ...(exceptionClass ? { exception_class: exceptionClass } : {}),
+      message: `spawn_config_refused:${BOX_SESSION_CONFIG_INVALID}`,
+    };
+  }
+  return {
+    code: "start_failed",
+    stage: "capability_start",
+    ...(exceptionClass ? { exception_class: exceptionClass } : {}),
+    message: `start_failed:${exceptionClass ?? "Error"}`,
+  };
 }

@@ -216,6 +216,8 @@ describe("createToolsHandler", () => {
       allowedToolsState: ["read", "grep"],
       harnessResolvedState: true,
       agentTypeState: "product_support",
+      agentEngineState: "pi-agent",
+      webSearchModeState: "disabled",
       subagentTierMenuState: null,
     });
   });
@@ -1116,20 +1118,20 @@ describe("skill directory resolution", () => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  // ── 1. server mode: resolved/ exists → use resolved/ + platform/ ──────
-  it("server mode: resolved/ takes priority over core/ and extension/ when it exists", () => {
+  // Bundles omit baked core assets. Keep bundle precedence while discovering
+  // authorized image roots; filterHarnessSkills applies disable/name masks.
+  it("server mode: resolved/ retains priority alongside authorized image roots", () => {
     const resolvedDir = path.join(skillsBase, "resolved");
     const platformDir = path.join(tmpDir, "skills", "platform");
     fs.mkdirSync(resolvedDir, { recursive: true });
     fs.mkdirSync(platformDir, { recursive: true });
-    // Also create core/ and extension/ to confirm they are NOT included
+    // Bundles exclude these image roots; they remain eligible for overlay filtering.
     fs.mkdirSync(path.join(tmpDir, "skills", "core"), { recursive: true });
     fs.mkdirSync(path.join(tmpDir, "skills", "extension"), { recursive: true });
 
     const result = resolveSkillDirs(tmpDir, skillsBase);
-    expect(result).toEqual([resolvedDir, platformDir]);
-    expect(result).not.toContain(path.join(tmpDir, "skills", "core"));
-    expect(result).not.toContain(path.join(tmpDir, "skills", "extension"));
+    expect(result).toEqual([resolvedDir, path.join(tmpDir, "skills", "core"),
+      path.join(tmpDir, "skills", "extension"), platformDir]);
   });
 
   // ── 2. server mode: resolved/ exists, no platform/ → use resolved/ only

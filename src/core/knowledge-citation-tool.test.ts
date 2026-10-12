@@ -1198,3 +1198,26 @@ sources:
     expect(normalizedResource("/foo.md")).toBe("/foo.md");
   });
 });
+
+it("pins source positions to the read page bytes and merges positions across cite calls", async () => {
+  const { createHash } = await import("node:crypto");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "knowledge-positions-"));
+  try {
+    const text = '---\nsources:\n- resource: a.md\n  id: src\n---\n<!-- okf:evidence {"id":"one","sources":["src"]} -->\n# One\nFirst fact.\n<!-- okf:evidence {"id":"two","sources":["src"]} -->\n# Two\nSecond fact.\n';
+    const hash = createHash("sha256").update(text).digest("hex");
+    const page = path.join(dir, "repos", "library", "guide.md");
+    fs.mkdirSync(path.dirname(page), { recursive: true });
+    fs.writeFileSync(page, text);
+    const location = { page: "guide.md", page_sha256: hash, raw_sha256: "b".repeat(64), evidence_id: "one", start_line: 3, end_line: 3, excerpt: "First fact." };
+    fs.writeFileSync(path.join(dir, KNOWLEDGE_CITATION_MANIFEST), JSON.stringify({ version: 1, repos: [{ id: "repo", root: "repos/library", sources: [{ sourceId: "src", resource: "a.md", title: "A", url: "https://example.com/a", locations: [location, { ...location, evidence_id: "two", start_line: 5, end_line: 5 }, { ...location, page_sha256: "f".repeat(64), start_line: 9, end_line: 9 }] }] }] }));
+    const events: any[] = [];
+    const support = createKnowledgeCitationSupport({ knowledgeDir: dir, turnRef: { current: 1 }, sessionEventEmitter: (e) => events.push(e) });
+    support.noteRead(page, text, support.captureMount());
+    await support.tool.execute("first", { evidence_refs: ["repos/library/guide.md#one"] } as never);
+    expect(events.at(-1).sources[0].locations).toEqual([location]);
+    await support.tool.execute("second", { evidence_refs: ["repos/library/guide.md#two"] } as never);
+    expect(events.at(-1).sources).toHaveLength(1);
+    expect(events.at(-1).sources[0].locations).toHaveLength(2);
+    expect(events.at(-1).sources[0].locations.map((l: any) => l.start_line)).toEqual([3, 5]);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});

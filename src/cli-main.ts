@@ -191,6 +191,7 @@ const buildSiclawOpts = (sm: SessionManager) => ({
 
 const { session, services, modelFallbackMessage, memoryIndexer, knowledgeIndexer, mcpManager } =
   await createSiclawSession(buildSiclawOpts(sessionManager));
+if (!session) throw new Error("The headless print runtime requires the Pi engine");
 cliBackgroundHost.setSession(session);
 disposeActiveSession = () => session.dispose();
 
@@ -198,8 +199,9 @@ disposeActiveSession = () => session.dispose();
 // configuration if an extension recreates its session.
 const createRuntime: CreateAgentSessionRuntimeFactory = async ({ sessionManager: sm }) => {
   const recreated = await createSiclawSession(buildSiclawOpts(sm));
+  if (!recreated.session) throw new Error("The headless print runtime requires the Pi engine");
   cliBackgroundHost.setSession(recreated.session);
-  disposeActiveSession = () => recreated.session.dispose();
+  disposeActiveSession = () => recreated.session!.dispose();
   return {
     session: recreated.session,
     services: recreated.services,

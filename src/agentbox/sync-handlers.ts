@@ -10,6 +10,8 @@
  */
 
 import { LIBRARY_INTRODUCTION_FILE, libraryIntroductionPreview, readLibraryIntroduction } from "../knowledge/library-introduction.js";
+import { resolveAgentEngine, type AgentEngine } from "../shared/agent-engine.js";
+import { resolveWebSearchMode, type WebSearchMode } from "../shared/web-search.js";
 import fs from "node:fs";
 import { AGENT_TYPES } from "../core/agent-types.js";
 import path from "node:path";
@@ -915,6 +917,8 @@ export function createHostHandler(broker: CredentialBroker): AgentBoxSyncHandler
  * unrestricted Custom only).
  */
 interface ToolsPayload {
+  agentEngine?: AgentEngine;
+  webSearchMode?: WebSearchMode;
   allowedTools: string[] | null;
   /** Agent type — drives capabilities and prompt fallback. */
   agentType: string;
@@ -950,6 +954,8 @@ const VALID_AGENT_TYPES: ReadonlySet<string> = new Set(Object.keys(AGENT_TYPES))
  * suite. Structural typing keeps sync-handlers.ts a leaf module.
  */
 export interface ToolsStateTarget {
+  agentEngineState?: AgentEngine;
+  webSearchModeState?: WebSearchMode;
   allowedToolsState: string[] | null;
   harnessResolvedState?: boolean;
   /** Agent type resolved from the tool-capabilities payload. */
@@ -1003,6 +1009,10 @@ export function createToolsHandler(
           (allowed === null && payload?.agentType !== "custom")) {
         throw new Error("[tools] Invalid tool-capabilities payload");
       }
+      const engine = resolveAgentEngine(payload.agentEngine);
+      const searchMode = resolveWebSearchMode(payload.webSearchMode);
+      target.agentEngineState = engine;
+      target.webSearchModeState = searchMode;
       target.allowedToolsState = allowed;
       target.agentTypeState = payload.agentType;
       target.harnessResolvedState = true;

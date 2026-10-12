@@ -2,6 +2,11 @@ import { describe, it, expect } from "vitest";
 import { sanitizeEnv } from "./sanitize-env.js";
 
 describe("sanitizeEnv", () => {
+  it("never lets a safe configuration prefix override a sensitive suffix",()=>{
+    const result=sanitizeEnv({NODE_AUTH_TOKEN:"node-canary",NPM_CONFIG_PASSWORD:"npm-canary",HOME_API_KEY:"home-canary",
+      PATH_TOKEN:"path-canary",XDG_SECRET:"xdg-canary",KUBECONFIG_TOKEN:"kube-canary",NODE_ENV:"production",NPM_CONFIG_CACHE:"/cache",PATH:"/usr/bin"});
+    expect(result).toEqual({NODE_ENV:"production",NPM_CONFIG_CACHE:"/cache",PATH:"/usr/bin"});
+  });
   it("blocks SICLAW_LLM_API_KEY", () => {
     const result = sanitizeEnv({ SICLAW_LLM_API_KEY: "sk-secret", PATH: "/usr/bin" });
     expect(result).not.toHaveProperty("SICLAW_LLM_API_KEY");

@@ -43,6 +43,8 @@ export type OutputAction = {
   type: "sanitize";
   sanitize: (output: string, report?: SanitizationNoticeSink) => string;
   lineSafe: boolean;
+  /** Stateful native streaming contract; Pi's complete-document API is unchanged. */
+  streamMode?: "text" | "json" | "env" | "env-nul" | "suppress";
 };
 
 /** Rule function: analyze user command args, return action or null */
@@ -103,7 +105,7 @@ OUTPUT_RULES["kubectl"] = (args) => {
   if (sub === "describe") {
     const resource = detectSensitiveResource(args);
     if (resource && resource !== "secret") {
-      return { type: "sanitize", sanitize: redactSensitiveContent, lineSafe: false };
+      return { type: "sanitize", sanitize: redactSensitiveContent, lineSafe: false, streamMode: "text" };
     }
     return null;
   }
@@ -118,7 +120,7 @@ OUTPUT_RULES["kubectl"] = (args) => {
 
   // -o json → structural sanitization (precise)
   if (fmt === "json") {
-    return { type: "sanitize", sanitize: makeKubectlJsonSanitizer(resource), lineSafe: false };
+    return { type: "sanitize", sanitize: makeKubectlJsonSanitizer(resource), lineSafe: false, streamMode: "json" };
   }
 
   // table / wide / name → safe, no sanitization needed
@@ -126,7 +128,7 @@ OUTPUT_RULES["kubectl"] = (args) => {
   if (!fmt || safeFormats.has(fmt)) return null;
 
   // All other formats (yaml, jsonpath, go-template, custom-columns) → line-level sanitization
-  return { type: "sanitize", sanitize: redactSensitiveContent, lineSafe: false };
+  return { type: "sanitize", sanitize: redactSensitiveContent, lineSafe: false, streamMode: "text" };
 };
 
 // ── File-reading command rules ──────────────────────────────────────
@@ -145,6 +147,7 @@ const fileReadingRule: OutputRuleFn = (_args) => ({
   // with the redaction notice attached. `false` makes the existing fail-closed guard in
   // SanitizingLineBuffer refuse to background these commands instead.
   lineSafe: false,
+  streamMode: "text",
 });
 
 for (const cmd of [
@@ -231,6 +234,7 @@ OUTPUT_RULES["env"] = (args) => {
   return {
     type: "sanitize",
     sanitize: (out, report) => redactEnvOutput(out, nul ? { separator: NUL_SEPARATOR } : undefined, report),
+    streamMode: nul ? "env-nul" : "env",
     // NEVER line-safe, NUL or not. `redactEnvOutput` folds continuation lines: a value containing a
     // newline is one env RECORD spanning several lines, and the sanitizer joins them before matching —
     // which is the whole reason a multi-line `PASSWORD=…` is covered. A per-batch streaming call has no
@@ -245,11 +249,13 @@ OUTPUT_RULES["printenv"] = (args) => {
   const names = args.filter((a) => !a.startsWith("-"));
   const nul = envNulSeparated(args);
   if (names.length > 0) {
-    return { type: "sanitize", sanitize: redactBareEnvValue(names), lineSafe: false };
+    return { type: "sanitize", sanitize: redactBareEnvValue(names), lineSafe: false,
+      streamMode: names.some(n => SENSITIVE_ENV_NAME_PATTERNS.some(p => p.test(n))) ? "suppress" : nul ? "env-nul" : "env" };
   }
   return {
     type: "sanitize",
     sanitize: (out, report) => redactEnvOutput(out, nul ? { separator: NUL_SEPARATOR } : undefined, report),
+    streamMode: nul ? "env-nul" : "env",
     // Same reasoning as `env` above: this redactor folds continuation lines, so a record spanning lines
     // cannot be redacted a batch at a time. Fixing only `env` left this half of the same rule behind.
     lineSafe: false,
@@ -311,7 +317,7 @@ OUTPUT_RULES["crictl"] = (args) => {
   // read as subcommand `<sock>` and no sanitizer attached, so the container's env came back verbatim.
   const sub = crictlSubcommand(args);
   if (sub === "inspect" || sub === "inspecti" || sub === "inspectp") {
-    return { type: "sanitize", sanitize: sanitizeCrictlInspect, lineSafe: false };
+    return { type: "sanitize", sanitize: sanitizeCrictlInspect, lineSafe: false, streamMode: "json" };
   }
   return null;
 };

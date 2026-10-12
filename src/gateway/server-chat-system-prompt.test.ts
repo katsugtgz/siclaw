@@ -50,6 +50,7 @@ const promptCalls: Array<{
   systemPromptTemplate?: string;
   sessionId: string;
   requiredResultToolName?: string;
+  toolPolicy?: string;
 }> = [];
 vi.mock("./agentbox/client.js", () => ({
   AgentBoxClient: class {
@@ -108,7 +109,7 @@ async function bootRuntime() {
     config: { port: 0, internalPort: 0, host: "127.0.0.1", serverUrl: "", portalSecret: "" } as any,
     agentBoxManager: fakeAgentBoxManager(),
     frontendClient: fakeFrontendClient(),
-    credentialService: {} as any,
+    credentialService: { attachGrants: () => {}, resolveActorResources: async () => ({ clusters: [], hosts: [] }) } as any,
   });
 }
 
@@ -172,11 +173,13 @@ describe("startRuntime — chat.send custom system prompt", () => {
       sessionId: "strict-result",
       requiredResultToolName: "mcp__result__submit",
       requireSessionPersistence: true,
+      toolPolicy: "ticket_fill_once",
     }, { sendEvent: vi.fn() }) as { strictResultProtocolVersion?: number };
     await waitFor(() => promptCalls.length > 0);
 
     expect(promptCalls[0].requiredResultToolName).toBe("mcp__result__submit");
     expect(ack.strictResultProtocolVersion).toBe(1);
+    expect(promptCalls[0].toolPolicy).toBe("ticket_fill_once");
   });
 
   it("does not advertise strict protocol support for a partial opt-in", async () => {

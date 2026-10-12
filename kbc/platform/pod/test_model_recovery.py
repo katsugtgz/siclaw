@@ -3,6 +3,7 @@
 from copy import deepcopy
 from contextlib import asynccontextmanager
 import asyncio
+import json
 import uuid
 import pytest
 import model_access
@@ -84,19 +85,23 @@ async def test_rejected_key_rotates_inside_same_model_request(protocol):
         async with session.post(url, json={"messages": [{"role": "tool", "content": "already executed"}]}) as response:
             assert response.status == 200
             assert (await response.json())["answer"] == "recovered"
-        assert len(calls) == len(refreshes) == 2
+        # Static keys never refresh ahead: only the rejection asks for one.
+        assert len(calls) == 2 and len(refreshes) == 1
         assert calls[0]["body"] == calls[1]["body"]
         assert "old-key" not in str(refreshes) and "new-key" not in str(refreshes)
 
 
-@pytest.mark.parametrize("status,expected_calls", [(503, 2), (429, 2), (402, 1), (401, 2), (400, 1)])
-async def test_recovery_is_bounded_and_does_not_retry_unchanged_billing_refusal(status, expected_calls):
+@pytest.mark.parametrize("status,expected_calls,expected_refreshes",
+                         [(503, 2, 0), (429, 2, 0), (402, 1, 1), (401, 2, 1), (400, 1, 0)])
+async def test_recovery_is_bounded_and_does_not_retry_unchanged_billing_refusal(status, expected_calls, expected_refreshes):
     async def respond(request, calls, current):
         return web.json_response({"error": "unavailable"}, status=status)
     async with recovery_proxy(respond) as (session, url, calls, refreshes):
         async with session.post(url, json={}) as response:
             assert response.status == status
         assert len(calls) == expected_calls
+        # Only a rejected credential waits for the control plane.
+        assert len(refreshes) == expected_refreshes
 
 
 async def test_transient_provider_recovers_without_replaying_a_turn():
@@ -108,13 +113,51 @@ async def test_transient_provider_recovers_without_replaying_a_turn():
         assert len(calls) == 2
 
 
-async def test_refresh_failure_never_sends_stale_key_to_provider():
+async def test_static_key_is_used_without_waiting_for_the_control_plane():
     async def respond(request, calls, current):
-        raise AssertionError("must not call upstream")
-    async with recovery_proxy(respond, refresh_error=True) as (session, url, calls, _):
+        assert request.headers["Authorization"] == "Bearer old-key"
+        return web.json_response({"answer": "ok"})
+    async with recovery_proxy(respond, refresh_error=True) as (session, url, calls, refreshes):
         async with session.post(url, json={}) as response:
-            assert response.status == 503
-        assert calls == []
+            assert response.status == 200
+        assert len(calls) == 1 and refreshes == []
+
+
+async def test_failed_refresh_after_rejection_returns_the_providers_answer():
+    async def respond(request, calls, current):
+        return web.json_response({"error": {"message": "invalid key"}}, status=401)
+    async with recovery_proxy(respond, refresh_error=True) as (session, url, calls, refreshes):
+        async with session.post(url, json={}) as response:
+            # The provider's authentication failure, not a synthetic 503.
+            assert response.status == 401
+            assert "invalid key" in await response.text()
+        assert len(calls) == 2 and len(refreshes) == 1
+        target = next(iter(model_access._routes.values()))
+        assert target["refresh_failures"] == 1 and target["api_key"] == "old-key"
+        # A second rejection right after a failed refresh does not wait again.
+        async with session.post(url, json={}) as response:
+            assert response.status == 401
+        assert len(calls) == 4 and len(refreshes) == 1
+
+
+async def test_unanswered_refresh_never_delays_a_rotating_bearer(monkeypatch):
+    monkeypatch.setattr(model_access, "_REFRESH_TIMEOUT_SECS", 0.2)
+    async def respond(request, calls, current):
+        return web.json_response({"answer": "ok"})
+    async with recovery_proxy(respond, protocol="openai-codex-responses") as (session, url, calls, refreshes):
+        target = next(iter(model_access._routes.values()))
+        target["attempted"] -= model_access._REFRESH_AHEAD_SECS
+        emitted = []
+        async def silent(event):
+            emitted.append(event)  # the control plane never answers
+        monkeypatch.setattr(model_access, "_emit", silent)
+        started = asyncio.get_running_loop().time()
+        async with session.post(url, json={}) as response:
+            assert response.status == 200
+        assert asyncio.get_running_loop().time() - started < 0.2
+        assert [event["type"] for event in emitted] == ["refresh_credentials"]
+        await target["refresh"]
+        assert target["refresh_failures"] == 1 and target["api_key"] == "old-key"
 
 
 async def test_credential_refresh_rejects_partial_contract_change_atomically(monkeypatch):
@@ -273,7 +316,7 @@ async def test_parallel_key_failures_share_one_rotation():
                 assert response.status == 200
                 await response.read()
         await asyncio.gather(*(ask() for _ in range(5)))
-        assert len(refreshes) == 2
+        assert len(refreshes) == 1
 
 
 async def test_cancelled_refresh_releases_pending_request(monkeypatch):
@@ -281,12 +324,162 @@ async def test_cancelled_refresh_releases_pending_request(monkeypatch):
     async def emit(event):
         emitted.set()
     monkeypatch.setattr(model_access, "_emit", emit)
-    monkeypatch.setattr(model_access, "_lock", asyncio.Lock())
     monkeypatch.setattr(model_access, "_pending", {})
-    target = {"identity": {"source_model_id": "fixture"}, "api_key": "old", "refreshed": 0.0}
-    task = asyncio.create_task(model_access.refresh(target))
+    target = {"identity": {"source_model_id": "fixture", "api": "openai-completions"}, "api_key": "old",
+              "attempted": 0.0, "refresh": None, "refresh_failures": 0}
+    waiter = asyncio.create_task(model_access.refresh_rejected(target, "old"))
     await emitted.wait()
-    task.cancel()
+    # A cancelled waiter leaves the shared refresh running for other requests.
+    waiter.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await task
+        await waiter
+    assert not target["refresh"].done()
+    target["refresh"].cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await target["refresh"]
     assert model_access._pending == {}
+
+
+def _codex_jwt(account, marker):
+    import base64
+    def part(value):
+        return base64.urlsafe_b64encode(json.dumps(value).encode()).decode().rstrip("=")
+    return ".".join([part({"alg": "none"}), part({"https://api.openai.com/auth": {"chatgpt_account_id": account},
+                                                  "marker": marker}), "signature"])
+
+
+def test_codex_subscription_api_is_a_valid_pi_protocol():
+    config = execution()
+    config["roles"]["compile"]["model"]["api"] = "openai-codex-responses"
+    config["roles"]["compile"]["auth_header"] = False
+    pi_config.validate_execution(config)
+    config["roles"]["compile"]["model"]["api"] = "openai-mystery"
+    with pytest.raises(ValueError, match="Unsupported Pi model protocol"):
+        pi_config.validate_execution(config)
+
+
+async def test_real_pi_worker_runs_codex_subscription_through_live_transport(tmp_path):
+    from pi_engine import PiAgentClient
+    from test_pi_engine import collect
+    from test_pi_responses import response
+    old_key, new_key = _codex_jwt("acct-fixture", "old"), _codex_jwt("acct-fixture", "new")
+    posts, upgrades, refreshes = [], [], []
+
+    async def codex(request):
+        if request.method != "POST":
+            upgrades.append(request.method)
+            return web.Response(status=426)
+        posts.append(dict(request.headers))
+        await request.read()
+        if len(posts) == 1:
+            return web.json_response({"error": {"message": "expired"}}, status=401)
+        return response(text="codex answer")
+
+    upstream_app = web.Application()
+    upstream_app.router.add_route("*", "/v1/codex/responses", codex)
+    # The real Codex backend decodes zstd bodies; the fixture only needs the raw bytes.
+    upstream_runner = web.AppRunner(upstream_app, auto_decompress=False)
+    await upstream_runner.setup()
+    upstream_site = web.TCPSite(upstream_runner, "127.0.0.1", 0)
+    await upstream_site.start()
+    upstream_url = f"http://127.0.0.1:{upstream_site._server.sockets[0].getsockname()[1]}/v1"
+    try:
+        app = web.Application()
+        app.on_startup.append(model_access.start)
+        app.router.add_post("/model-credentials/{run_id}/{request_id}", model_access.receive)
+        async with TestClient(TestServer(app)) as control:
+            async def emit(event):
+                refreshes.append(event)
+                async with control.post("/model-credentials/run/" + event["request_id"], json={"api_key": new_key}) as reply:
+                    assert reply.status == 200
+            model_access.configure("run", emit)
+            config = execution(old_key)["roles"]["compile"]
+            config["model"].update({"api": "openai-codex-responses", "baseUrl": upstream_url,
+                                    "reasoning": True, "input": ["text", "image"]})
+            config["auth_header"] = False
+            client = PiAgentClient(cwd=str(tmp_path), system_prompt="Answer briefly.", session_id="codex-subscription",
+                                   model_config=model_access.route(config), tools=[])
+            try:
+                await client.connect()
+                await client.query("Say hello")
+                events = await collect(client)
+            finally:
+                await client.disconnect()
+    finally:
+        await upstream_runner.cleanup()
+    assert events[-1].data["outcome"] == "completed", events[-1].data.get("error")
+    assert upgrades == [], "the loopback transport carries HTTP only; no WebSocket upgrade may be attempted"
+    assert len(posts) == 2 and len(refreshes) == 1  # the rejected-bearer refresh
+    assert all(headers.get("chatgpt-account-id") == "acct-fixture" for headers in posts)
+    assert posts[1]["Authorization"] == "Bearer " + new_key
+    assert old_key not in str(refreshes) and new_key not in str(refreshes)
+
+
+async def test_refused_session_configuration_is_structured_and_not_registered(tmp_path, monkeypatch):
+    monkeypatch.setattr(compile_box, "RUNS", {})
+    app = web.Application()
+    app.router.add_post("/session/{run_id}", compile_box.handle_session)
+    broken = execution()
+    broken["roles"]["compile"]["model"]["api"] = "openai-mystery"
+    async with TestClient(TestServer(app)) as client:
+        response = await client.post("/session/refused-run", json={
+            "workdir": str(tmp_path), "llm": {"engine": "pi_agent", "execution": broken}})
+        assert response.status == 422
+        body = await response.json()
+    assert body["error"]["code"] == "session_config_invalid"
+    assert body["error"]["retriable"] is False
+    assert "refused-run" not in compile_box.RUNS
+
+
+async def test_unexpected_handler_failure_returns_a_structured_summary():
+    async def explode(_request):
+        raise RuntimeError("seed directory missing\nsecond line stays out")
+    app = web.Application(middlewares=[compile_box._unhandled_error_middleware])
+    app.router.add_post("/boom", explode)
+    async with TestClient(TestServer(app)) as client:
+        response = await client.post("/boom")
+        assert response.status == 500
+        body = await response.json()
+    assert body["error"] == {"code": "box_internal_error", "retriable": True,
+                             "message": "RuntimeError: seed directory missing"}
+
+
+async def test_handler_failure_after_a_started_stream_leaves_the_stream_to_aiohttp():
+    async def stream_then_explode(request):
+        response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        await response.write(b"data: one\n\n")
+        raise RuntimeError("relay broke mid-stream")
+    app = web.Application(middlewares=[compile_box._unhandled_error_middleware])
+    app.router.add_get("/events", stream_then_explode)
+    server = TestServer(app)
+    await server.start_server()
+    try:
+        reader, writer = await asyncio.open_connection(server.host, server.port)
+        writer.write(b"GET /events HTTP/1.1\r\nHost: box\r\n\r\n")
+        await writer.drain()
+        raw, closed = b"", False
+        try:
+            while chunk := await asyncio.wait_for(reader.read(4096), 2):
+                raw += chunk
+            closed = True
+        except asyncio.TimeoutError:
+            pass
+        writer.close()
+    finally:
+        await server.close()
+    # A second status line inside the chunked body desynchronises the relay; the
+    # broken stream must end with the connection closed instead.
+    assert b"data: one" in raw
+    assert raw.count(b"HTTP/1.1 ") == 1, raw
+    assert closed
+
+
+async def test_handler_timeout_keeps_aiohttps_gateway_timeout():
+    async def time_out(_request):
+        raise asyncio.TimeoutError()
+    app = web.Application(middlewares=[compile_box._unhandled_error_middleware])
+    app.router.add_post("/slow", time_out)
+    async with TestClient(TestServer(app)) as client:
+        response = await client.post("/slow")
+        assert response.status == 504

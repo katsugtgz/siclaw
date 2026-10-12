@@ -5,6 +5,7 @@ import { LocalScriptTraffic, type ScriptTrafficAdmission } from "../../script-sa
 import { SandboxCallbackUncertainError } from "../../shared/sandbox-tool-types.js";
 import { SandboxToolError } from "../../script-sandbox/errors.js";
 import { createMcpToolDefinition } from "../../core/mcp-client.js";
+import { McpModelSecurity, mcpSensitiveValues } from "../../core/mcp-security.js";
 import { normalizeAgentType, effectiveCapabilityKeys } from "../../core/agent-types.js";
 import { resolveCapabilities } from "../../core/tool-capabilities.js";
 import { kubeConnection } from "../../tools/infra/inline-kubeconfig.js";
@@ -219,7 +220,8 @@ export class ReadOnlyScriptBroker implements ScriptBroker {
           await client.connect(transport);
           // Share the exact Agent MCP tool factory while keeping this transport's
           // byte limits, credential snapshot, HTTPS and no-redirect policy.
-          const tool = createMcpToolDefinition(a.server, undefined, { name: a.tool }, client, 15_000, { includeRawResult: true });
+          const tool = createMcpToolDefinition(a.server, undefined, { name: a.tool }, client, 15_000,
+            { includeRawResult: true, security: new McpModelSecurity(() => mcpSensitiveValues({ approved: grant.mcp })) });
           const result = await tool.execute(call.id, { ...a.arguments, ...policy.fixedArguments }, boundedSignal, undefined, {} as any);
           const details = result.details as { rawResult?: unknown; execution?: "NOT_DISPATCHED" | "FINISHED" | "UNKNOWN" };
           if (!details?.rawResult) {

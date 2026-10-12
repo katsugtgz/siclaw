@@ -252,10 +252,20 @@ export async function sshExecStream(
   });
   try {
     const handle = await runCommandStream(client, command, options);
-    // Tear the chain down once the remote command closes (or is aborted, which
-    // closes the channel → resolves done). finally so a rejected done still cleans up.
-    void handle.done.finally(() => { try { teardown(); } catch { /* already gone */ } });
-    return handle;
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      options.signal?.removeEventListener("abort", abort);
+      try { teardown(); } catch { /* already gone */ }
+    };
+    const abort = () => { try { handle.abort(); } finally { release(); } };
+    // Channel close needs a peer acknowledgement and may never resolve done.
+    // Stop must release the entire owned chain independently of that reply.
+    options.signal?.addEventListener("abort", abort, { once: true });
+    void handle.done.then(release, release);
+    if (options.signal?.aborted) abort();
+    return { ...handle, abort };
   } catch (err) {
     teardown();
     throw err;

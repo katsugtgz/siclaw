@@ -250,6 +250,23 @@ describe("GatewayClient — agent task CRUD", () => {
     expect(tasks).toEqual([{ id: "t1", name: "cron1", schedule: "* * * * *", status: "active" }]);
   });
 
+  it("threads the same owning session through task list queries", async () => {
+    const scoped = await startServer((req, res) => {
+      const url = new URL(req.url!, "http://gateway");
+      if (url.pathname !== "/api/internal/agent-tasks" || url.searchParams.get("session_id") !== "owner/session?x") {
+        res.writeHead(403).end(); return;
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ tasks: [{ id: "owned-task", name: "paused", status: "paused" }] }));
+    });
+    const certPath = fs.mkdtempSync(path.join(os.tmpdir(), "gwc-list-owner-"));
+    try {
+      const client = new GatewayClient({ gatewayUrl: `http://127.0.0.1:${scoped.port}`, certPath, sessionId: "owner/session?x" });
+      expect(await client.listAgentTasks()).toMatchObject([{ id: "owned-task" }]);
+      expect(scoped.requests[0].url).toBe("/api/internal/agent-tasks?session_id=owner%2Fsession%3Fx");
+    } finally { fs.rmSync(certPath, { recursive: true, force: true }); await scoped.close(); }
+  });
+
   it("createAgentTask POSTs the input and returns the response", async () => {
     const created = await client.createAgentTask({ name: "new", schedule: "* * * * *", prompt: "p" });
     expect(created.id).toBe("t2");

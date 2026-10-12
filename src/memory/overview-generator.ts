@@ -4,11 +4,19 @@ import path from "node:path";
 import { modelKnowledgeLocations, modelKnowledgePath } from "../knowledge/model-path.js";
 import { maskMarkdownCode } from "../core/knowledge-citation-tool.js";
 import { rewriteCatalogLinkPaths } from "../knowledge/catalog-graph.js";
+import { discoverKnowledgeLibraries } from "../knowledge/libraries.js";
 import { LIBRARY_INTRODUCTION_FILE, libraryIntroductionPreview, readLibraryIntroduction } from "../knowledge/library-introduction.js";
 import { CODE_VIEW_MANIFEST_FILE } from "../shared/code-view-manifest.js";
 
 const VERIFIED_ROUTES_BEGIN = "<!-- verified-routes:begin -->";
 const VERIFIED_ROUTES_END = "<!-- verified-routes:end -->";
+
+/**
+ * Characters of library page catalogs an answer-only prompt carries when several
+ * libraries are mounted (see collectLibraryCatalogs). The two product libraries
+ * of the 09-29 customer-service Agent take about 26K together.
+ */
+const MULTI_LIBRARY_CATALOG_BUDGET = 48_000;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -205,6 +213,10 @@ export function buildKnowledgeWikiCatalog(
   const { catalogIndex, verifiedRoutes } = collectVerifiedRoutes(knowledgeDir, index);
   const multiLibrary = readCitationManifestRepos(knowledgeDir).filter((repo) => (repo.root ?? "") !== "").length > 1;
   const introduction = !multiLibrary ? readLibraryIntroduction(knowledgeDir) : { status: "missing" as const };
+  // An answer-only harness goes to knowledge on nearly every turn, so it also
+  // carries each library's own catalog; an operational one opens them on demand.
+  const libraryCatalogs = multiLibrary && opts.operational === false ? collectLibraryCatalogs(knowledgeDir) : null;
+  const carried = libraryCatalogs && libraryCatalogs.sections.length > 0 ? libraryCatalogs : null;
 
   return [
     "# Knowledge Wiki",
@@ -217,7 +229,16 @@ export function buildKnowledgeWikiCatalog(
     "Read tool before answering, and " +
     "follow standard markdown links " +
     "such as `[name](relative/path.md)` by resolving the target relative to the current page's directory. " +
-    (multiLibrary
+    (carried
+      ? "Several libraries are mounted: the catalog below lists them, and under \"Library catalogs\" each library's " +
+        "own index follows as written, so route to pages from it directly instead of reading that index; its links " +
+        "are relative to the library directory named above it. " +
+        (carried.omitted.length > 0
+          ? "A library under \"Library catalogs not included\" has no catalog here: pick it by its domain, then Read its own index. "
+          : "") +
+        "`knowledge_search` groups results per library and `listLibraries=true` compares their domains in one call. " +
+        "Do not grep or list the whole tree before choosing a library. "
+      : multiLibrary
       ? "Several libraries are mounted: the catalog below lists libraries, not pages. For catalog exploration or " +
         "label-only search, pick the library whose domain " +
         "covers the task, then Read that library's own index; `knowledge_search` groups results per library and " +
@@ -249,7 +270,79 @@ export function buildKnowledgeWikiCatalog(
       "",
     ] : introduction.status === "invalid" ? ["The library introduction is unavailable because its metadata or reading paths are invalid. Use the complete catalog below.", ""] : []),
     catalogIndex,
+    ...(carried
+      ? [
+          "",
+          "## Library catalogs",
+          "",
+          carried.sections.join("\n\n"),
+          ...(carried.omitted.length > 0
+            ? ["", "## Library catalogs not included", "", ...carried.omitted]
+            : []),
+        ]
+      : []),
   ].join("\n");
+}
+
+/**
+ * Each mounted library's own page catalog, for an answer-only prompt that mounts
+ * several libraries.
+ *
+ * With one library its index IS the root catalog and reaches the prompt whole.
+ * With several, the root catalog names only the libraries, so a conversation
+ * that needed knowledge spent its first model round reading a library index
+ * before it could pick a page (09-29 customer-service traces: both indexes
+ * read, one extra round, on every first question). Carrying the indexes here
+ * lets the first round go straight to pages, and the text changes only with
+ * the knowledge version, so it stays in the cached prompt prefix.
+ *
+ * A catalog is carried whole or not at all: a truncated one would present part
+ * of a library as all of it. Libraries are taken in manifest order while they
+ * fit MULTI_LIBRARY_CATALOG_BUDGET, and each one that does not is named, so the
+ * Agent reads that index as before. A verified-route block already lifted into
+ * "Verified Fast Routes" is left out of the copy rather than shown twice.
+ */
+function collectLibraryCatalogs(knowledgeDir: string): { sections: string[]; omitted: string[] } {
+  const routed = new Set(
+    readCitationManifestRepos(knowledgeDir)
+      .filter((repo) => repo.verifiedRoutes === true)
+      .map((repo) => (repo.root ?? "").replace(/^\/+|\/+$/g, "")),
+  );
+  const sections: string[] = [];
+  const omitted: string[] = [];
+  let used = 0;
+  for (const library of discoverKnowledgeLibraries(knowledgeDir)) {
+    if (!library.root) continue;
+    const relativeIndex = path.posix.join(library.root, "index.md");
+    let catalog: string;
+    try {
+      catalog = fs.readFileSync(path.join(knowledgeDir, library.root, "index.md"), "utf-8").trim();
+    } catch {
+      continue;
+    }
+    if (!catalog) continue;
+    if (routed.has(library.root)) {
+      catalog = extractVerifiedRoutesBlock(catalog)?.withoutBlock ?? catalog;
+    }
+    const indexPath = modelKnowledgePath(knowledgeDir, relativeIndex);
+    // As written, not link-rewritten: the index is exactly what the Agent would
+    // otherwise Read, so its links keep resolving against its own directory,
+    // and the budget measures the catalog rather than the mount's path length.
+    const section = [
+      `### ${library.name} — \`${indexPath}\``,
+      "",
+      `Links below are relative to \`${modelKnowledgePath(knowledgeDir, library.root)}/\`.`,
+      "",
+      catalog,
+    ].join("\n");
+    if (used + section.length > MULTI_LIBRARY_CATALOG_BUDGET) {
+      omitted.push(`- ${library.name} — \`${indexPath}\``);
+      continue;
+    }
+    used += section.length;
+    sections.push(section);
+  }
+  return { sections, omitted };
 }
 
 // ---------------------------------------------------------------------------

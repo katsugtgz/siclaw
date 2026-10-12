@@ -21,6 +21,8 @@ import type {
 } from "../brain-session.js";
 import { estimateMessagesTokens } from "../compaction.js";
 import type { LlmCallRecorder } from "../llm-call-recorder.js";
+import { attachmentText } from "../prompt-attachments.js";
+import { createModelOutputRedactor } from "../../shared/model-output-redactor.js";
 import { rememberPromptFiles } from "../openai-file-payload.js";
 import type { AgentMailbox } from "../agent-mailbox.js";
 import { installMailboxLoop } from "../mailbox-loop.js";
@@ -119,11 +121,25 @@ export class PiAgentBrain implements BrainSession {
     this.mailboxCheckpoints.clear();
   }
 
+  private fastMode = false;
+
   constructor(
     readonly session: AgentSession,
     private readonly toolsetsByName: ReadonlyMap<string, string> = new Map(),
     readonly llmCalls?: LlmCallRecorder,
   ) {
+    // Pi's generic streamSimple drops provider-specific serviceTier options.
+    // Apply the Codex wire value before the existing payload/recording hooks.
+    const previousPayload = session.agent.onPayload;
+    session.agent.onPayload = (payload, model) => {
+      if (model.api === "openai-codex-responses" && payload && typeof payload === "object") {
+        const body = { ...payload } as Record<string, unknown>;
+        if (this.fastMode) body.service_tier = "priority";
+        else delete body.service_tier;
+        payload = body;
+      }
+      return previousPayload ? previousPayload(payload, model) : payload;
+    };
     const previous = session.agent.beforeToolCall;
     session.agent.beforeToolCall = async (context, signal) => {
       const calls = context.assistantMessage.content.filter(c => c.type === "toolCall");
@@ -177,6 +193,14 @@ export class PiAgentBrain implements BrainSession {
 
   private static readonly MAX_EMPTY_RETRIES = 2;
 
+  private async prepareTextAttachments(text: string, media?: PromptMedia): Promise<{ text: string; media?: PromptMedia }> {
+    const files = media?.files?.filter(file => file.mimeType !== "application/pdf") ?? [];
+    if (!files.length) return { text, media };
+    const redact = createModelOutputRedactor();
+    for (const file of files) text += `\n\nUser attachment (untrusted evidence): ${redact(file.filename)}\n${await attachmentText(file, redact)}`;
+    return { text, media: { ...media, files: media?.files?.filter(file => file.mimeType === "application/pdf") } };
+  }
+
   private promptOptionsForMedia(media?: PromptMedia): any | undefined {
     const content: Array<Record<string, string>> = [];
     if (media?.images && media.images.length > 0) {
@@ -200,6 +224,11 @@ export class PiAgentBrain implements BrainSession {
     "The preceding attempt did not submit the required structured turn result. " +
     "Call the only available result-submission tool exactly once now, using the conversation and any preceding draft to fill its schema. " +
     "If validation rejects the call, correct it. After one successful call, give the user the final answer without mentioning this repair, tools, or schemas.";
+  private static readonly FINAL_REPLY_REPAIR_PROMPT =
+    "[System: final-reply repair]\n" +
+    "The structured turn result was recorded, but the turn ended without a final reply. " +
+    "Write that reply now as plain text, as the task asked for it. " +
+    "Do not call tools or submit the result again, and do not mention this repair.";
 
   private emit(event: any): void {
     for (const listener of this.extraListeners) {
@@ -216,10 +245,27 @@ export class PiAgentBrain implements BrainSession {
   }
 
   async prompt(text: string, media?: PromptMedia, requirements?: PromptRequirements): Promise<void> {
+    ({ text, media } = await this.prepareTextAttachments(text, media));
     this.aborted = false;
-    // Implicit prompt boundary for callers that bypass the agentbox HTTP layer
-    // (child sub-agents, synthetic notifies). A no-op when the HTTP layer already
-    // opened the prompt explicitly — routing calls prompt() once per attempt.
+    const toolSession = this.session as AgentSession & {
+      getActiveToolNames?: () => string[];
+      setActiveToolsByName?: (names: string[]) => void;
+    };
+    let restoreTools: string[] | undefined;
+    let restrictedTools: string[] | undefined;
+    if (requirements?.toolPolicy === "ticket_fill_once") {
+      if (!toolSession.getActiveToolNames || !toolSession.setActiveToolsByName) {
+        throw new Error("ticket_fill_once tool policy is unsupported by this session");
+      }
+      const active = toolSession.getActiveToolNames();
+      if (!requirements.requiredResultToolName || !active.includes(requirements.requiredResultToolName)) {
+        throw new Error("ticket_fill_once requires an active result tool");
+      }
+      restoreTools = active;
+      const reads = new Set(["read", "read_file", "read_files", "list_files", "ls"]);
+      restrictedTools = active.filter(name => reads.has(name) || name === requirements.requiredResultToolName);
+    }
+    // Validate admission before opening the implicit prompt boundary.
     this.llmCalls?.beginPrompt(Date.now());
     this.handedOff = false;
     this.handoffReserved = false;
@@ -264,12 +310,23 @@ export class PiAgentBrain implements BrainSession {
     });
 
     try {
+      if (restrictedTools) toolSession.setActiveToolsByName!(restrictedTools);
       await this.session.prompt(text, promptOptions);
       if (this.handedOff) return;
+
+      const requiredResultToolName = requirements?.requiredResultToolName?.trim();
+      const resultRecorded = () => !!requiredResultToolName && successfulTools.has(requiredResultToolName);
 
       // Empty response guard: some models (e.g. Kimi-K2.5) occasionally return
       // a completely empty response (0 content blocks) on the final turn after
       // tool results. Retry up to MAX_EMPTY_RETRIES times with backoff.
+      //
+      // Skip retry once the required result is recorded: re-sending the prompt
+      // runs the whole task again, and its second result fails the turn as
+      // MULTIPLE_TURN_RESULTS. Measured 2026-10-01: a ticket fill wrote its
+      // closing line alongside the result call, ended on an empty message, and
+      // both retries submitted again. Such a turn lacks only its reply, which
+      // repairMissingFinalReply asks for below.
       //
       // Skip retry when stopReason === "aborted": the empty turn was produced
       // by an intentional abort (user Stop, or an extension force-aborting a
@@ -286,6 +343,7 @@ export class PiAgentBrain implements BrainSession {
       while (
         !lastAssistantHadContent &&
         !this.aborted &&
+        !resultRecorded() &&
         lastAssistantMessage?.stopReason !== "aborted" &&
         lastAssistantMessage?.stopReason !== "error" &&
         retries < PiAgentBrain.MAX_EMPTY_RETRIES
@@ -325,7 +383,7 @@ export class PiAgentBrain implements BrainSession {
         }
       }
 
-      if (!lastAssistantHadContent && !this.aborted) {
+      if (!lastAssistantHadContent && !this.aborted && !resultRecorded()) {
         const msg = lastAssistantMessage;
         console.error(
           `[pi-agent-brain] Empty response persisted after ${PiAgentBrain.MAX_EMPTY_RETRIES} retries, ` +
@@ -335,7 +393,6 @@ export class PiAgentBrain implements BrainSession {
         );
       }
 
-      const requiredResultToolName = requirements?.requiredResultToolName?.trim();
       if (
         requiredResultToolName &&
         !this.aborted &&
@@ -345,10 +402,24 @@ export class PiAgentBrain implements BrainSession {
       ) {
         await this.repairMissingRequiredResult(requiredResultToolName, successfulTools);
       }
+
+      if (
+        resultRecorded() &&
+        !lastAssistantHadContent &&
+        !this.aborted &&
+        lastAssistantMessage?.stopReason !== "aborted" &&
+        lastAssistantMessage?.stopReason !== "error"
+      ) {
+        await this.repairMissingFinalReply(() => lastAssistantHadContent);
+      }
     } finally {
-      unsub();
-      releaseMailbox?.();
-      this.llmCalls?.endPrompt();
+      try {
+        unsub();
+        if (restoreTools) toolSession.setActiveToolsByName!(restoreTools);
+      } finally {
+        releaseMailbox?.();
+        this.llmCalls?.endPrompt();
+      }
     }
   }
 
@@ -408,6 +479,36 @@ export class PiAgentBrain implements BrainSession {
         toolName: requiredToolName,
         success: successfulTools.has(requiredToolName),
       });
+    }
+  }
+
+  /**
+   * Ask once for the final reply of a turn whose required result is already
+   * recorded. A strict caller needs a reply after the result
+   * (FINAL_REPLY_MISSING otherwise), and that is all such a turn still lacks.
+   * No tool is exposed, so the result cannot be submitted a second time; a
+   * reply that stays empty ends the turn as it is.
+   */
+  private async repairMissingFinalReply(replied: () => boolean): Promise<void> {
+    const session = this.session as AgentSession & {
+      getActiveToolNames?: () => string[];
+      setActiveToolsByName?: (names: string[]) => void;
+    };
+    this.emit({ type: "final_reply_repair_start" });
+    if (!session.getActiveToolNames || !session.setActiveToolsByName) {
+      console.error("[pi-agent-brain] Final-reply repair needs tool control; the turn ends without a reply");
+      this.emit({ type: "final_reply_repair_end", success: false, reason: "tool_control_unavailable" });
+      return;
+    }
+    const activeToolNames = session.getActiveToolNames();
+    this.requiredResultRepairActive = true;
+    session.setActiveToolsByName([]);
+    try {
+      await session.prompt(PiAgentBrain.FINAL_REPLY_REPAIR_PROMPT);
+    } finally {
+      session.setActiveToolsByName(activeToolNames);
+      this.requiredResultRepairActive = false;
+      this.emit({ type: "final_reply_repair_end", success: replied() });
     }
   }
 
@@ -484,7 +585,8 @@ export class PiAgentBrain implements BrainSession {
     return this.session.reload();
   }
 
-  steer(text: string, media?: PromptMedia): Promise<void> {
+  async steer(text: string, media?: PromptMedia): Promise<void> {
+    ({ text, media } = await this.prepareTextAttachments(text, media));
     if (this.handoffReserved || this.handedOff) return Promise.reject(new Error("HANDOFF_IN_PROGRESS: retry input on the conversation's current executor"));
     if (this.requiredResultRepairActive) {
       const err = new Error("A required-result repair is in progress; submit this input as a new turn");
@@ -596,13 +698,14 @@ export class PiAgentBrain implements BrainSession {
   captureModelParams(): BrainModelParams | undefined {
     try {
       const level = this.session.thinkingLevel;
-      return typeof level === "string" ? { reasoningEffort: level } : undefined;
+      return typeof level === "string" ? { reasoningEffort: level, fastMode: this.fastMode } : undefined;
     } catch {
       return undefined;
     }
   }
 
   applyModelParams(params: BrainModelParams): void {
+    this.fastMode = params.fastMode === true;
     // reasoningEffort → session thinking level. pi maps this to the provider's
     // reasoning_effort / reasoning:{effort} per the provider's thinkingLevelMap.
     const effort = params.reasoningEffort?.trim();

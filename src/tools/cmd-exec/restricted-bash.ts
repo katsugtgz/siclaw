@@ -324,9 +324,10 @@ Do NOT use for file editing or package management — those binaries are not whi
       // as "the platform refused this agent" when the truth is "this box never
       // received a credential" — a diagnosis one process and one network hop away
       // from the evidence.
+      let deliveryEnvironment: Record<string, string> | undefined;
       if (!trustedOptions?.kubeconfigPath) {
         try {
-          await ensureDevopsCredentialForTool(kubeconfigRef?.credentialBroker, commands, "restricted_bash");
+          deliveryEnvironment = await ensureDevopsCredentialForTool(kubeconfigRef?.credentialBroker, commands, "restricted_bash");
         } catch (err) {
           return {
             content: [{
@@ -354,6 +355,7 @@ Do NOT use for file editing or package management — those binaries are not whi
         : sandboxTimeoutS * 1000;
       const env: Record<string, string> = {
         ...sanitizeEnv(process.env as Record<string, string>),
+        ...deliveryEnvironment,
         SICLAW_DEBUG_IMAGE: loadConfig().debugImage,
         // KUBECONFIG from the resolved `cluster` param (see above): the cluster's
         // kubeconfig when set, else /dev/null. Inline --kubeconfig is rejected by

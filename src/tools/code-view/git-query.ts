@@ -205,6 +205,7 @@ function literalPathspec(rel: string): string[] {
 interface Rendered {
   text: string;
   truncated: boolean;
+  commits?: string[];
 }
 
 async function runCapped(repo: CodeViewRepo, args: string[], signal: AbortSignal | undefined, empty: string): Promise<Rendered> {
@@ -288,7 +289,7 @@ async function opLog(repo: CodeViewRepo, rules: CodeViewRules, p: GitQueryParams
     "--end-of-options", resolved.sha, "--", ...literalPathspec(rel),
   ];
   const out = await runCapped(repo, args, signal, "(no commits match)");
-  return { text: resolvedHeader([resolved]) + out.text, truncated: out.truncated };
+  return { text: resolvedHeader([resolved]) + out.text, truncated: out.truncated, commits: [resolved.sha] };
 }
 
 async function opDiff(repo: CodeViewRepo, rules: CodeViewRules, p: GitQueryParams, signal?: AbortSignal): Promise<Rendered> {
@@ -301,7 +302,7 @@ async function opDiff(repo: CodeViewRepo, rules: CodeViewRules, p: GitQueryParam
     "--end-of-options", from.sha, to.sha, "--", ...literalPathspec(rel), ...excludePathspecs(rules),
   ];
   const out = await runCapped(repo, args, signal, "(no differences)");
-  return { text: resolvedHeader([from, to]) + out.text, truncated: out.truncated };
+  return { text: resolvedHeader([from, to]) + out.text, truncated: out.truncated, commits: [from.sha, to.sha] };
 }
 
 async function opShow(repo: CodeViewRepo, rules: CodeViewRules, p: GitQueryParams, signal?: AbortSignal): Promise<Rendered> {
@@ -311,7 +312,7 @@ async function opShow(repo: CodeViewRepo, rules: CodeViewRules, p: GitQueryParam
     "--end-of-options", resolved.sha, "--", ...excludePathspecs(rules),
   ];
   const out = await runCapped(repo, args, signal, "(empty)");
-  return { text: resolvedHeader([resolved]) + out.text, truncated: out.truncated };
+  return { text: resolvedHeader([resolved]) + out.text, truncated: out.truncated, commits: [resolved.sha] };
 }
 
 async function opBlame(view: CodeView, repo: CodeViewRepo, rules: CodeViewRules, p: GitQueryParams, signal?: AbortSignal): Promise<Rendered> {
@@ -334,7 +335,7 @@ async function opBlame(view: CodeView, repo: CodeViewRepo, rules: CodeViewRules,
   // resolved 40-hex SHA, which cannot be parsed as an option.
   const args = ["blame", "--no-textconv", "--date=short", ...range, resolved.sha, "--", rel];
   const out = await runCapped(repo, args, signal, "(empty file)");
-  return { text: resolvedHeader([resolved]) + out.text, truncated: out.truncated };
+  return { text: resolvedHeader([resolved]) + out.text, truncated: out.truncated, commits: [resolved.sha] };
 }
 
 interface GitQueryResult {
@@ -350,8 +351,8 @@ function failure(message: string, reason: string, p: Partial<GitQueryParams>): G
   };
 }
 
-function success(text: string, p: GitQueryParams, truncated: boolean): GitQueryResult {
-  return { content: [{ type: "text", text }], details: { op: p.op, repo: p.repo, truncated } };
+function success(text: string, p: GitQueryParams, truncated: boolean, commits?: string[]): GitQueryResult {
+  return { content: [{ type: "text", text }], details: { op: p.op, repo: p.repo, truncated, ...(commits ? { full_shas: commits } : {}) } };
 }
 
 const DESCRIPTION = `Read the git history of this session's code repositories: branches, tags and merge requests, commit logs, diffs, single commits and blame. Read-only, against a local mirror — no network. The repositories it can read are listed in the "Git history" section of the knowledge overview.
@@ -367,12 +368,10 @@ Ops:
 
 "ref", "from" and "to" take a commit SHA (7-40 hex), a ref name (main, refs/heads/main, v1.2, refs/mr/42), or either followed by ~N / ^N (e.g. <sha>^ is its parent). Branches move: when the output resolves a name, it prints "name = <sha>" — cite that SHA. "path" is relative to the repository root. Directories excluded from code views (such as node_modules) are left out of diff and show, and refused as "path". Output over ${GIT_QUERY_MAX_OUTPUT_BYTES / 1024} KiB is cut at a line boundary and marked.`;
 
-export function createGitQueryTool(view: CodeView): ToolDefinition {
-  return {
-    name: "git_query",
-    label: "Git Query",
-    description: DESCRIPTION,
-    parameters: Type.Object({
+export const GIT_QUERY_DESCRIPTOR = {
+  name: "git_query",
+  description: DESCRIPTION,
+  inputSchema: Type.Object({
       op: Type.Union(OPS.map((op) => Type.Literal(op)), { description: "refs | log | diff | show | blame" }),
       repo: Type.String({ description: "Repository name, as listed in the knowledge overview's Git history section" }),
       ref: Type.Optional(Type.String({ description: "log / show / blame: commit SHA or ref name (log defaults to HEAD)" })),
@@ -386,36 +385,44 @@ export function createGitQueryTool(view: CodeView): ToolDefinition {
       stat: Type.Optional(Type.Boolean({ description: "diff: per-file summary instead of the patch" })),
       search: Type.Optional(Type.String({ description: "log: commits that add or remove this exact string (needs path or limit)" })),
       grep: Type.Optional(Type.String({ description: "log: commits whose message matches this regular expression (needs path or limit)" })),
-    }),
-    async execute(_toolCallId, rawParams, signal) {
-      const p = rawParams as GitQueryParams;
-      try {
-        if (!OPS.includes(p.op)) throw new GitQueryInputError(`"op" must be one of ${OPS.join(", ")}, got ${JSON.stringify(p.op)}`);
-        if (typeof p.repo !== "string" || !p.repo.trim()) throw new GitQueryInputError(`"repo" is required`);
-        const { repo, rules } = view.requireRepository(p.repo.trim());
-        let out: Rendered;
-        switch (p.op) {
-          case "refs": out = await opRefs(repo, p, signal); break;
-          case "log": out = await opLog(repo, rules, p, signal); break;
-          case "diff": out = await opDiff(repo, rules, p, signal); break;
-          case "show": out = await opShow(repo, rules, p, signal); break;
-          case "blame": out = await opBlame(view, repo, rules, p, signal); break;
-        }
-        return success(out.text, p, out.truncated);
-      } catch (err) {
-        // Only the failures this tool can explain become a result the model
-        // reads; anything else (an abort, a spawn failure, a bug) propagates.
-        if (err instanceof GitQueryInputError) return failure(err.message, "invalid_argument", p);
-        if (err instanceof CodeViewError) return failure(err.message, err.kind, p);
-        if (err instanceof GitTimeoutError) {
-          return failure(`${err.message}. Narrow the query (path, limit, a line range).`, "timeout", p);
-        }
-        // Stuck processes, not a slow query: narrowing would not help, so do not suggest it.
-        if (err instanceof GitGateBusyError) return failure(err.message, "git_unavailable", p);
-        if (err instanceof GitCommandError) return failure(err.message, "git_failed", p);
-        throw err;
-      }
-    },
+    })
+};
+
+export async function queryGit(view: CodeView, rawParams: GitQueryParams, signal?: AbortSignal): Promise<GitQueryResult> {
+  const p = rawParams as GitQueryParams;
+  try {
+    if (!OPS.includes(p.op)) throw new GitQueryInputError(`"op" must be one of ${OPS.join(", ")}, got ${JSON.stringify(p.op)}`);
+    if (typeof p.repo !== "string" || !p.repo.trim()) throw new GitQueryInputError(`"repo" is required`);
+    const { repo, rules } = view.requireRepository(p.repo.trim());
+    let out: Rendered;
+    switch (p.op) {
+      case "refs": out = await opRefs(repo, p, signal); break;
+      case "log": out = await opLog(repo, rules, p, signal); break;
+      case "diff": out = await opDiff(repo, rules, p, signal); break;
+      case "show": out = await opShow(repo, rules, p, signal); break;
+      case "blame": out = await opBlame(view, repo, rules, p, signal); break;
+    }
+    return success(out.text, p, out.truncated, out.commits);
+  } catch (err) {
+    // Only the failures this tool can explain become a result the model
+    // reads; anything else (an abort, a spawn failure, a bug) propagates.
+    if (err instanceof GitQueryInputError) return failure(err.message, "invalid_argument", p);
+    if (err instanceof CodeViewError) return failure(err.message, err.kind, p);
+    if (err instanceof GitTimeoutError) {
+      return failure(`${err.message}. Narrow the query (path, limit, a line range).`, "timeout", p);
+    }
+    // Stuck processes, not a slow query: narrowing would not help, so do not suggest it.
+    if (err instanceof GitGateBusyError) return failure(err.message, "git_unavailable", p);
+    if (err instanceof GitCommandError) return failure(err.message, "git_failed", p);
+    throw err;
+  }
+}
+
+export function createGitQueryTool(view: CodeView): ToolDefinition {
+  return {
+    name: GIT_QUERY_DESCRIPTOR.name, label: "Git Query",
+    description: GIT_QUERY_DESCRIPTOR.description, parameters: GIT_QUERY_DESCRIPTOR.inputSchema,
+    execute: (_id, params, signal) => queryGit(view, params as GitQueryParams, signal),
   };
 }
 

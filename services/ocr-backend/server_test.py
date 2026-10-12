@@ -10,6 +10,24 @@ import server
 
 
 class RouteTests(unittest.TestCase):
+    def test_pdf_text_layer_uses_existing_parser_and_scanned_pages_fall_back(self) -> None:
+        class Page:
+            def __init__(self, text: str) -> None:
+                self.text = text
+
+            def extract_text(self) -> str:
+                return self.text
+
+        module = types.ModuleType("pypdf")
+        module.PdfReader = lambda _path: types.SimpleNamespace(pages=[Page("Pod status healthy"), Page("Recent events clean")])
+        with patch.dict(sys.modules, {"pypdf": module}):
+            result = server.extract_pdf_text("/tmp/runbook.pdf", "en")
+            self.assertEqual(result["route"], "pdf_text")
+            self.assertIn("Recent events clean", result["text"])
+            module.PdfReader = lambda _path: types.SimpleNamespace(pages=[Page("text"), Page("")])
+            self.assertIsNone(server.extract_pdf_text("/tmp/scanned.pdf", "auto"))
+        self.assertIsNone(server.extract_pdf_text("/tmp/screenshot.png", "auto"))
+
     def test_routes_everything_to_text_when_structure_is_disabled(self) -> None:
         with patch.dict(os.environ, {"SICLAW_OCR_ENABLE_STRUCTURE": "0"}):
             self.assertEqual(server.choose_route("/tmp/receipt.pdf", "pdf"), "text")

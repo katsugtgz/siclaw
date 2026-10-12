@@ -2,7 +2,7 @@
  * BrainSession — unified interface for the AI agent backend.
  *
  * Consumers (http-server, session.ts, cli-main) program against this interface.
- * Implementation: PiAgentBrain (pi-coding-agent).
+ * Implementations: PiAgentBrain and CodexAgentBrain.
  *
  * Event protocol follows the pi-agent format (frontend already adapted):
  * - agent_start/end, turn_start/end, message_start/end
@@ -13,8 +13,9 @@
  */
 
 import type { LlmCallPromptBoundary } from "./llm-call-recorder.js";
+import type { NativeUserInputRequest, NativeUserInputAnswer, NativeUserInputAcceptance } from "../shared/native-user-input.js";
 
-export type BrainType = "pi-agent";
+export type BrainType = "pi-agent" | "codex";
 
 /**
  * An image attachment to send alongside a prompt. `data` is raw base64 (no
@@ -39,6 +40,8 @@ export interface PromptMedia {
 
 /** Runtime-only completion requirements supplied by a trusted control plane. */
 export interface PromptRequirements {
+  /** Narrows this turn to file reads and its required result, never grants tools. */
+  toolPolicy?: "ticket_fill_once";
   /**
    * Exact MCP result tool that must succeed before this prompt may finish.
    * The normal agent run remains unrestricted. If it omits the result, the
@@ -132,6 +135,8 @@ export interface BrainToolDefinition {
 export interface BrainModelParams {
   /** Reasoning effort: off|minimal|low|medium|high|xhigh. */
   reasoningEffort?: string;
+  /** Request Codex priority processing; absent/false restores standard mode. */
+  fastMode?: boolean;
 }
 
 export interface BrainContextUsage {
@@ -174,6 +179,12 @@ export interface TaskCompletionAssessment {
 export interface BrainSession {
   readonly brainType: BrainType;
 
+  /** Release backend-owned processes and sockets when the session leaves memory. */
+  close?(): Promise<void>;
+
+  /** Model-visible conversation used for child context inheritance. */
+  getConversationMessages?(): readonly unknown[];
+
   /**
    * Optional: prompt / routing-attempt boundaries for the LLM call recorder
    * (`src/core/llm-call-recorder.ts`). The agentbox HTTP layer marks receipt and
@@ -181,6 +192,9 @@ export interface BrainSession {
    * attempt events rewind rounds on rollback.
    */
   readonly llmCalls?: LlmCallPromptBoundary;
+
+  /** Product persistence observer; native child execution remains owned by Codex. */
+  setNativeChildSink?(sink: import("./brains/codex-child-projection.js").NativeChildSink): void;
 
   /** Send a prompt to the agent. Resolves when the agent finishes responding. */
   prompt(text: string, media?: PromptMedia, requirements?: PromptRequirements): Promise<void>;
@@ -202,7 +216,11 @@ export interface BrainSession {
   reload(): Promise<void>;
 
   /** Interrupt mid-run and inject a user message. */
-  steer(text: string, media?: PromptMedia): Promise<void>;
+  steer(text: string, media?: PromptMedia, delivery?: { messageId: string }): Promise<void>;
+  /** Codex-only structured user questions. Never grants execution permission. */
+  getPendingUserInput?(): NativeUserInputRequest | undefined;
+  prepareUserInput?(answer: NativeUserInputAnswer): NativeUserInputAcceptance;
+  submitUserInput?(answer: NativeUserInputAnswer): NativeUserInputAcceptance;
 
   /**
    * Queue a message delivered only after the agent finishes its current run (no
@@ -229,6 +247,12 @@ export interface BrainSession {
    * on the llm.call generation. Absent → no tool definitions are recorded.
    */
   getTools?(): BrainToolDefinition[];
+  /** Business request mode; native engines retain their own child orchestration. */
+  setRequestMode?(mode: import("../shared/request-mode.js").RequestMode): void;
+  setNativeChildRecovery?(recover: (scopeId: string) => void): void;
+  /** One accepted request can span provider retries and native parent turns. */
+  beginRequest?(mode: import("../shared/request-mode.js").RequestMode): void;
+  endRequest?(): void;
 
   /** Switch to a different model. */
   setModel(model: BrainModelInfo): Promise<void>;

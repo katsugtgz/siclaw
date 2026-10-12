@@ -2,9 +2,8 @@ import type { ToolEntry } from "../../core/tool-registry.js";
 import { Type } from "@sinclair/typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 
-import { flattenClusterMeta } from "./cluster-meta.js";
 import type { KubeconfigRef } from "../../core/types.js";
-import type { ProbeResult } from "../../agentbox/credential-broker.js";
+import { listBoundClusters, type ClusterListParams } from "../../core/resource-list-service.js";
 
 /**
  * cluster_list — list and search the clusters bound to the current agent.
@@ -36,7 +35,7 @@ import type { ProbeResult } from "../../agentbox/credential-broker.js";
  *     `reachable:true`: an HTTP responder answered, but a wrong URL or intermediary
  *     can produce that without the real API server, so it is not proof of health.
  */
-export function createClusterListTool(kubeconfigRef: KubeconfigRef): ToolDefinition {
+export function createClusterListTool(kubeconfigRef: KubeconfigRef, options: { allowProbe?: boolean } = {}): ToolDefinition {
   return {
     name: "cluster_list",
     label: "Cluster List",
@@ -72,91 +71,13 @@ to use rather than guessing.`,
       name: Type.Optional(Type.String({ description: "Narrow to clusters whose name contains this substring (case-insensitive). Omit to list all bound clusters." })),
       probe: Type.Optional(Type.Boolean({ description: "When true, run kubectl version for each cluster and include probe_status + probe_reason. Only probe_status=unreachable means the cluster's API server couldn't be reached; probe_status=probe_failed (reason kubectl_missing/kubeconfig/credential/auth/authz/endpoint/tls_cert/timeout/unknown) is a local tooling/config/credential/trust issue and does NOT mean the cluster is down. reachable is included for success (true), unreachable (false), and auth/authz probe_failed (true — a 401/403 means the server answered, so the cluster is up); omitted for other probe_failed reasons including endpoint (404) and tls_cert." })),
     }),
-    async execute(_toolCallId, rawParams) {
-      const params = rawParams as { name?: string; probe?: boolean };
-      const broker = kubeconfigRef.credentialBroker;
-      if (!broker) {
-        return {
-          content: [{ type: "text", text: JSON.stringify({ error: "Credential broker not initialized for this session" }) }],
-          details: {},
-        };
-      }
-
-      // Lazy fill: pay one transport round-trip only on first access.
-      // Subsequent calls serve the cached Map synchronously; the Map is
-      // kept fresh by notify-driven refresh (POST /api/reload-cluster).
-      if (!broker.isClustersReady()) {
-        try {
-          await broker.refreshClusters();
-        } catch (err) {
-          const message = err instanceof Error ? err.message : String(err);
-          return {
-            content: [{ type: "text", text: JSON.stringify({ error: `Failed to list clusters: ${message}` }) }],
-            details: {},
-          };
-        }
-      }
-
-      let metas = broker.getClustersLocal();
-      const boundTotal = metas.length;
-      if (params.name) {
-        const needle = params.name.toLowerCase();
-        metas = metas.filter((meta) => meta.name.toLowerCase().includes(needle));
-      }
-
-      // Opt-in connectivity: probe only the clusters we're about to return,
-      // in parallel (bounded in the broker). A probe failure lands as an
-      // per-entry status, never an error for the whole call.
-      let probeByName: Map<string, ProbeResult> | undefined;
-      if (params.probe && metas.length > 0) {
-        const results = await broker.probeClusters(metas.map((meta) => meta.name));
-        probeByName = new Map(results.map((r) => [r.name, r] as const));
-      }
-
-      const entries = metas.map((meta) => {
-        const probe = probeByName?.get(meta.name);
-        return {
-          name: meta.name,
-          description: meta.description ?? null,
-          api_server: meta.api_server ?? null,
-          is_production: meta.is_production,
-          ...(meta.contexts ? { contexts: meta.contexts } : {}),
-          ...(meta.current_context ? { current_context: meta.current_context } : {}),
-          ...flattenClusterMeta(meta.meta),
-          ...(probe
-            ? {
-                probe_status: probe.probe_status,
-                ...(probe.probe_status !== "success" ? { probe_reason: probe.reason } : {}),
-                // reachable is present for success (true), unreachable (false),
-                // and auth/authz probe_failed (true — the server answered). It is
-                // omitted for every other probe_failed reason (reachability unknown).
-                ...(probe.reachable !== undefined ? { reachable: probe.reachable } : {}),
-                ...(probe.probe_status === "success" ? { server_version: probe.server_version } : {}),
-                ...(probe.probe_status !== "success" ? { probe_error: probe.probe_error } : {}),
-              }
-            : {}),
-        };
-      });
-
-      let hint = "";
-      if (boundTotal === 0) {
-        hint = "\n\nNo clusters are bound to this agent. Ask the user to bind clusters in the Portal (Agent detail page).";
-      } else if (entries.length === 0) {
-        hint = `\n\nNo clusters match "${params.name}". Call cluster_list without a name to see all ${boundTotal} bound cluster(s).`;
-      } else if (entries.length > 1) {
-        const scope = params.name ? `match "${params.name}"` : "are bound";
-        hint = `\n\nIMPORTANT: ${entries.length} clusters ${scope}. Ask the user which one to use, then set the \`cluster\` parameter (the cluster's name) on every kubectl/script tool call. Do NOT pick one yourself.`;
-      }
-
-      return {
-        content: [{ type: "text", text: JSON.stringify({ clusters: entries }, null, 2) + hint }],
-        details: {},
-      };
+    async execute(_toolCallId, rawParams, signal) {
+      return listBoundClusters(kubeconfigRef, (rawParams ?? {}) as ClusterListParams, { allowProbe: options.allowProbe, signal });
     },
   };
 }
 
 export const registration: ToolEntry = {
   category: "query",
-  create: (refs) => createClusterListTool(refs.kubeconfigRef),
+  create: (refs) => createClusterListTool(refs.kubeconfigRef, { allowProbe: refs.allowClusterProbe }),
 };

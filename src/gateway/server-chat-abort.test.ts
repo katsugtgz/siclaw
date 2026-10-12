@@ -138,7 +138,7 @@ async function bootRuntime(agentBoxManager = fakeAgentBoxManager(), frontendClie
     config: { port: 0, internalPort: 0, host: "127.0.0.1", serverUrl: "", portalSecret: "" } as any,
     agentBoxManager,
     frontendClient,
-    credentialService: {} as any,
+    credentialService: { attachGrants: () => {}, resolveActorResources: async () => ({ clusters: [], hosts: [] }) } as any,
   });
 }
 
@@ -183,7 +183,7 @@ describe("startRuntime — chat.abort wiring", () => {
     settleConsumer!();
   });
 
-  it.each([ ["sync", "async"], ["async", "sync"], ["sync", "sync"] ])(
+  it.each([ ["sync", "async"], ["async", "sync"], ["sync", "sync"], ["async", "async"] ])(
     "queues %s -> %s as separate request streams without steering", async (firstMode, secondMode) => {
       server = await bootRuntime();
       const send = server.rpcMethods.get("chat.send")!;
@@ -191,7 +191,8 @@ describe("startRuntime — chat.abort wiring", () => {
       await send({ agentId: "a", userId: "u", sessionId: "S", text: "first", requestMode: firstMode, turnId: "first" }, first);
       await waitFor(() => settleConsumer !== undefined);
       const finishFirst = settleConsumer!;
-      await send({ agentId: "a", userId: "u", sessionId: "S", text: "second", requestMode: secondMode, turnId: "second" }, second);
+      await send({ agentId: "a", userId: "u", sessionId: "S", text: "second", requestMode: secondMode, turnId: "second",
+        ...(firstMode === "async" && secondMode === "async" ? {requiredAgentEngine:"codex"} : {}) }, second);
       await new Promise(resolve => setTimeout(resolve, 25));
       expect(promptCalls).toHaveLength(1);
       expect(steerSessionMock).not.toHaveBeenCalled();

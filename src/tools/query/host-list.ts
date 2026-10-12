@@ -3,6 +3,7 @@ import { Type } from "@sinclair/typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 
 import type { KubeconfigRef } from "../../core/types.js";
+import { listBoundHosts, type HostListParams } from "../../core/resource-list-service.js";
 
 /**
  * host_list — list SSH-reachable hosts bound to the current agent.
@@ -33,58 +34,8 @@ The response includes "total" (full match count) and "next_cursor": if total exc
         description: "Opaque pagination cursor from a previous response's next_cursor.",
       })),
     }),
-    async execute(_toolCallId, rawParams) {
-      const broker = kubeconfigRef.credentialBroker;
-      if (!broker) {
-        return {
-          content: [{ type: "text", text: JSON.stringify({ error: "Credential broker not initialized for this session" }) }],
-          details: {},
-        };
-      }
-
-      const params = (rawParams ?? {}) as { query?: string; limit?: number; cursor?: string };
-      const query = typeof params.query === "string" ? params.query.trim() : "";
-
-      // Always go through the server-side search (a blank query = browse). This
-      // keeps results capped and never loads the full host list into the broker.
-      let result;
-      try {
-        result = await broker.queryHosts(query, { limit: params.limit, cursor: params.cursor });
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        return {
-          content: [{ type: "text", text: JSON.stringify({ error: `Failed to list hosts: ${message}` }) }],
-          details: {},
-        };
-      }
-
-      const entries = result.hosts.map((meta) => ({
-        ...(meta.id ? { id: meta.id } : {}),
-        name: meta.name,
-        ip: meta.ip,
-        port: meta.port,
-        username: meta.username,
-        auth_type: meta.auth_type,
-        is_production: meta.is_production,
-        ...(meta.description ? { description: meta.description } : {}),
-        // Surfaced so the model knows a host is reached through a bastion; the
-        // jump chain is dialed automatically by host_exec / host_script.
-        ...(meta.jump_host ? { jump_host: meta.jump_host } : {}),
-      }));
-
-      let hint = "";
-      if (entries.length === 0) {
-        hint = query
-          ? `\n\nNo hosts match "${query}".`
-          : "\n\nNo hosts are bound to this agent. Ask the user to bind hosts in the Portal (Agent detail page).";
-      } else if (result.next_cursor) {
-        hint = `\n\nShowing ${entries.length} of ${result.total}. Narrow the query, or pass cursor="${result.next_cursor}" for the next page.`;
-      }
-
-      return {
-        content: [{ type: "text", text: JSON.stringify({ hosts: entries, total: result.total, next_cursor: result.next_cursor }, null, 2) + hint }],
-        details: {},
-      };
+    async execute(_toolCallId, rawParams, signal) {
+      return listBoundHosts(kubeconfigRef, (rawParams ?? {}) as HostListParams, signal);
     },
   };
 }

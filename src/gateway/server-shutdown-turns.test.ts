@@ -79,7 +79,7 @@ async function bootRuntime(frontendClient: any) {
       cleanup: vi.fn(async () => {}),
     } as any,
     frontendClient,
-    credentialService: {} as any,
+    credentialService: { attachGrants: () => {}, resolveActorResources: async () => ({ clusters: [], hosts: [] }) } as any,
   });
 }
 

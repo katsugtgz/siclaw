@@ -1,3 +1,4 @@
+import { summarizeModelPayload, type ModelRequestSummary } from "./model-request-summary.js";
 import { installMailboxStream } from "./mailbox-loop.js";
 import {
   createAgentSessionFromServices,
@@ -16,6 +17,8 @@ import { LlmCallRecorder } from "./llm-call-recorder.js";
 export interface PiExecutionOptions extends Omit<CreateAgentSessionFromServicesOptions, "noTools" | "tools" | "excludeTools"> {
   /** Harness-owned guards. Omission retains the standard message/tool guards. */
   guards?: GuardRegistry;
+  /** Per-request serialized counts, including tool-result pairing; no contents. */
+  onModelPayload?: (summary: ModelRequestSummary) => void;
   /** Receives hashes and counts, never prompt or tool contents. */
   onModelEnvelope?: (manifest: ModelEnvelopeManifest) => void;
 }
@@ -30,7 +33,7 @@ export interface PiExecutionOptions extends Omit<CreateAgentSessionFromServicesO
  * guards and per-request recorder below it.
  */
 export async function createPiExecutionSession(options: PiExecutionOptions) {
-  const { guards, onModelEnvelope, ...sessionOptions } = options;
+  const { guards, onModelEnvelope, onModelPayload, ...sessionOptions } = options;
   const result = await createAgentSessionFromServices({
     ...sessionOptions,
     // Every harness supplies its own bounded tools. Never enable SDK built-ins
@@ -49,6 +52,7 @@ export async function createPiExecutionSession(options: PiExecutionOptions) {
     const converted = convertOpenAIPdfPayload(payload);
     const next = previousOnPayload ? await previousOnPayload(converted, model) : converted;
     const finalPayload = convertOpenAIPdfPayload(next ?? converted);
+    onModelPayload?.(summarizeModelPayload(finalPayload));
     const manifest = inspectModelEnvelope(finalPayload);
     modelEnvelopeInspectionRef.current = extractModelEnvelopeInspection(finalPayload);
     const previous = modelEnvelopeManifestRef.current;

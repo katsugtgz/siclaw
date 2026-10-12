@@ -265,11 +265,14 @@ function makeFakeSessionManager(ledgerDir = fs.mkdtempSync(path.join(os.tmpdir()
     lateResults: vi.fn(),
     beginBackgroundWorkTurn(managed: any, requestMode = "async") {
       managed._requestMode = requestMode;
+      managed.brain.beginRequest?.(requestMode);
       const turn = new BackgroundWorkTurn(n => this.lateResults(n));
       managed._backgroundWorkTurn = turn;
       managed.brain.setMailbox?.(turn.mailbox);
       return turn;
     },
+    agentEngineState: "pi-agent" as "pi-agent" | "codex",
+    async resolveAgentEngine() { return this.agentEngineState; },
     getOrCreate: async (
       id?: string,
       _mode?: unknown,
@@ -277,8 +280,12 @@ function makeFakeSessionManager(ledgerDir = fs.mkdtempSync(path.join(os.tmpdir()
       activeMode?: unknown,
       userId?: string,
       allowInputRequest?: boolean,
+      _handoffSupported?: boolean,
+      _handoffPolicy?: unknown,
+      _structuredResultRequired?: boolean,
+      agentEngine?: string,
     ) => {
-      getOrCreateCalls.push({ id, activeMode, userId, allowInputRequest });
+      getOrCreateCalls.push({ id, activeMode, userId, allowInputRequest, agentEngine });
       const key = id ?? "default";
       let s = sessions.get(key);
       if (!s) {
@@ -344,7 +351,8 @@ function modelConfigWithInput(input: string[]) {
 let server: http.Server | https.Server;
 let port: number;
 let sm: ReturnType<typeof makeFakeSessionManager>;
-const origEnv = { SICLAW_GATEWAY_URL: process.env.SICLAW_GATEWAY_URL, SICLAW_CERT_PATH: process.env.SICLAW_CERT_PATH };
+const origEnv = { SICLAW_GATEWAY_URL: process.env.SICLAW_GATEWAY_URL, SICLAW_CERT_PATH: process.env.SICLAW_CERT_PATH,
+  SICLAW_AGENT_ENGINE: process.env.SICLAW_AGENT_ENGINE };
 
 beforeEach(async () => {
   mockConfigState.modelRouting = undefined;
@@ -357,6 +365,7 @@ beforeEach(async () => {
   // Point to a non-existent cert path → plain HTTP.
   process.env.SICLAW_CERT_PATH = "/tmp/nonexistent-cert-path-for-siclaw-tests";
   delete process.env.SICLAW_GATEWAY_URL;
+  delete process.env.SICLAW_AGENT_ENGINE;
 
   sm = makeFakeSessionManager();
   server = createHttpServer(sm as any);
@@ -368,6 +377,8 @@ afterEach(async () => {
   vi.restoreAllMocks();
   process.env.SICLAW_GATEWAY_URL = origEnv.SICLAW_GATEWAY_URL;
   process.env.SICLAW_CERT_PATH = origEnv.SICLAW_CERT_PATH;
+  if (origEnv.SICLAW_AGENT_ENGINE === undefined) delete process.env.SICLAW_AGENT_ENGINE;
+  else process.env.SICLAW_AGENT_ENGINE = origEnv.SICLAW_AGENT_ENGINE;
 });
 
 // ── Basic endpoints ───────────────────────────────────────────────────
@@ -637,6 +648,44 @@ describe("http-server — sub-agent tier turn state", () => {
 });
 
 describe("http-server — prompt + session lifecycle", () => {
+  it("does not let global env or a chat payload override the Agent engine", async () => {
+    process.env.SICLAW_AGENT_ENGINE = "codex";
+    sm.agentEngineState = "pi-agent";
+    await getJson(port, "/api/prompt", "POST", { text: "hello", sessionId: "engine-spoof", agentEngine: "codex", agent_engine: "codex" });
+    expect(sm.getOrCreateCalls.at(-1)?.agentEngine).toBe("pi-agent");
+  });
+  it("keeps an explicitly selected Codex engine instead of silently falling back to Pi", async () => {
+    sm.agentEngineState = "codex";
+    const responses = { ...modelConfigWithInput(["text"]), api: "openai-responses", authHeader: true };
+    await getJson(port, "/api/prompt", "POST", {
+      text: "inspect", sessionId: "codex-compatible", modelProvider: "openai", modelId: "gpt-4",
+      modelConfig: responses,
+    });
+    expect(sm.getOrCreateCalls.at(-1)?.agentEngine).toBe("codex");
+
+    await getJson(port, "/api/prompt", "POST", {
+      text: "submit result", sessionId: "codex-required-result", modelProvider: "openai", modelId: "gpt-4",
+      modelConfig: responses, requiredResultToolName: "mcp__result__submit",
+    });
+    expect(sm.getOrCreateCalls.at(-1)?.agentEngine).toBe("codex");
+
+    await getJson(port, "/api/prompt", "POST", {
+      text: "inspect", sessionId: "codex-wire-override", modelProvider: "openai", modelId: "gpt-4",
+      modelConfig: { ...responses, models: [{ ...responses.models[0], compat: { supportsTemperature: false } }] },
+    });
+    expect(sm.getOrCreateCalls.at(-1)?.agentEngine).toBe("codex");
+
+    await getJson(port, "/api/prompt", "POST", {
+      text: "inspect", sessionId: "codex-fallback", modelProvider: "openai", modelId: "gpt-4",
+      modelConfig: responses,
+      modelRouting: { enabled: true, strategy: "ordered_fallback", candidates: [
+        { provider: "openai", modelId: "gpt-4", modelConfig: responses },
+        { provider: "legacy", modelId: "gpt-4", modelConfig: modelConfigWithInput(["text"]) },
+      ] },
+    });
+    expect(sm.getOrCreateCalls.at(-1)?.agentEngine).toBe("codex");
+  });
+
   it("sync keeps the original SSE through child completion and root synthesis", async () => {
     const session = await sm.getOrCreate("sync-join");
     const emit = (text: string) => session.brain.emitter.emit("event", { type: "message_end", message: {
@@ -817,7 +866,7 @@ describe("http-server — prompt + session lifecycle", () => {
     expect(seen).not.toContain("�");
   });
 
-  it("refuses Ticket prompts until the configured result tool is available", async () => {
+  it("refuses a DECLARED Ticket result tool that the instance cannot call, and runs without one", async () => {
     const { handleToolCapabilities } = await import("../gateway/internal-api.js");
     const { createToolsHandler } = await vi.importActual<typeof import("./sync-handlers.js")>("./sync-handlers.js");
     let status = 0;
@@ -834,9 +883,15 @@ describe("http-server — prompt + session lifecycle", () => {
     expect(sm.agentTypeState).toBe("ticket");
     expect(sm.allowedToolsState).toContain("read");
     const session = await sm.getOrCreate("ticket-result");
-    const missing = await getJson(port, "/api/prompt", "POST", { text: "review", sessionId: "ticket-result" });
-    expect(missing.status).toBe(400);
-    expect(session.brain.prompt).not.toHaveBeenCalled();
+    // A Ticket instance that declares no result contract is a multi-turn
+    // assistant, not a broken closure workflow: it runs, and nothing instructs
+    // it to submit a result it has no tool for.
+    const noContract = await getJson(port, "/api/prompt", "POST", { text: "review", sessionId: "ticket-result" });
+    await flushAsync();
+    expect(noContract.status).toBe(200);
+    expect(session.brain.prompt).toHaveBeenCalledWith("review", undefined);
+    (session.brain.prompt as any).mockClear();
+    // Declaring one the instance cannot call stays a configuration error.
     const unavailable = await getJson(port, "/api/prompt", "POST", { text: "review", sessionId: "ticket-result", requiredResultToolName: "mcp__review__submit" });
     expect(unavailable.status).toBe(400);
     expect(session.brain.prompt).not.toHaveBeenCalled();

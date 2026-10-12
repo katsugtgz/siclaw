@@ -64,8 +64,11 @@ function validatePodTarget(pod: string, namespace: string, container?: string): 
  * replaced, just moved into the node's configuration.
  */
 export function buildCrictlNetnsScript(pod: string, namespace: string): string {
+  // CRI filters are regular expressions: dots are legal Pod-name characters,
+  // and the namespace must not match a longer name in another namespace.
+  const exactPod = pod.replaceAll(".", "\\.");
   return [
-    `SANDBOX_ID=$(crictl pods --name "^${pod}$" --namespace "${namespace}" -q 2>/dev/null | head -1)`,
+    `SANDBOX_ID=$(crictl pods --name "^${exactPod}$" --namespace "^${namespace}$" -q 2>/dev/null | head -1)`,
     `if [ -z "$SANDBOX_ID" ]; then echo "Error: cannot find sandbox for pod ${pod} in namespace ${namespace} on this node" >&2; exit 1; fi`,
     `crictl inspectp -o json "$SANDBOX_ID"`,
   ].join("\n");
@@ -134,17 +137,26 @@ export async function resolvePodNetnsViaKubectl(opts: {
   userId: string;
   clusterKey: string;
   image: string;
+  /** Trusted native adapter overrides; never supplied by model command flags. */
+  debugNamespace?: string;
+  requireExistingNamespace?: boolean;
+  enterHostRoot?: boolean;
   signal?: AbortSignal;
 }): Promise<{ node: string; netns: string } | { error: string }> {
   const invalid = validatePodTarget(opts.pod, opts.namespace, opts.container);
   if (invalid) return { error: invalid };
-  const resolved = await resolveContainerNetns(opts.pod, opts.namespace, opts.container, opts.env);
+  if (opts.signal?.aborted) return { error: "Aborted." };
+  const resolved = await resolveContainerNetns(opts.pod, opts.namespace, opts.container, opts.env, opts.signal);
   if ("error" in resolved) return resolved;
+  if (opts.signal?.aborted) return { error: "Aborted." };
 
   const script = buildCrictlNetnsScript(opts.pod, opts.namespace);
-  const nsenterCmd = ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--", "sh", "-c", script];
+  const nsenterCmd = ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p",
+    ...(opts.enterHostRoot ? ["--root", "--wd"] : []), "--", "sh", "-c", script];
   const execResult = await runInDebugPod(
-    { userId: opts.userId, nodeName: resolved.nodeName, command: nsenterCmd, image: opts.image, clusterKey: opts.clusterKey },
+    { userId: opts.userId, nodeName: resolved.nodeName, command: nsenterCmd, image: opts.image, clusterKey: opts.clusterKey,
+      ...(opts.debugNamespace !== undefined ? { namespace: opts.debugNamespace } : {}),
+      ...(opts.requireExistingNamespace !== undefined ? { requireExistingNamespace: opts.requireExistingNamespace } : {}) },
     opts.env,
     { timeoutMs: 30_000, signal: opts.signal },
   );
@@ -170,6 +182,7 @@ export async function resolvePodNetnsViaSsh(opts: {
 }): Promise<{ netns: string } | { error: string }> {
   const invalid = validatePodTarget(opts.pod, opts.namespace, opts.container);
   if (invalid) return { error: invalid };
+  if (opts.signal?.aborted) return { error: "Aborted." };
   const script = buildCrictlNetnsScript(opts.pod, opts.namespace);
   let result;
   try {

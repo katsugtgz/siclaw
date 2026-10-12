@@ -3,7 +3,6 @@ export const TICKET_TYPES = [
   "incident",
   "llm_incident",
   "requirement",
-  "unknown",
 ] as const;
 
 export type TicketType = (typeof TICKET_TYPES)[number];
@@ -40,13 +39,16 @@ export const LIMITS = {
   evidenceItemMaxChars: 300,
   missingFieldsMaxItems: 20,
   missingFieldMaxChars: 64,
+  modulesMaxItems: 10,
+  moduleIdMaxChars: 64,
 } as const;
 
 /**
- * Best-effort intake details for an `llm_incident`. Every field may stay empty:
- * the block exists so first-line support sees what the conversation did
- * establish, not so the agent is forced to guess. Only the enum shape is
- * validated; none of the fields is required for a ticket-ready result.
+ * Intake details for an `llm_incident`. While gathering (`label=false`) every
+ * field may stay empty. A handoff (`label=true`) requires region and aspect,
+ * and the model name when the aspect is `model`: first-line support routes an
+ * LLM incident on exactly these facts, so the agent asks for them instead of
+ * handing off without them.
  */
 export interface LlmIncidentInfo {
   region: "" | LlmRegion;
@@ -61,6 +63,13 @@ export interface ProductSupportInfo {
   description: string;
   evidence: string[];
   missing_fields: string[];
+  /**
+   * Component tags: module_id values from the component catalogue the Agent
+   * was given, at whatever level the conversation supports. Empty means no
+   * component is established. Best effort on every turn and never a handoff
+   * requirement, so it constrains nothing below.
+   */
+  modules: string[];
   llm: LlmIncidentInfo;
 }
 
@@ -82,13 +91,20 @@ const INFO_KEYS = new Set([
 // four of the five ticket types, so requiring the block would only turn the
 // most common shape into a host-side schema rejection on the turn's one
 // mandatory tool call.
-const INFO_OPTIONAL_KEYS = new Set(["llm"]);
+// modules is optional for the same reason, and because a prompt that predates
+// the field must keep producing accepted results: absent means "no component
+// established", which is also its most common value.
+const INFO_OPTIONAL_KEYS = new Set(["llm", "modules"]);
 const LLM_KEYS = new Set(["region", "aspect", "model"]);
 const TICKET_TYPE_SET = new Set<string>(TICKET_TYPES);
 const LLM_REGION_SET = new Set<string>(LLM_REGIONS);
 const LLM_ASPECT_SET = new Set<string>(LLM_ASPECTS);
 export const MISSING_FIELD_PATTERN = "^[a-z][a-z0-9_]*$";
 const MISSING_FIELD_RE = new RegExp(MISSING_FIELD_PATTERN);
+// The channel's own module_id rule. Whether an id exists is the channel's
+// check: this server has no catalogue and makes no calls.
+export const MODULE_ID_PATTERN = "^[a-z][a-z0-9_-]*$";
+const MODULE_ID_RE = new RegExp(MODULE_ID_PATTERN);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -153,7 +169,12 @@ function readEnum<T extends string>(
 interface StringArrayRules {
   maxItems: number;
   itemMaxChars: number;
-  /** Validated against each item at its ORIGINAL index, before dedup. */
+  /**
+   * Validated against each item's RAW value at its ORIGINAL index, before
+   * dedup. Raw, because the host checks the advertised pattern before dispatch:
+   * trimming first would make this parser accept " id " while the primary path
+   * refuses it, and the model would learn the rule from a retry.
+   */
   itemPattern?: { re: RegExp; message: string };
 }
 
@@ -173,7 +194,7 @@ function readStringArray(value: unknown, path: string, rules: StringArrayRules):
     if (text.length === 0) {
       throw new Error(`${itemPath} must not be blank`);
     }
-    if (rules.itemPattern && !rules.itemPattern.re.test(text)) {
+    if (rules.itemPattern && !rules.itemPattern.re.test(item as string)) {
       throw new Error(`${itemPath} ${rules.itemPattern.message}`);
     }
     // Post-trim duplicates are dropped; this canonicalization is documented in
@@ -244,6 +265,17 @@ export function parseProductSupportResult(input: unknown): ProductSupportResult 
           message: "must be a lowercase snake_case field identifier",
         },
       }),
+      modules:
+        input.info.modules === undefined
+          ? []
+          : readStringArray(input.info.modules, "input.info.modules", {
+              maxItems: LIMITS.modulesMaxItems,
+              itemMaxChars: LIMITS.moduleIdMaxChars,
+              itemPattern: {
+                re: MODULE_ID_RE,
+                message: "must be a module_id: lowercase letters, digits, '-' or '_', starting with a letter",
+              },
+            }),
       llm:
         input.info.llm === undefined
           ? { region: "", aspect: "", model: "" }
@@ -251,17 +283,23 @@ export function parseProductSupportResult(input: unknown): ProductSupportResult 
     },
   };
 
-  // Unknown intake may temporarily retain user-stated LLM details. A final
-  // unknown handoff keeps those clues in description/evidence instead: typed
-  // LLM fields must not imply that an LLM incident has been established.
-  const gatheringUnknown = !result.label && result.info.ticket_type === "unknown";
-  if (result.info.ticket_type !== "llm_incident" && !gatheringUnknown) {
+  // Typed LLM fields assert that an LLM incident is established, so they stay
+  // empty for every other type; unconfirmed clues belong in description and
+  // evidence.
+  if (result.info.ticket_type !== "llm_incident") {
     const { region, aspect, model } = result.info.llm;
     if (region !== "" || aspect !== "" || model !== "") {
       throw new Error(
-        "input.info.llm fields must be empty unless ticket_type is llm_incident or label=false with ticket_type=unknown; preserve unclassified clues in description and evidence",
+        "input.info.llm fields must be empty unless ticket_type is llm_incident; preserve unconfirmed clues in description and evidence",
       );
     }
+  }
+
+  // Every turn, not only the handoff: the channel may hand the ticket to a
+  // human at any moment without another Agent turn (an urgent-handoff button),
+  // and then the latest result's description is all first-line support gets.
+  if (result.info.description.length === 0) {
+    throw new Error("input.info.description must be non-empty on every turn; state the current understanding of the issue");
   }
 
   if (!result.label) {
@@ -271,14 +309,22 @@ export function parseProductSupportResult(input: unknown): ProductSupportResult 
   if (result.info.summary.length === 0) {
     throw new Error("label=true requires a non-empty info.summary");
   }
-  if (result.info.description.length === 0) {
-    throw new Error("label=true requires a non-empty info.description");
-  }
   if (result.info.missing_fields.length > 0) {
     throw new Error("label=true requires info.missing_fields to be empty");
   }
   if (result.info.ticket_type === "requirement" && result.info.product.length === 0) {
     throw new Error("label=true with ticket_type=requirement requires info.product");
+  }
+  if (result.info.ticket_type === "llm_incident") {
+    const { region, aspect, model } = result.info.llm;
+    if (region === "" || aspect === "") {
+      throw new Error(
+        "label=true with ticket_type=llm_incident requires info.llm.region and info.llm.aspect; ask the user instead of handing off without them",
+      );
+    }
+    if (aspect === "model" && model.length === 0) {
+      throw new Error("label=true with info.llm.aspect=model requires info.llm.model");
+    }
   }
 
   return result;

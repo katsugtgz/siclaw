@@ -4,6 +4,7 @@
 
 跑:platform/pod/.venv/bin/python platform/pod/test_compile_box.py
 """
+import uuid
 import asyncio
 import base64
 import contextlib
@@ -202,7 +203,9 @@ async def test_workspace_sync():
         # must NOT be tombstoned — deletion is judged by is_file(), not by
         # absence from the collection.
         (wd / "eval" / "TESTS.md").write_text("x" * (compile_box.MAX_SYNC_FILE_BYTES + 1))
-        assert await compile_box._sync_workspace(run, sent) == 0 and run.events.empty()
+        assert await compile_box._sync_workspace(run, sent) == 0
+        assert run.events.get_nowait()["type"] == "summary", "skipped artifacts must be visible"
+        assert run.events.empty()
         assert "eval/TESTS.md" in sent, "row kept: file exists, just oversized"
     print("✓ workspace sync (B5) + deletion tombstones")
 
@@ -396,6 +399,19 @@ class _FakeAgentClient:
 
     async def disconnect(self):
         pass
+
+
+class _OpenFakeAgentClient(_FakeAgentClient):
+    """Keep an HTTP-opened test session live until explicit teardown."""
+    async def receive_messages(self):
+        while self._pending:
+            yield self._pending.pop(0)
+        await asyncio.Future()
+
+
+class _FailConnectAgentClient(_FakeAgentClient):
+    async def connect(self, prompt=None):
+        raise RuntimeError("private provider detail")
 
 
 async def test_session_driver_conversational():
@@ -904,7 +920,7 @@ async def test_open_close_test_session_http():
     missing index.md → 400; concurrency cap → 429; close tears down
     (snapshot dir + registry entry gone)."""
     orig = compile_box.create_agent_client
-    compile_box.create_agent_client = _FakeAgentClient
+    compile_box.create_agent_client = _OpenFakeAgentClient
     compile_box.RUNS.clear()
     compile_box.TEST_SESSIONS.clear()
     snap_root = tempfile.mkdtemp()
@@ -981,6 +997,22 @@ async def test_open_close_test_session_http():
         nobidx = make_source_bundle({"only.md": "x"})
         r = await client.post("/test-session/p1", json={"bundle_base64": base64.b64encode(nobidx).decode()})
         assert r.status == 400, await r.text()
+
+        # A failed worker connect is rejected by testStart itself. The response
+        # retains bounded routing facts, not the private exception message, and
+        # no dead session is advertised to a later testMessage call.
+        compile_box.create_agent_client = _FailConnectAgentClient
+        failed = await client.post("/test-session/p1")
+        assert failed.status == 503, await failed.text()
+        error = (await failed.json())["error"]
+        assert error == {
+            "code": "test_session_start_failed",
+            "stage": "worker_connect",
+            "exception_class": "RuntimeError",
+            "message": "test session failed to initialize",
+            "retriable": True,
+        }, error
+        assert "private" not in json.dumps(error)
 
         # sha mismatch → 400
         r = await client.post("/test-session/p1", json={
@@ -1240,6 +1272,14 @@ async def test_test_session_stall_reaps_turn_keeps_session_live():
                 while time.monotonic() < deadline and fake.interrupts == 0:
                     await asyncio.sleep(0.02)
                 assert fake.interrupts == 1, fake.interrupts
+                # The interrupt request precedes the delivered turn boundary.
+                # Wait for the event that actually enables the UI's next turn.
+                first_turn_events = []
+                while True:
+                    event = await asyncio.wait_for(run.events.get(), timeout=3)
+                    first_turn_events.append(event)
+                    if event["type"] == "turn_done":
+                        break
                 # turn 2 → the SAME live session answers a fresh question
                 compile_box._arm_test_turn(run)
                 await fake.query("again")
@@ -1251,7 +1291,7 @@ async def test_test_session_stall_reaps_turn_keeps_session_live():
                     await wdog
                 except asyncio.CancelledError:
                     pass
-        evs = _drain(run)
+        evs = first_turn_events + _drain(run)
         types = [e["type"] for e in evs]
         assert "turn_stalled" in types and "error" in types and "turn_done" in types, types
         td = next(e for e in evs if e["type"] == "turn_done")
@@ -3196,15 +3236,14 @@ async def test_unconverged_files_residual_ticket():
         assert repair is None, repair  # unconverged does not inject another repair
         sc = _json.loads((wd / "authoring" / "SELFCHECK.json").read_text())
         assert sc["state"] == "unconverged", sc
-        tickets = _json.loads((wd / "authoring" / "CONTRADICTIONS.json").read_text())
-        assert len(tickets) == 1 and tickets[0]["id"].startswith("selfcheck-residual-"), tickets
-        assert "never-compiled.md" in tickets[0]["sources"][0]["quote"]
+        assert not (wd / "authoring" / "CONTRADICTIONS.json").exists()
+        assert "snap/never-compiled.md" in sc["coverage"]["unaccounted"]
         # a second settle with the same residuals does not duplicate the ticket
         run._selfcheck_key = None
         (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: raw/snap/one.md\n---\n正文a 又动了。")
         await compile_box._post_turn_selfcheck(run)
-        tickets2 = _json.loads((wd / "authoring" / "CONTRADICTIONS.json").read_text())
-        assert len(tickets2) == 1, tickets2
+        assert not (wd / "authoring" / "CONTRADICTIONS.json").exists()
+
     print("OK  unconverged files a residual ticket (once, code-written, question queue)")
 
 
@@ -3471,52 +3510,9 @@ async def test_noop_repair_turn_reaches_the_gate():
         assert repair2 is None, repair2
         sc2 = _json.loads((wd / "authoring" / "SELFCHECK.json").read_text())
         assert sc2["state"] == "unconverged", sc2  # budget spent honestly, not stuck 'repairing'
-        tickets = _json.loads((wd / "authoring" / "CONTRADICTIONS.json").read_text())
-        assert any(str(tk.get("id", "")).startswith("selfcheck-residual-") for tk in tickets), tickets
+        assert not (wd / "authoring" / "CONTRADICTIONS.json").exists()
         del os.environ["KBC_L1_REPAIR_ROUNDS"]
     print("OK  no-op repair turn reaches the gate (unconverged + residual ticket, not silent)")
-
-
-def test_media_verify_suppresses_text_backed_beyond_transcript():
-    """A beyond-transcript image doubt whose claim is verbatim-backed by a
-    co-cited TEXT source is corroboration noise, not an owner question (live
-    adoption run 2026-07-22: "FP4 +46%" flagged while the co-cited markdown
-    states the figure verbatim). Inconsistent findings are never suppressed."""
-    import mediaverify
-    with tempfile.TemporaryDirectory() as td:
-        wd = Path(td)
-        (wd / "raw" / "snap").mkdir(parents=True)
-        (wd / "raw" / "snap" / "perf.md").write_text(
-            "B300较B200，FP4有46%提升；整体也只 +39.7%，不太符合预期。")
-        page_text = (
-            "---\ntype: Comparison\ntitle: c\nsources:\n"
-            "  - resource: raw/snap/perf.md\n  - resource: raw/snap/assets/tok1.png\n---\n"
-            "B300 FP4 较 B200 +46%。整体 +39.7%。另一个编造值 +87.5%。")
-        findings = [
-            {"image": "snap/assets/tok1.png", "claim": "B300 FP4 较 B200 +46%",
-             "kind": "超出转写范围", "expected": "not in the transcript", "fix": "…"},
-            {"image": "snap/assets/tok1.png", "claim": "整体 +39.7%",
-             "kind": "超出转写范围", "expected": "not in the transcript", "fix": "…"},
-            {"image": "snap/assets/tok1.png", "claim": "编造值 +87.5%",
-             "kind": "超出转写范围", "expected": "not in the transcript", "fix": "…"},
-            {"image": "snap/assets/tok1.png", "claim": "FP4 较 B200 +46%",
-             "kind": "不一致", "expected": "图中为 40%", "fix": "…"},
-        ]
-        kept, suppressed = mediaverify.suppress_text_backed(
-            str(wd), "c.md", page_text, findings)
-        s_claims = {s["claim"] for s in suppressed}
-        assert s_claims == {"B300 FP4 较 B200 +46%", "整体 +39.7%"}, suppressed
-        k_kinds = [(f["kind"], f["claim"]) for f in kept]
-        assert ("超出转写范围", "编造值 +87.5%") in k_kinds, kept   # not in text → real doubt
-        assert ("不一致", "FP4 较 B200 +46%") in k_kinds, kept      # conflicts never suppressed
-        assert all(s["suppressed_reason"] == "text_source_backed" for s in suppressed)
-        # qualitative claim without distinctive numbers → never suppressed
-        kept2, sup2 = mediaverify.suppress_text_backed(
-            str(wd), "c.md", page_text,
-            [{"image": "snap/assets/tok1.png", "claim": "该型号为 X 系列",
-              "kind": "超出转写范围", "expected": "not in the transcript", "fix": "…"}])
-        assert not sup2 and len(kept2) == 1
-    print("OK  media verify suppresses text-backed beyond-transcript doubts (keeps real ones + conflicts)")
 
 
 def test_l1_repair_budget_scales_with_workload():
@@ -3577,13 +3573,11 @@ async def test_l1_repair_budget_high_water_survives_shrinking_workload():
             assert repair2 is not None, "high-water must keep the gate open (used=1 < 3)"
             run._begin_turn(repair2)
             repair3 = await compile_box._post_turn_selfcheck(run)
-            assert repair3 is not None, "used=2 < 3 still repairing"
-            run._begin_turn(repair3)
-            repair4 = await compile_box._post_turn_selfcheck(run)
-            assert repair4 is None  # used=3 == limit -> unconverged
+            assert repair3 is None, "no new evidence or repair progress must stop retries"
             sc = _json.loads((wd / "authoring" / "SELFCHECK.json").read_text())
             assert sc["state"] == "unconverged", sc["state"]
-            assert sc["repair_rounds_used"] == 3 and sc["repair_rounds_limit"] == 3, sc
+            assert sc["repair_rounds_used"] == 2 and sc["repair_rounds_limit"] == 3, sc
+            assert sc["repair_stop_reason"] == "no_progress"
         finally:
             del os.environ["KBC_L1_REPAIR_ROUNDS"]
     print("OK  L1 repair budget keeps its episode high-water while the workload shrinks")
@@ -3758,7 +3752,7 @@ async def test_batch_orchestrator_routing_and_resume():
         assert all(b["status"] == "done" for b in plan["batches"]), plan
         assert (wd / batching.SOURCES_INVENTORY_PATH).is_file()
         # two batches + 终审 were driven, in order
-        assert len(driven) == 3 and driven[-1].startswith("final review"), driven
+        assert len(driven) == 4 and all(d.startswith("final review") for d in driven[2:]), driven
 
         # resume: mark one batch pending again → next trigger routes to batch even
         # under a huge threshold, and only the pending batch (+终审) re-runs
@@ -3775,7 +3769,7 @@ async def test_batch_orchestrator_routing_and_resume():
         finally:
             compile_box._drive_batch_session = real_drive
             compile_box._unaccounted_batch_sources = real_accounted
-        assert len(driven) == 2 and driven[0].startswith("batch 2/2"), driven
+        assert len(driven) == 1 and driven[0].startswith("batch 2/2"), driven
 
         # mid-batch owner chat queues and is relayed into the next directive
         run._batch_active = True
@@ -3803,7 +3797,7 @@ async def test_batch_orchestrator_routing_and_resume():
         finally:
             compile_box._drive_batch_session = real_drive
             compile_box._unaccounted_batch_sources = real_accounted
-        assert len(driven) == 3, driven
+        assert len(driven) == 4, driven
         assert not reset_marker.exists(), "reset marker survived replacement-plan seal"
         assert (wd / batching.BATCH_PLAN_PATH).is_file()
         del os.environ["KBC_BATCH_THRESHOLD_BYTES"]
@@ -5105,7 +5099,7 @@ async def test_hierarchical_batch_plan_and_section_reduce():
                             if label.startswith("final review")]
             saved = json.loads((wd / batching.BATCH_PLAN_PATH).read_text())
             assert reduce_scopes == [compile_box.NO_RAW_SCOPE], observed_raw_scopes
-            assert final_scopes == [compile_box.semantic_review_raw_scope(saved)], observed_raw_scopes
+            assert final_scopes and all(scope == compile_box.semantic_review_raw_scope(saved) for scope in final_scopes), observed_raw_scopes
             assert set(observed_idle_timeouts) == {
                 max(compile_box._MODEL_IDLE_TIMEOUT_S, 123)
             }, observed_idle_timeouts
@@ -5122,7 +5116,7 @@ async def test_hierarchical_batch_plan_and_section_reduce():
             assert compile_box._should_route_to_batch(run, "直接开始编译")
             driven.clear()
             await compile_box._run_batch_compile(run, "直接开始编译")
-            assert len(driven) == 1 and driven[0].startswith("final review"), driven
+            assert driven == [], "durable final units must not be replayed"
 
             # A crash after semantic finalization but before the durable commit
             # retries delivery only. No model session is replayed.
@@ -5369,13 +5363,14 @@ async def test_batch_orchestrator_review_fixes():
             async def drive_and_note(run_, directive, label, pdf_page_ranges=None,
                                      raw_scope=None):
                 driven.append(f"{label}|{directive}")
-                if label == "final review":  # owner speaks while the tail is running
+                if label.startswith("final review") and not getattr(run_, "_fixture_note_sent", False):  # one owner note
+                    run_._fixture_note_sent = True
                     run_._batch_notes.append("附录不要发布")
                 return f"done {label}"
 
             compile_box._drive_batch_session = drive_and_note
             await compile_box._run_batch_compile(run, "直接开始编译")
-            digest = [d for d in driven if d.startswith("note digest|")]
+            digest = [d for d in driven if d.startswith("final review notes ")]
             assert len(digest) == 1 and "附录不要发布" in digest[0], driven
             assert [e for e in _events(run) if e["type"] == "turn_done"], "turn still closes"
 
@@ -6179,10 +6174,11 @@ async def test_durable_workspace_sync_waits_for_consumer_ack():
         sent = {}
 
         pending = asyncio.create_task(
-            compile_box._sync_workspace(run, sent, durable_barrier=True))
+            compile_box._sync_workspace(run, sent, durable_barrier=True, completed_checkpoint=True))
         event = await asyncio.wait_for(run.events.get(), timeout=1)
         run.events.task_done()
         assert event["type"] == "syncArtifacts", event
+        assert uuid.UUID(event["completed_checkpoint_id"])
         sync_id = event.get("sync_id")
         assert sync_id and not pending.done(), "batch advanced before durable ACK"
         assert run._pending_sync_events[sync_id] == event
@@ -7391,6 +7387,7 @@ async def test_file_ticket_is_the_only_door_and_the_evidence_picks_the_kind():
         assert "id" not in ft.input_schema["properties"]  # identity is code-owned
         base = {"title": "K8s 版本", "question": "当前 K8s 是 1.30.2 还是 1.29?",
                 "options": ["1.30.2", "1.29.0"], "current_value": "1.30.2", "affected_pages": ["cluster.md"]}
+        base.update(review_action="needs_owner", investigation="Read original versions and applicability; neither states which is active.", answer_impact="Which Kubernetes version should a new cluster use?", owner_decision="Confirm the currently supported version.")
         two = [{"doc": "raw/a.md", "quote": "1.30.2"}, {"doc": "b.md", "quote": "1.29.0"}]
         one = [{"doc": "raw/a.md", "quote": "1.30.2"}]
         ledger = Path(td) / "authoring" / "CONTRADICTIONS.json"

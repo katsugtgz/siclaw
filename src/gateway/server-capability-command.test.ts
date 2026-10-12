@@ -95,7 +95,7 @@ describe("capability.command", () => {
   it("validates the common envelope and forwards the command opaquely", async () => {
     server = await startRuntime({
       config: { port: 0, internalPort: 0, host: "127.0.0.1", serverUrl: "", portalSecret: "" } as any,
-      agentBoxManager: fakeAgentBoxManager(), frontendClient: fakeFrontendClient(), credentialService: {} as any,
+      agentBoxManager: fakeAgentBoxManager(), frontendClient: fakeFrontendClient(), credentialService: { attachGrants: () => {}, resolveActorResources: async () => ({ clusters: [], hosts: [] }) } as any,
     });
     const start = server.rpcMethods.get("capability.start")!;
     const started = await start({ profile: "kb-compile", org_id: "org-1", correlation_id: "attempt-1" }) as { run_id: string };
@@ -132,7 +132,7 @@ describe("capability.command", () => {
   it("does not coerce a non-conflict AgentBox rejection into CONFLICT", async () => {
     server = await startRuntime({
       config: { port: 0, internalPort: 0, host: "127.0.0.1", serverUrl: "", portalSecret: "" } as any,
-      agentBoxManager: fakeAgentBoxManager(), frontendClient: fakeFrontendClient(), credentialService: {} as any,
+      agentBoxManager: fakeAgentBoxManager(), frontendClient: fakeFrontendClient(), credentialService: { attachGrants: () => {}, resolveActorResources: async () => ({ clusters: [], hosts: [] }) } as any,
     });
     const start = server.rpcMethods.get("capability.start")!;
     const started = await start({ profile: "kb-compile", org_id: "org-1", correlation_id: "attempt-1" }) as { run_id: string };
@@ -156,7 +156,7 @@ describe("capability.command", () => {
   it("rejects malformed common fields before touching the box", async () => {
     server = await startRuntime({
       config: { port: 0, internalPort: 0, host: "127.0.0.1", serverUrl: "", portalSecret: "" } as any,
-      agentBoxManager: fakeAgentBoxManager(), frontendClient: fakeFrontendClient(), credentialService: {} as any,
+      agentBoxManager: fakeAgentBoxManager(), frontendClient: fakeFrontendClient(), credentialService: { attachGrants: () => {}, resolveActorResources: async () => ({ clusters: [], hosts: [] }) } as any,
     });
     const before = posts.length;
     const command = server.rpcMethods.get("capability.command")!;
@@ -171,7 +171,7 @@ describe("capability.command", () => {
     const frontend = fakeFrontendClient();
     server = await startRuntime({
       config: { port: 0, internalPort: 0, host: "127.0.0.1", serverUrl: "", portalSecret: "" } as any,
-      agentBoxManager: fakeAgentBoxManager(), frontendClient: frontend, credentialService: {} as any,
+      agentBoxManager: fakeAgentBoxManager(), frontendClient: frontend, credentialService: { attachGrants: () => {}, resolveActorResources: async () => ({ clusters: [], hosts: [] }) } as any,
     });
     const start = server.rpcMethods.get("capability.start")!;
     const started = await start({ profile: "kb-compile", org_id: "org-1", correlation_id: "attempt-1" }) as { run_id: string };
@@ -189,7 +189,7 @@ describe("capability.command", () => {
     const frontend = fakeFrontendClient();
     server = await startRuntime({
       config: { port: 0, internalPort: 0, host: "127.0.0.1", serverUrl: "", portalSecret: "" } as any,
-      agentBoxManager: fakeAgentBoxManager(), frontendClient: frontend, credentialService: {} as any,
+      agentBoxManager: fakeAgentBoxManager(), frontendClient: frontend, credentialService: { attachGrants: () => {}, resolveActorResources: async () => ({ clusters: [], hosts: [] }) } as any,
     });
     const start = server.rpcMethods.get("capability.start")!;
     const started = await start({ profile: "kb-compile", org_id: "org-1", correlation_id: "attempt-1" }) as { run_id: string };

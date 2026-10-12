@@ -12,6 +12,7 @@ import {
   issuePersonalWebChatLink,
   type ChannelHandler,
 } from "./channel-manager.js";
+import { parseChannelAcceptanceScope } from "./channel-acceptance-scope.js";
 import type { FrontendWsClient } from "./frontend-ws-client.js";
 import type { AgentBoxManager } from "./agentbox/manager.js";
 
@@ -66,6 +67,21 @@ const fakeManager = {} as unknown as AgentBoxManager;
 beforeEach(() => {
   fakeHandlerRegistry.length = 0;
   frontend = new FakeFrontendClient();
+});
+
+it("acceptance Runtime starts only its selected personal bot, including direct starts", async () => {
+  const agentId = "79068105-473b-4417-8935-b4f11c16c5b3";
+  const selected = { id: "selected", type: "lark", config: { personal_bot: { agent_id: agentId } } };
+  const global = { id: "global", type: "lark", config: { app_id: "other" } };
+  frontend.responses.set("channel.list", { data: [global, selected] });
+  const mgr = new ChannelManager(fakeManager, undefined, frontend as unknown as FrontendWsClient,
+    { acceptanceScope: parseChannelAcceptanceScope(JSON.stringify({ agent_id: agentId, group_ids: [] })) });
+  await mgr.bootFromDb();
+  expect(mgr.size).toBe(1);
+  expect(fakeHandlerRegistry[0].receivedChannel).toEqual(selected);
+  expect(await mgr.startChannel(global)).toBe(false);
+  expect(fakeHandlerRegistry).toHaveLength(1);
+  await mgr.stopAll();
 });
 
 // ── resolveBinding / handlePairingCode ───────────────────────
@@ -164,6 +180,15 @@ describe("personal binding RPC wrappers", () => {
     frontend.responses.set("channel.resolvePersonalBinding", { binding: null, denied });
     const result = await resolvePersonalBinding("pb1", "ou_1", frontend as unknown as FrontendWsClient);
     expect(result.denied?.ttlMinutes).toBe(10);
+  });
+
+  it("preserves only a boolean trusted local identity-entry opt-in", async () => {
+    for (const value of [true, false, "true", 1, null]) {
+      frontend.responses.set("channel.resolvePersonalBinding", {binding:null,
+        denied:{reason:"shared_identity_entry", actionUrl:"http://127.0.0.1:30105/siclaw/channel-identity/a1",identityLinkLocalTest:value}});
+      const result = await resolvePersonalBinding("pb1", "ou_1", frontend as unknown as FrontendWsClient);
+      expect(result.denied?.identityLinkLocalTest).toBe(value === true ? true : undefined);
+    }
   });
 
   it("drops a nonsensical ttlMinutes rather than printing it", async () => {

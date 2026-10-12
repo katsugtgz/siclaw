@@ -70,7 +70,7 @@ describe("capability.message idempotency", () => {
       config: { port: 0, internalPort: 0, host: "127.0.0.1", serverUrl: "", portalSecret: "" } as any,
       agentBoxManager: fakeAgentBoxManager(),
       frontendClient: frontend,
-      credentialService: {} as any,
+      credentialService: { attachGrants: () => {}, resolveActorResources: async () => ({ clusters: [], hosts: [] }) } as any,
     });
     const start = server.rpcMethods.get("capability.start")!;
     const message = server.rpcMethods.get("capability.message")!;
@@ -97,7 +97,7 @@ describe("capability.message idempotency", () => {
       config: { port: 0, internalPort: 0, host: "127.0.0.1", serverUrl: "", portalSecret: "" } as any,
       agentBoxManager: fakeAgentBoxManager(),
       frontendClient: frontend,
-      credentialService: {} as any,
+      credentialService: { attachGrants: () => {}, resolveActorResources: async () => ({ clusters: [], hosts: [] }) } as any,
     });
     const start = server.rpcMethods.get("capability.start")!;
     const message = server.rpcMethods.get("capability.message")!;
@@ -127,7 +127,7 @@ describe("capability.message idempotency", () => {
       config: { port: 0, internalPort: 0, host: "127.0.0.1", serverUrl: "", portalSecret: "" } as any,
       agentBoxManager: fakeAgentBoxManager(),
       frontendClient: frontend,
-      credentialService: {} as any,
+      credentialService: { attachGrants: () => {}, resolveActorResources: async () => ({ clusters: [], hosts: [] }) } as any,
     });
     const start = server.rpcMethods.get("capability.start")!;
     const message = server.rpcMethods.get("capability.message")!;

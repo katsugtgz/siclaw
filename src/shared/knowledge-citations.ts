@@ -1,4 +1,50 @@
+/** Server-verified excerpt of the frozen Raw input; coordinates are not live-document anchors. */
+export interface KnowledgeSourceLocation {
+  page: string;
+  page_sha256: string;
+  evidence_id: string;
+  raw_sha256: string;
+  start_line: number;
+  end_line: number;
+  section?: string;
+  excerpt: string;
+}
+
+export function normalizeSourceLocations(value: unknown): KnowledgeSourceLocation[] {
+  if (!Array.isArray(value)) return [];
+  const result: KnowledgeSourceLocation[] = [];
+  const seen = new Set<string>();
+  for (const item of value) {
+    if (!item || typeof item !== "object") continue;
+    const v = item as KnowledgeSourceLocation;
+    if (typeof v.page !== "string" || typeof v.evidence_id !== "string" ||
+        !/^[a-f0-9]{64}$/.test(v.page_sha256 ?? "") || !/^[a-f0-9]{64}$/.test(v.raw_sha256 ?? "") ||
+        !Number.isSafeInteger(v.start_line) || !Number.isSafeInteger(v.end_line) ||
+        v.start_line < 1 || v.end_line < v.start_line || v.end_line - v.start_line >= 20 ||
+        typeof v.excerpt !== "string" || !v.excerpt.trim() || Array.from(v.excerpt).length > 1200) continue;
+    const key = JSON.stringify([v.page, v.page_sha256, v.evidence_id, v.raw_sha256, v.start_line, v.end_line]);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push({ page: v.page, page_sha256: v.page_sha256, evidence_id: v.evidence_id,
+      raw_sha256: v.raw_sha256, start_line: v.start_line, end_line: v.end_line,
+      ...(typeof v.section === "string" ? { section: v.section } : {}), excerpt: v.excerpt });
+  }
+  return result;
+}
+
+/** Group document links without discarding different positions in one original. */
+export function mergeKnowledgeCitationLocations(values: KnowledgeSourceCitation[]): KnowledgeSourceCitation[] {
+  const out = new Map<string, KnowledgeSourceCitation>();
+  for (const value of values) {
+    const previous = out.get(value.url);
+    const locations = normalizeSourceLocations([...(previous?.locations ?? []), ...(value.locations ?? [])]);
+    out.set(value.url, { ...(previous ?? value), ...(locations.length ? { locations } : {}) });
+  }
+  return [...out.values()];
+}
+
 export interface KnowledgeSourceCitation {
+  locations?: KnowledgeSourceLocation[];
   title: string;
   url: string;
   resource?: string;
@@ -19,7 +65,7 @@ export interface KnowledgeSourceCitation {
  */
 export interface KnowledgeCitationsMetadata {
   repo_ids: string[];
-  pages: Array<{ repo_id?: string; page?: string; url: string; source_id?: string; evidence?: string; claim?: string }>;
+  pages: Array<{ repo_id?: string; page?: string; url: string; source_id?: string; evidence?: string; claim?: string; locations?: KnowledgeSourceLocation[] }>;
 }
 
 export function knowledgeCitationsMetadata(citations: KnowledgeSourceCitation[]): KnowledgeCitationsMetadata {
@@ -34,6 +80,7 @@ export function knowledgeCitationsMetadata(citations: KnowledgeSourceCitation[])
       ...(c.sourceId ? { source_id: c.sourceId } : {}),
       ...(c.evidence ? { evidence: c.evidence } : {}),
       ...(c.claim ? { claim: c.claim } : {}),
+      ...(c.locations?.length ? { locations: c.locations } : {}),
     });
   }
   return { repo_ids: repoIds, pages };
@@ -67,13 +114,15 @@ export function normalizeKnowledgeSourceCitations(value: unknown): KnowledgeSour
     const url = typeof row.url === "string" ? row.url.trim() : "";
     let parsed: URL;
     try { parsed = new URL(url); } catch { continue; }
-    if (parsed.protocol !== "https:" || seen.has(parsed.href)) continue;
+    if (parsed.protocol !== "https:") continue;
+    if (!seen.has(parsed.href) && seen.size >= MAX_KNOWLEDGE_CITATIONS) continue;
     const titleRaw = typeof row.title === "string" ? row.title : "";
     const title = titleRaw.replace(/[\r\n]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 160) || "原文";
     seen.add(parsed.href);
     out.push({
       title,
       url: parsed.href,
+      ...(Array.isArray(row.locations) ? { locations: normalizeSourceLocations(row.locations) } : {}),
       resource: typeof row.resource === "string" ? row.resource : undefined,
       sourceId: typeof row.sourceId === "string" ? row.sourceId : undefined,
       page: typeof row.page === "string" ? row.page : undefined,
@@ -83,9 +132,8 @@ export function normalizeKnowledgeSourceCitations(value: unknown): KnowledgeSour
         ? Array.from(row.claim.trim()).slice(0, CLAIM_MAX_LENGTH).join("")
         : undefined,
     });
-    if (out.length >= MAX_KNOWLEDGE_CITATIONS) break;
   }
-  return out;
+  return mergeKnowledgeCitationLocations(out);
 }
 
 export function appendKnowledgeSourceCitations(text: string, value: unknown): string {
@@ -97,9 +145,25 @@ export function appendKnowledgeSourceCitations(text: string, value: unknown): st
   // closes a Markdown destination early and the remaining path can be parsed as
   // attacker-controlled document text. Percent-encoding preserves the URL while
   // keeping the destination inside the one link we render.
+  const chinese = heading === "参考原文";
+  let remaining = 8;
+  const plain = (value: string) => value.replace(/[\r\n\t]+/g, " ").replace(/[\\`*_{}\[\]()<>#!|]/g, "\\$&");
   const lines = citations.map((source) => {
     const destination = source.url.replaceAll("(", "%28").replaceAll(")", "%29");
-    return `- [${source.title.replace(/[\[\]]/g, "")}](${destination})`;
+    let line = `- [${source.title.replace(/[\[\]]/g, "")}](${destination})`;
+    const positions = source.locations ?? [];
+    const shown = positions.slice(0, remaining);
+    remaining -= shown.length;
+    for (const location of shown) {
+      const quote = Array.from(location.excerpt);
+      const preview = quote.slice(0, 400).join("") + (quote.length > 400 ? "…" : "");
+      const label = chinese ? "编译时原文快照" : "Compiled source snapshot";
+      line += `\n  ${location.section ? `${plain(location.section)} · ` : ""}${label} L${location.start_line}–${location.end_line}\n  > ${plain(preview)}`;
+    }
+    if (positions.length > shown.length) line += chinese
+      ? `\n  另有 ${positions.length - shown.length} 处证据位置未展开。`
+      : `\n  ${positions.length - shown.length} additional evidence positions are not expanded.`;
+    return line;
   });
   const sourceList = lines.join("\n");
   const trimmedText = text.trimEnd();

@@ -304,7 +304,7 @@ describe("TaskCoordinator.fireNow", () => {
 describe("TaskCoordinator execution", () => {
   it("finalizes the original scheduled run only after the remote destination finishes", async () => {
     const { coord, frontend, mgr } = makeCoord();
-    frontend.responses.set("conversation.capabilities", { handoff: true });
+    frontend.responses.set("conversation.capabilities", { handoff: true, requestModes: ["sync", "async"] });
     frontend.responses.set("task.fireNow", { outcome: "ok", task: {
       id: "scheduled-original", agent_id: "domestic", name: "Regional check", schedule: "*/5 * * * *",
       prompt: "check overseas", status: "active", created_by: "u1",
@@ -318,6 +318,7 @@ describe("TaskCoordinator execution", () => {
     });
     await coord.fireNow("scheduled-original");
     await vi.waitFor(() => expect(frontend.calls.some(c => c.method === "conversation.start")).toBe(true));
+    expect(frontend.calls.find(c => c.method === "conversation.start")?.params.requestMode).toBe("sync");
     expect(mgr.getOrCreate).not.toHaveBeenCalled();
     expect(frontend.calls.some(c => c.method === "task.runFinalize")).toBe(false);
     const start = frontend.calls.find(c => c.method === "conversation.start")!.params;

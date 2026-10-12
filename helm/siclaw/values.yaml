@@ -129,6 +129,8 @@ runtime:
   # agent by Portal, so you normally leave this unset. SICLAW_TRACING_ENVIRONMENT set
   # here is only a fallback for deployments where Portal does not supply one (Portal's
   # per-agent value wins when present).
+  # Set SICLAW_AGENT_ENGINE: codex here to enable compatible new AgentBox sessions.
+  # Non-Responses bindings, PDFs, required results, handoff sessions, and existing Pi transcripts stay on Pi.
   env: {}
 
 # -- Portal (standalone web UI, replaces Upstream)

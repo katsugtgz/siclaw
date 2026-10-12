@@ -183,6 +183,61 @@ describe("buildRedactionConfig — generic secret patterns", () => {
     expect(redactText("SECRET_TOKEN=foo", cfg)).toContain("[REDACTED]");
   });
 
+  it("keeps env references and placeholders in secret-named fields", () => {
+    const cases = [
+      '"apiKey": "{env:SIFLOW_API_KEY}"',
+      '"api_key": "$SIFLOW_API_KEY"',
+      '"api_key": "${SIFLOW_API_KEY}"',
+      '"apiKey": "<Your API Key>"',
+      "OPENAI_API_KEY=<Your API Key>",
+      'export OPENAI_API_KEY="<Your API Key>"',
+      "OPENAI_API_KEY=$SIFLOW_API_KEY",
+      'OPENAI_API_KEY="$SIFLOW_API_KEY"',
+      "API_KEY=<your-api-key> # replace",
+      '"apiKey": "<API_KEY>"',
+      '"api_key": "<你的API密钥>"',
+      "OPENAI_API_KEY=<your api key>",
+      '"token": "<token>"',
+      '"password": "<您的密码>"',
+      "TOKEN=$TOKEN",
+    ];
+    for (const input of cases) expect(redactText(input, cfg)).toBe(input);
+  });
+
+  it("still redacts literal values and defaulted references in secret-named fields", () => {
+    expect(redactText('"api_key": "${SIFLOW_API_KEY:-literalfallback}"', cfg)).toBe('"api_key": "[REDACTED]"');
+    expect(redactText('"apiKey": "plainliteralvalue"', cfg)).toBe('"apiKey": "[REDACTED]"');
+    expect(redactText('export OPENAI_API_KEY="plainliteral"', cfg)).toBe("export [REDACTED]");
+  });
+
+  it("redacts literal values that only resemble a reference or placeholder", () => {
+    // printenv prints expanded values: these are the secrets themselves.
+    expect(redactText("PASSWORD=$Summer2024abc", cfg)).toBe("[REDACTED]");
+    expect(redactText("PASSWORD=$ABC123XYZ", cfg)).toBe("[REDACTED]");
+    expect(redactText("PASSWORD=<Xk9mQ2vLp8Zt", cfg)).toBe("[REDACTED]");
+    expect(redactText("TOKEN=<abc>def", cfg)).toBe("[REDACTED]");
+    // A closed <...> holding a value-shaped token is a secret, not a placeholder.
+    expect(redactText("PASSWORD=<MyProductionPassword123>", cfg)).toBe("[REDACTED]");
+    expect(redactText("PASSWORD=<MyProductionPassword>", cfg)).toBe("[REDACTED]");
+    expect(redactText('{"password": "<MyProductionPassword123>"}', cfg)).toBe('{"password": "[REDACTED]"}');
+    expect(redactText('{"token": "<a8f3c1d9e7b2a4f6>"}', cfg)).toBe('{"token": "[REDACTED]"}');
+    // Placeholder-shaped but naming nothing: a passphrase, not a placeholder.
+    expect(redactText("PASSWORD=<correcthorsebatterystaple>", cfg)).toBe("[REDACTED]");
+    expect(redactText('{"password": "<correcthorsebatterystaple>"}', cfg)).toBe('{"password": "[REDACTED]"}');
+    expect(redactText("PASSWORD=<correct-horse-battery-staple>", cfg)).toBe("[REDACTED]");
+    expect(redactText("PASSWORD=<CORRECTHORSE>", cfg)).toBe("[REDACTED]");
+    expect(redactText("PASSWORD=<mypassword>", cfg)).toBe("[REDACTED]");
+    expect(redactText('{"password": "<correct horse battery staple>"}', cfg)).toBe('{"password": "[REDACTED]"}');
+    expect(redactText('{"password": "<正确马电池订书钉>"}', cfg)).toBe('{"password": "[REDACTED]"}');
+    expect(redactText('{"password": "$Summer2024abc"}', cfg)).toBe('{"password": "[REDACTED]"}');
+    expect(redactText('{"token": "<a8f3c1d9e7b2a4f6"}', cfg)).toBe('{"token": "[REDACTED]"}');
+  });
+
+  it("never exempts a configured credential that looks like a reference", () => {
+    const literal = buildRedactionConfig(undefined, undefined, ["{env:NOT_A_REF}"]);
+    expect(redactText("value {env:NOT_A_REF} here", literal)).toBe("value [REDACTED] here");
+  });
+
   it("leaves unrelated text untouched", () => {
     // No known secret pattern; pure prose should pass through unchanged.
     const input = "hello world, pods are healthy.";

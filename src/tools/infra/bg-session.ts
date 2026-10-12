@@ -87,16 +87,17 @@ export function killRemoteSessionViaKubectl(opts: {
   childEnv: Record<string, string>;
   namespace: string;
   podName: string;
+  container?: string;
   nsenterPrefix: string[];
   pgidFile: string;
   timeoutMs?: number;
 }): void {
-  const { kubeconfigArgs, childEnv, namespace, podName, nsenterPrefix, pgidFile } = opts;
+  const { kubeconfigArgs, childEnv, namespace, podName, container, nsenterPrefix, pgidFile } = opts;
   const timeoutMs = opts.timeoutMs ?? 15_000;
   try {
     const killer = spawn(
       "kubectl",
-      [...kubeconfigArgs, "-n", namespace, "exec", podName, "--", ...nsenterPrefix, "sh", "-c", backgroundSessionKillScript(pgidFile)],
+      [...kubeconfigArgs, "-n", namespace, "exec", podName, ...(container ? ["-c", container] : []), "--", ...nsenterPrefix, "sh", "-c", backgroundSessionKillScript(pgidFile)],
       { env: childEnv, detached: true },
     );
     killer.on("error", () => {});

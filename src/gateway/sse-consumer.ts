@@ -115,7 +115,7 @@ export interface ConsumeAgentSseOptions {
    * leave every question ordered before every answer. Fired for the turn's opening prompt
    * as well as for each steer, so one rule covers every user row.
    */
-  onUserMessageStarted?: (echoedText: string) => void | Promise<void>;
+  onUserMessageStarted?: (echoedText: string, inputMessageId?: string) => void | string | {messageId:string;kind:"prompt"|"steer"} | Promise<void | string | {messageId:string;kind:"prompt"|"steer"}>;
   /** Abort signal — breaks the loop when triggered. */
   signal?: AbortSignal;
   /**
@@ -528,9 +528,12 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
   // by agent_end these point at the turn's final assistant message.
   let assistantEndedInStep = false;
   const assistantItems = new AssistantItemStream();
+  const textReceipts = { rawTextDeltas: 0, itemTextDeltas: 0, firstTextDeltaAtMs: undefined as number | undefined,
+    lastTextDeltaAtMs: undefined as number | undefined };
   const itemTurnId = opts.turnId ?? opts.traceId ?? randomUUID();
   const startedItems = new Set<string>();
   const emitItem = (item: AssistantItem, completed: boolean, dbId?: string, delta?: string, metadata?: Record<string, unknown>) => {
+    if (delta !== undefined) textReceipts.itemTextDeltas++;
     const type = delta !== undefined ? "item/agentMessage/delta" : completed ? "item/completed" : "item/started";
     const scope = { threadId: sessionId, turnId: itemTurnId, itemId: item.id };
     if (!startedItems.has(item.id) && type !== "item/started") {
@@ -651,6 +654,11 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
           (evt.message as { role?: string } | undefined)?.role === "assistant")) assistantItems.begin();
       if (eventType === "message_update") {
         const update = evt.assistantMessageEvent as Record<string, unknown> | undefined;
+        if (update?.type === "text_delta") {
+          textReceipts.rawTextDeltas++;
+          textReceipts.firstTextDeltaAtMs ??= Date.now();
+          textReceipts.lastTextDeltaAtMs = Date.now();
+        }
         if (update) {
           const output = assistantItems.update(update);
           if (output) {
@@ -897,10 +905,13 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
             ? (message.content as Array<{ type?: string; text?: string }>)
                 .filter((part) => part?.type === "text" && typeof part.text === "string")
                 .map((part) => part.text as string).join("")
-            : "";
+            : typeof message.content === "string" ? message.content : "";
           // Never let bookkeeping break the stream the user is watching.
           try {
-            await onUserMessageStarted(echoed);
+            const consumedId = typeof evt.inputMessageId === "string"
+              ? await onUserMessageStarted(echoed, evt.inputMessageId) : await onUserMessageStarted(echoed);
+            if (typeof consumedId === "string") dbMessageId = consumedId;
+            else if (consumedId) { dbMessageId=consumedId.messageId;evt.inputMessageKind=consumedId.kind; }
           } catch (err) {
             console.warn(`[sse-consumer] ${userId}: failed to mark user message as started:`, err);
           }
@@ -1113,7 +1124,8 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
           (evt as Record<string, unknown>).phase = phase;
           // Provider phase is item-level. Unknown is not a guessed final answer.
           for (const item of completedItems) emitItem(item, true, undefined, undefined,
-            currentModelRouteMetadata ? { modelRoute: currentModelRouteMetadata } : {});
+            { ...(currentModelRouteMetadata ? { modelRoute: currentModelRouteMetadata } : {}),
+              ...(message.nativeUserInput ? { nativeUserInput: message.nativeUserInput } : {}) });
           if (currentModelRouteMetadata) {
             (evt as Record<string, unknown>).modelRoute = currentModelRouteMetadata;
           }
@@ -1134,6 +1146,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
               ? buildThinkingRow(message, rowEnvelope, (text) => redactText(text, redactionConfig))
               : null;
             const headMetadata: Record<string, unknown> = {
+              ...(message.nativeUserInput ? { native_user_input: message.nativeUserInput } : {}),
               ...(rowEnvelope ? { llm_call: rowEnvelope } : {}),
               ...(!rowEnvelope && envelope && envelope.round > 0 ? { llm_round: envelope.round } : {}),
               ...(currentModelRouteMetadata ? { model_route: currentModelRouteMetadata } : {}),
@@ -1302,6 +1315,9 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
   // consistent.
   const cleanedResult = stripEmptyResponseMarkers(taskReportText || resultText);
   const finalResultText = redactText(cleanedResult, redactionConfig);
+  // These are bridge receipt timestamps, not provider TTFT or token accounting.
+  // Counters contain no text/error/header values; IDs are trusted session scope.
+  console.info("[sse-text-receipts]", JSON.stringify({ sessionId, turnId: opts.turnId, ...textReceipts, finishedAtMs: Date.now() }));
   return {
     resultText: finalResultText,
     taskReportText: redactText(stripEmptyResponseMarkers(taskReportText), redactionConfig),

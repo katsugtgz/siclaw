@@ -11,7 +11,7 @@
 
 import crypto from "node:crypto";
 import WebSocket from "ws";
-import { wrapRpcError } from "../lib/error-envelope.js";
+import { RpcResponseError, wrapRpcError } from "../lib/error-envelope.js";
 
 // ── Public types ─────────────────────────────────────────────
 
@@ -56,6 +56,10 @@ const JITTER_MAX_MS = 2_000;
 // ── Client ───────────────────────────────────────────────────
 
 export class FrontendWsClient {
+  private consumerCapabilities: Record<string, unknown> | null = null;
+  consumerDeclares(name: string): boolean | null {
+    return this.consumerCapabilities === null ? null : this.consumerCapabilities[name] === true;
+  }
   private readonly opts: Required<FrontendWsClientOptions>;
   private ws: WebSocket | null = null;
   private _connected = false;
@@ -244,7 +248,12 @@ export class FrontendWsClient {
     // left, so a consumer told they are active would keep waiting for them forever.
     const params: Record<string, unknown> = { capabilities: caps ?? {} };
     if (activeSessions) params.activeSessions = activeSessions;
-    this.request("runtime.register", params).catch((err: unknown) => {
+    this.request("runtime.register", params).then((reply: any) => {
+      const capabilities = reply?.capabilities;
+      this.consumerCapabilities = capabilities && typeof capabilities === "object" && !Array.isArray(capabilities)
+        ? { ...capabilities } : {};
+    }).catch((err: unknown) => {
+      this.consumerCapabilities = {};
       const message = err instanceof Error ? err.message : String(err);
       console.warn(`[frontend-ws] capability advertise not acked (ok on older consumer): ${message}`);
     });
@@ -341,7 +350,16 @@ export class FrontendWsClient {
         const errMsg = typeof msg.error === "string"
           ? msg.error
           : msg.error?.message ?? `RPC error (id=${msg.id})`;
-        entry.reject(new Error(errMsg));
+        // Keep the peer's classification: callers tell a permanent refusal
+        // (e.g. CONFLICT from a fenced writer) from a transient failure by it.
+        entry.reject(typeof msg.error?.code === "string"
+          ? new RpcResponseError({
+              code: msg.error.code,
+              message: errMsg,
+              retriable: typeof msg.error.retriable === "boolean" ? msg.error.retriable : true,
+              ...(typeof msg.error.status === "number" ? { status: msg.error.status } : {}),
+            })
+          : new Error(errMsg));
       }
       return;
     }

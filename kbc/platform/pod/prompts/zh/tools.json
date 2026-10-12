@@ -27,7 +27,7 @@
     "deleted": "已删除 candidate 页面: {path}"
   },
   "file_ticket": {
-    "desc": "开一张矛盾工单。一律通过本工具开单,不要手写 authoring/CONTRADICTIONS.json:手写的票没有 ticket_kind,轮末会落成「未分类」并需要重新开单。每个搞不定的问题调一次,且必须在你已把 best-guess 写进页面并标了 ⚠️ 之后。参数:`ticket_kind` —— 两份以上【不同】raw 文档确实互相矛盾时填 `source_conflict`(该修的是原文,wiki 只是投影,由原文负责人处理);只有负责人能拍板的填 `model_gap`:单一来源、基于 BRIEF.json 的定调/范围问题、图读不清、你理解不了的地方。系统会拿你的 `sources` 核对 kind:两个及以上不同 raw 文档且都有引文 → 只能是 source_conflict;不足两个 → 只能是 model_gap;对不上会被拒并告知应填哪个,你按提示重提即可。`title`(短标题)、`question`(一句大白话)、`sources`([{doc, quote}],互相矛盾的原文段落或你判断的依据)、`options`(2–4 个干净的候选值,不要写「以…为准」)、`current_value`(你写进页面的值)、`affected_pages`(带 ⚠️ 的 candidate 文件)。id 由 question + 涉及文档算出:同一问题再提会更新那张票,不会重复开。",
+    "desc": "先查证再升级：默认用 file_ticket(review_action=\"investigate\") 保存内部疑点，不直接编辑 CONTRADICTIONS.json 或 REVIEW_NOTES.json。同一业务问题先查已有记录，复用 review_id。结合完整原料、附近正文、版本适用范围、已有裁决及原图查证；每次重试必须增加证据，后续批次未到的事项先延后。resolved 需要说明证据与结论。只有已完成查证仍无法解决、影响具体问答且需要负责人补充事实或决策，才用 needs_owner，并填写 investigation、answer_impact、owner_decision。技术故障、结构修订和审核模型分歧不直接提业务工单。图片描述和模型转写仅是线索，不是原图的替代品；使用图像事实时阅读原图及附近原文，读不清则保留未知。终审核对暂存事项，利用已完成批次自行解决，不能为减少工单编造确定结论。已有负责人回答沿用原裁决流程。 ticket_kind 沿用 model_gap/source_conflict 分类，title、question、sources [{doc,quote}]、current_value、affected_pages 必填。 历史工单尚无 review_id 时，可传 CONTRADICTIONS.json 中的 existing_ticket_id；该 ID 必须已存在，且不能与已有调查绑定冲突。",
     "bad_kind": "file_ticket 需要 `ticket_kind`,取值之一:{kinds}",
     "need_args": "file_ticket 需要 `title`、`question`、非空 `sources`(每条带 `doc`)、`current_value` 和 `affected_pages`。",
     "kind_needs_conflict": "已拒:引用了 {n} 份不同的 raw 文档({docs})—— 这是 source_conflict(文档之间打架,该由原文负责人统一口径),不是 model_gap。请按 ticket_kind=source_conflict 重提。",

@@ -14,6 +14,7 @@ import {
   normalizeModelRouteState,
   resolveEffectivePolicy,
   runPromptWithModelRouting,
+  candidateSupportsPromptMedia,
   shouldFallbackForKind,
   type ModelRouteEvent,
   type ModelRouteFailureKind,
@@ -909,6 +910,18 @@ describe("runPromptWithModelRouting", () => {
     });
     expect(brain.promptModels).toEqual(["anthropic/claude"]);
     expect(state.activeCandidateKey).toBe("anthropic/claude");
+  });
+
+  it("lets Codex validate native images instead of rejecting a legacy text-only descriptor", async () => {
+    const brain = makeBrain(["ok"]);
+    Object.assign(brain, { brainType: "codex" });
+    const candidate = candidateWithInput("openai", "gpt-4", ["text"]);
+    const media = { images: [{ mimeType: "image/png", data: "aGVsbG8=" }] };
+    expect(candidateSupportsPromptMedia(candidate, media, "codex")).toBe(true);
+    expect(candidateSupportsPromptMedia(candidate, media, "pi-agent")).toBe(false);
+    const result = await runPromptWithModelRouting(brain, "Inspect the image", { ...makePolicy(), candidates: [candidate, candidateWithInput("anthropic", "claude", ["text"])] }, createModelRouteState(), {}, media);
+    expect(result.success).toBe(true);
+    expect(brain.promptModels).toEqual(["openai/gpt-4"]);
   });
 
   it("skips non-image-capable fallback candidates when images are present", async () => {

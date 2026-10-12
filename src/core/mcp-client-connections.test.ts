@@ -108,8 +108,8 @@ describe("McpClientManager.getServerConnections", () => {
     });
     const manager = new McpClientManager({
       mcpServers: {
-        devops: { transport: "streamable-http", url: good },
-        siverse: { transport: "streamable-http", url: bad },
+        devops: { transport: "streamable-http", env: { SICLAW_MCP_READ_ONLY_TOOLS: '["ping","echo","query","status","first"]' }, url: good },
+        siverse: { transport: "streamable-http", env: { SICLAW_MCP_READ_ONLY_TOOLS: '["ping","echo","query","status","first"]' }, url: bad },
       },
     });
     try {
@@ -123,7 +123,7 @@ describe("McpClientManager.getServerConnections", () => {
       expect(connections[0].transport).toBe("streamable-http");
       expect(connections[0].error).toBeUndefined();
       expect(connections[1].error).toMatchObject({ kind: "not_found", httpStatus: 404, contentType: "text/html" });
-      expect(connections[1].error?.message).toBe("HTML page: Simate");
+      expect(connections[1].error?.message).toBe("MCP connection or security validation failed");
       for (const c of connections) {
         expect(c.observedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
         expect(c.durationMs).toBeGreaterThanOrEqual(0);
@@ -139,7 +139,7 @@ describe("McpClientManager.getServerConnections", () => {
     const manager = new McpClientManager({ mcpServers: { odd: { transport: "carrier-pigeon" } as any } });
     await manager.initialize();
     expect(manager.getServerConnections()).toEqual([
-      expect.objectContaining({ name: "odd", state: "failed", toolCount: 0, error: { kind: "invalid_config", message: 'unknown transport "carrier-pigeon"' } }),
+      expect.objectContaining({ name: "odd", state: "failed", toolCount: 0, error: { kind: "invalid_config", message: "Unknown MCP transport" } }),
     ]);
   });
 
@@ -149,7 +149,7 @@ describe("McpClientManager.getServerConnections", () => {
     const port = (closed.address() as AddressInfo).port;
     await new Promise<void>((r) => closed.close(() => r()));
     const manager = new McpClientManager({
-      mcpServers: { gone: { transport: "streamable-http", url: `http://127.0.0.1:${port}/mcp` } },
+      mcpServers: { gone: { transport: "streamable-http", env: { SICLAW_MCP_READ_ONLY_TOOLS: '["ping","echo","query","status","first"]' }, url: `http://127.0.0.1:${port}/mcp` } },
     });
     await manager.initialize();
     expect(manager.getServerConnections()[0]).toMatchObject({ name: "gone", state: "failed", error: { kind: "connection_refused" } });
@@ -173,9 +173,9 @@ describe("McpClientManager.getServerInstructions", () => {
     const without = await listen(fakeMcpServer(["ping"]));
     const manager = new McpClientManager({
       mcpServers: {
-        devops: { transport: "streamable-http", url: withGuide },
-        blank: { transport: "streamable-http", url: blank },
-        plain: { transport: "streamable-http", url: without },
+        devops: { transport: "streamable-http", url: withGuide, env: { SICLAW_MCP_READ_ONLY_TOOLS: '["inventory"]' } },
+        blank: { transport: "streamable-http", url: blank, env: { SICLAW_MCP_READ_ONLY_TOOLS: '["echo"]' } },
+        plain: { transport: "streamable-http", url: without, env: { SICLAW_MCP_READ_ONLY_TOOLS: '["ping"]' } },
       },
     });
     try {
@@ -203,7 +203,7 @@ describe("McpClientManager.getServerInstructions", () => {
       }
       fakeMcpServer([], "should not appear")(req, body, res);
     });
-    const manager = new McpClientManager({ mcpServers: { broken: { transport: "streamable-http", url } } });
+    const manager = new McpClientManager({ mcpServers: { broken: { transport: "streamable-http", url, env: { SICLAW_MCP_READ_ONLY_TOOLS: '["ping"]' } } } });
     try {
       await manager.initialize();
       expect(manager.getServerConnections()[0]).toMatchObject({ name: "broken", state: "failed" });
@@ -236,7 +236,7 @@ describe("McpClientManager closes clients that fail after the transport is up", 
       }
       fakeMcpServer([])(req, body, res);
     });
-    const manager = new McpClientManager({ mcpServers: { flaky: { transport: "streamable-http", url } } });
+    const manager = new McpClientManager({ mcpServers: { flaky: { transport: "streamable-http", env: { SICLAW_MCP_READ_ONLY_TOOLS: '["ping","echo","query","status","first"]' }, url } } });
     await manager.initialize();
     expect(manager.getServerConnections()[0]).toMatchObject({ name: "flaky", state: "failed", error: { kind: "protocol" } });
     expect(manager.getTools()).toEqual([]);
@@ -259,7 +259,7 @@ describe("McpClientManager paginated tool inventory", () => {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ jsonrpc: "2.0", id: message.id, ...page(message.params) as object }));
     });
-    const manager = new McpClientManager({ mcpServers: { metrics: { transport: "streamable-http", url } } });
+    const manager = new McpClientManager({ mcpServers: { metrics: { transport: "streamable-http", env: { SICLAW_MCP_READ_ONLY_TOOLS: '["ping","echo","query","status","first"]' }, url } } });
     await manager.initialize();
     return { manager, requests };
   }
@@ -312,7 +312,7 @@ describe("McpClientManager paginated tool inventory", () => {
       };
       if (pages === 2) { release = reply; reached(); } else reply();
     });
-    const manager = new McpClientManager({ mcpServers: { metrics: { transport: "streamable-http", url } } });
+    const manager = new McpClientManager({ mcpServers: { metrics: { transport: "streamable-http", env: { SICLAW_MCP_READ_ONLY_TOOLS: '["ping","echo","query","status","first"]' }, url } } });
     const initializing = manager.initialize();
     await waiting;
     await manager.shutdown();
@@ -333,7 +333,7 @@ describe("McpClientManager.shutdown during initialize", () => {
       // Answer slowly so shutdown() can land while the SDK is still dialling.
       setTimeout(() => fakeMcpServer(["ping"])(req, body, res), 300);
     });
-    const manager = new McpClientManager({ mcpServers: { slow: { transport: "streamable-http", url } } });
+    const manager = new McpClientManager({ mcpServers: { slow: { transport: "streamable-http", env: { SICLAW_MCP_READ_ONLY_TOOLS: '["ping","echo","query","status","first"]' }, url } } });
     const init = manager.initialize();
     await new Promise((r) => setTimeout(r, 50));
     await manager.shutdown();

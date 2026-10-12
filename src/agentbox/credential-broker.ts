@@ -29,7 +29,10 @@
 import { execFile } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { load as loadYaml, JSON_SCHEMA } from "js-yaml";
 import { ConcurrencyLimiter } from "../core/concurrency-limiter.js";
+import { ChannelKubernetesProxy } from "./channel-kubernetes-proxy.js";
+import { requireChannelOperation, channelPolicyForCluster, requireChannelHostOperation, type ChannelExecutionPolicy } from "../shared/channel-execution-policy.js";
 import type {
   CredentialTransport,
   ClusterMeta,
@@ -348,6 +351,12 @@ class ResourceRegistry<TMeta extends { name: string }> {
 // ---------------------------------------------------------------------------
 
 export class CredentialBroker {
+  private readonly channelProxies = new Map<string, ChannelKubernetesProxy>();
+  private readonly ownedCleanups = new Set<() => void>();
+  private readonly directory: string;
+  // Keep rotated/revoked values until this owner is disposed: older tool
+  // artifacts and upstream error messages can still echo those credentials.
+  private readonly sensitiveValues = new Set<string>();
   private readonly clusters: ResourceRegistry<ClusterMeta>;
   private readonly hosts: ResourceRegistry<HostMeta>;
   private readonly cleanupTimer: ReturnType<typeof setInterval>;
@@ -389,15 +398,19 @@ export class CredentialBroker {
    * "no" forever.
    */
   private devopsCredentialWritten = false;
+  private devopsCredentialPath: string | undefined;
   private devopsInflight: Promise<void> | null = null;
 
   constructor(
     private readonly transport: CredentialTransport,
     credentialsDir?: string,
+    private readonly channel?: { policy: ChannelExecutionPolicy; validate: () => Promise<void> },
   ) {
     const dir = credentialsDir || path.resolve(process.cwd(), ".siclaw/credentials");
+    this.directory = path.resolve(dir);
     fs.mkdirSync(dir, { recursive: true });
     this.credentialsDir = dir;
+    if (fs.lstatSync(dir).isSymbolicLink()) throw new Error("Credential cache root is an unsafe path");
     this.clusters = new ResourceRegistry<ClusterMeta>("clusters", dir, {
       fileMode: 0o640,
       sharedGroup: "kubecred",
@@ -406,6 +419,24 @@ export class CredentialBroker {
       fileMode: 0o640,
       sharedGroup: "hostcred",
     });
+    // A LocalSpawner/CLI process may restart with this owner's materialized
+    // files still on disk. Register them before any MCP or tool output is
+    // accepted, even before a fresh credential request warms the registry.
+    const existingFiles: CredentialFile[] = [];
+    let existingBytes = 0;
+    for (const kind of ["clusters", "hosts"]) {
+      const directory = path.join(dir, kind);
+      if (fs.lstatSync(directory).isSymbolicLink()) throw new Error("Credential cache directory is an unsafe path");
+      for (const name of fs.readdirSync(directory)) {
+        const file = path.join(directory, name);
+        const stat = fs.lstatSync(file);
+        if (stat.isSymbolicLink() || !stat.isFile()) throw new Error("Credential cache contains an unsafe path");
+        existingBytes += stat.size;
+        if (existingFiles.length >= 1000 || existingBytes > 8 * 1024 * 1024) throw new Error("Credential cache exceeds the redaction budget");
+        existingFiles.push({ name, content: fs.readFileSync(file, "utf8") });
+      }
+    }
+    this.rememberSensitiveFiles(existingFiles);
     this.cleanupTimer = setInterval(() => {
       this.clusters.evictExpired();
       this.hosts.evictExpired();
@@ -458,6 +489,7 @@ export class CredentialBroker {
     purpose: string,
     options: { bypassCache?: boolean } = {},
   ): Promise<CredentialResponse> {
+    await this.validateChannelPolicy();
     const cached = this.clusters.get(sourceId);
     if (
       !options.bypassCache &&
@@ -468,7 +500,17 @@ export class CredentialBroker {
       return reconstructClusterResponse(cached);
     }
 
-    const response = await this.transport.getClusterCredential(sourceId, purpose);
+    let response = await this.transport.getClusterCredential(sourceId, purpose);
+    this.rememberSensitiveValues(response);
+    if (this.channel) {
+      const file = response.credential.files.find(file => file.name.endsWith("kubeconfig")) ?? response.credential.files[0];
+      if (!file) throw new Error("Missing scoped Kubernetes credential");
+      let proxy = this.channelProxies.get(response.credential.name);
+      if (!proxy) { proxy = new ChannelKubernetesProxy(channelPolicyForCluster(this.channel.policy,response.credential.name), this.channel.validate); this.channelProxies.set(response.credential.name, proxy); }
+      const scoped = await proxy.configure(file.content);
+      response = { ...response, credential: { ...response.credential, files: [{ name: "kubeconfig", content: scoped }] } };
+      this.rememberSensitiveValues(response);
+    }
     const meta = mergeClusterMeta(cached?.meta, response);
     const ttlMs = (response.credential.ttl_seconds ?? 300) * 1000;
     const filePaths = this.clusters.setMaterialized(response.credential.name, meta, response.credential.files, ttlMs);
@@ -662,7 +704,11 @@ export class CredentialBroker {
     purpose: string,
     _options: { bypassCache?: boolean } = {},
   ): Promise<CredentialResponse> {
+    this.requireChannelOperation(purpose.includes("script") ? "scripts" : "ssh_exec");
+    await this.validateChannelPolicy();
     const response = await this.transport.getHostCredential(sourceId, purpose);
+    requireChannelHostOperation(this.channel?.policy,typeof response.credential.metadata?.resource_id==='string'?response.credential.metadata.resource_id:'',purpose.includes("script")?"scripts":"ssh_exec");
+    this.rememberSensitiveValues(response);
     const cached = this.hosts.get(sourceId);
     const meta = mergeHostMeta(cached?.meta, response, sourceId);
     const ttlMs = (response.credential.ttl_seconds ?? 300) * 1000;
@@ -757,7 +803,9 @@ export class CredentialBroker {
         if (!credential) {
           throw new Error("Gateway returned malformed credential-request (devops) response");
         }
-        registerDevopsCredential(this.credentialsDir, {
+        this.sensitiveValues.add(credential.token);
+        this.sensitiveValues.add(credential.service_token);
+        const registered = registerDevopsCredential(this.credentialsDir, {
           name: credential.name,
           endpoint: credential.metadata.endpoint,
           project: credential.metadata.project,
@@ -765,6 +813,7 @@ export class CredentialBroker {
           serviceToken: credential.service_token,
           description: credential.description,
         });
+        this.devopsCredentialPath = path.resolve(this.credentialsDir, registered.entry.files[0]);
         this.devopsCredentialWritten = true;
         console.log(
           `[credential-broker] acquired delivery credential "${credential.name}" (project=${credential.metadata.project})`,
@@ -783,8 +832,77 @@ export class CredentialBroker {
 
   dispose(): void {
     clearInterval(this.cleanupTimer);
+    for (const proxy of this.channelProxies.values()) proxy.dispose();
+    this.channelProxies.clear();
+    for (const cleanup of [...this.ownedCleanups].reverse()) cleanup();
+    this.ownedCleanups.clear();
     this.clusters.dispose();
     this.hosts.dispose();
+    this.devopsCredentialWritten = false;
+    this.devopsCredentialPath = undefined;
+    this.sensitiveValues.clear();
+  }
+
+  /** Private backend redaction source, never a tool response or sync payload. */
+  getSensitiveValues(): readonly string[] { return [...this.sensitiveValues]; }
+  getDevopsCredentialPath(): string {
+    if (!this.devopsCredentialPath) throw new Error("Delivery credential has not been materialized");
+    return this.devopsCredentialPath;
+  }
+  getChannelPolicy(): ChannelExecutionPolicy | undefined { return this.channel?.policy; }
+  /** Trusted factory-owned resources, never a model tool or arbitrary path. */
+  registerOwnedCleanup(cleanup: () => void): void { this.ownedCleanups.add(cleanup); }
+  requireChannelOperation(operation: string): void { requireChannelOperation(this.channel?.policy, operation); }
+  async validateChannelPolicy(): Promise<void> { if (this.channel) await this.channel.validate(); }
+  registerChannelPodTransport(cluster:string,namespace:string,pod:string,container:string,args:readonly string[],script:boolean,cleanupArgs:readonly string[]){
+    if(!this.channel)return undefined;
+    const proxy=this.channelProxies.get(cluster);if(!proxy)throw new Error("Scoped cluster transport is unavailable");
+    return proxy.registerPodTransport(namespace,pod,container,args,script,cleanupArgs);
+  }
+  /** Backend policy metadata only; never expose this through a model tool. */
+  getPrivateDirectory(): string { return this.directory; }
+
+  private rememberSensitiveValues(response: CredentialResponse): void {
+    const files = [...response.credential.files, ...(response.credential.jump_chain ?? []).flatMap(hop => hop.files)];
+    this.rememberSensitiveFiles(files);
+  }
+
+  private rememberSensitiveFiles(files: CredentialFile[]): void {
+    for (const file of files) {
+      if (!file.content) continue;
+      this.sensitiveValues.add(file.content);
+      // Host passwords and keys may be echoed without their trailing newline
+      // or PEM wrapper. Retain their literal body as well as the full file.
+      if (!/kubeconfig/i.test(file.name)) {
+        this.sensitiveValues.add(file.content.trim());
+        for (const line of file.content.split(/\r?\n/)) {
+          if (line.length >= 16 && !line.startsWith("-----")) this.sensitiveValues.add(line);
+        }
+        continue;
+      }
+      try {
+        const visit = (value: unknown, depth: number): void => {
+          if (depth > 48) throw new Error("Credential structure exceeds safety budget");
+          if (Array.isArray(value)) { for (const item of value) visit(item, depth + 1); return; }
+          if (!value || typeof value !== "object") return;
+          for (const [key, item] of Object.entries(value)) {
+            if (/token|password|client-key|private-key|secret/i.test(key) && typeof item === "string" && item) {
+              this.sensitiveValues.add(item);
+              if (/data$/i.test(key)) this.sensitiveValues.add(Buffer.from(item, "base64").toString("utf8"));
+            }
+            // Kubeconfig exec/auth-provider env pairs can carry arbitrary keys.
+            if (key === "env" && Array.isArray(item)) for (const pair of item) {
+              if (pair && typeof pair === "object" && typeof pair.value === "string" && pair.value) this.sensitiveValues.add(pair.value);
+            }
+            visit(item, depth + 1);
+          }
+        };
+        visit(loadYaml(file.content, { schema: JSON_SCHEMA }), 0);
+      } catch { throw new Error("Credential could not be registered for safe output redaction"); }
+    }
+    if (Buffer.byteLength(JSON.stringify([...this.sensitiveValues])) > 8 * 1024 * 1024) {
+      throw new Error("Credential redaction set exceeds safety budget");
+    }
   }
 
 }

@@ -22,6 +22,32 @@ function visibleMessage(sessionId: string, text = "milestone"): ChannelDeliverMe
 }
 
 describe("background-delivery TTL", () => {
+  it("routes overlapping same-session requests to their original cards and rejects unscoped/stale results", async () => {
+    const a = vi.fn(async () => true), b = vi.fn(async () => true);
+    const clearA = registerBackgroundChannelDelivery("s1", a, TTL, "request-a");
+    const clearB = registerBackgroundChannelDelivery("s1", b, TTL, "request-b");
+    expect(await deliverChannelVisibleMessage({ ...visibleMessage("s1"), requestId: "request-a" })).toBe(true);
+    expect(a).toHaveBeenCalledTimes(1); expect(b).not.toHaveBeenCalled();
+    expect(await deliverChannelVisibleMessage(visibleMessage("s1"))).toBe(false);
+    clearA();
+    expect(await deliverChannelVisibleMessage({ ...visibleMessage("s1"), requestId: "request-a" })).toBe(false);
+    expect(await deliverChannelVisibleMessage({ ...visibleMessage("s1"), requestId: "request-b" })).toBe(true);
+    expect(b).toHaveBeenCalledTimes(1); clearB();
+  });
+  it("an older cleanup cannot remove a replacement with the same request identity", async () => {
+    const old = registerBackgroundChannelDelivery("s1", async () => true, TTL, "a");
+    const replacement = vi.fn(async () => true);
+    registerBackgroundChannelDelivery("s1", replacement, TTL, "a"); old();
+    expect(await deliverChannelVisibleMessage({ ...visibleMessage("s1"), requestId: "a" })).toBe(true);
+    expect(replacement).toHaveBeenCalledTimes(1);
+  });
+  it("a scoped expiry does not remove another queued request's delivery", async () => {
+    registerBackgroundChannelDelivery("s1", async () => true, TTL, "a");
+    vi.advanceTimersByTime(500); registerBackgroundChannelDelivery("s1", async () => true, TTL, "b");
+    vi.advanceTimersByTime(501);
+    expect(await deliverChannelVisibleMessage({ ...visibleMessage("s1"), requestId: "a" })).toBe(false);
+    expect(await deliverChannelVisibleMessage({ ...visibleMessage("s1"), requestId: "b" })).toBe(true);
+  });
   beforeEach(() => vi.useFakeTimers());
   afterEach(() => {
     clearBackgroundChannelDelivery("s1");

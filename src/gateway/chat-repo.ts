@@ -154,7 +154,8 @@ export async function ensureChatSession(
   sessionId: string, agentId: string, userId: string,
   title?: string, preview?: string, origin?: string,
   lineage?: ChatSessionLineageInput,
-  opts?: { senderExternalId?: string | null; channelId?: string | null; senderType?: string | null },
+  opts?: { senderExternalId?: string | null; channelId?: string | null; senderType?: string | null;
+    identity?: import("../shared/execution-identity.js").ExecutionIdentity; sender?: import("../shared/execution-context.js").ExecutionSender },
 ): Promise<void> {
   const payload: Record<string, unknown> = {
     session_id: sessionId, agent_id: agentId, user_id: userId,
@@ -179,6 +180,8 @@ export async function ensureChatSession(
   // senders send this (Feishu today), and "absent" must stay distinguishable
   // from "user" — which is why this is gated on != null like the two above.
   if (opts?.senderType != null) payload.sender_type = opts.senderType;
+  if (opts?.identity) payload.identity = { kind: opts.identity.kind, id: opts.identity.id };
+  if (opts?.sender) payload.sender = opts.sender;
   await getClient().request("chat.ensureSession", payload);
 }
 

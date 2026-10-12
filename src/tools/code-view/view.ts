@@ -224,6 +224,13 @@ export class CodeView {
 
   // ── Authority ─────────────────────────────────────────────────────────────
 
+  /** Force a current manifest/mount read at a native authorization boundary. */
+  refreshAuthority(): CodeViewAuthority {
+    this.authority = null;
+    return this.getAuthority();
+  }
+
+
   /**
    * Manifest ∩ mounts, re-read at most every `authorityTtlMs`.
    *
@@ -490,7 +497,7 @@ export class CodeView {
    */
   async listRecursive(loc: VirtualLocation, rel: string, signal?: AbortSignal): Promise<RecursiveEntry[]> {
     const commit = await this.commit(loc, signal);
-    const key = `${loc.repo.gitDir}\0${commit}\0${rel}`;
+    const key = `${loc.repo.gitDir}\0${commit}\0${rel}\0${JSON.stringify(loc.rules)}`;
     const hit = this.recursive.get(key);
     if (hit) return hit;
     const treeish = rel ? `${commit}:${rel}` : commit;

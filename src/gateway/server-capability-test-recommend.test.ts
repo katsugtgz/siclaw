@@ -94,7 +94,7 @@ describe("capability.testRecommend", () => {
       method === "capability.fetchInput" && params.ref === "test-model" ? { llm } : {});
     server = await startRuntime({
       config: { port: 0, internalPort: 0, host: "127.0.0.1", serverUrl: "", portalSecret: "" } as any,
-      agentBoxManager: manager, frontendClient: frontend, credentialService: {} as any,
+      agentBoxManager: manager, frontendClient: frontend, credentialService: { attachGrants: () => {}, resolveActorResources: async () => ({ clusters: [], hosts: [] }) } as any,
     });
     const started = await server.rpcMethods.get("capability.start")!({ profile: "kb-compile", org_id: "org-1", correlation_id: "attempt-1" }) as { run_id: string };
     await server.rpcMethods.get("capability.testStart")!({ run_id: started.run_id });
@@ -108,7 +108,7 @@ describe("capability.testRecommend", () => {
   it("runs an explicit recommendation on the authoring box with a bounded long timeout", async () => {
     server = await startRuntime({
       config: { port: 0, internalPort: 0, host: "127.0.0.1", serverUrl: "", portalSecret: "" } as any,
-      agentBoxManager: fakeAgentBoxManager(), frontendClient: fakeFrontendClient(), credentialService: {} as any,
+      agentBoxManager: fakeAgentBoxManager(), frontendClient: fakeFrontendClient(), credentialService: { attachGrants: () => {}, resolveActorResources: async () => ({ clusters: [], hosts: [] }) } as any,
     });
     const start = server.rpcMethods.get("capability.start")!;
     const started = await start({ profile: "kb-compile", org_id: "org-1", correlation_id: "attempt-1" }) as { run_id: string };
@@ -132,7 +132,7 @@ describe("capability.testReferenceAssist", () => {
   it("runs a bounded reference-answer assist call on the authoring box", async () => {
     server = await startRuntime({
       config: { port: 0, internalPort: 0, host: "127.0.0.1", serverUrl: "", portalSecret: "" } as any,
-      agentBoxManager: fakeAgentBoxManager(), frontendClient: fakeFrontendClient(), credentialService: {} as any,
+      agentBoxManager: fakeAgentBoxManager(), frontendClient: fakeFrontendClient(), credentialService: { attachGrants: () => {}, resolveActorResources: async () => ({ clusters: [], hosts: [] }) } as any,
     });
     const start = server.rpcMethods.get("capability.start")!;
     const started = await start({ profile: "kb-compile", org_id: "org-1", correlation_id: "attempt-1" }) as { run_id: string };
@@ -160,7 +160,7 @@ describe("capability.testReferenceAssist", () => {
   it("strips the box envelope from a polished answer response", async () => {
     server = await startRuntime({
       config: { port: 0, internalPort: 0, host: "127.0.0.1", serverUrl: "", portalSecret: "" } as any,
-      agentBoxManager: fakeAgentBoxManager(), frontendClient: fakeFrontendClient(), credentialService: {} as any,
+      agentBoxManager: fakeAgentBoxManager(), frontendClient: fakeFrontendClient(), credentialService: { attachGrants: () => {}, resolveActorResources: async () => ({ clusters: [], hosts: [] }) } as any,
     });
     const start = server.rpcMethods.get("capability.start")!;
     const started = await start({ profile: "kb-compile", org_id: "org-1", correlation_id: "attempt-1" }) as { run_id: string };

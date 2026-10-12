@@ -105,6 +105,96 @@ async def test_failed_step_does_not_finalize_conversation_or_commit(run, monkeyp
     assert not any(e["type"] in {"turn_done", "syncArtifacts"} for e in drain(run))
 
 
+@pytest.mark.parametrize("message,code", [
+    ("KBC_MODEL_CALL_BUDGET_EXCEEDED", "model_call_budget_exceeded"),
+    ("provider echoed KBC_MODEL_CALL_BUDGET_EXCEEDED in private content", "model_result_error"),
+])
+async def test_model_call_budget_keeps_its_failure_identity(run, monkeypatch, message, code):
+    worker = Client([AgentEvent("result", "worker", data={
+        "outcome": "failed", "error": message,
+        "model_calls": 150, "tool_calls": 316,
+    })])
+    monkeypatch.setattr(compile_box, "_compile_session_client", lambda *a, **kw: worker)
+    with pytest.raises(compile_box.ModelResultError) as error:
+        await compile_box._drive_batch_session(run, "review scope", "final review")
+    assert compile_box._batch_error_code(error.value) == code
+
+
+async def test_batch_observations_carry_only_the_controlled_execution_stage(run):
+    from execution_observation import ExecutionObserver
+
+    @compile_box._observe_pi_sessions
+    async def observe(run):
+        observer = ExecutionObserver("session", {"role": "compile", "model": {"id": "fixture", "provider": "fixture"}})
+        await observer.emit("tool_start", {"call_id": "call", "name": "Read"}, "turn")
+
+    run._batch_stage = "batch_final"
+    await observe(run)
+    assert (await run.events.get())["observation"]["data"]["compile_stage"] == "batch_final"
+    run._batch_stage = "private-source-name"
+    await observe(run)
+    assert "compile_stage" not in (await run.events.get())["observation"]["data"]
+
+
+async def test_final_failure_waits_for_full_workspace_ack(run, monkeypatch, tmp_path):
+    import json
+
+    (tmp_path / "raw").mkdir()
+    (tmp_path / "raw/source.md").write_text("Synthetic source")
+    (tmp_path / "candidate").mkdir()
+    (tmp_path / "candidate/index.md").write_text("# Index\n")
+    (tmp_path / "authoring").mkdir()
+    plan = {"phase": "final", "mode": "flat", "batches": [
+        {"id": "b01", "sources": ["source.md"], "status": "done"}], "budget": 1000}
+    monkeypatch.setattr(compile_box, "_load_batch_plan", lambda _: plan)
+    monkeypatch.setattr(compile_box, "_batch_plan_resumable", lambda _: True)
+    monkeypatch.setattr(compile_box, "_materialize_batch_slices", lambda *a: {})
+    run._artifact_ack_required = True
+    run._sync_sent = {}
+
+    async def edit():
+        (tmp_path / "candidate/review.md").write_text(
+            "---\ntype: concept\ntitle: Review\nsources:\n"
+            "  - resource: raw/source.md\n---\n# Saved final-review work\n")
+        (tmp_path / "authoring/SELFCHECK.json").write_text(json.dumps({
+            "version": 1, "state": "passed", "converge_phase": "settled"}))
+
+    worker = Client([AgentEvent("result", "worker", data={
+        "outcome": "failed", "error": "KBC_MODEL_CALL_BUDGET_EXCEEDED",
+    })], edit)
+    monkeypatch.setattr(compile_box, "_compile_session_client", lambda *a, **kw: worker)
+    task = asyncio.create_task(compile_box._run_batch_compile(run, "resume"))
+    saved = False
+    events = []
+    try:
+        async with asyncio.timeout(3):
+            while True:
+                event = await run.events.get()
+                events.append(event)
+                if event["type"] == "syncArtifacts":
+                    artifacts = {a["path"]: a.get("content", "") for a in event["artifacts"]}
+                    if "candidate/review.md" in artifacts:
+                        assert not event.get("commit_input")
+                        assert "converge_phase" not in json.loads(artifacts["authoring/SELFCHECK.json"])
+                        assert not task.done(), "failure escaped before save ACK"
+                        saved = True
+                    run._pending_sync_acks[event["sync_id"]].set_result(None)
+                if event["type"] == "error":
+                    assert saved, "failed final session published failure before saving its edits"
+                    assert event["code"] == "model_call_budget_exceeded"
+                    assert event["stage"] == "batch_final"
+                    break
+            await task
+        events.extend(drain(run))
+        assert plan["phase"] == "final"
+        assert not any(e.get("commit_input") for e in events)
+        assert "converge_phase" not in json.loads((tmp_path / "authoring/SELFCHECK.json").read_text())
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
 async def test_step_cancellation_retains_ownership_until_teardown(run):
     entered, teardown, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
 

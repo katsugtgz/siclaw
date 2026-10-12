@@ -1,0 +1,21 @@
+{
+  "$comment": "Capability names exchanged on `runtime.register`. Authoritative for BOTH control planes: siclaw reads it through src/shared/control-plane-capabilities.ts (control-plane-capabilities.test.ts pins the two agree); sicore keeps a copy under internal/siclaw/adapter/testdata/ and a Go test pins internal/siclaw/ws/connection_map.go against it. A name is a wire identifier: it is spelled exactly like this on both sides, and adding one here without a reader on the other side is a name nobody honours.",
+  "runtime": {
+    "channelAgentScope": "Enforces behavior-only channel admission and revocation while inheriting Agent resource capabilities; rejects older AgentBoxes.",
+    "$comment": "Advertised BY the Runtime in the `runtime.register` request. Absent reads as not capable — a capability nobody advertised is a capability nobody promised.",
+    "channelPolicyV1": "This Runtime rejects legacy boxes for published Channel policies, enforces immutable resource/operation/namespace/MCP constraints, and supports grant revocation.",
+    "channelPolicyV2": "This Runtime preserves resource/action rule associations, per-tool MCP constraints and rejects boxes without resource-rule enforcement.",
+    "compile": "This Runtime can run a KB compile box; the control plane may route compile runs to it without any consumer-side configuration.",
+    "webUserIsolation": "This Runtime isolates Web users inside the agent's pooled AgentBoxes (per-session workspace, per-grant execution slots; K8s spawner only) — private sessions run in the agent's pool, not in a box of their own; the control plane may treat Web sessions as per-user.",
+    "privateMemory": "This Runtime can serve per-user memory scopes (K8s spawner only); the console may turn an agent's `memory_scope_policy` to `private`. Without it the switch is REFUSED, never degraded.",
+    "executionIdentity": "This Runtime reads `identity` / `sender` / `origin` off `channel.resolveBinding` and carries the identity into every credential request; the control plane leaves `createdBy` empty for a non-user identity whether or not this is advertised, so an older Runtime fails closed (design 2026-09-25 §5.1, §10)."
+  },
+  "controlPlane": {
+    "channelAgentScope": "Publishes behavior-only channel settings and resolves Agent-bound authority without per-user or per-group resource policies.",
+    "$comment": "Declared BY the control plane in its `runtime.register` reply. The Runtime keeps them per connection (`consumerDeclares`) and reads a missing declaration as an older control plane.",
+    "channelPolicyV1": "The control plane serves channel.policy.resolve with exact session/identity authority and independently enforces DM/group admission and policy publication.",
+    "channelPolicyV2": "The control plane validates and publishes versioned resource rules and resolves immutable per-target authority without flattening action scope.",
+    "sessionOwnership": "`chat.ensureSession` always answers with the session's routing, so a reply without one is malformed rather than 'an older control plane'. Undeclared, the Runtime serves only the never-private origins from the agent's pool and refuses Web and embedded sessions.",
+    "executionIdentity": "`channel.resolveBinding` / `channel.resolvePersonalBinding` answer with `identity`, `sender` and `origin`, and `credential.*` honour a request's `identity` (`none` ⇒ nothing). Undeclared, the Runtime falls back to `{kind:\"user\", id: createdBy}`; declared, a binding reply without `identity` is malformed and refused."
+  }
+}

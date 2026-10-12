@@ -73,7 +73,7 @@ export async function ensureDevopsCredentialForTool(
   broker: CredentialBroker | undefined,
   commands: string[],
   purpose: string,
-): Promise<void> {
+): Promise<Record<string, string> | undefined> {
   if (!broker) return;
   // `commands` are the pipeline's command STRINGS, not binaries — the same shape
   // extractCommands produces. Reduced through the shared getCommandBinary rather
@@ -88,6 +88,7 @@ export async function ensureDevopsCredentialForTool(
   );
   if (!needsCredential) return;
   await broker.ensureDevopsCredential(purpose);
+  return { SIFORGECTL_CREDENTIAL_FILE: broker.getDevopsCredentialPath() };
 }
 
 /** Structured result of a failed `ensureClusterForTool`, rendered to the model. */

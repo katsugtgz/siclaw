@@ -82,7 +82,7 @@ def test_group_progress_counts_cache_and_failures_without_source_content():
             _mk(root, "candidate/p.md", "page")
             _mk(root, "candidate/q.md", "page")
             _mk(root, "authoring/SELFCHECK.json", json.dumps({"media_verify": {"verified_fingerprints": {"q.md": "older"}}}))
-            mediaverify.save_transcripts(td, {"s/i1.png": {"sha8": mediaverify._sha8(root / "raw/s/i1.png"), "transcript": {"facts": []}}})
+            await mediaverify.transcribe_image(FakeEngine(), td, "s/i1.png", {})
             snapshots = []
 
             async def snapshot():

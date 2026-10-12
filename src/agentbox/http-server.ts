@@ -1,5 +1,6 @@
 import { AGENT_RETIRED_STATUS, agentRetiredDetail } from "../shared/agent-retirement.js";
 import { SandboxToolError } from "../script-sandbox/errors.js";
+import { SessionEngineMismatchError } from "./session-engine.js";
 import { parseHandoffPolicy } from "../shared/agent-handoff.js";
 /**
  * AgentBox HTTP Server
@@ -73,6 +74,7 @@ import {
   type SubagentTierCandidates,
 } from "../core/subagent-models.js";
 import type { BrainSession, PromptFile, PromptImage, PromptMedia } from "../core/brain-session.js";
+import { PROMPT_FILE_MIMES } from "../core/prompt-attachments.js";
 import { compactDispatchLogMessage } from "../shared/dispatch-observability.js";
 import { SESSION_CONTEXT_UNAVAILABLE_CODE, SESSION_CONTEXT_UNAVAILABLE_STATUS } from "../shared/session-context.js";
 
@@ -90,6 +92,10 @@ interface Route {
 }
 
 interface PromptRequestBody {
+  identity?: import("../shared/execution-identity.js").ExecutionIdentity;
+  sender?: import("../shared/execution-context.js").ExecutionSender;
+  grantId?: string;
+  channelDeliveryId?: string;
   requestMode?: RequestMode;
   /** Trusted Runtime continuation context; per-request, never session-cached. */
   handoffTrace?: unknown;
@@ -143,6 +149,8 @@ interface PromptRequestBody {
   turnId?: string;
   /** Trusted control-plane contract for one required structured result tool. */
   requiredResultToolName?: string;
+  requiredAgentEngine?: "codex";
+  toolPolicy?: "ticket_fill_once";
 }
 
 /**
@@ -219,7 +227,7 @@ const MAX_PROMPT_IMAGE_BASE64_CHARS = MAX_PROMPT_MEDIA_BASE64_CHARS;
 const SUPPORTED_PROMPT_IMAGE_MIMES = new Set(["image/png", "image/jpeg", "image/webp"]);
 const MAX_PROMPT_FILES = MAX_PROMPT_MEDIA_ITEMS;
 const MAX_PROMPT_FILE_BASE64_CHARS = MAX_PROMPT_MEDIA_BASE64_CHARS;
-const SUPPORTED_PROMPT_FILE_MIMES = new Set(["application/pdf"]);
+const SUPPORTED_PROMPT_FILE_MIMES = PROMPT_FILE_MIMES;
 const BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
 
 class HttpRequestError extends Error {
@@ -323,7 +331,7 @@ function validatePromptFiles(raw: unknown): PromptMediaValidationResult<PromptFi
 
     const normalizedMime = mimeType.trim().toLowerCase();
     if (!SUPPORTED_PROMPT_FILE_MIMES.has(normalizedMime)) {
-      return { error: `files[${index}].mimeType must be application/pdf` };
+      return { error: `files[${index}].mimeType must be a supported text document or application/pdf` };
     }
     if (filename.trim() === "") {
       return { error: `files[${index}].filename must not be empty` };
@@ -433,6 +441,7 @@ function requestBindingCandidate(body: PromptRequestBody): ModelRouteCandidate |
     modelConfig: body.modelConfig,
   };
 }
+
 
 /**
  * The binding to actually route this turn on.
@@ -874,6 +883,7 @@ export function createHttpServer(
     sendJson(res, 200, {
       status: "ok",
       requestModes: ["sync", "async"],
+      inputDeliveryVersion: 1,
       sessions: sessionManager.list().length,
       timestamp: new Date().toISOString(),
     });
@@ -899,6 +909,14 @@ export function createHttpServer(
    *
    * The message is sent to the Agent, and responses are returned via SSE stream.
    */
+  // Dedicated callback; bypasses the prompt queue to avoid deadlocking run_script.
+  addRoute("POST", "/api/internal/execution-grants/revoke", async (req,res)=>{
+    if(!useTls && !["127.0.0.1","::1","::ffff:127.0.0.1"].includes(req.socket.remoteAddress??"")){sendJson(res,403,{error:"Revocation denied"});return;}
+    const body=await parseJsonBody(req) as {grant_ids?:unknown};
+    if(!Array.isArray(body?.grant_ids)||body.grant_ids.length>128||body.grant_ids.some(id=>typeof id!=="string"||!/^[A-Za-z0-9._-]{1,128}$/.test(id))){sendJson(res,400,{error:"Invalid revocation"});return;}
+    sessionManager.revokeExecutionGrants(body.grant_ids);sendJson(res,200,{ok:true});
+  });
+
   // Dedicated callback; bypasses the prompt queue to avoid deadlocking run_script.
   // The unguessable per-invocation grant is required in BOTH local and mTLS modes.
   addRoute("POST", "/api/internal/sandbox-tool", async (req, res) => {
@@ -950,6 +968,12 @@ export function createHttpServer(
       return;
     }
     const requiredResultToolName = body.requiredResultToolName?.trim() || undefined;
+    if (body.requiredAgentEngine !== undefined && body.requiredAgentEngine !== "codex") { sendJson(res,400,{error:"Invalid required execution engine"});return; }
+    if (body.toolPolicy !== undefined && (body.toolPolicy !== "ticket_fill_once" || !requiredResultToolName)) {
+      logPromptResponse(400, "rejected", "Invalid tool policy");
+      sendJson(res, 400, { error: "toolPolicy requires ticket_fill_once and a result tool" });
+      return;
+    }
 
     const promptMediaValidation = validatePromptMedia(body.images, body.files);
     if (promptMediaValidation.error) {
@@ -987,11 +1011,19 @@ export function createHttpServer(
     // holds its whole transcript. For a brand-new session the load is one cheap
     // empty round-trip.
     const resumed = await sessionManager.ensureSessionContext(body.sessionId);
-    if (sessionManager.agentTypeState === "ticket" && !requiredResultToolName) {
-      logPromptResponse(400, "rejected", "Ticket Agent requires a result tool");
-      sendJson(res, 400, { error: "Ticket Agent requires a host-configured result tool" });
-      return;
-    }
+    // A Ticket instance without a result contract is a legitimate configuration:
+    // the type means "tenant-defined ticket workflow", and only some of those
+    // workflows end in one structured result. A closure dispatch does; an
+    // assistant answering an operator over many turns does not, and rejecting it
+    // here made that shape impossible to build at all.
+    //
+    // The invariant this gate used to assert moves rather than disappears: it is
+    // no longer "a Ticket Agent produces a structured result" but "a DECLARED
+    // result contract is honoured". The declaration is the host's, and the rest
+    // of that contract is still enforced — the tool must exist (below), the
+    // model is repaired once if it finishes without calling it (pi-agent-brain),
+    // and the caller's own tracker fails the run with TURN_RESULT_MISSING if no
+    // result arrives. Nothing here was the only line of defence.
     if (body.requireExistingSession === true && !resumed) {
       const detail = {
         code: SESSION_CONTEXT_UNAVAILABLE_CODE,
@@ -1003,17 +1035,37 @@ export function createHttpServer(
       sendJson(res, SESSION_CONTEXT_UNAVAILABLE_STATUS, { error: detail });
       return;
     }
+    const { parseWireIdentity } = await import("../shared/execution-identity.js");
+    const { executionOwnerKey } = await import("../shared/execution-context.js");
+    const executionIdentity = parseWireIdentity(body.identity);
+    if ((body.identity !== undefined && !executionIdentity) || (body.grantId && !executionIdentity)
+        || (executionIdentity && !body.grantId)) {
+      sendJson(res, 403, { error: "Execution identity requires a Runtime authorization" }); return;
+    }
     const managed = await sessionManager.getOrCreate(
       body.sessionId,
       body.mode,
       body.systemPromptTemplate,
       activeMode,
-      body.userId,
+      executionIdentity ? executionOwnerKey(executionIdentity, body.sessionId ?? "") : body.userId,
       body.allowInputRequest === true,
       body.handoffSupported === true,
       parseHandoffPolicy(body.handoffPolicy),
+      Boolean(requiredResultToolName),
+      await sessionManager.resolveAgentEngine(),
+      executionIdentity && body.grantId ? { grantId: body.grantId, identity: executionIdentity, sender: body.sender } : undefined,
     );
-    if (sessionManager.agentTypeState === "ticket" && !managed.toolNames.includes(requiredResultToolName!)) {
+    // Still fail closed when a Ticket instance DID declare a contract: a named
+    // result tool it cannot call is a misbinding, and letting the turn run would
+    // surface it much later as a missing result instead of as a config error.
+    // Scoped to Ticket as before — other types may also carry a result contract
+    // through a custom harness, and whether an unavailable tool should stop them
+    // is a separate question this change does not answer.
+    if (body.requiredAgentEngine && managed.brain.brainType !== body.requiredAgentEngine) {
+      sendJson(res,409,{error:"Queued input requires Codex; the execution engine changed",code:"QUEUE_ENGINE_CHANGED"});return;
+    }
+    if (sessionManager.agentTypeState === "ticket" && requiredResultToolName
+        && !managed.toolNames.includes(requiredResultToolName)) {
       logPromptResponse(400, "rejected", "Ticket result tool is unavailable", managed.id);
       sendJson(res, 400, { error: "The configured Ticket result tool is unavailable; check the instance MCP binding" });
       return;
@@ -1067,6 +1119,7 @@ export function createHttpServer(
     managed._promptDone = false;
     sessionManager.setUsageRole(managed.id, String(body.origin) === "delegation" ? "delegated" : "root", body.apiRequestId);
     managed._requestMode = requestMode;
+    managed._channelDeliveryId = typeof body.channelDeliveryId === "string" ? body.channelDeliveryId : undefined;
     managed._promptOutcome = undefined;
     managed._aborted = false;
     // LLM-call timeline: the prompt is accepted NOW. Everything between here and
@@ -1175,15 +1228,15 @@ export function createHttpServer(
       // call below. Applying them here would be before the model switch, which
       // pi silently discards.
 
-      if (requiredInputsForPromptMedia(promptMedia).length > 0) {
+      if (requiredInputsForPromptMedia(promptMedia, managed.brain.brainType).length > 0) {
         if (shouldUseModelRouteRunner(configuredModelRouting, managed.modelRouteState)) {
           const candidates = normalizeCandidates(configuredModelRouting?.candidates);
-          if (filterCandidatesForPromptMedia(candidates, promptMedia).length === 0) {
+          if (filterCandidatesForPromptMedia(candidates, promptMedia, managed.brain.brainType).length === 0) {
             throw new Error(unsupportedPromptMediaMessage(promptMedia));
           }
         } else {
           const candidate = singleCandidateForMediaPreflight(body, configuredModelRouting);
-          if (!candidate || !candidateSupportsPromptMedia(candidate, promptMedia)) {
+          if (!candidate || !candidateSupportsPromptMedia(candidate, promptMedia, managed.brain.brainType)) {
             throw new Error(unsupportedPromptMediaMessage(promptMedia));
           }
         }
@@ -1272,6 +1325,7 @@ export function createHttpServer(
       reportUnsubscribe();
       if (managed._aborted) backgroundWorkTurn.cancel();
       else backgroundWorkTurn.finish();
+      managed.brain.endRequest?.();
       managed.brain.setMailbox?.(undefined);
       managed._promptOutcome ??= managed._aborted ? "aborted" : promptOutcome;
       managed._promptDone = true;
@@ -1455,7 +1509,7 @@ export function createHttpServer(
       },
       media,
       requiredResultToolName
-        ? { requiredResultToolName }
+        ? { requiredResultToolName, toolPolicy: body.toolPolicy }
         : undefined,
     );
 
@@ -1711,7 +1765,10 @@ export function createHttpServer(
       return;
     }
 
-    const body = (await parseJsonBody(req)) as { text?: string; images?: PromptImage[]; files?: PromptFile[] };
+    const body = (await parseJsonBody(req)) as { text?: string; images?: PromptImage[]; files?: PromptFile[]; deliveryMessageId?: string };
+    if (body.deliveryMessageId !== undefined && (typeof body.deliveryMessageId !== "string" || !/^[a-zA-Z0-9_-]{1,128}$/.test(body.deliveryMessageId))) {
+      sendJson(res, 400, { error: "Invalid delivery message ID" }); return;
+    }
     const promptMediaValidation = validatePromptMedia(body.images, body.files);
     if (promptMediaValidation.error) {
       sendJson(res, 400, { error: promptMediaValidation.error });
@@ -1736,12 +1793,14 @@ export function createHttpServer(
     // addition to that active prompt, so it inherits this existing trace.
     const traceId = tracingRecorder.getRootTraceId(sessionId);
     try {
-      if (promptMedia) {
+      if (body.deliveryMessageId && managed.brain.brainType === "codex") {
+        await managed.brain.steer(steerText, promptMedia, { messageId: body.deliveryMessageId });
+      } else if (promptMedia) {
         await managed.brain.steer(steerText, promptMedia);
       } else {
         await managed.brain.steer(steerText);
       }
-      sendJson(res, 200, { ok: true, traceId });
+      sendJson(res, 200, { ok: true, traceId, deliveryTracked: managed.brain.brainType === "codex" && !!body.deliveryMessageId });
     } catch (err) {
       console.error(`[agentbox-http] Steer error for session ${sessionId}:`, err);
       const message = err instanceof Error ? err.message : "Steer failed";
@@ -1792,6 +1851,28 @@ export function createHttpServer(
     const managed = sessionManager.get(sessionId);
     const running = !!managed && (managed._promptDone === false || managed.isAgentActive || managed.isCompacting || managed.isRetrying);
     sendJson(res, 200, { running });
+  });
+
+  // Codex-only UI input. Never falls back to a new prompt or execution approval.
+  addRoute("GET", "/api/sessions/:sessionId/user-input", async (_req, res, params) => {
+    const brain = sessionManager.get(params.sessionId)?.brain;
+    sendJson(res, 200, { nativeUserInput: brain?.brainType === "codex" ? brain.getPendingUserInput?.() ?? null : null });
+  });
+  for (const prepare of [true, false]) addRoute("POST", `/api/sessions/:sessionId/user-input${prepare ? "/prepare" : ""}`, async (req, res, params) => {
+    const managed = sessionManager.get(params.sessionId);
+    if (managed?.brain.brainType !== "codex" || !managed.brain.submitUserInput) {
+      sendJson(res, 409, { error: "USER_INPUT_EXPIRED: No active native question" });
+      return;
+    }
+    try {
+      const answer = await parseJsonBody(req);
+      const response = answer as import("../shared/native-user-input.js").NativeUserInputAnswer;
+      const result = prepare ? managed.brain.prepareUserInput!(response) : managed.brain.submitUserInput(response);
+      sendJson(res, 200, { ok: true, ...result, traceId: tracingRecorder.getRootTraceId(params.sessionId) });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Invalid user answer";
+      sendJson(res, message.startsWith("USER_INPUT_INVALID:") ? 400 : 409, { error: message });
+    }
   });
 
   /**
@@ -2183,6 +2264,10 @@ export function createHttpServer(
       try {
         await route.handler(req, res, params);
       } catch (err) {
+        if (err instanceof SessionEngineMismatchError) {
+          if (!res.headersSent) sendJson(res, 409, { error: { code: err.code, message: err.message, retriable: false } });
+          return;
+        }
         if (err instanceof HttpRequestError) {
           console.warn(`[agentbox-http] Rejected ${method} ${pathname}: ${err.message}`);
           if (!res.headersSent) {

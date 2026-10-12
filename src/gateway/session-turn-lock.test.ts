@@ -133,6 +133,19 @@ describe("SessionTurnLocks", () => {
 });
 
 describe("SessionTurnLocks — waiting for the box to take the prompt", () => {
+  it("keeps a queued Codex turn distinct but steerable once it starts", async () => {
+    const locks = new SessionTurnLocks();
+    const first = await locks.acquireRequest("s1", "async");
+    let acquired = false;
+    const next = locks.acquireRequest("s1", "async", undefined, false, true).then(release => { acquired = true; return release; });
+    await tick(10);
+    expect(acquired).toBe(false);
+    first();
+    const release = await next;
+    expect(locks.canSteer("s1")).toBe(true);
+    release();
+    expect(locks.isBusy("s1")).toBe(false);
+  });
   it("holds a steer until the box has accepted, then lets it through", async () => {
     // Placement records the box before the box is asked to do anything, so a steer that
     // arrives in that gap reaches the right box and is still told "Session not found".

@@ -56,7 +56,7 @@ async function bootRuntime() {
       getAsync: vi.fn(), getOrCreate: vi.fn(), list: vi.fn(async () => []), cleanup: vi.fn(async () => {}),
     } as any,
     frontendClient: { request: vi.fn(async () => ({})), onCommand: vi.fn(), emitEvent: vi.fn(), close: vi.fn() } as any,
-    credentialService: {} as any,
+    credentialService: { attachGrants: () => {}, resolveActorResources: async () => ({ clusters: [], hosts: [] }) } as any,
   });
 }
 
@@ -91,7 +91,7 @@ describe("mcp.probe RPC", () => {
     const out: any = await probe({ server: { name: "siverse", url } }, { sendEvent: vi.fn() } as any);
     expect(out.probe).toMatchObject({
       name: "siverse", transport: "streamable-http", state: "failed", toolCount: 0,
-      error: { kind: "not_found", httpStatus: 404, contentType: "text/html", message: "HTML page: Simate" },
+      error: { kind: "not_found", httpStatus: 404, contentType: "text/html", message: "MCP connection or security validation failed" },
     });
   });
 

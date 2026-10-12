@@ -23,6 +23,11 @@ loaded at agent startup and merged into the built-in registry.
    declarative `CommandDef` constraint fields (`allowedFlags`, `blockedFlags`,
    `allowedSubcommands`, `positionals`, `requiredFlags`). Custom `validate` functions are
    not expressible in JSON — by design, configuration cannot inject code.
+   Optional `executablePaths` metadata lists reviewed vendor binary locations
+   for native transports. Each path must be canonical, under `/usr` or `/opt`,
+   and have exactly the configured command's basename. It does not relax command
+   arguments or permit a different binary. Standard system directories remain
+   available; arbitrary temporary paths remain rejected by native transports.
 3. **Forbidden names.** Binaries the built-in whitelist excludes *on purpose* cannot be
    re-added via configuration: shells/interpreters (`bash`, `python3`, …), multi-call
    wrappers that bundle a shell (`busybox`, `toybox`), Turing-complete text tools (`sed`,
@@ -41,9 +46,11 @@ loaded at agent startup and merged into the built-in registry.
    a silent no-op.
 5. **Single merge point.** Extras are stored alongside (never inside) the frozen built-in
    registry; every lookup consults built-in first, then extras. The per-context allowed-set
-   cache is invalidated when extras are (re)registered. All three exec tools
-   (restricted-bash, pod-exec, node-exec) automatically see the same merged view because
-   they all resolve through `validateCommand()` → command-sets.
+   cache is invalidated when extras are (re)registered. Pi's restricted-bash,
+   pod-exec, node-exec and host-exec tools and Codex's native executor automatically
+   see the same merged view because they all resolve through `validateCommand()`
+   → command-sets. An engine adapter must not shadow this registry with a second
+   command-name allow-list.
 6. **All other defense layers unchanged.** Extra commands still run as the `sandbox` OS
    user, still pass shell-operator validation, sensitive-path checks, and output
    sanitization. `category` placement controls context availability via the existing
@@ -72,9 +79,11 @@ Validation rules (violations throw):
 - `version` must be `1`.
 - Command names must match `^[a-z0-9][a-z0-9._+-]*$` (lookup lowercases binary names).
 - `category` must be one of the existing `CommandCategory` values.
-- Only `category`, `description`, `contexts`, `credentialFreeSubcommands` and the
-  five declarative constraint fields are accepted; unknown keys (including
-  `validate`) are rejected.
+- Only `category`, `description`, `contexts`, `credentialFreeSubcommands`,
+  `executablePaths` and the five declarative constraint fields are accepted;
+  unknown keys (including `validate`) are rejected. `executablePaths` must be a
+  non-empty list of canonical absolute paths under `/usr` or `/opt` with the
+  entry's own command basename.
 - Flags must be non-empty strings starting with `-`; `positionals` must be
   `"allow" | "block" |` a non-negative integer; `allowedSubcommands` must be
   `{ position: <non-negative int>, allowed: <non-empty string[]> }`;

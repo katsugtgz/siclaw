@@ -1,4 +1,8 @@
 import { UsageOutbox } from "./usage-outbox.js";
+import { BoxExecutionGrants, type BoxExecutionGrant } from "./execution-grants.js";
+import { claimSessionEngine } from "./session-engine.js";
+import type { ExecutionAuthorization } from "../shared/execution-context.js";
+import { createNativeChildSink } from "./native-child-persistence.js";
 /**
  * AgentBox session manager
  *
@@ -125,12 +129,14 @@ import { extractToolResultId } from "../core/message-utils.js";
 type SubagentTraceContext = { apiRequestId?: string; mainTraceId?: string; spawnSpanContext?: SpanContext };
 
 export interface ManagedSession {
+  executionGrant?: BoxExecutionGrant;
+  releaseExecutionGrant?: () => void;
   agentPrompt?: string;
   id: string;
   /** User identity bound to this conversation's tools and child-session persistence. */
   userId?: string;
   brain: BrainSession;
-  session: AgentSession;  // backward compat — only guaranteed for pi-agent brain
+  session?: AgentSession;  // Only the Pi path creates a Pi AgentSession.
   /** Exact function-schema names exposed when this in-memory brain was built. */
   toolNames: string[];
   /** Exact Skill names exposed after personal overlay and Built-in masks. */
@@ -155,6 +161,7 @@ export interface ManagedSession {
   _promptDone: boolean;
   /** User-input policy for the whole accepted request, including root continuations. */
   _requestMode?: RequestMode;
+  _channelDeliveryId?: string;
   /** Result of the whole prompt, for live and late event-stream subscribers. */
   _promptOutcome?: import("../shared/execution-lifecycle.js").ExecutionOutcome;
   /** Launch ownership and mailbox scoped to the current user prompt. */
@@ -248,6 +255,7 @@ export interface ManagedSession {
   /** Whether this session was built with top-level `request_input` available. */
   allowInputRequest: boolean;
   handoffSupported?: boolean;
+  structuredResultRequired?: boolean;
   handoffPolicy?: import("../shared/agent-handoff.js").HandoffPolicy;
   /** MCP client manager — per-session, shut down on release/close */
   mcpManager?: McpClientManager;
@@ -396,6 +404,8 @@ async function abortBrainBestEffort(
 }
 
 export class AgentBoxSessionManager {
+  private executionGrants?: BoxExecutionGrants;
+  revokeExecutionGrants(ids: readonly string[]): void { this.executionGrants?.revoke(ids); }
   private sessions = new Map<string, ManagedSession>();
   private subagentRuns = new Map<string, { mailbox: SubagentMailbox; jobId: string; restoredSession?: SessionManager }>();
   // Retain the launching request owner until notification, even if Stop/handoff
@@ -406,6 +416,7 @@ export class AgentBoxSessionManager {
   /** Both HTTP and fallback turns use the same mailbox and late-result recovery. */
   beginBackgroundWorkTurn(managed: ManagedSession, mode: RequestMode = "async"): BackgroundWorkTurn {
     managed._requestMode = mode;
+    managed.brain.beginRequest?.(mode);
     const apiRequestId = managed._apiRequestId;
     const turn = new BackgroundWorkTurn(notification => {
       const job = this.jobs.get(notification.taskId);
@@ -416,6 +427,16 @@ export class AgentBoxSessionManager {
     });
     managed._backgroundWorkTurn = turn;
     managed.brain.setMailbox?.(turn.mailbox);
+    managed.brain.setNativeChildRecovery?.(scopeId => {
+      const recover = () => {
+        if (mode !== "async" || turn.isCancelled || this.sessions.get(managed.id) !== managed || managed._aborted) return;
+        this.queueParentNotification(managed, { taskId: scopeId, status: "done", summary: "Owned native child executions ended", nativeChild: true }, apiRequestId);
+      };
+      // A late result is not steering for a newer request, even when Web turns
+      // have no API receipt. Wait for its successor to finish before recovery.
+      if (!managed._promptDone && managed._backgroundWorkTurn !== turn) managed._promptDoneCallbacks.add(recover);
+      else recover();
+    });
     return turn;
   }
 
@@ -493,6 +514,29 @@ export class AgentBoxSessionManager {
   /** Agent type, fetched alongside allowedTools.
    *  Drives capabilities and the legacy-row prompt fallback. */
   agentTypeState: string = "custom";
+  agentEngineState: import("../shared/agent-engine.js").AgentEngine = "pi-agent";
+  webSearchModeState: import("../shared/web-search.js").WebSearchMode = "disabled";
+  codexMemoryEnabledState = true;
+
+  /** Refresh via this AgentBox's authenticated client, including in shared-process Local mode. */
+  async resolveAgentEngine(): Promise<import("../shared/agent-engine.js").AgentEngine> {
+    const { resolveAgentEngine } = await import("../shared/agent-engine.js");
+    if (this.gatewayClient && this.agentId) {
+      const payload = await this.gatewayClient.toClientLike().request("/api/internal/tool-capabilities", "GET") as { agentEngine?: unknown; webSearchMode?: unknown;codexMemoryEnabled?:unknown };
+      if (!payload || typeof payload !== "object") throw new Error("Agent engine configuration unavailable");
+      const { resolveWebSearchMode } = await import("../shared/web-search.js");
+      const searchMode = resolveWebSearchMode(payload.webSearchMode);
+      const {resolveCodexMemoryEnabled}=await import("../shared/codex-memory.js");
+      const memoryEnabled=resolveCodexMemoryEnabled(payload.codexMemoryEnabled);
+      if (this.webSearchModeState !== searchMode || this.codexMemoryEnabledState!==memoryEnabled) {
+        for (const session of this.sessions.values()) this.invalidate(session.id);
+      }
+      this.webSearchModeState = searchMode;
+      this.codexMemoryEnabledState = memoryEnabled;
+      this.agentEngineState = resolveAgentEngine(payload.agentEngine);
+    }
+    return this.agentEngineState;
+  }
 
   /**
    * Latest sub-agent tier MENU for this box (credential-free), refreshed by the
@@ -517,6 +561,7 @@ export class AgentBoxSessionManager {
 
   // ── Shared components (AgentBox-level, outlive individual sessions) ──
   private _sharedMemoryIndexer: MemoryIndexer | null = null;
+  private _sharedMemoryInitialized = false;
   private _sharedKnowledgeIndexer: KnowledgeResolver | null = null;
   /** Whether shared components have been initialized */
   private _sharedInitialized = false;
@@ -749,6 +794,10 @@ export class AgentBoxSessionManager {
         // parent model running at `xhigh`.
         if (restoreParams && brain.applyModelParams) brain.applyModelParams(restoreParams);
         applyModelParamsForCandidate(brain, resolved, resolved.modelConfig);
+      } else {
+        // Untiered children retain their historical reasoning default, while
+        // honoring the selected model's independent Fast setting.
+        applyModelParamsForCandidate(brain, resolved, resolved.modelConfig, { applyReasoningEffort: false });
       }
 
       if (checkFit && brain.checkContextFitForModelPrompt) {
@@ -878,17 +927,20 @@ export class AgentBoxSessionManager {
    * Lazily initialize shared components (memory indexer, MCP manager).
    * Called on first getOrCreate(). Idempotent.
    */
-  private async ensureSharedComponents(): Promise<void> {
-    if (this._sharedInitialized) return;
-    this._sharedInitialized = true;
-
-    try {
-      this._sharedKnowledgeIndexer = await this.createSharedKnowledgeIndexer();
-      console.log(`[agentbox-session] Shared knowledge label resolver initialized`);
-    } catch (err) {
-      console.warn(`[agentbox-session] Shared knowledge label resolver init failed:`, err);
-      this._sharedKnowledgeIndexer = null;
+  private async ensureSharedComponents(includePiMemory: boolean): Promise<void> {
+    if (!this._sharedInitialized) {
+      this._sharedInitialized = true;
+      try {
+        this._sharedKnowledgeIndexer = await this.createSharedKnowledgeIndexer();
+        console.log(`[agentbox-session] Shared knowledge label resolver initialized`);
+      } catch (err) {
+        console.warn(`[agentbox-session] Shared knowledge label resolver init failed:`, err);
+        this._sharedKnowledgeIndexer = null;
+      }
     }
+
+    if (!includePiMemory || this._sharedMemoryInitialized) return;
+    this._sharedMemoryInitialized = true;
 
     if (!isMemoryEnabled()) {
       this._sharedMemoryIndexer = null;
@@ -1092,10 +1144,11 @@ export class AgentBoxSessionManager {
       if (request.resumeHandle && request.forkTurns !== undefined) throw new Error("Cannot change fork_turns on a resumed child");
       const parent = this.sessions.get(request.parentSessionId);
       if (request.forkTurns !== undefined && request.forkTurns !== "none") {
-        if (!parent || parent.userId !== request.userId || !Array.isArray(parent.session.messages)) {
+        const conversation = parent?.brain.getConversationMessages?.() ?? parent?.session?.messages;
+        if (!parent || parent.userId !== request.userId || !Array.isArray(conversation)) {
           throw new Error("Active parent context is unavailable for this session and user");
         }
-        request = { ...request, parentContext: captureSubagentContext(parent.session.messages, request.forkTurns, request.spawnId) };
+        request = { ...request, parentContext: captureSubagentContext(conversation, request.forkTurns, request.spawnId) };
       } else {
         request = { ...request, parentContext: undefined };
       }
@@ -1924,6 +1977,7 @@ export class AgentBoxSessionManager {
         type: "channel.deliver_message",
         message: {
           sessionId: request.sessionId,
+          requestId: this.sessions.get(request.sessionId)?._channelDeliveryId,
           kind: request.kind,
           text,
           fromAgentId: this.agentId,
@@ -2313,8 +2367,12 @@ export class AgentBoxSessionManager {
     }
     for (const [receipt, notifications] of byRequest) {
       const hasSubagent = notifications.some(n => this.jobs.get(n.taskId)?.type === "subagent");
+      // Native children have no Pi JobRegistry entry. Their continuation input
+      // still belongs to the framework, not a new human request, and must be
+      // durable/hidden before the model starts just like a late Pi child result.
+      const persistInput = hasSubagent || notifications.some(n => n.nativeChild);
       await this.runSyntheticPrompt(managed,
-        hasSubagent ? lateSubagentResultPrompt(notifications) : buildNotificationBatch(notifications), hasSubagent, receipt);
+        hasSubagent ? lateSubagentResultPrompt(notifications) : buildNotificationBatch(notifications), persistInput, receipt);
     }
   }
 
@@ -2541,6 +2599,7 @@ export class AgentBoxSessionManager {
           }
           if (managed._aborted) backgroundWorkTurn.cancel();
           else backgroundWorkTurn.finish();
+          managed.brain.endRequest?.();
           managed.brain.setMailbox?.(undefined);
           managed.brain.llmCalls?.endPrompt({ explicit: true });
           managed._promptDone = true;
@@ -2875,9 +2934,11 @@ export class AgentBoxSessionManager {
     const childSessionManager = this.subagentRuns.get(childSessionId)?.restoredSession
       ?? SessionManager.continueRecent(process.cwd(), childSessionDir);
     const config = loadConfig();
+    const inheritedExecutionGrant = this.sessions.get(request.parentSessionId)?.executionGrant;
     const kubeconfigRef: KubeconfigRef = {
       credentialsDir: this.credentialsDir ?? path.resolve(process.cwd(), config.paths.credentialsDir),
-      credentialBroker: this.credentialBroker,
+      credentialBroker: inheritedExecutionGrant?.broker ?? this.credentialBroker,
+      identity: inheritedExecutionGrant?.identity,
     };
     const type = getSubagentType(request.subagentType) ?? getSubagentType(DEFAULT_SUBAGENT_TYPE)!;
     const agentId = request.parentAgentId ?? this.agentId ?? null;
@@ -2901,6 +2962,7 @@ export class AgentBoxSessionManager {
     // launch, even if a queued child starts after the parent has finished its turn.
     const parentMailbox = this.backgroundWorkOwners.get(request.spawnId.split("#")[0])?.mailbox;
     const child = await createSiclawSession({
+      executionClient: inheritedExecutionGrant?.client,
       mcpManager: sharedMcpManager,
       sessionManager: childSessionManager,
       kubeconfigRef,
@@ -3217,7 +3279,7 @@ export class AgentBoxSessionManager {
           const content = await materializeSubagentContext(request.parentContext, source, child.toolResultArtifactStore,
             text => redactText(text, redactionConfig), () => stopRequested || deadlineReached);
           if (stopRequested || deadlineReached) throw new Error("stopped before context inheritance completed");
-          await child.session.sendCustomMessage({ customType: "subagent-parent-context", content, display: false }, { triggerTurn: false });
+          await child.session!.sendCustomMessage({ customType: "subagent-parent-context", content, display: false }, { triggerTurn: false });
         }
         const promptRequest = request.inputReports ? {
           ...request,
@@ -3504,12 +3566,31 @@ export class AgentBoxSessionManager {
     allowInputRequest = false,
     handoffSupported = false,
     handoffPolicy?: import("../shared/agent-handoff.js").HandoffPolicy,
+    structuredResultRequired = false,
+    requestedAgentEngine: "pi-agent" | "codex" = this.agentEngineState,
+    authorization?: ExecutionAuthorization,
   ): Promise<ManagedSession> {
     const id = sessionId || this.defaultSessionId;
     const effectiveUserId = requestUserId?.trim() || this.userId;
+    const agentEngine = requestedAgentEngine;
+    let executionGrant: BoxExecutionGrant | undefined;
+    if (authorization) {
+      if (!this.gatewayClient) throw new Error("Execution authorization needs a Runtime");
+      const config = loadConfig();
+      this.executionGrants ??= new BoxExecutionGrants(this.gatewayClient,
+        this.credentialsDir ?? path.resolve(process.cwd(), config.paths.credentialsDir));
+      executionGrant = await this.executionGrants.accept(authorization.grantId, id, authorization.identity);
+      if (executionGrant.policy && agentEngine !== "codex") throw new Error("Channel policy requires the native Codex enforcement runtime");
+    }
+
+    claimSessionEngine(this.getSessionDir(id), this.agentId ?? "", id, agentEngine);
 
     const existing = this.sessions.get(id);
     if (existing) {
+      if (existing.executionGrant?.grantId !== executionGrant?.grantId
+          && (!existing._promptDone || existing._promptInflight || (existing._backgroundWorkCount ?? 0) > 0
+            || this.hasPendingNotificationWork(existing)))
+        throw Object.assign(new Error("Session execution authorization is still in use"), { status: 409 });
       existing.lastActiveAt = new Date();
       if (effectiveUserId && existing.userId && effectiveUserId !== existing.userId) {
         throw new Error(`Session ${id} is already bound to a different user`);
@@ -3545,9 +3626,12 @@ export class AgentBoxSessionManager {
         }
         // Rebuild an idle session when its execution context changes.
         const sameInputCapability = existing.allowInputRequest === allowInputRequest
+          && existing.executionGrant?.grantId === executionGrant?.grantId
           && Boolean(existing.handoffSupported) === handoffSupported
+          && Boolean(existing.structuredResultRequired) === structuredResultRequired
           && JSON.stringify(existing.handoffPolicy) === JSON.stringify(handoffPolicy)
-          && existing.mode === (mode ?? "web");
+          && existing.mode === (mode ?? "web")
+          && (existing.brain.brainType ?? "pi-agent") === agentEngine;
         if (
           (existing.activeMode === activeMode && sameInputCapability && !needsUserIdentityRebuild) ||
           !existing._promptDone ||
@@ -3563,13 +3647,13 @@ export class AgentBoxSessionManager {
     }
 
     // Ensure shared components are ready
-    await this.ensureSharedComponents();
+    await this.ensureSharedComponents(agentEngine === "pi-agent");
 
     const sessionDir = this.getSessionDir(id);
     console.log(`[agentbox-session] Creating session: ${id} in ${sessionDir}`);
     const modelRouteState = this.loadModelRouteState(id);
 
-    if (isMemoryEnabled()) {
+    if (agentEngine === "pi-agent" && isMemoryEnabled()) {
       const memoryDir = this.getMemoryDir();
       if (!fs.existsSync(memoryDir)) {
         fs.mkdirSync(memoryDir, { recursive: true });
@@ -3588,8 +3672,10 @@ export class AgentBoxSessionManager {
     const kubeconfigRef: KubeconfigRef = {
       // Prefer the per-user dir set by LocalSpawner; fall back to the
       // config-driven global path (K8s mode and CLI both use this).
+      // Protect the complete credential root, not only this grant's directory.
       credentialsDir: this.credentialsDir ?? path.resolve(process.cwd(), config.paths.credentialsDir),
-      credentialBroker: this.credentialBroker,
+      credentialBroker: executionGrant?.broker ?? this.credentialBroker,
+      identity: executionGrant?.identity,
     };
     const effectiveMode = mode ?? "web";
 
@@ -3649,7 +3735,7 @@ export class AgentBoxSessionManager {
     // full pod/process restart from the PV snapshot. taskListId == session id.
     this.rehydrateLedger(id);
 
-    const gc = this.gatewayClient;
+    const gc = executionGrant?.client ?? this.gatewayClient;
     // Load the authorized handoff index from the control plane.
     let handoffTargets: HandoffTarget[] | undefined;
     if (gc) {
@@ -3660,15 +3746,27 @@ export class AgentBoxSessionManager {
         console.warn(`[agentbox-session] fetchHandoffTargets failed for ${id}:`, err);
       }
     }
-    const scriptInfo = effectiveMode === "web" && gc ? await gc.scriptSandboxInfo() : undefined;
+    // Codex owns JS Code Mode. Never advertise the legacy Python/Bash runner
+    // or couple native code execution to the disposable-runner enablement switch.
+    const scriptInfo = agentEngine === "pi-agent" && effectiveMode === "web" && gc ? await gc.scriptSandboxInfo() : undefined;
     const result = await createSiclawSession({
+      executionClient: gc,
+      agentEngine,
+      webSearchMode: this.webSearchModeState,
+      codexMemoryEnabled: agentEngine==="codex" && this.codexMemoryEnabledState,
       scriptExecutor: scriptInfo?.enabled ? (request, _sessionId, signal) => gc!.runScript(request, id, signal) : undefined,
       scriptSandboxInfo: scriptInfo,
+      authorizeNativeMcp: gc ? (operation, signal) => gc.authorizeNativeMcp(id, operation, signal, this.agentId ?? undefined) : undefined,
+      validateNativeExecution: executionGrant ? async () => {
+        if (executionGrant.ended || Date.now() >= executionGrant.deadline) throw new Error("Execution authorization ended");
+        const current = await this.executionGrants!.accept(executionGrant.grantId, id, executionGrant.identity);
+        if (current !== executionGrant || executionGrant.ended) throw new Error("Execution authorization changed");
+      } : undefined,
       sessionManager: frameworkSessionManager,
       kubeconfigRef,
       mode: effectiveMode,
       activeMode,
-      memoryIndexer: this._sharedMemoryIndexer ?? undefined,
+      memoryIndexer: agentEngine === "pi-agent" ? this._sharedMemoryIndexer ?? undefined : undefined,
       knowledgeIndexer: this._sharedKnowledgeIndexer ?? undefined,
       userId: effectiveUserId,
       agentId: this.agentId ?? null,
@@ -3699,6 +3797,7 @@ export class AgentBoxSessionManager {
       allowInputRequest,
       handoffSupported,
       handoffPolicy,
+      structuredResultRequired,
       // spawn_subagent is available in normal chat (top-level sessions only — child
       // sessions above omit this executor, so sub-agents cannot recurse).
       spawnSubagentExecutor: this.createSpawnSubagentExecutor(),
@@ -3717,7 +3816,7 @@ export class AgentBoxSessionManager {
     this.attachUsage(result.brain, id, "root");
 
     // New session: sync memory index, then purge stale investigations (chained to avoid race)
-    if (isMemoryEnabled() && isNewSession && this._sharedMemoryIndexer) {
+    if (result.brain.brainType !== "codex" && isMemoryEnabled() && isNewSession && this._sharedMemoryIndexer) {
       const memDir = this.getMemoryDir();
       this._sharedMemoryIndexer.sync()
         .then(() => this._sharedMemoryIndexer!.purgeStaleInvestigations(memDir, { skipSync: true }))
@@ -3725,12 +3824,15 @@ export class AgentBoxSessionManager {
     }
 
     const managed: ManagedSession = {
+      executionGrant,
       agentPrompt: systemPromptTemplate,
       id,
       userId: effectiveUserId,
       brain: result.brain,
       session: result.session,
-      toolNames: (result.customTools ?? []).map((tool) => tool.name).sort(),
+      toolNames: (result.brain.brainType === "codex"
+        ? result.brain.getTools?.() ?? result.customTools ?? []
+        : result.customTools ?? []).map((tool) => tool.name).sort(),
       skillNames: [...(result.skillNames ?? [])].sort(),
       skillDigests: { ...(result.skillDigests ?? {}) },
       getSkillSnapshot: result.getSkillSnapshot,
@@ -3761,6 +3863,7 @@ export class AgentBoxSessionManager {
       allowInputRequest,
       handoffSupported,
       handoffPolicy,
+      structuredResultRequired,
       // Per-session references point to shared instances (not owned by session)
       mcpManager: result.mcpManager,
       memoryIndexer: result.memoryIndexer,
@@ -3784,6 +3887,36 @@ export class AgentBoxSessionManager {
     };
 
     this.sessions.set(id, managed);
+    if (executionGrant) {
+      const busy = () => !managed._promptDone || Boolean(managed._promptInflight)
+        || (managed._backgroundWorkCount ?? 0) > 0 || this.hasPendingNotificationWork(managed);
+      const end = () => {
+        managed._aborted = true;
+        this.stopSessionJobs(id);
+        void managed.brain.abort().catch(() => {});
+      };
+      executionGrant.onEnd.add(end); executionGrant.busy.add(busy);
+      managed.releaseExecutionGrant = () => { executionGrant.onEnd.delete(end); executionGrant.busy.delete(busy); };
+    }
+    if (result.brain.setNativeChildSink && this.gatewayClient && this.agentId && effectiveUserId) {
+      const nativeRunning = new Set<string>();
+      result.brain.setNativeChildSink(createNativeChildSink({ gateway: executionGrant?.client ?? this.gatewayClient,
+        rootSessionId: id, agentId: this.agentId, userId: executionGrant?.sender?.userId ?? effectiveUserId,
+        redact: text => redactText(text, buildRedactionConfigForModelConfig(this.delegationModelConfig)),
+        recordUsage: observation => {
+          if (!this.usageOutbox) throw new Error("Native child usage collector is unavailable");
+          this.usageOutbox.record(observation);
+        },
+        activity: (childId, running) => {
+          if (this.sessions.get(id) !== managed) return;
+          if (running && !nativeRunning.has(childId)) {
+            nativeRunning.add(childId);
+            managed._backgroundWorkCount++;
+            if (managed._releaseTimer) { clearTimeout(managed._releaseTimer); managed._releaseTimer = null; }
+          } else if (!running && nativeRunning.delete(childId)) this.releaseBackgroundWork(id);
+        },
+      }));
+    }
     emitDiagnostic({ type: "session_created", sessionId: id });
 
     // OpenTelemetry trace recorder. Gated on isTracingEnabled() so that when
@@ -4133,9 +4266,11 @@ export class AgentBoxSessionManager {
     }
 
     console.log(`[agentbox-session] Releasing session: ${sessionId}`);
+    managed.releaseExecutionGrant?.();
+    await managed.brain.close?.();
 
     // 1. Auto-save session memory (dedup: only if new messages since last save)
-    if (isMemoryEnabled()) {
+    if (managed.brain.brainType !== "codex" && isMemoryEnabled()) {
       try {
         const sessionDir = this.getSessionDir(sessionId);
         const memoryDir = this.getMemoryDir();
@@ -4167,7 +4302,7 @@ export class AgentBoxSessionManager {
     }
 
     // 3. Sync shared memory index to pick up the new summary file
-    if (isMemoryEnabled() && this._sharedMemoryIndexer) {
+    if (managed.brain.brainType !== "codex" && isMemoryEnabled() && this._sharedMemoryIndexer) {
       await this._sharedMemoryIndexer.sync().catch((err) => {
         console.warn(`[agentbox-session] Memory sync on release failed:`, err);
       });
@@ -4254,6 +4389,8 @@ export class AgentBoxSessionManager {
     const managed = this.sessions.get(sessionId);
     if (managed) {
       console.log(`[agentbox-session] Closing session: ${sessionId}`);
+      managed.releaseExecutionGrant?.();
+      await managed.brain.close?.();
       if (managed._releaseTimer) {
         clearTimeout(managed._releaseTimer);
         managed._releaseTimer = null;
@@ -4307,6 +4444,7 @@ export class AgentBoxSessionManager {
    * Called on AgentBox shutdown.
    */
   async closeAll(): Promise<void> {
+    this.executionGrants?.close();
     console.log(`[agentbox-session] Closing all sessions (${this.sessions.size})`);
     // Snapshot and clear the map atomically — prevents in-flight release()
     // from emitting a duplicate session_released for the same session.
@@ -4314,6 +4452,8 @@ export class AgentBoxSessionManager {
     this.sessions.clear();
 
     for (const [id, managed] of snapshot) {
+      managed.releaseExecutionGrant?.();
+      await managed.brain.close?.();
       if (managed._releaseTimer) {
         clearTimeout(managed._releaseTimer);
         managed._releaseTimer = null;
@@ -4368,6 +4508,7 @@ export class AgentBoxSessionManager {
     }
 
     this._sharedInitialized = false;
+    this._sharedMemoryInitialized = false;
   }
 
   /**

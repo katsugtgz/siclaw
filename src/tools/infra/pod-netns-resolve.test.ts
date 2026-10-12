@@ -64,7 +64,7 @@ function inspectpJson(netnsPath: string | null, opts?: { infoAsString?: boolean 
 describe("buildCrictlNetnsScript", () => {
   it("looks up the sandbox by pod+namespace and returns RAW crictl JSON", () => {
     const s = buildCrictlNetnsScript("rdma-a", "rdma-test");
-    expect(s).toContain('crictl pods --name "^rdma-a$" --namespace "rdma-test"');
+    expect(s).toContain('crictl pods --name "^rdma-a$" --namespace "^rdma-test$"');
     expect(s).toContain("crictl inspectp");
     // -o json is explicit, not inherited: crictl's default output is configurable (CRICTL_OUTPUT,
     // or `output:` in /etc/crictl.yaml), and a node set to yaml would fail `pod=` before the user's
@@ -79,6 +79,10 @@ describe("buildCrictlNetnsScript", () => {
     const s = buildCrictlNetnsScript("rdma-a", "rdma-test");
     expect(s).not.toContain("jq");
     expect(s).not.toContain("basename");
+  });
+  it("selects the exact Pod name and namespace rather than a regex lookalike", () => {
+    expect(buildCrictlNetnsScript("rdma.a", "rdma-test"))
+      .toContain('--name "^rdma\\.a$" --namespace "^rdma-test$"');
   });
 });
 
@@ -143,6 +147,19 @@ describe("resolvePodNetnsViaKubectl", () => {
     expect("error" in r && r.error).toMatch(/Invalid namespace/);
     expect(resolveContainerNetns).not.toHaveBeenCalled();
     expect(runInDebugPod).not.toHaveBeenCalled();
+  });
+  it("retains native prepared-namespace/host-root restrictions and propagates cancellation", async () => {
+    const stop = new AbortController();
+    vi.mocked(resolveContainerNetns).mockResolvedValue({ nodeName: "worker-1", containerID: "c" });
+    vi.mocked(runInDebugPod).mockResolvedValue({ stdout: inspectpJson("/var/run/netns/cni-abc"), stderr: "", exitCode: 0 });
+    await resolvePodNetnsViaKubectl({ ...base, signal: stop.signal, debugNamespace: "prepared-debug",
+      requireExistingNamespace: true, enterHostRoot: true });
+    expect(resolveContainerNetns).toHaveBeenCalledWith(base.pod, base.namespace, undefined, base.env, stop.signal);
+    expect(runInDebugPod).toHaveBeenCalledWith(expect.objectContaining({ namespace: "prepared-debug", requireExistingNamespace: true,
+      command: expect.arrayContaining(["--root", "--wd"]) }), base.env, { timeoutMs: 30_000, signal: stop.signal });
+    vi.mocked(resolveContainerNetns).mockClear(); vi.mocked(runInDebugPod).mockClear(); stop.abort();
+    expect(await resolvePodNetnsViaKubectl({ ...base, signal: stop.signal })).toEqual({ error: "Aborted." });
+    expect(resolveContainerNetns).not.toHaveBeenCalled(); expect(runInDebugPod).not.toHaveBeenCalled();
   });
 });
 

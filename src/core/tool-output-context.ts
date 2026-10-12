@@ -4,6 +4,8 @@ import { AsyncLocalStorage } from "node:async_hooks";
 export interface ToolOutputContext {
   directory: string;
   outputs: Array<{ preview: string; full: string }>;
+  /** Per-invocation credential redactor, applied before projections/truncation. */
+  redactOutput?: (text: string) => string;
 }
 const context = new AsyncLocalStorage<ToolOutputContext>();
 export function currentToolOutputContext(): ToolOutputContext | undefined { return context.getStore(); }

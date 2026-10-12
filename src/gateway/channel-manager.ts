@@ -12,6 +12,7 @@ import type { AgentBoxManager } from "./agentbox/manager.js";
 import type { FrontendWsClient } from "./frontend-ws-client.js";
 import { createLarkHandler } from "./channels/lark.js";
 import { createDingTalkHandler } from "./channels/dingtalk.js";
+import { channelMatchesAcceptanceScope, parseChannelAcceptanceScope, type ChannelAcceptanceScope } from "./channel-acceptance-scope.js";
 
 export interface ChannelHandler {
   start(): Promise<void>;
@@ -31,6 +32,9 @@ export interface ChannelReloadResult {
 }
 
 export interface ResolvedChannelBinding {
+  identity?: import("../shared/execution-identity.js").ExecutionIdentity;
+  sender?: import("../shared/execution-context.js").ExecutionSender;
+  origin?: "channel" | "dm";
   agentId: string;
   bindingId: string;
   sessionId: string;
@@ -66,6 +70,13 @@ export interface ChannelAccessDenied {
   walled: true;
   reason?: string;
   authorizeUrl?: string;
+  /** Published group admission needs identity only, never a personal grant. */
+  identityLinkOnly?: boolean;
+  identityLinkingEnabled?: boolean;
+  /** Reusable entry; contains no requester identity or invitation token. */
+  identityLinkUrl?: string;
+  /** Trusted control-plane opt-in for the isolated operator's loopback test. */
+  identityLinkLocalTest?: boolean;
 }
 
 export function isChannelAccessDenied(
@@ -107,6 +118,7 @@ export interface PersonalAccessDenied {
   reason?: string;
   /** Single-use next step (link/apply). Absent when the tier accepts no self-service. */
   actionUrl?: string;
+  identityLinkLocalTest?: boolean;
   /** Epoch ms the `actionUrl` dies. Use for EXPIRY checks — not for the displayed duration. */
   expiresAtMs?: number;
   /**
@@ -278,12 +290,14 @@ export async function resolvePersonalBinding(
   senderOpenId: string,
   frontendClient: FrontendWsClient,
   senderType?: string,
+  identityLinkOnly = false,
 ): Promise<PersonalBindingResult> {
   const data = await frontendClient.request("channel.resolvePersonalBinding", {
     channel_id: channelId,
     sender_open_id: senderOpenId,
     // Same contract as the group lookup: verbatim, and absent stays absent.
     ...(senderType ? { sender_type: senderType } : {}),
+    ...(identityLinkOnly ? { identity_link_only: true } : {}),
   });
   return {
     binding: data?.binding ?? null,
@@ -307,6 +321,7 @@ export function normalizeDenied(raw: unknown): { denied: PersonalAccessDenied } 
   const denied: PersonalAccessDenied = {
     ...(str(src.reason) ? { reason: str(src.reason) } : {}),
     ...(str(src.actionUrl) ? { actionUrl: str(src.actionUrl) } : {}),
+    ...(src.identityLinkLocalTest === true ? { identityLinkLocalTest: true } : {}),
     ...(str(src.message) ? { message: str(src.message) } : {}),
     ...(typeof src.expiresAtMs === "number" && Number.isFinite(src.expiresAtMs)
       ? { expiresAtMs: src.expiresAtMs }
@@ -498,12 +513,15 @@ export interface ChannelManagerOptions {
   bootRetryAttempts?: number;
   /** Base backoff ms between bootFromDb retries (doubles each attempt up to 8s). */
   bootRetryBaseMs?: number;
+  /** Trusted test Runtime policy; never comes from a model or a channel row. */
+  acceptanceScope?: ChannelAcceptanceScope;
 }
 
 export class ChannelManager {
   private handlers = new Map<string, RunningChannel>();
   private readonly bootRetryAttempts: number;
   private readonly bootRetryBaseMs: number;
+  private readonly acceptanceScope?: ChannelAcceptanceScope;
 
   constructor(
     private agentBoxManager: AgentBoxManager,
@@ -513,6 +531,7 @@ export class ChannelManager {
   ) {
     this.bootRetryAttempts = options.bootRetryAttempts ?? 5;
     this.bootRetryBaseMs = options.bootRetryBaseMs ?? 1000;
+    this.acceptanceScope = options.acceptanceScope ?? parseChannelAcceptanceScope(process.env.SICLAW_CHANNEL_ACCEPTANCE_SCOPE);
   }
 
   /**
@@ -575,7 +594,8 @@ export class ChannelManager {
 
   private async fetchChannels(): Promise<Record<string, any>[]> {
     const result = await this.frontendClient!.request("channel.list") as { data?: Record<string, any>[] };
-    return Array.isArray(result.data) ? result.data : [];
+    const channels = Array.isArray(result.data) ? result.data : [];
+    return this.acceptanceScope ? channels.filter(channel => channelMatchesAcceptanceScope(channel, this.acceptanceScope!)) : channels;
   }
 
   private async reconcileChannels(channels: Record<string, any>[]): Promise<ChannelReloadResult> {
@@ -624,6 +644,7 @@ export class ChannelManager {
   }
 
   async startChannel(channel: Record<string, any>, fingerprint = channelFingerprint(channel)): Promise<boolean> {
+    if (this.acceptanceScope && !channelMatchesAcceptanceScope(channel, this.acceptanceScope)) return false;
     if (this.handlers.has(channel.id)) {
       console.warn(`[channel-manager] Channel id=${channel.id} already running — skipping`);
       return false;
@@ -638,6 +659,7 @@ export class ChannelManager {
           this.agentBoxManager,
           this.agentBoxTlsOptions,
           this.frontendClient,
+          this.acceptanceScope,
         );
         break;
       case "dingtalk":

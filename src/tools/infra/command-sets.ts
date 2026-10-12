@@ -1,3 +1,4 @@
+import path from "node:path";
 import {
   getOutputFormat,
   kubectlAllNamespaces,
@@ -1860,6 +1861,8 @@ export type CommandCategory =
  */
 export interface CommandDef {
   category: CommandCategory;
+  /** Reviewed vendor locations for native transports; never an argument grant. */
+  executablePaths?: readonly string[];
   blockedFlags?: string[];
   allowedFlags?: string[];
   allowedSubcommands?: { position: number; allowed: string[] };
@@ -2234,6 +2237,16 @@ export function isCredentialFreeInvocation(cmd: string): boolean {
   if (!declared) return false;
   const sub = positionalAt(args, declared.position);
   return sub !== undefined && declared.subcommands.includes(sub);
+}
+
+/** Native transports accept standard system binaries or an exact operator-
+ * configured vendor path. Command/flag admission still uses the shared policy. */
+export function isTrustedCommandExecutable(binary: string): boolean {
+  if (!binary.includes("/")) return true;
+  if (!path.posix.isAbsolute(binary) || path.posix.normalize(binary) !== binary) return false;
+  if (["/bin", "/sbin", "/usr/bin", "/usr/sbin", "/usr/local/bin", "/usr/local/sbin"].includes(path.posix.dirname(binary))) return true;
+  if (!/^\/(?:usr|opt)\//.test(binary)) return false;
+  return getCommandDef(path.posix.basename(binary))?.executablePaths?.includes(binary) ?? false;
 }
 
 // ── Context Policies (internal) ─────────────────────────────────

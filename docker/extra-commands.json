@@ -11,6 +11,7 @@
     },
     "mmlscluster": {
       "category": "diagnostic",
+      "executablePaths": ["/usr/lpp/mmfs/bin/mmlscluster"],
       "description": "IBM Spectrum Scale (GPFS) cluster configuration query — the node/manager layout behind a shared filesystem, read next to mount/findmnt when a node's GPFS mount is the subject. Read-only: the mm* family splits along its verb and every writer is a SEPARATE binary (mmchcluster, mmcrfs, mmdelnode, mmshutdown), none of which is whitelisted. Invoked by its absolute path (/usr/lpp/mmfs/bin/mmlscluster), which resolves to this basename. Takes no operands — only --ces / --cnfs / --cloud-gateway — so operands are blocked.",
       "positionals": "block"
     }

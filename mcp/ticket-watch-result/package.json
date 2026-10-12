@@ -1,0 +1,30 @@
+{
+  "name": "mcp-ticket-watch-result",
+  "version": "0.3.2",
+  "description": "Stateless MCP validator for the per-turn result of an L1 ticket follow",
+  "type": "module",
+  "bin": {
+    "mcp-ticket-watch-result": "./dist/index.js"
+  },
+  "main": "./dist/index.js",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "clean": "rm -rf dist"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.0"
+  },
+  "license": "Apache-2.0"
+}

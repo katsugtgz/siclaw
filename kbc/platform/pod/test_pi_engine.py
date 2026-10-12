@@ -207,7 +207,7 @@ async def test_model_call_budget_stops_tool_loop(tmp_path):
             await instance.query("Loop")
             events = await collect(instance)
             assert events[-1].data["outcome"] == "failed"
-            assert "KBC_MODEL_CALL_BUDGET_EXCEEDED" in events[-1].data["error"]
+            assert events[-1].data["error"] == "KBC_MODEL_CALL_BUDGET_EXCEEDED"
             assert len(requests) == 1
 
 

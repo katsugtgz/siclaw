@@ -2184,6 +2184,8 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
       // capabilities and an immutable behavior contract; system_prompt stores
       // only the optional Agent-owned Addendum.
       agent_type: agent.agent_type,
+      agent_engine: agent.agent_engine ?? "pi-agent",
+      web_search_mode: agent.web_search_mode ?? "disabled",
       // Sub-agent tier MENU, already projected — credential-free {tier, whenToUse}
       // plus the revision.
       //

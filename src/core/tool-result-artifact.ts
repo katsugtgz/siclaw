@@ -86,6 +86,8 @@ export interface ToolResultArtifactStoreOptions {
   maxScopeBytes?: number;
   maxScopeArtifacts?: number;
   now?: () => number;
+  /** Owner-scoped gate applied before hashes, persistence and artifact delivery. */
+  redactOutput?: (text: string) => string;
 }
 
 export interface ToolResultArtifactReadResult {
@@ -355,6 +357,7 @@ export function formatUnrecoverableToolResult(
 }
 
 export class ToolResultArtifactStore {
+  readonly redactOutput: (text: string) => string;
   private readonly rootDir: string;
   private readonly getScope: () => ToolResultArtifactScope | null;
   private readonly ttlMs: number;
@@ -365,6 +368,7 @@ export class ToolResultArtifactStore {
   private rootReady: Promise<void> | null = null;
 
   constructor(options: ToolResultArtifactStoreOptions) {
+    this.redactOutput = options.redactOutput ?? (text => text);
     this.rootDir = path.resolve(options.rootDir);
     this.getScope = options.getScope;
     this.ttlMs = options.ttlMs ?? DEFAULT_TTL_MS;
@@ -390,6 +394,8 @@ export class ToolResultArtifactStore {
   }
 
   async capture(input: { text: string; toolCallId: string; toolName: string }): Promise<ToolResultArtifactCapture> {
+    try { input = { ...input, text: this.redactOutput(input.text) }; }
+    catch { return { failure: { version: 1, sizeChars: 0, sizeBytes: 0, reason: "write_failed" } }; }
     const sizeBytes = Buffer.byteLength(input.text, "utf8");
     const failureBase = { version: 1 as const, sizeChars: input.text.length, sizeBytes };
     const scope = this.getScope();
@@ -652,7 +658,7 @@ export function withToolResultArtifactCapture(
     ...tool,
     execute: async (...executeArgs: Parameters<ToolDefinition["execute"]>) => {
       const [toolCallId] = executeArgs;
-      const scope: ToolOutputContext = { directory: await store.scopedDirectory(), outputs: [] };
+      const scope: ToolOutputContext = { directory: await store.scopedDirectory(), outputs: [], redactOutput: store.redactOutput };
       const result = await withToolOutputContext(scope, () => originalExecute(...executeArgs));
       const preview = toolResultText(result);
       let text = preview;

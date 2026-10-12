@@ -23,19 +23,29 @@ both MCP text content and `structuredContent`.
 }
 ```
 
-`ticket_type` is one of `consultation`, `incident`, `llm_incident`,
-`requirement`, or `unknown`. A `label=true` result marks the Agent's final
+`ticket_type` is one of `consultation`, `incident`, `llm_incident` or
+`requirement`. A `label=true` result marks the Agent's final
 conversation turn: intake is complete and the channel can offer its human
 handoff button. The user triggers that workflow; the result itself does not
 initiate a handoff or create a ticket. End with an acknowledgment that the
 information is prepared, without further questions or claims of completed actions.
 
-A `label=true` result must provide a non-empty summary and description and
-have no blocking clarification fields. The type may remain `unknown` when
-the user cannot or declines to clarify; preserve that uncertainty and the
-handoff request in the description instead of inventing a classification.
-An empty `missing_fields` means no further Agent clarification is needed,
-not that every fact is known.
+### Every turn is handoff-ready material
+
+A channel may hand the ticket to a human at any moment without another Agent
+turn — for example when the user presses an urgent-handoff button. First-line
+support then receives the **latest** result as it stands. Every result,
+whatever its `label`, therefore carries:
+
+- a non-empty `description`: a self-contained account of the user's issue, the
+  facts established so far and what has been answered, updated each turn;
+- the most likely `ticket_type` from the conversation so far. While
+  `label=false` it is provisional and may change as the user clarifies; there is
+  no `unknown` value to fall back on.
+
+A `label=true` result must additionally provide a non-empty summary and have no
+blocking clarification fields. An empty `missing_fields` means no further Agent
+clarification is needed, not that every fact is known.
 Requirements must also name a concrete product grounded in product knowledge.
 For incidents and consultations, a concrete `product` must be established by
 the conversation or authoritative product knowledge; otherwise leave it empty,
@@ -50,7 +60,8 @@ or inference endpoint: gateway errors, authentication and rate-limit or quota
 failures, broken streaming, or a specific named model misbehaving. `incident`
 remains every other fault.
 
-The `llm` block carries best-effort intake details for first-line support:
+The `llm` block carries the intake details first-line support routes an LLM
+incident on:
 
 ```json
 {
@@ -73,18 +84,41 @@ The `llm` block carries best-effort intake details for first-line support:
 | `llm.aspect` | `""`, `platform_api`, `network`, `model` | Failing part of the path: the API platform or gateway, network reachability, or a specific model |
 | `llm.model` | free text | Model name as the user stated it |
 
-These fields are hints, not gates. Fill each one only from what the
-conversation establishes and leave it empty otherwise; a `label=true`
-`llm_incident` does not require any of them. While still gathering, the
-identifiers `llm_region`, `llm_aspect` and `llm_model` may appear in
-`missing_fields`. While `label=false` and `ticket_type=unknown`, the block may
-temporarily retain details stated by the user. If the final handoff remains
-`unknown`, leave all three fields empty and retain those clues in `description`
-and `evidence`, without asserting an LLM incident. For `consultation`, `incident` or `requirement`,
-all three fields must be empty, so a stray value is never read as an
-established fact. The block is optional on input: omitting it means all three
+Fill each field only from what the conversation establishes. While still
+gathering (`label=false`) any of them may be empty, and the identifiers
+`llm_region`, `llm_aspect` and `llm_model` may appear in `missing_fields`. A
+`label=true` `llm_incident` requires `region` and `aspect`, and `model` when
+the aspect is `model`: the Agent asks for them instead of handing off without
+them. A user who needs a human before answering has the channel's own handoff
+action, which does not wait for a `label=true` result. For `consultation`,
+`incident` or `requirement`, all three fields must be empty, so a stray value
+is never read as an established fact; unconfirmed clues belong in
+`description` and `evidence`. The block is optional on input: omitting it means all three
 fields are empty, which is the correct value for every type except
 `llm_incident`. It is always present in the returned result.
+
+### Component tags (`modules`)
+
+`modules` lists the components the issue concerns, as `module_id` values from
+the component catalogue the Agent was given. A tag may be a first-level
+product, a second-level system or a third-level component, and several may be
+combined, across products:
+
+```json
+"modules": ["storage-object-upload", "billing"]
+```
+
+Tags are best effort. The Agent tags the most specific level the conversation
+and product knowledge support, never a guessed deeper one, and resubmits the
+full current set on every turn. An empty list means no component is
+established yet; there is no placeholder value for "unknown". Tags never gate
+a handoff: a `label=true` result is valid with an empty list.
+
+Each item must match the channel's `module_id` rule, `^[a-z][a-z0-9_-]*$`.
+Whether the id exists is the channel's check, not this server's: the server
+has no catalogue and makes no calls. The field is optional on input, so a
+prompt that predates it keeps producing accepted results; it is always present
+in the returned result.
 
 ### Size limits
 
@@ -99,6 +133,7 @@ shorten it. Limits are in characters, not bytes.
 | `product`, `llm.model` | 128 |
 | `evidence` | 20 items, 300 characters each |
 | `missing_fields` | 20 items, 64 characters each |
+| `modules` | 10 items, 64 characters each |
 
 Limits apply to the raw value before trimming, exactly as a host that
 validates the advertised schema before dispatch applies `maxLength`, so the
@@ -108,9 +143,12 @@ parser is never more lenient than the schema the model was shown.
 
 The parser mirrors the advertised JSON Schema and adds nothing the schema does
 not say: enum values (`ticket_type`, `llm.region`, `llm.aspect`) must be the
-exact lowercase spelling. String fields are trimmed. `evidence` and
-`missing_fields` items are trimmed and post-trim duplicates are removed, so the
-returned arrays can be shorter than the caller's.
+exact lowercase spelling. String fields are trimmed. `evidence` items are
+trimmed and post-trim duplicates are removed. `missing_fields` and `modules`
+items must match their advertised pattern exactly as sent — the host checks
+that pattern before dispatch, so surrounding spaces are refused rather than
+trimmed — and duplicates are removed. The returned arrays can therefore be
+shorter than the caller's.
 
 The server validates each call independently. It does not know Siclaw session
 or turn identity, so "exactly one successful result per turn" is not enforced

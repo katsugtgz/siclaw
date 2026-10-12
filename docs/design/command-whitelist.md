@@ -2,21 +2,26 @@
 
 This document describes all commands allowed by Siclaw's execution tools and the security restrictions applied to each. All filtering uses **whitelist mechanisms** — unknown commands, flags, subcommands, and actions are blocked by default.
 
-> **Source of truth**: `src/tools/command-sets.ts`
+> **Source of truth**: `src/tools/infra/command-sets.ts` (`COMMANDS` and context policies)
 
 ## Architecture
 
 Commands are validated in two layers:
 
-1. **Command whitelist** (`ALLOWED_COMMANDS`) — only listed binaries are allowed to execute. Any unlisted binary is blocked immediately.
+1. **Command whitelist** (`COMMANDS` plus deployment extras, selected by context) — only listed binaries are allowed to execute. Any unlisted binary is blocked immediately.
 2. **Per-command validators** — whitelisted commands with dangerous capabilities have additional flag/subcommand validation. Only explicitly allowed flags and actions are permitted.
 
-These validations apply to three tools:
+These validations apply to Pi execution tools and the Codex native executor:
 - `restricted-bash` — sandboxed shell execution (also allows `kubectl` and skill scripts)
 - `pod-exec` — command execution inside Kubernetes pods
 - `node-exec` — command execution on Kubernetes nodes via privileged debug pods
+- `host-exec` — command execution on bound SSH hosts
+- Codex native `exec_command` — the same command/flag/path policy at the
+  exec-server boundary, with broker-controlled Pod, node and SSH transports
 
-Additionally, `restricted-bash` validates **shell operators** (see [Shell Operator Restrictions](#shell-operator-restrictions)).
+All of these paths validate **shell operators** (see [Shell Operator Restrictions](#shell-operator-restrictions)).
+Pod execution permits a single command; node and host execution permit validated
+pipelines. Engine adapters must not maintain their own command-name allow-lists.
 
 ---
 
@@ -33,6 +38,10 @@ contract. Summary:
   file can never relax built-in restrictions.
 - **Declarative constraints only**: `category` + `allowedFlags` / `blockedFlags` /
   `allowedSubcommands` / `positionals` / `requiredFlags`. No custom validators.
+- Optional `executablePaths` lists exact reviewed vendor locations under `/usr`
+  or `/opt` for native execution (for example GPFS's
+  `/usr/lpp/mmfs/bin/mmlscluster`). It does not relax argument restrictions or
+  authorize a temporary executable with a whitelisted basename.
 - **Forbidden names**: shells, interpreters, `sed`/`awk`, `nc`/`wget`/`socat`,
   `sudo`/`nsenter`, argument-executing wrappers (`xargs`, `timeout`, `watch`, …),
   `ssh`/`scp`/`rsync`, and `kubectl` are rejected at load time.

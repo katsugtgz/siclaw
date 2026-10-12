@@ -16,6 +16,7 @@ import { modelOptionsSupportImageInput, type ModelRoutePolicy } from "../../core
 import type { OriginKind } from "../../core/types.js";
 import { enrichImagesFromText, redactImageUrlsInText } from "./image-url-ingest.js";
 import { RpcResponseError, wrapRpcError } from "../../lib/error-envelope.js";
+import type { NativeUserInputRequest, NativeUserInputAnswer, NativeUserInputAcceptance } from "../../shared/native-user-input.js";
 
 export interface AgentBoxTlsOptions {
   cert: string;
@@ -24,6 +25,11 @@ export interface AgentBoxTlsOptions {
 }
 
 export interface PromptOptions {
+  requiredAgentEngine?: "codex";
+  identity?: import("../../shared/execution-identity.js").ExecutionIdentity;
+  sender?: import("../../shared/execution-context.js").ExecutionSender;
+  grantId?: string;
+  channelDeliveryId?: string;
   /** Opaque control-plane dispatch receipt; never a credential. */
   apiRequestId?: string;
   requestMode?: import("../../shared/request-mode.js").RequestMode;
@@ -38,6 +44,7 @@ export interface PromptOptions {
   turnId?: string;
   /** Exact result tool required by a strict control-plane turn. */
   requiredResultToolName?: string;
+  toolPolicy?: "ticket_fill_once";
   /** User who initiated this prompt. Forwarded per-request to the trace
    *  recorder as the root span's user.id (mirrors sessionId's per-request
    *  path), so tracing carries the user dimension in every deployment mode. */
@@ -135,6 +142,7 @@ export interface PromptResponse {
 
 export interface SteerResponse {
   ok: boolean;
+  deliveryTracked?: boolean;
   /** Trace of the active prompt that accepted this additional user input. */
   traceId?: string;
 }
@@ -146,6 +154,7 @@ export interface SessionInfo {
 }
 
 export interface HealthResponse {
+  inputDeliveryVersion?: number;
   requestModes?: Array<"sync" | "async">;
   status: string;
   sessions: number;
@@ -178,6 +187,9 @@ function agentBoxResponseError(status: number, body: string): RpcResponseError {
   let structuredMessage: string | undefined;
   try {
     const parsed = JSON.parse(body) as Record<string, unknown>;
+    // The pre-prompt busy gate uses a legacy string error; preserve its exact
+    // 409 reason for safe queue retries, without changing other HTTP errors.
+    if (status === 409 && typeof parsed.error === "string" && parsed.error.trim()) structuredMessage = parsed.error;
     const nested = parsed?.error && typeof parsed.error === "object"
       ? parsed.error as Record<string, unknown>
       : parsed;
@@ -299,6 +311,9 @@ export class AgentBoxClient {
    * Send a prompt
    */
   async prompt(opts: PromptOptions): Promise<PromptResponse> {
+    if (opts.requiredAgentEngine && (await this.health()).inputDeliveryVersion !== 1) {
+      throw new Error("AgentBox does not support durable input engine fencing");
+    }
     if (opts.requestMode === "sync" && !supportsRequestMode((await this.health()).requestModes, "sync")) {
       throw new Error("AgentBox does not support requestMode=sync; deploy matching Runtime and AgentBox versions");
     }
@@ -365,7 +380,7 @@ export class AgentBoxClient {
   /**
    * Send a steer instruction (inserts a user message after interrupting the current tool)
    */
-  async steerSession(sessionId: string, text: string, media?: PromptMediaOptions): Promise<SteerResponse> {
+  async steerSession(sessionId: string, text: string, media?: PromptMediaOptions, deliveryMessageId?: string): Promise<SteerResponse> {
     const images = media?.images;
     const files = media?.files;
     const resp = await this.fetch(`/api/sessions/${sessionId}/steer`, {
@@ -373,6 +388,7 @@ export class AgentBoxClient {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         text,
+        ...(deliveryMessageId ? { deliveryMessageId } : {}),
         ...(images && images.length > 0 ? { images } : {}),
         ...(files && files.length > 0 ? { files } : {}),
       }),
@@ -444,6 +460,17 @@ export class AgentBoxClient {
     return resp.json();
   }
 
+  async getUserInput(sessionId: string): Promise<{ nativeUserInput: NativeUserInputRequest | null }> {
+    const resp = await this.fetch(`/api/sessions/${sessionId}/user-input`);
+    return resp.json();
+  }
+  async submitUserInput(sessionId: string, answer: NativeUserInputAnswer, prepare = false): Promise<NativeUserInputAcceptance & { traceId?: string }> {
+    const resp = await this.fetch(`/api/sessions/${sessionId}/user-input${prepare ? "/prepare" : ""}`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(answer),
+    });
+    return resp.json();
+  }
+
   /**
    * List available models
    */
@@ -486,7 +513,7 @@ export class AgentBoxClient {
    * streams structured events on /events/:runId; agentbox uses /api/stream/:id.
    * Both speak `data: <json>\n\n` with `: heartbeat` comment lines.
    */
-  async *streamPath(path: string, opts?: { onComment?: () => void }): AsyncIterable<unknown> {
+  async *streamPath(path: string, opts?: { onComment?: () => void; signal?: AbortSignal }): AsyncIterable<unknown> {
     const url = `${this.endpoint}${path}`;
 
     // Use https.request for HTTPS with mTLS
@@ -497,6 +524,7 @@ export class AgentBoxClient {
 
     const resp = await fetch(url, {
       headers: { Accept: "text/event-stream" },
+      signal: opts?.signal,
     });
 
     if (!resp.ok) {
@@ -544,7 +572,10 @@ export class AgentBoxClient {
         }
       }
     } catch (err) {
-      console.error(`[agentbox-client] SSE stream error path=${path}:`, err instanceof Error ? err.message : err);
+      // A caller-requested abort is a normal close, not a stream failure.
+      if (!opts?.signal?.aborted) {
+        console.error(`[agentbox-client] SSE stream error path=${path}:`, err instanceof Error ? err.message : err);
+      }
       throw err;
     } finally {
       console.log(`[agentbox-client] SSE closed path=${path} (${eventCount} events)`);
@@ -555,7 +586,7 @@ export class AgentBoxClient {
   /**
    * SSE stream over HTTPS with mTLS, on an arbitrary path.
    */
-  private async *streamPathHttps(path: string, opts?: { onComment?: () => void }): AsyncIterable<unknown> {
+  private async *streamPathHttps(path: string, opts?: { onComment?: () => void; signal?: AbortSignal }): AsyncIterable<unknown> {
     const urlObj = new URL(path, this.endpoint);
 
     const res = await new Promise<import("node:http").IncomingMessage>((resolve, reject) => {
@@ -567,6 +598,7 @@ export class AgentBoxClient {
           method: "GET",
           headers: { Accept: "text/event-stream" },
           agent: this.httpsAgent!,
+          signal: opts?.signal,
         },
         resolve,
       );
@@ -624,7 +656,10 @@ export class AgentBoxClient {
       // so any remaining unterminated text stays buffered as before.
       buffer += decoder.decode();
     } catch (err) {
-      console.error(`[agentbox-client] SSE stream error path=${path}:`, err instanceof Error ? err.message : err);
+      // A caller-requested abort is a normal close, not a stream failure.
+      if (!opts?.signal?.aborted) {
+        console.error(`[agentbox-client] SSE stream error path=${path}:`, err instanceof Error ? err.message : err);
+      }
       throw err;
     } finally {
       console.log(`[agentbox-client] SSE closed (HTTPS) path=${path} (${eventCount} events)`);

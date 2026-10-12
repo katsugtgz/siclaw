@@ -80,7 +80,7 @@ docker-runtime: ## Build runtime image
 	docker build -f Dockerfile.runtime $(DOCKER_LABELS) -t $(RUNTIME_IMAGE) .
 
 docker-agentbox: ## Build agentbox image
-	docker build -f Dockerfile.agentbox $(DOCKER_LABELS) -t $(AGENTBOX_IMAGE) .
+	docker build --ssh default -f Dockerfile.agentbox $(DOCKER_LABELS) -t $(AGENTBOX_IMAGE) .
 
 docker-portal: ## Build portal image
 	docker build -f Dockerfile.portal $(DOCKER_LABELS) -t $(PORTAL_IMAGE) .

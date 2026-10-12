@@ -1,0 +1,100 @@
+{
+  "version": 1,
+  "tools": {
+    "propose_deploy_run": {
+      "effect": "write",
+      "authorization": "backend",
+      "publicResultPaths": [
+        "/items/0/claim_token"
+      ]
+    },
+    "propose_deploy_multi": {
+      "effect": "write",
+      "authorization": "backend",
+      "publicResultPaths": [
+        "/items/0/claim_token"
+      ]
+    },
+    "propose_deploy_rollback": {
+      "effect": "write",
+      "authorization": "backend",
+      "publicResultPaths": [
+        "/items/0/claim_token"
+      ]
+    },
+    "propose_deploy_services": {
+      "effect": "write",
+      "authorization": "backend",
+      "publicResultPaths": [
+        "/items/0/claim_token"
+      ]
+    },
+    "propose_workflow_run": {
+      "effect": "write",
+      "authorization": "backend",
+      "publicResultPaths": [
+        "/items/0/claim_token"
+      ]
+    },
+    "propose_helm_deploy": {
+      "effect": "write",
+      "authorization": "backend",
+      "publicResultPaths": [
+        "/items/0/claim_token"
+      ]
+    },
+    "propose_edit": {
+      "effect": "write",
+      "authorization": "backend",
+      "publicResultPaths": [
+        "/items/0/claim_token"
+      ]
+    },
+    "propose_delete": {
+      "effect": "write",
+      "authorization": "backend",
+      "publicResultPaths": [
+        "/items/0/claim_token"
+      ]
+    },
+    "propose_service_restart": {
+      "effect": "write",
+      "authorization": "backend",
+      "publicResultPaths": [
+        "/items/0/claim_token"
+      ]
+    },
+    "propose_build_run": {
+      "effect": "write",
+      "authorization": "backend",
+      "publicResultPaths": [
+        "/items/0/claim_token"
+      ]
+    },
+    "propose_workflow_task": {
+      "effect": "write",
+      "authorization": "backend",
+      "publicResultPaths": [
+        "/items/0/claim_token"
+      ]
+    },
+    "propose_define": {
+      "effect": "write",
+      "authorization": "backend",
+      "publicResultPaths": [
+        "/items/0/claim_token"
+      ]
+    },
+    "propose_update": {
+      "effect": "write",
+      "authorization": "backend",
+      "publicResultPaths": [
+        "/items/0/claim_token"
+      ]
+    },
+    "submit_check_result": {
+      "effect": "write",
+      "authorization": "backend"
+    }
+  }
+}

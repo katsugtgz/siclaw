@@ -12,12 +12,16 @@ import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { type ResolvedToolDefinition } from "./tool-registry.js";
 import type { Tool as McpTool } from "@modelcontextprotocol/sdk/types.js";
 import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
+import { McpModelSecurity, resolveMcpReadOnlyPolicy, mcpTransportEnv, mcpSensitiveValues } from "./mcp-security.js";
+import { authorizeMcpArguments, type McpToolRule } from "./mcp-operation-policy.js";
+import { redactModelJson, type SensitiveValueSource } from "../shared/model-output-redactor.js";
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
 export interface McpStdioServerConfig {
+  siclawId?: string;
   transport: "stdio";
   command: string;
   args?: string[];
@@ -27,17 +31,23 @@ export interface McpStdioServerConfig {
 }
 
 export interface McpSseServerConfig {
+  siclawId?: string;
   transport: "sse";
   url: string;
   headers?: Record<string, string>;
+  /** Reserved Siclaw security policy entries; never forwarded to HTTP servers. */
+  env?: Record<string, string>;
   /** Admin-provided server context (e.g. tenant IDs) — surfaced to the model via tool descriptions. */
   description?: string;
 }
 
 export interface McpStreamableHttpServerConfig {
+  siclawId?: string;
   transport: "streamable-http";
   url: string;
   headers?: Record<string, string>;
+  /** Reserved Siclaw security policy entries; never forwarded to HTTP servers. */
+  env?: Record<string, string>;
   /** Admin-provided server context (e.g. tenant IDs) — surfaced to the model via tool descriptions. */
   description?: string;
 }
@@ -164,15 +174,18 @@ function truncateUtf8(text: string, maxBytes: number): string {
  */
 export function buildMcpInstructionsPrompt(servers: McpServerInstructions[]): string[] {
   return servers.map(({ serverName, instructions }) => {
-    const text = instructions.trim();
-    const bytes = Buffer.byteLength(text, "utf8");
-    const body = bytes <= MCP_INSTRUCTIONS_MAX_BYTES
-      ? text
-      : `${truncateUtf8(text, MCP_INSTRUCTIONS_MAX_BYTES)}\n\n` +
-        `[truncated: server "${serverName}" sent ${bytes} bytes of instructions; only the first ${MCP_INSTRUCTIONS_MAX_BYTES} bytes are shown]`;
+    const body = boundMcpInstructions(serverName, instructions);
     return `\n## MCP server "${serverName}"\n\n` +
       `Instructions this server sent for its tools (\`${buildMcpToolName(serverName, "*")}\`):\n\n${body}`;
   });
+}
+
+export function boundMcpInstructions(serverName: string, instructions: string): string {
+  const text = instructions.trim();
+  const bytes = Buffer.byteLength(text, "utf8");
+  return bytes <= MCP_INSTRUCTIONS_MAX_BYTES ? text
+    : `${truncateUtf8(text, MCP_INSTRUCTIONS_MAX_BYTES)}\n\n` +
+      `[truncated: server "${serverName}" sent ${bytes} bytes of instructions; only the first ${MCP_INSTRUCTIONS_MAX_BYTES} bytes are shown]`;
 }
 
 // ---------------------------------------------------------------------------
@@ -465,7 +478,8 @@ export class McpClientManager {
    */
   private disposed = false;
 
-  constructor(config: McpServersConfig) {
+  constructor(config: McpServersConfig, private readonly sensitiveValues: SensitiveValueSource = () => [],
+    private readonly options: { discoveryOnly?: boolean; privateRoots?: () => readonly string[] } = {}) {
     this.config = config;
   }
 
@@ -503,13 +517,23 @@ export class McpClientManager {
         });
       };
       try {
+        if (!["stdio", "sse", "streamable-http"].includes(detectedTransport)) {
+          recordFailure({ kind: "invalid_config", message: "Unknown MCP transport" });
+          continue;
+        }
         const client = new Client(
           { name: `siclaw-mcp-${serverName}`, version: "1.0.0" },
         );
+        const policy = resolveMcpReadOnlyPolicy({ ...cfg, transport: detectedTransport });
+        const security = new McpModelSecurity(() => [...mcpSensitiveValues(this.config.mcpServers), ...this.sensitiveValues()], this.options.privateRoots);
+        if (!this.options.discoveryOnly && !policy.tools.size && !policy.resources.size && !policy.prompts.size) {
+          recordFailure({ kind: "invalid_config", message: "No explicit MCP read-only policy; connection denied" });
+          continue;
+        }
 
         let transport: any;
         const stdioEnv = detectedTransport === "stdio"
-          ? mergeMcpStdioEnv(cfg.env, process.env, isBundledCreateChartCommand(cfg.command, cfg.args))
+          ? mergeMcpStdioEnv(mcpTransportEnv(cfg.env), process.env, policy.trustedRenderer)
           : undefined;
         switch (detectedTransport) {
           case "stdio":
@@ -517,18 +541,21 @@ export class McpClientManager {
               command: cfg.command,
               args: cfg.args,
               env: stdioEnv,
+              stderr: "pipe",
             });
+            transport.stderr?.on("data", () => {});
             break;
           case "sse":
             transport = new SSEClientTransport(
               new URL(cfg.url),
-              cfg.headers ? { requestInit: { headers: cfg.headers } } : undefined,
+              { requestInit: { headers: cfg.headers, redirect: "error" },
+                fetch: (input, init) => fetch(input, { ...init, redirect: "error" }) },
             );
             break;
           case "streamable-http":
             transport = new StreamableHTTPClientTransport(
               new URL(cfg.url),
-              cfg.headers ? { requestInit: { headers: cfg.headers } } : undefined,
+              { requestInit: { headers: cfg.headers, redirect: "error" } },
             );
             break;
           default:
@@ -555,7 +582,8 @@ export class McpClientManager {
         }
         console.log(`[mcp-client] Connected to "${serverName}" (${detectedTransport})`);
         const serverImplementationName = client.getServerVersion()?.name;
-        const instructions: string | undefined = client.getInstructions();
+        const rawInstructions = client.getInstructions();
+        const instructions = rawInstructions === undefined ? undefined : security.text(rawInstructions);
 
         // Publish a complete per-server inventory. A failed later page must not
         // leave a partial tool set that silently hides capabilities from the model.
@@ -589,17 +617,22 @@ export class McpClientManager {
           await this.closeLate(serverName, client, startedAt, detectedTransport);
           continue;
         }
-        console.log(`[mcp-client] "${serverName}" provides ${mcpTools.length} tools: ${mcpTools.map((t: any) => t.name).join(", ")}`);
+        const authorizedTools = mcpTools.flatMap(tool => {
+          const safe = security.tool(tool, policy, cfg.description);
+          return safe ? [safe] : [];
+        });
+        console.log(`[mcp-client] Authorized ${authorizedTools.length} tools by operator policy`);
 
-        for (const mcpTool of mcpTools) {
+        for (const mcpTool of this.options.discoveryOnly ? [] : authorizedTools) {
           const toolDef = createMcpToolDefinition(
             serverName,
-            cfg.description,
+            undefined,
             mcpTool,
             client,
             detectedTransport === "stdio"
               ? visualMcpRequestTimeoutMs(serverImplementationName, mcpTool.name, stdioEnv)
               : undefined,
+            { security, allowImages: policy.trustedRenderer, argumentRule: policy.toolRules?.get(mcpTool.name) },
           );
           this.tools.push(toolDef);
         }
@@ -607,13 +640,15 @@ export class McpClientManager {
         this.clients.push({ serverName, client, transport, instructions });
         this.connections.push({
           name: serverName, transport: detectedTransport, state: "connected",
-          toolCount: mcpTools.length,
-          toolNames: mcpTools.map((t: any) => String(t.name)).sort(),
+          toolCount: this.options.discoveryOnly ? mcpTools.length : authorizedTools.length,
+          toolNames: (this.options.discoveryOnly ? mcpTools : authorizedTools).map(tool => security.redact(tool.name)).sort(),
           durationMs: Date.now() - startedAt,
           observedAt: new Date().toISOString(),
         });
       } catch (err) {
         const error = classifyMcpConnectError(err);
+        // Upstream exception bodies and URLs can contain authentication data.
+        error.message = "MCP connection or security validation failed";
         // The classified line is what an operator greps for; the raw error keeps
         // the full detail (it can be a whole response body) on the next line.
         console.error(
@@ -622,11 +657,10 @@ export class McpClientManager {
           (error.contentType ? ` content-type=${error.contentType}` : "") +
           ` — ${error.message}`,
         );
-        console.error(`[mcp-client] Raw error for "${serverName}":`, err);
         recordFailure(error);
         if (connected) {
-          try { await connected.close(); } catch (closeErr) {
-            console.warn(`[mcp-client] Failed to close "${serverName}" after a failed handshake:`, closeErr);
+          try { await connected.close(); } catch {
+            console.warn("[mcp-client] Failed to close MCP after handshake failure");
           }
         }
       }
@@ -640,8 +674,8 @@ export class McpClientManager {
     console.warn(`[mcp-client] "${serverName}" connected after the manager was shut down; closing it`);
     try {
       await client.close();
-    } catch (err) {
-      console.warn(`[mcp-client] Error closing late connection to "${serverName}":`, err);
+    } catch {
+      console.warn("[mcp-client] Error closing late MCP connection");
     }
     this.connections.push({
       name: serverName, transport, state: "failed", toolCount: 0, toolNames: [],
@@ -698,8 +732,8 @@ export class McpClientManager {
       try {
         await client.close();
         console.log(`[mcp-client] Disconnected from "${serverName}"`);
-      } catch (err) {
-        console.warn(`[mcp-client] Error disconnecting from "${serverName}":`, err);
+      } catch {
+        console.warn("[mcp-client] Error disconnecting from MCP");
       }
     }
     this.clients = [];
@@ -716,15 +750,12 @@ export function createMcpToolDefinition(
     name: string;
     description?: string;
     inputSchema?: any;
-    /**
-     * MCP 规范的工具注解。这里只用 `readOnlyHint` —— authority guard 靠它决定
-     * 这个工具算不算"读"。见 tool-registry 的 MCP_TOOL_EFFECTS。
-     */
+    /** Presentation only. Admission uses the operator-owned MCP policy. */
     annotations?: { readOnlyHint?: boolean };
   },
   client: any,
   requestTimeoutMs?: number,
-  trustedOptions?: { includeRawResult?: boolean },
+  trustedOptions?: { includeRawResult?: boolean; security?: McpModelSecurity; allowImages?: boolean; argumentRule?: McpToolRule },
 ): ResolvedToolDefinition {
   const fullName = buildMcpToolName(serverName, mcpTool.name);
   const inputSchema = mcpTool.inputSchema ?? { type: "object", properties: {} };
@@ -739,7 +770,8 @@ export function createMcpToolDefinition(
   // get_panel_image's `panelId` fail validation with "must be integer". Raw JSON Schema
   // leaves the kind metadata absent, letting pi-ai's coercion path run, and providers
   // advertise tools straight from `.properties`/`.required`. See scitix/siclaw#355.
-  const parameters = normalizeMcpInputSchema(inputSchema);
+  const security = trustedOptions?.security ?? new McpModelSecurity();
+  const parameters = redactModelJson(normalizeMcpInputSchema(inputSchema), security.redact);
 
   // Prepend the admin-provided server description so the model sees server-level
   // context (e.g. monitoring tenant IDs) on every tool from that server.
@@ -752,19 +784,29 @@ export function createMcpToolDefinition(
     name: fullName,
     toolset: `mcp:${serverName}`,
     label: `${serverName}/${mcpTool.name}`,
-    description: serverContext + toolDescription,
+    description: security.text(serverContext + toolDescription),
     parameters,
     execute: async (_toolCallId, args, signal) => {
+      let dispatch: "NOT_DISPATCHED" | "UNKNOWN" | "FINISHED" = "NOT_DISPATCHED";
       try {
         signal?.throwIfAborted();
-        const result = await client.callTool(
+        if (!trustedOptions?.allowImages) security.arguments(args ?? {});
+        const approvedArgs = authorizeMcpArguments(trustedOptions?.argumentRule, args ?? {});
+        // Fixed operator routing values do not grant private-file authority.
+        // Validate what will actually be dispatched after policy injection.
+        if (!trustedOptions?.allowImages) security.arguments(approvedArgs);
+        dispatch = "UNKNOWN";
+        const rawResult = await client.callTool(
           {
             name: mcpTool.name,
-            arguments: args ?? {},
+            arguments: approvedArgs,
           },
           undefined,
           requestTimeoutMs === undefined && !signal ? undefined : { ...(requestTimeoutMs === undefined ? {} : { timeout: requestTimeoutMs }), ...(signal ? { signal } : {}) },
         );
+        dispatch = "FINISHED";
+        const result = security.result(rawResult, trustedOptions?.allowImages === true, trustedOptions?.argumentRule?.publicResultPaths,
+          trustedOptions?.argumentRule?.effect);
 
         const isError = !!result.isError;
         const { content, text } = mcpContentToAgentContent(result.content);
@@ -780,13 +822,16 @@ export function createMcpToolDefinition(
           },
         };
       } catch (err: any) {
-        const errorMsg = err?.message ?? String(err);
-        const execution = err instanceof McpError && ![ErrorCode.ConnectionClosed, ErrorCode.RequestTimeout].includes(err.code)
+        // Raw exception messages can echo authentication headers or bodies.
+        const backend = trustedOptions?.argumentRule?.authorization === "backend";
+        const errorMsg = "MCP operation failed; upstream error details were suppressed." +
+          (backend && dispatch !== "NOT_DISPATCHED" ? " The operation may have completed. Do not automatically repeat it." : "");
+        const execution = backend ? dispatch : err instanceof McpError && ![ErrorCode.ConnectionClosed, ErrorCode.RequestTimeout].includes(err.code)
           ? [ErrorCode.InvalidRequest, ErrorCode.InvalidParams, ErrorCode.MethodNotFound].includes(err.code) ? "NOT_DISPATCHED" : "FINISHED"
           : "UNKNOWN";
         return {
           content: [{ type: "text" as const, text: `MCP tool error: ${errorMsg}` }],
-          details: { error: errorMsg, ...(trustedOptions?.includeRawResult ? { execution } : {}) },
+          details: { error: errorMsg, ...(trustedOptions?.includeRawResult || backend ? { execution } : {}) },
         };
       }
     },

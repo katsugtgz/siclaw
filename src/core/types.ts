@@ -17,11 +17,12 @@ export type SessionMode = "web" | "channel" | "cli" | "task";
  * cron). Used for audit categorization and to carry the entry context into a
  * conversation turn. `undefined` ⇒ web.
  */
-export type OriginKind = "web" | "webchat" | "api" | "a2a" | "channel" | "task";
+export type OriginKind = "web" | "webchat" | "api" | "a2a" | "channel" | "dm" | "task";
 
 // ── Mutable ref types ──
 
 export interface KubeconfigRef {
+  identity?: import("../shared/execution-identity.js").ExecutionIdentity;
   credentialsDir?: string; // path to credentials directory (e.g. /home/agentbox/.credentials)
   /** On-demand credential broker — if set, tools can acquire credentials from Upstream Adapter */
   credentialBroker?: import("../agentbox/credential-broker.js").CredentialBroker;
@@ -43,7 +44,7 @@ export interface MemoryRef {
 // docs/design/2026-04-24-dp-mode-refactor-design.md.
 
 /**
- * Writable version of DpStateRef — held only by the extension (single writer).
+ * Writable version of DpStateRef — held by the selected engine adapter (single writer).
  * Agentbox and other consumers receive the readonly DpStateRef view.
  */
 export interface MutableDpStateRef {

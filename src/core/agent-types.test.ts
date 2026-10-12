@@ -205,7 +205,10 @@ describe("Ticket Agent instance contract", () => {
     expect(effectiveCapabilityKeys("ticket", ["read_files"])).toEqual(["read_files"]);
     const layers = resolveAgentPromptLayers("ticket", "Review supplied handling records.");
     expect(layers.addendum).toBe("Review supplied handling records.");
-    expect(layers.typeContract).toContain("configured result tool");
+    // The result sentence is no longer part of the type contract: it is appended
+    // per dispatch, so an instance with no contract is not told to submit one.
+    expect(layers.typeContract).not.toContain("configured result tool");
+    expect(layers.typeContract).toContain("Never claim that a ticket was created");
     expect(resolveAgentPromptLayers("ticket", "").typeContract).toBe(layers.typeContract);
   });
 });

@@ -192,7 +192,7 @@ describe("strict API result consumer", () => {
       await client.connect(clientTransport);
       try {
         await client.listTools();
-        const values = role === "review" ? drafts : [{ label: true, info: { ticket_type: "unknown", product: "", summary: "Human help requested", description: "The user cannot clarify and requests human help.", evidence: [], missing_fields: [] } }];
+        const values = role === "review" ? drafts : [{ label: true, info: { ticket_type: "incident", product: "", summary: "Human help requested", description: "Training task task-123 stays Pending after retry; the user requests human help.", evidence: [], missing_fields: [] } }];
         for (const value of values) {
           const result = await client.callTool({ name: role === "review" ? "submit_ticket_review_result" : "submit_product_support_result", arguments: value }, CallToolResultSchema);
           expect(result.isError).not.toBe(true);

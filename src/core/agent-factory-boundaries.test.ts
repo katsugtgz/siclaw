@@ -17,8 +17,9 @@ vi.mock("./config.js", async importOriginal => ({
   loadConfig: () => ({ providers: {}, allowedTools: null, paths: {
     skillsDir: ".siclaw/skills", userDataDir: ".siclaw/user-data",
     knowledgeDir: ".siclaw/knowledge", reposDir: "repos", docsDir: "docs", gitReposDir: "gitrepos",
+    credentialsDir: ".siclaw/credentials",
   } }),
-  getConfigPath: () => path.join(fixture.root, "settings.json"),
+  getConfigPath: () => path.join(fixture.root, ".siclaw/config/settings.json"),
   getDefaultLlm: () => undefined,
   isMemoryEnabled: () => false,
 }));
@@ -35,6 +36,7 @@ vi.mock("./pi-execution.js", () => ({
 }));
 import { createSiclawSession } from "./agent-factory.js";
 import type { McpClientManager } from "./mcp-client.js";
+import { CodexAgentBrain } from "./brains/codex-agent-brain.js";
 
 const sessions: Awaited<ReturnType<typeof createSiclawSession>>[] = [];
 beforeEach(async () => {
@@ -45,6 +47,74 @@ afterEach(async () => {
   for (const session of sessions.splice(0)) session.knowledgeIndexer?.close();
   vi.restoreAllMocks();
   await fs.rm(fixture.root, { recursive: true, force: true });
+});
+
+it("projects frequent inventory capabilities without granting shell execution", async () => {
+  const create = vi.spyOn(CodexAgentBrain, "create").mockResolvedValue({ brainType: "codex", getTools: () => [], close: async () => {} } as never);
+  const broker = { getChannelPolicy:()=>undefined,validateChannelPolicy:async()=>{},getSensitiveValues: () => [], refreshClusters: vi.fn(), refreshHosts: vi.fn() };
+  const result = await createSiclawSession({ agentEngine: "codex", agentType: "custom", mode: "web", userId: "owner",
+    sessionManager: SessionManager.create(fixture.root, path.join(fixture.root, "inventory-transcripts")),
+    allowedTools: ["cluster_list", "host_list"], kubeconfigRef: { credentialsDir: "/private/credentials", credentialBroker: broker as never } });
+  sessions.push(result);
+  expect(create).toHaveBeenCalledOnce();
+  const options = create.mock.calls[0][0];
+  expect(options.workflow).toMatchObject({ clusterList: true, hostList: true, allowClusterProbe: false });
+  expect(options.grants.allowCommands).toBe(false); expect(options.environments).toEqual([]);
+  expect(broker.refreshClusters).not.toHaveBeenCalled(); expect(broker.refreshHosts).not.toHaveBeenCalled();
+});
+
+it("advertises native Pod netns selectors without granting ordinary API or Pod exec", async () => {
+  const create = vi.spyOn(CodexAgentBrain, "create").mockResolvedValue({ brainType: "codex", getTools: () => [], close: async () => {} } as never);
+  const broker = { getChannelPolicy:()=>undefined,validateChannelPolicy:async()=>{},getSensitiveValues: () => [], refreshClusters: vi.fn().mockResolvedValue([{ name: "bound" }]),
+    refreshHosts: vi.fn().mockResolvedValue([{ name: "bound-host" }]) };
+  const result = await createSiclawSession({ agentEngine: "codex", agentType: "custom", mode: "web", userId: "owner",
+    sessionManager: SessionManager.inMemory(fixture.root), allowedTools: ["node_exec", "host_exec"],
+    kubeconfigRef: { credentialsDir: "/private/credentials", credentialBroker: broker as never } });
+  sessions.push(result);
+  const options = create.mock.calls[0][0];
+  expect(options.systemPrompt).toContain("debug pod/<pod>");
+  expect(options.systemPrompt).toContain("--pod <pod> --namespace <namespace>");
+  expect(options.systemPrompt).toContain("does not create an ephemeral container");
+  expect(options.environments?.[0].grants.infrastructure).toMatchObject({ allowNode: true, allowPod: false, allowApi: false });
+});
+
+it("projects native code capabilities without granting mirror file access", async () => {
+  const create = vi.spyOn(CodexAgentBrain, "create").mockResolvedValue({ brainType: "codex", getTools: () => [], close: async () => {} } as never);
+  const result = await createSiclawSession({ agentEngine: "codex", agentType: "custom", mode: "web", agentId: "agent-a",
+    allowedTools: ["read", "ls"], sessionManager: SessionManager.inMemory(fixture.root) });
+  sessions.push(result);
+  const options = create.mock.calls[0][0];
+  expect(options.code).toMatchObject({ recursiveList: false,
+    allowed: { git_query: false, code_read: true, code_list: true, code_search: false } });
+  expect(options.code!.artifacts).toBe(result.toolResultArtifactStore);
+  expect(options.grants.deniedRoots).toContain(options.code!.view.gitReposDir);
+  expect(options.grants.readRoots).not.toContain(options.code!.view.gitReposDir);
+});
+
+it("connects native preview, feedback receipt and channel delivery to the owned session", async () => {
+  const create = vi.spyOn(CodexAgentBrain, "create").mockResolvedValue({ brainType: "codex", getTools: () => [], close: async () => {} } as never);
+  const manager = SessionManager.inMemory(fixture.root), channel = vi.fn();
+  const result = await createSiclawSession({ agentEngine: "codex", agentType: "custom", mode: "channel", userId: "owner",
+    allowedTools: ["write", "edit", "skill_preview", "save_feedback", "channel_update"], sessionManager: manager, channelMessageExecutor: channel });
+  sessions.push(result);
+  const options = create.mock.calls[0][0];
+  expect(options.workflow?.draftsRoot).toBe(path.join(fixture.root, ".siclaw/user-data/skill-drafts", manager.getSessionId()));
+  expect(options.workflow?.channelUpdate).toBe(channel);
+  const receipt = await options.workflow!.feedback!.persist({ summary: "feedback", sessionId: "owned", userId: "owner" });
+  expect(receipt.id).toBeTruthy();
+  expect(manager.getEntries().find(entry => entry.id === receipt.id)).toMatchObject({ type: "custom", customType: "product-feedback", data: { summary: "feedback", userId: "owner" } });
+  expect(options.systemPrompt).toContain(options.workflow!.draftsRoot!);
+});
+
+it("does not acknowledge feedback buffered before a disk review conversation", async () => {
+  const create = vi.spyOn(CodexAgentBrain, "create").mockResolvedValue({ brainType: "codex", getTools: () => [], close: async () => {} } as never);
+  const manager = SessionManager.create(fixture.root, path.join(fixture.root, "sessions"));
+  const result = await createSiclawSession({ agentEngine: "codex", agentType: "custom", mode: "web", userId: "owner",
+    allowedTools: ["save_feedback"], sessionManager: manager });
+  sessions.push(result);
+  const persist = create.mock.calls[0][0].workflow!.feedback!.persist;
+  await expect(persist({ summary: "not durable" })).rejects.toThrow(/persisted feedback review/);
+  expect(manager.getEntries().filter(e => e.type === "custom" && e.customType === "product-feedback")).toHaveLength(0);
 });
 async function skill(relative: string, name: string) {
   const file = path.join(fixture.root, relative, name, "SKILL.md");
@@ -59,6 +129,24 @@ async function create(agentType: "sre" | "custom" | "knowledge_qa", scoped = tru
   return result;
 }
 describe("factory resource boundaries", () => {
+  it("blocks credential symlinks and another temp workspace, and sanitizes scoped file reads before model delivery", async () => {
+    const result = await create("sre");
+    const workspace = path.join(fixture.root, ".siclaw/user-data");
+    const credentials = path.join(fixture.root, ".siclaw/credentials");
+    await fs.mkdir(workspace, { recursive: true }); await fs.mkdir(credentials, { recursive: true });
+    await fs.writeFile(path.join(credentials, "cluster.key"), "private credential marker");
+    await fs.symlink(credentials, path.join(workspace, "alias"));
+    const read = result.customTools.find(tool => tool.name === "read")!;
+    await expect(read.execute("link", { path: path.join(workspace, "alias/cluster.key") })).rejects.toThrow(/blocked|outside/);
+    const other = await fs.mkdtemp(path.join(os.tmpdir(), "other-owner-"));
+    try {
+      await fs.writeFile(path.join(other, "data"), "private other owner");
+      await expect(read.execute("other", { path: path.join(other, "data") })).rejects.toThrow(/outside/);
+    } finally { await fs.rm(other, { recursive: true, force: true }); }
+    await fs.writeFile(path.join(workspace, "evidence"), "healthy evidence\npassword: tiny\n");
+    const safe = await read.execute("evidence", { path: path.join(workspace, "evidence") });
+    expect(JSON.stringify(safe)).toContain("healthy evidence"); expect(JSON.stringify(safe)).not.toContain("tiny");
+  });
   it.each(["sre", "custom", "knowledge_qa"] as const)("filters ambient Skills before the first %s sync", async type => {
     await skill("agent-config/skills", "ambient-helper");
     await skill("skills/core", "bundled-helper");

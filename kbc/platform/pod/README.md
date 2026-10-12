@@ -19,6 +19,7 @@ contract into `capability.*`. See [execution and rollout design](../../../docs/d
   - `POST /message/{run_id}` `{message, message_id?}` → inject one genuine conversational turn; a repeated consumer-minted `message_id` is acknowledged without injecting a second turn; legacy control-prefix recognition remains only for rolling upgrades
   - `POST /command/{run_id}` `{command_id, command}` → validate and execute one typed authoring action; action routing is language-independent, idempotent per live run, and pinned to one operation/generation
   - `GET  /events/{run_id}` → SSE structured events: `session` / `log` / `summary` / `turn_done` / `syncArtifacts` / `plan_proposed` / `error` / `end`
+  - `GET  /control-events/{run_id}` → SSE control frames (`refresh_credentials`) that never wait behind an unacknowledged `/events` frame; advertised by `relay_ready.control_events`
   - `POST /test-session/{run_id}` → **start a test session**: pin the parent run's current draft (`candidate/`) into an immutable snapshot + start a read-only consumer session (reuses this pod, zero new infra); returns `test_session_id` + `snapshot_hash` + `pages`
   - `POST /test-message/{tid}` / `GET /test-events/{tid}` / `POST /test-session/{tid}/close` → the test session's inject / live-stream / teardown
   - `GET  /health` → `{status, runs, test_sessions, engine: "pi_agent"}`

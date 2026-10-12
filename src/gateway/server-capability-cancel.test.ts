@@ -104,7 +104,7 @@ describe("capability.cancel", () => {
       config: { port: 0, internalPort: 0, host: "127.0.0.1", serverUrl: "", portalSecret: "" } as any,
       agentBoxManager: manager,
       frontendClient: frontend,
-      credentialService: {} as any,
+      credentialService: { attachGrants: () => {}, resolveActorResources: async () => ({ clusters: [], hosts: [] }) } as any,
     });
     const start = server.rpcMethods.get("capability.start")!;
     const cancel = server.rpcMethods.get("capability.cancel")!;
@@ -143,7 +143,7 @@ describe("capability.cancel", () => {
       config: { port: 0, internalPort: 0, host: "127.0.0.1", serverUrl: "", portalSecret: "" } as any,
       agentBoxManager: fakeAgentBoxManager(stop),
       frontendClient: frontend,
-      credentialService: {} as any,
+      credentialService: { attachGrants: () => {}, resolveActorResources: async () => ({ clusters: [], hosts: [] }) } as any,
     });
     const start = server.rpcMethods.get("capability.start")!;
     const cancel = server.rpcMethods.get("capability.cancel")!;
@@ -174,7 +174,7 @@ describe("capability.cancel", () => {
       config: { port: 0, internalPort: 0, host: "127.0.0.1", serverUrl: "", portalSecret: "" } as any,
       agentBoxManager: manager,
       frontendClient: frontend,
-      credentialService: {} as any,
+      credentialService: { attachGrants: () => {}, resolveActorResources: async () => ({ clusters: [], hosts: [] }) } as any,
     });
     const cancel = server.rpcMethods.get("capability.cancel")!;
 
@@ -197,7 +197,7 @@ describe("capability.cancel", () => {
       config: { port: 0, internalPort: 0, host: "127.0.0.1", serverUrl: "", portalSecret: "" } as any,
       agentBoxManager: manager,
       frontendClient: frontend,
-      credentialService: {} as any,
+      credentialService: { attachGrants: () => {}, resolveActorResources: async () => ({ clusters: [], hosts: [] }) } as any,
     });
     const cancel = server.rpcMethods.get("capability.cancel")!;
 
@@ -218,7 +218,7 @@ describe("capability.cancel", () => {
       config: { port: 0, internalPort: 0, host: "127.0.0.1", serverUrl: "", portalSecret: "" } as any,
       agentBoxManager: manager,
       frontendClient: frontend,
-      credentialService: {} as any,
+      credentialService: { attachGrants: () => {}, resolveActorResources: async () => ({ clusters: [], hosts: [] }) } as any,
     });
 
     await expect(server.rpcMethods.get("capability.cancel")!({ run_id: "run-after-restart" })).resolves.toMatchObject({
@@ -241,7 +241,7 @@ describe("capability.cancel", () => {
       config: { port: 0, internalPort: 0, host: "127.0.0.1", serverUrl: "", portalSecret: "" } as any,
       agentBoxManager: manager,
       frontendClient: frontend,
-      credentialService: {} as any,
+      credentialService: { attachGrants: () => {}, resolveActorResources: async () => ({ clusters: [], hosts: [] }) } as any,
     });
     if (failure === "store-error") {
       const request = frontend.request.getMockImplementation();

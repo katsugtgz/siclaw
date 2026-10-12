@@ -7,6 +7,15 @@ import {
 } from "./agent-context.js";
 
 describe("resolveAgentHarness", () => {
+  it("uses native infrastructure guidance without changing SRE execution grants or safety", () => {
+    const input = { agentType: "sre", allowedTools: null, harnessResolved: true, memoryConfigured: false };
+    const pi = resolveAgentHarness(input);
+    const native = resolveAgentHarness({ ...input, nativeInfrastructure: true });
+    expect(pi.includeInfrastructureGuidance).toBe(true);
+    expect(native.includeInfrastructureGuidance).toBe(false);
+    expect(native.allowedTools).toEqual(pi.allowedTools);
+    expect(native.includeOperationalSafety).toBe(true);
+  });
   it.each(["sre", "knowledge_qa"])("fails closed for %s when type/capability resolution did not complete", agentType => {
     const harness = resolveAgentHarness({
       agentType,
@@ -167,6 +176,18 @@ describe("compileAgentContext", () => {
     expect(context.systemPrompt).toContain("spawn_subagent");
     expect(context.harness.includeBundledSkills).toBe(true);
   });
+
+  it("lets Codex own planning while preserving the SRE safety guidance", () => {
+    const input = { agentType: "sre", allowedTools: ["bash", "task_create", "task_update"],
+      memoryConfigured: false, mode: "web" as const };
+    const pi = compileAgentContext(input);
+    const codex = compileAgentContext({ ...input, nativePlanning: true });
+    expect(pi.harness.includePlanningGuidance).toBe(true);
+    expect(codex.harness.includePlanningGuidance).toBe(false);
+    expect(codex.systemPrompt).not.toContain("task_create");
+    expect(codex.harness.includeOperationalSafety).toBe(true);
+    expect(codex.harness.allowedTools).toEqual(pi.harness.allowedTools);
+  });
 });
 
 describe("createAgentContextManifest", () => {
@@ -242,5 +263,43 @@ describe("subagent prompt layers", () => {
     expect(child.harness.includeOperationalSafety).toBe(parent.harness.includeOperationalSafety);
     expect(child.harness.allowedTools).toEqual(parent.harness.allowedTools);
     expect(parent.systemPrompt).not.toContain("Investigate independently; report gaps to the caller");
+  });
+});
+
+describe("ticket result contract", () => {
+  it("instructs a dispatch that carries a result contract to submit one", () => {
+    const context = compileAgentContext({
+      agentType: "ticket", allowedTools: ["read"], memoryConfigured: false, mode: "web",
+      structuredResultRequired: true,
+    });
+    expect(context.systemPrompt).toContain("Submit a valid result through the configured result tool");
+  });
+
+  it("says nothing about a result tool when the instance declares no contract", () => {
+    const context = compileAgentContext({
+      agentType: "ticket", allowedTools: ["read"], memoryConfigured: false, mode: "web",
+    });
+    // A multi-turn Ticket assistant has no result tool, so naming one would send
+    // it looking for something that is not in its tool surface.
+    expect(context.systemPrompt).not.toContain("result tool");
+    // The rest of the Ticket contract is unconditional.
+    expect(context.systemPrompt).toContain("Never claim that a ticket was created, closed or updated");
+  });
+
+  it("keys the clause on the requirement rather than on the Agent type", () => {
+    // Only Ticket dispatches carry a result contract today, but the sentence
+    // describes the contract, not the type — so it follows the flag. Asserting
+    // the type here instead would pass for the wrong reason.
+    const withRequirement = compileAgentContext({
+      agentType: "sre", allowedTools: null, memoryConfigured: false, mode: "web",
+      structuredResultRequired: true,
+    });
+    const without = compileAgentContext({
+      agentType: "sre", allowedTools: null, memoryConfigured: false, mode: "web",
+    });
+    expect(withRequirement.systemPrompt).toContain("Submit a valid result through the configured result tool");
+    expect(without.systemPrompt).not.toContain("Submit a valid result through the configured result tool");
+    // The Ticket-specific half stays with the Ticket type.
+    expect(withRequirement.systemPrompt).not.toContain("Never claim that a ticket was created");
   });
 });

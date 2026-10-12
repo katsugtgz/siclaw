@@ -87,11 +87,27 @@ export type ChatMessageKind = (typeof CHAT_MESSAGE_KINDS)[number];
  * The `role='user'` rows that are workflow plumbing rather than a person's
  * question — i.e. the rows a prompt count must exclude.
  *
- * This registry defines prompt-count semantics for this runtime. External
- * portals may classify rows differently for trace titles or feedback attribution;
- * those lists answer different questions and must not be copied here.
- * In particular, `steer` is a real user question even when it would make a poor
- * session title, so it must stay out of this list.
+ * **sicore keeps its own copy of this list, and it is a SECOND source of
+ * truth.** `syntheticUserKinds` in
+ * `internal/siclaw/chatfields/message_kind.go` carries the same four values and
+ * is applied to prompt counts through `HumanPromptPredicate`, with the same
+ * MySQL/SQLite dialect split the SQL here needs — prompt metrics
+ * (`internal/siclaw/metrics/handler.go`,
+ * `internal/siclaw/metrics/platform_usage_{aggregate,cache_store}.go`) and
+ * feedback attribution (`internal/siclaw/chat/service.go`) all go through it.
+ *
+ * The two lists agree today and NOTHING holds them together: no shared
+ * definition, no test spanning the two repositories. Editing one does not move
+ * the other, and a divergence announces itself only as two metrics disagreeing
+ * about the same rows. Change both, deliberately.
+ *
+ * What is NOT the same question is
+ * `internal/siclaw/metrics/trace_kinds.go`, whose `TraceNonPromptUserKinds`
+ * decides which user row may be a trace's title or an analysis input. `steer`
+ * is the case to understand before syncing anything: it belongs in THAT set (a
+ * mid-turn steer is a poor session title) and must stay OUT of this one (it is
+ * a real question a person asked). Copying either list into the other would be
+ * wrong in both directions.
  *
  * The SQL that consumes this list lives in `portal/human-prompt.ts`: it needs
  * the database driver to pick a dialect, and `src/shared` is bundled into the

@@ -1468,6 +1468,67 @@ def asset_attribution_edges(
     return edges
 
 
+# Text documents whose bodies may embed screenshots a reader relies on. MDX is
+# the Mintlify/Docusaurus page format; its image syntax is ordinary Markdown or
+# an HTML ``<img src="...">`` inside components such as ``<Frame>``.
+EMBEDDING_DOCUMENT_EXTS = (".md", ".mdx")
+_NON_PATH_TARGET_RE = re.compile(r"^(?:[a-z][a-z0-9+.-]*:|//)", re.IGNORECASE)
+
+
+def embedded_image_edges(
+    workdir: str, sources: list[str] | None = None,
+) -> dict[str, list[str]]:
+    """Map each raw ``.md``/``.mdx`` document to the images its body embeds.
+
+    Review scope only — never coverage accounting. ``asset_attribution_edges``
+    must stay byte-identical to the control plane's coverage ledger, which reads
+    ``.md`` bodies and relative targets only. Image review asks a different
+    question: which pixels does a page that cites this document inherit
+    responsibility for? A documentation-site archive answers it with ``.mdx``
+    pages and site-root targets (``![x](/product/media/shot.png)``), both of
+    which the coverage reader skips, so screenshots never reached blind
+    transcription while the pages that reproduced their surrounding text did.
+
+    A relative target resolves against the document's directory. A site-root
+    target resolves against the Raw root first, then each deeper ancestor of the
+    document (a site nested below Raw); the first existing image wins. URLs and
+    other schemes are ignored. Only existing IMAGE_SOURCE_EXTS files become
+    edges, so the result is always a superset of the coverage edges' images."""
+    sources = source_inventory(workdir) if sources is None else sources
+    images = {s for s in sources
+              if posixpath.splitext(s)[1].lower() in IMAGE_SOURCE_EXTS}
+    if not images:
+        return {}
+    raw = Path(workdir) / "raw"
+    edges: dict[str, list[str]] = {}
+    for doc in sources:
+        if not doc.lower().endswith(EMBEDDING_DOCUMENT_EXTS):
+            continue
+        try:
+            text = (raw / doc).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        base = posixpath.dirname(doc)
+        parts = base.split("/") if base else []
+        roots = [""] + ["/".join(parts[:i]) for i in range(1, len(parts) + 1)]
+        hits: set[str] = set()
+        for target in document_link_targets(text):
+            if _NON_PATH_TARGET_RE.match(target):
+                continue
+            if target.startswith("/"):
+                candidates = [posixpath.normpath(posixpath.join(root, target.lstrip("/")))
+                              for root in roots]
+            else:
+                candidates = [posixpath.normpath(posixpath.join(base, target))]
+            for candidate in candidates:
+                if candidate in images:
+                    hits.add(candidate)
+                    break
+        if hits:
+            edges[doc] = sorted(hits)
+    return edges
+
+
 def document_attachment_edges(
     workdir: str, sources: list[str] | None = None,
 ) -> dict[str, list[str]]:
@@ -2233,6 +2294,24 @@ def _remap_evidence_source_ids(text: str, original: str, manifest_ids: dict[str,
             edits.append((match.start(1), match.end(1), json.dumps(marker, separators=(",", ":"))))
     for start, end, value in reversed(edits):
         text = text[:start] + value + text[end:]
+    def rebind_locations(match):
+        try:
+            rows = json.loads(match[1])
+        except json.JSONDecodeError:
+            return match[0]
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            return match[0]
+        changed = False
+        for row in rows:
+            old = row.get("source_id")
+            if isinstance(old, str) and old in remap and remap[old] != old:
+                row["source_id"] = remap[old]
+                changed = True
+        return "source_locations: " + json.dumps(rows, ensure_ascii=False, separators=(",", ":")) if changed else match[0]
+    # Canonical generated metadata only; never rewrite a lookalike in page prose.
+    boundary = text.find("\n---", 4)
+    if boundary > 0:
+        text = re.sub(r"(?m)^source_locations: (.+)$", rebind_locations, text[:boundary]) + text[boundary:]
     return text
 
 
@@ -2317,6 +2396,7 @@ _SETEXT_UNDERLINE_RE = re.compile(r"^[ ]{0,3}(=+|-+)[ \t]*$")
 
 def _attribute_page_text(
     text: str, ids_by_resource: dict[str, str],
+    location_sections: list | None = None,
 ) -> tuple[str, dict[str, int], list[str]]:
     """Regenerate machine evidence markers for one page.
 
@@ -2405,6 +2485,14 @@ def _attribute_page_text(
         if any(_EVIDENCE_MARKER_START_RE.search(masked) for masked in section_prose):
             stats["sections"] += 1
             stats["authored"] += 1
+            if location_sections is not None:
+                for match in _EVIDENCE_MARKER_RE.finditer("".join(section_prose)):
+                    try:
+                        marker = json.loads(match.group(1))
+                    except json.JSONDecodeError:
+                        continue  # Existing evidence lint reports malformed markers.
+                    if isinstance(marker, dict) and isinstance(marker.get("id"), str) and isinstance(marker.get("sources"), list):
+                        location_sections.append((marker, "".join(section_prose)))
             continue
         if not any(_substantive_line(raw) for raw in content):
             continue
@@ -2437,6 +2525,8 @@ def _attribute_page_text(
         digest = hashlib.sha1((heading or "").encode("utf-8")).hexdigest()[:8]
         marker = {"id": f"{MACHINE_EVIDENCE_PREFIX}{ordinal}-{digest}", "sources": chosen}
         markers[heading_idx] = f"<!-- okf:evidence {json.dumps(marker, separators=(',', ':'))} -->"
+        if location_sections is not None:
+            location_sections.append((marker, "".join(section_prose)))
 
     newline = "\r\n" if "\r\n" in text else "\n"
     out = list(lines[:fm_end + 1])
@@ -2448,6 +2538,146 @@ def _attribute_page_text(
         out.append(raw)
     return "".join(out), stats, unattributed
 
+
+
+# Position declarations are optional producer input. Sicore rechecks them against
+# the frozen Raw archive and derives the excerpt; consumers trust only that result.
+_SOURCE_LINE_RANGE = re.compile(r"^(.+?)\s+lines?\s+(\d+)(?:\s*[-–]\s*(\d+))?$", re.IGNORECASE)
+MAX_SOURCE_LOCATION_LINES = 20
+MAX_SOURCE_LOCATIONS_PER_PAGE = 64
+
+
+def _raw_location_target(raw_root: Path, resource: str) -> Path | None:
+    relative = Path(resource)
+    if relative.is_absolute() or ".." in relative.parts:
+        return None
+    target = raw_root
+    for part in relative.parts:
+        target = target / part
+        if target.is_symlink():
+            return None
+    return target
+
+
+def _stamp_source_locations(text: str, sections: list, ids: dict[str, str], workdir: str) -> str:
+    lines = _lf_lines(text)
+    end = next(i for i, line in enumerate(lines[1:], 1) if _is_frontmatter_end(line))
+    front = "".join(lines[1:end])
+    root = yaml.compose(front, Loader=yaml.SafeLoader)
+    if not isinstance(root, yaml.MappingNode) or root.flow_style or any(key.start_mark.column for key, _ in root.value):
+        return text
+    rows = []
+    hashes: dict[str, str] = {}
+    raw_root = (Path(workdir) / "raw").resolve()
+    for marker, section in sections:
+        for payload in _body_source_payloads(section):
+            match = _SOURCE_LINE_RANGE.fullmatch(payload.strip())
+            if not match:
+                continue  # Legacy page/section locators retain document citations.
+            resource = _norm_source_entry(match[1].strip(" `"))
+            source_id = ids.get(resource)
+            if not isinstance(source_id, str) or source_id not in marker.get("sources", []):
+                continue
+            if Path(resource).suffix.lower() not in {".md", ".txt", ".markdown"}:
+                continue
+            target = _raw_location_target(raw_root, resource)
+            if target is None or not target.is_file():
+                continue  # Existing coverage lint owns missing sources.
+            if resource not in hashes:
+                if target.stat().st_size > 16 * 1024 * 1024:
+                    continue  # Optional positions cannot verify this Raw; retain document attribution.
+                hashes[resource] = hashlib.sha256(target.read_bytes()).hexdigest()
+            digest = hashes[resource]
+            row = {"evidence_id": marker["id"], "source_id": source_id,
+                   "raw_sha256": digest, "start_line": int(match[2]),
+                   "end_line": int(match[3] or match[2])}
+            if row not in rows:
+                rows.append(row)
+    pairs = [(k, v) for k, v in root.value if k.value == "source_locations"]
+    if len(pairs) > 1:
+        return text  # Duplicate fields remain a lint error, not silently repaired.
+    if pairs:
+        key, value = pairs[0]
+        # Only rewrite our canonical single-line JSON field. Preserve hand-edited
+        # YAML for validation rather than deleting aliases or adjacent comments.
+        if key.start_mark.column != 0 or value.start_mark.line != value.end_mark.line:
+            return text
+        try:
+            json.loads(front[value.start_mark.index:value.end_mark.index])
+        except json.JSONDecodeError:
+            return text
+        start = key.start_mark.index
+        finish = front.find("\n", value.end_mark.index)
+        finish = len(front) if finish < 0 else finish + 1
+        front = front[:start] + front[finish:]
+    if rows:
+        front += "source_locations: " + json.dumps(rows, ensure_ascii=False, separators=(",", ":")) + "\n"
+    return lines[0] + front + "".join(lines[end:])
+
+
+def source_location_violations(workdir: str, pages: dict) -> list[dict]:
+    findings = []
+    for rel, page in pages.items():
+        if "error" in page:
+            continue
+        text = page.get("text", "")
+        try:
+            lines = _lf_lines(text)
+            if not lines or not _is_frontmatter_start(lines[0]):
+                continue
+            end = next(i for i, line in enumerate(lines[1:], 1) if _is_frontmatter_end(line))
+            fm = yaml.safe_load("".join(lines[1:end]))
+            rows = fm.get("source_locations", []) if isinstance(fm, dict) else []
+            if not isinstance(rows, list) or len(rows) > MAX_SOURCE_LOCATIONS_PER_PAGE:
+                raise ValueError("source_locations must contain at most 64 positions")
+            if not rows:
+                continue
+            declared = fm.get("sources")
+            if not isinstance(declared, list):
+                raise ValueError("source locations require declared sources")
+            sources = {row.get("id"): _norm_source_entry(row.get("resource", ""))
+                       for row in declared if isinstance(row, dict) and isinstance(row.get("resource"), str) and isinstance(row.get("id"), str)}
+            evidence = {}
+            body = "".join(lines[end+1:])
+            for match in _EVIDENCE_MARKER_RE.finditer(_markdown_prose(body)):
+                try:
+                    marker = json.loads(match[1])
+                except json.JSONDecodeError:
+                    continue  # The existing evidence lint owns malformed markers.
+                if isinstance(marker, dict) and isinstance(marker.get("id"), str) and isinstance(marker.get("sources"), list):
+                    evidence[marker["id"]] = marker["sources"]
+            for row in rows:
+                if (not isinstance(row, dict) or set(row) != {"source_id", "evidence_id", "raw_sha256", "start_line", "end_line"}
+                        or not isinstance(row.get("source_id"), str) or not isinstance(row.get("evidence_id"), str)):
+                    raise ValueError("invalid source location")
+                if row["source_id"] not in evidence.get(row["evidence_id"], []):
+                    raise ValueError("source location does not match its evidence marker")
+                start, finish = row.get("start_line"), row.get("end_line")
+                if type(start) is not int or type(finish) is not int or start < 1 or finish < start or finish - start >= MAX_SOURCE_LOCATION_LINES:
+                    raise ValueError("source location must select 1-20 original Raw lines")
+                resource = sources.get(row.get("source_id"))
+                if not resource or Path(resource).is_absolute() or ".." in Path(resource).parts:
+                    raise ValueError("source location must reference a declared source")
+                raw_root = (Path(workdir) / "raw").resolve()
+                target = _raw_location_target(raw_root, resource)
+                if target is None:
+                    raise ValueError("source location cannot follow a symlink")
+                if target.stat().st_size > 16 * 1024 * 1024:
+                    raise ValueError("source location Raw file exceeds the 16 MiB verification limit")
+                raw = target.read_bytes()
+                if hashlib.sha256(raw).hexdigest() != row.get("raw_sha256"):
+                    raise ValueError("source location Raw hash changed; re-read and update the page")
+                raw_lines = raw.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n").removesuffix("\n").split("\n")
+                if finish > len(raw_lines):
+                    raise ValueError("source location exceeds original Raw line count")
+                excerpt = "\n".join(raw_lines[start-1:finish])
+                if not excerpt.strip() or len(excerpt) > 1200:
+                    raise ValueError("source location must select a nonempty excerpt of at most 1200 characters")
+                if credential_exposure_violations(rel, excerpt):
+                    raise ValueError("source location excerpt contains a credential; choose a safe supporting passage")
+        except (ValueError, OSError, UnicodeError, yaml.YAMLError, StopIteration) as exc:
+            findings.append({"page": rel, "kind": "source_location_invalid", "detail": str(exc)})
+    return findings
 
 
 def normalize_evidence_source_ids(workdir: str) -> list[dict[str, object]]:
@@ -2480,6 +2710,22 @@ def normalize_evidence_source_ids(workdir: str) -> list[dict[str, object]]:
     return fixes
 
 
+def attribute_evidence_text(
+    workdir: str, text: str, manifest_ids: dict[str, str], managed_sources: set[str],
+) -> tuple[str, dict]:
+    """Project the same evidence metadata used by finalization without writing."""
+    sources, derived, _ = parse_okf_sources(text, managed_sources)
+    if derived or not sources:
+        return text, {}
+    stamped = _stamp_source_ids_text(text, manifest_ids)
+    if stamped is None or not stamped[1]:
+        return text, {}
+    rebound = _remap_evidence_source_ids(stamped[0], text, manifest_ids)
+    location_sections: list = []
+    updated, stats, _ = _attribute_page_text(rebound, stamped[1], location_sections)
+    return _stamp_source_locations(updated, location_sections, stamped[1], workdir), stats
+
+
 def attribute_evidence_sections(
     workdir: str,
     allowed_pages: set[str] | None = None,
@@ -2505,14 +2751,7 @@ def attribute_evidence_sections(
             text = path.read_bytes().decode("utf-8")
         except (OSError, UnicodeDecodeError):
             continue
-        sources, derived, _ = parse_okf_sources(text, managed_sources)
-        if derived or not sources:
-            continue
-        stamped = _stamp_source_ids_text(text, manifest_ids)
-        if stamped is None or not stamped[1]:
-            continue
-        rebound = _remap_evidence_source_ids(stamped[0], text, manifest_ids)
-        updated, stats, _ = _attribute_page_text(rebound, stamped[1])
+        updated, stats = attribute_evidence_text(workdir, text, manifest_ids, managed_sources)
         if updated == text:
             continue
         _write_text_atomic(path, updated)
@@ -3058,6 +3297,7 @@ def run_layer1(workdir: str) -> dict:
         except (OSError, ValueError) as exc:
             lint["violations"].append({"page": LIBRARY_INTRODUCTION_PATH, "kind": "library_introduction", "detail": str(exc)})
     lint["violations"].extend(trusted_evidence_violations(workdir, pages))
+    lint["violations"].extend(source_location_violations(workdir, pages))
     lint["ok"] = not lint["violations"]
     over_broad = detect_over_broad_exclusions(workdir, exclusions)
     previous = read_selfcheck(workdir) or {}
@@ -3378,77 +3618,6 @@ def _write_text_atomic(path: Path, text: str) -> None:
         raise
 
 
-# ── L2: budget spent with residuals → a ticket, never owner homework ─────────
-# The publish page only DISPLAYS residual state; the owner must never discover
-# work there. When the bounded repair loop gives up (state=unconverged), CODE
-# files one contradiction ticket — same schema, same queue, same rule/dispatch/
-# resolve_ticket loop the model's own tickets ride (box_role.md 「矛盾工单」).
-
-def file_residual_ticket(workdir: str, report: dict, locale: str | None = None) -> bool:
-    """Append ONE residual ticket to authoring/CONTRADICTIONS.json, model-free.
-    Stable id = fingerprint of the residual list: the same residuals repeatedly
-    unconverging never duplicate the ticket; different residuals open a fresh
-    one. An existing same-id ticket (open or already ruled) is left untouched.
-    Returns whether a ticket was filed."""
-    cov = report.get("coverage") or {}
-    lint = report.get("lint") or {}
-    incr = report.get("incremental") or {}
-    # The FULL residual set — both the fingerprint and the quote derive from it.
-    # Fingerprinting a truncated view (the old [:10] caps) made two genuinely
-    # different residual sets sharing a prefix collide to one ticket id, so the
-    # second was silently deduped away (review finding). Only the DISPLAY quote
-    # is truncated, below.
-    residuals: list[str] = []
-    pages: set[str] = set()
-    for p in (cov.get("unaccounted") or []):
-        residuals.append(f"未入账源: {p}")
-    for p in (cov.get("dangling_citations") or []):
-        residuals.append(f"悬空引用: {p}")
-    for v in (lint.get("violations") or []):
-        residuals.append(f"lint {v.get('kind')}: {v.get('page')} — {str(v.get('detail', ''))[:80]}")
-        if v.get("page"):
-            pages.add(str(v["page"]))
-    for p in (incr.get("out_of_scope_pages") or []):
-        residuals.append(f"越界未还原: {p}")
-        pages.add(str(p))
-    if not residuals:
-        return False
-    digest = hashlib.sha256("\n".join(sorted(residuals)).encode("utf-8")).hexdigest()[:8]
-    tid = f"selfcheck-residual-{digest}"
-    path = Path(workdir) / "authoring" / "CONTRADICTIONS.json"
-    tickets: list = []
-    if path.is_file():
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-            # Unreadable ledger: bail rather than clobber the model's tickets.
-            return False
-        if not isinstance(data, list):
-            return False
-        tickets = data
-    if any(isinstance(t, dict) and t.get("id") == tid for t in tickets):
-        return False
-    en = _is_en(locale)
-    tickets.append({
-        "id": tid,
-        "title": "Self-check residuals" if en else "自检残留待处理",
-        "question": ("The automatic self-check repair budget is spent and the items below remain unfixed — how should they be handled?"
-                     if en else "自检自动回修额度已用完,以下残留没有修完,要怎么处理?"),
-        "sources": [{"doc": "authoring/SELFCHECK.json", "quote": "; ".join(residuals)[:600]}],
-        "options": (["Run another repair round", "Accept as-is"] if en else ["再修一轮", "接受现状"]),
-        "current_value": "unresolved residuals" if en else "残留未处理",
-        "affected_pages": sorted(pages)[:20],
-        "status": "open",
-        "answer": None,
-        # A residual ticket asks the owner for an ACTION on the model's own
-        # output; no raw source is in dispute. Code knows that, so code says it.
-        "ticket_kind": TICKET_KIND_MODEL_GAP,
-        "origin": TICKET_ORIGIN_SELFCHECK,
-    })
-    _write_text_atomic(path, json.dumps(tickets, ensure_ascii=False, indent=2))
-    return True
-
-
 # ── ticket kind: filed by evidence, never by self-description ────────────────
 # A contradiction ticket has exactly two kinds, decided when it is FILED and
 # re-decided every compile round from the evidence on the ticket itself:
@@ -3599,7 +3768,7 @@ def file_ticket_record(workdir: str, ticket: dict) -> tuple[str, str | None]:
     else:
         for key in ("ticket_kind", "title", "question", "sources", "options",
                     "current_value", "affected_pages", "origin",
-                    "filed_operation_id", "filed_generation"):
+                    "filed_operation_id", "filed_generation", "escalation"):
             if key in ticket:
                 existing[key] = ticket[key]
         existing["superseded_at"] = ticket["filed_at"]
@@ -3609,6 +3778,14 @@ def file_ticket_record(workdir: str, ticket: dict) -> tuple[str, str | None]:
     except OSError as e:
         return "", f"{CONTRADICTIONS_PATH} write failed: {e}"
     return status, None
+
+
+def _review_note_receipts(workdir: str) -> list:
+    path = Path(workdir) / "authoring/REVIEW_NOTES.json"
+    if not path.exists():
+        return []
+    rows = json.loads(path.read_text("utf-8"))
+    return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
 
 
 def normalize_contradictions_file(workdir: str) -> tuple[int, str | None]:
@@ -3642,7 +3819,8 @@ def normalize_contradictions_file(workdir: str) -> tuple[int, str | None]:
         elif t.get("origin") not in (TICKET_ORIGIN_SELFCHECK, TICKET_ORIGIN_EDGE):
             filed_by_tool = (
                 t.get("ticket_kind") in TICKET_KINDS
-                and tid == ticket_claim_id(str(t.get("question", "")), normalize_ticket_sources(t.get("sources")))
+                and (tid == ticket_claim_id(str(t.get("question", "")), normalize_ticket_sources(t.get("sources")))
+                     or any(n.get("ticket_id") == tid for n in _review_note_receipts(workdir)))
             )
             if not filed_by_tool and t.get("ticket_kind") != TICKET_KIND_UNCLASSIFIED:
                 t["ticket_kind"] = TICKET_KIND_UNCLASSIFIED
@@ -3676,9 +3854,10 @@ def media_citing_pages(workdir: str) -> dict[str, list[str]]:
     this page is responsible for. Three discovery paths, UNIONED:
       1. direct sources image entries — an image cited directly;
       2. body ``(source: …)`` image citations — basename match tolerated;
-      3. attribution-edge reverse lookup — a page that cites a DOCUMENT ``d`` in
+      3. embed-edge reverse lookup — a page that cites a DOCUMENT ``d`` in
          its sources list inherits the numeric check of every image ``d``
-         embeds in its body.
+         embeds in its body (``.md`` or ``.mdx``; relative or site-root target,
+         see ``embedded_image_edges``).
     Path 3 is what keeps image re-verification alive under coverage v2: agents
     now cite DOCUMENTS (images auto-attach, see coverage/asset_attribution_edges)
     rather than listing images one-by-one, so without it the fresh-eyes numeric
@@ -3692,7 +3871,9 @@ def media_citing_pages(workdir: str) -> dict[str, list[str]]:
     for p in raw_images:
         by_basename.setdefault(posixpath.basename(p), []).append(p)
     raw_set = set(raw_images)
-    edges = asset_attribution_edges(workdir)
+    # Review scope, not the coverage edges: a docs-site archive embeds its
+    # screenshots from .mdx pages with site-root paths (see embedded_image_edges).
+    edges = embedded_image_edges(workdir)
     out: dict[str, list[str]] = {}
     for rel, page in candidate_pages(workdir).items():
         if "error" in page:
@@ -3734,6 +3915,10 @@ def pending_media_verification(workdir: str) -> dict[str, list[str]]:
             if fingerprints.get(p) != current.get(p)}
 
 
+# v2 verifies every page segment; old prefix-only receipts cannot prove it ran.
+MEDIA_VERIFICATION_CONTRACT_VERSION = 2
+
+
 def media_page_fingerprints(
     workdir: str, citing: dict[str, list[str]] | None = None,
 ) -> dict[str, str]:
@@ -3755,6 +3940,7 @@ def media_page_fingerprints(
         except OSError:
             continue
         digest = hashlib.sha256()
+        digest.update(f"media-verification:{MEDIA_VERIFICATION_CONTRACT_VERSION}\0".encode())
         digest.update(page_bytes)
         for image in sorted(images):
             digest.update(b"\0")

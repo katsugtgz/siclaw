@@ -248,7 +248,16 @@ describe("handleToolCapabilities", () => {
       allowedTools: null,
       agentType: "custom",
       subagentTierMenu: null,
+      agentEngine: "pi-agent",
+      webSearchMode: "disabled",
+      codexMemoryEnabled: false,
     });
+  });
+
+  it.each([true,false])("projects the per-Agent native memory choice %s",async enabled=>{
+    frontend.responses.set("config.getAgent",{agent_type:"custom",tool_capabilities:null,agent_engine:"codex",codex_memory_enabled:enabled});
+    const res=new FakeRes();await handleToolCapabilities(asReq(new FakeReq("")),asRes(res),identity,frontend as unknown as FrontendWsClient);
+    expect(res.statusCode).toBe(200);expect(JSON.parse(res.body).codexMemoryEnabled).toBe(enabled);
   });
 
   it("treats an empty selection as null (whitelist off)", async () => {
@@ -261,6 +270,9 @@ describe("handleToolCapabilities", () => {
       allowedTools: null,
       agentType: "custom",
       subagentTierMenu: null,
+      agentEngine: "pi-agent",
+      webSearchMode: "disabled",
+      codexMemoryEnabled: false,
     });
   });
 

@@ -63,4 +63,24 @@ describe("resolveSkillDirectories", () => {
       includePlatformSkills: false,
     })).toEqual([resolved]);
   });
+
+  it("keeps authorized baked Skills when a pod-local bundle exists", () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "siclaw-skill-roots-"));roots.push(cwd);
+    const skillsBase = path.join(cwd, ".siclaw", "skills"), resolved = path.join(skillsBase, "resolved");
+    const core = path.join(cwd, "skills", "core"), extension = path.join(cwd, "skills", "extension");
+    for (const dir of [resolved, core, extension]) fs.mkdirSync(dir, { recursive: true });
+    expect(resolveSkillDirectories({ cwd, skillsBase, includeBundledSkills: true, includePlatformSkills: false }))
+      .toEqual([resolved, core, extension]);
+  });
+
+  it("adds only authorized image roots when the Agent-scoped bundle is missing", () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "siclaw-skill-roots-"));roots.push(cwd);
+    const skillsBase = path.join(cwd, ".siclaw", "skills"), shared = path.join(skillsBase, "resolved"),
+      scoped = path.join(skillsBase, "agents", "agent-a", "resolved"), core = path.join(cwd, "skills", "core");
+    for (const dir of [shared, core]) fs.mkdirSync(dir, { recursive: true });
+    expect(resolveSkillDirectories({ cwd, skillsBase, scopedSkillsDir: scoped, includeBundledSkills: true, includePlatformSkills: false }))
+      .toEqual([core]);
+    expect(resolveSkillDirectories({ cwd, skillsBase, scopedSkillsDir: scoped, includeBundledSkills: false, includePlatformSkills: false }))
+      .toEqual([]);
+  });
 });

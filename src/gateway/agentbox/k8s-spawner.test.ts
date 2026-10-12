@@ -153,6 +153,8 @@ const originalGatewayEnv = {
   SICLAW_GATEWAY_HOSTNAME: process.env.SICLAW_GATEWAY_HOSTNAME,
   SICLAW_INTERNAL_PORT: process.env.SICLAW_INTERNAL_PORT,
   SICLAW_MEMORY_ENABLED: process.env.SICLAW_MEMORY_ENABLED,
+  SICLAW_AGENT_ENGINE: process.env.SICLAW_AGENT_ENGINE,
+  SICLAW_CODEX_BIN: process.env.SICLAW_CODEX_BIN,
   SICLAW_VISUAL_EXPORT_URL: process.env.SICLAW_VISUAL_EXPORT_URL,
   SICLAW_VISUAL_EXPORT_TIMEOUT_MS: process.env.SICLAW_VISUAL_EXPORT_TIMEOUT_MS,
   SICLAW_VISUAL_EXPORT_THEME: process.env.SICLAW_VISUAL_EXPORT_THEME,
@@ -352,6 +354,23 @@ describe("K8sSpawner — spawn branches", () => {
     } finally {
       delete process.env.SICLAW_SUBAGENT_CONCURRENCY;
     }
+  });
+
+  it("forwards the Codex canary switch only to normal AgentBoxes", async () => {
+    process.env.SICLAW_AGENT_ENGINE = "codex";
+    process.env.SICLAW_CODEX_BIN = "/usr/local/bin/codex";
+    const s = new K8sSpawner({ namespace: "siclaw-debug" });
+    s.setCertManager(new FakeCertManager() as any);
+    let reads = 0;
+    readPodImpl.fn = async () => {
+      reads++;
+      if (reads === 1) throw Object.assign(new Error("nf"), { code: 404 });
+      return { status: { phase: "Running", podIP: "10.0.0.11", conditions: [{ type: "Ready", status: "True" }] }, metadata: { labels: {} } };
+    };
+    await s.spawn({ agentId: "default" });
+    const env = calls.createNamespacedPod[0].body.spec.containers[0].env;
+    expect(env.some((item: { name: string }) => item.name === "SICLAW_AGENT_ENGINE")).toBe(false);
+    expect(env).toContainEqual({ name: "SICLAW_CODEX_BIN", value: "/usr/local/bin/codex" });
   });
 
   it("forwards the sub-agent OPS ROLLBACK knobs, which are read inside the box", async () => {

@@ -59,7 +59,7 @@ export async function bootstrapRuntime(opts: BootstrapRuntimeOptions): Promise<R
     // Advertise KB-compile capability so the consumer can route compile runs to
     // this Runtime with no consumer-side config. True iff a compile-box image
     // was configured (helm agentbox.compileBoxEnabled ⇒ SICLAW_COMPILE_BOX_IMAGE).
-    capabilities: { compile: isCompileCapable(), webUserIsolation: spawnerKind === "k8s" },
+    capabilities: { compile: isCompileCapable(), webUserIsolation: spawnerKind === "k8s", executionIdentity: true, channelPolicyV1:true, channelPolicyV2:true,channelAgentScope:true },
   });
   if (config.serverUrl) {
     try {

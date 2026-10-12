@@ -513,6 +513,102 @@ describe("buildKnowledgeWikiCatalog", () => {
     expect(single).toContain("The complete page catalog is below.");
   });
 
+  // Two nested libraries, as the materializer lays out a multi-library mount.
+  const writeLibraries = (catalogs: Record<string, string>, routed: string[] = []) => {
+    const roots = Object.keys(catalogs);
+    fs.writeFileSync(
+      path.join(knowledgeDir, "index.md"),
+      ["# Knowledge Index", "", ...roots.map((root) => `- [[repos/${root}/index]] - Library ${root} v1 — ${root} topics`)].join("\n") + "\n",
+    );
+    for (const [root, catalog] of Object.entries(catalogs)) {
+      fs.mkdirSync(path.join(knowledgeDir, "repos", root), { recursive: true });
+      fs.writeFileSync(path.join(knowledgeDir, "repos", root, "index.md"), catalog);
+    }
+    writeManifest(roots.map((root) => ({ root: `repos/${root}`, verifiedRoutes: routed.includes(root) })));
+  };
+
+  it("carries every library's own catalog for an answer-only harness", () => {
+    writeLibraries({
+      compute: "# Compute\n\n- [XID errors](gpu/xid.md) - what each XID code means",
+      network: "# Network\n\n- [RoCE loss](roce/loss.md) - packet loss on RoCE links",
+    });
+
+    const out = buildKnowledgeWikiCatalog(knowledgeDir, { operational: false });
+
+    expect(out).toContain("route to pages from it directly instead of reading that index");
+    expect(out).not.toContain("lists libraries, not pages");
+    expect(out).not.toContain("Library catalogs not included");
+    expect(out.indexOf("# Knowledge Index")).toBeLessThan(out.indexOf("## Library catalogs"));
+    expect(out).toContain(`### Library compute — \`${path.join(knowledgeDir, "repos", "compute", "index.md")}\``);
+    expect(out).toContain(`Links below are relative to \`${path.join(knowledgeDir, "repos", "compute")}/\`.`);
+    // As written: the same text the Agent would Read from that index.
+    expect(out).toContain("- [XID errors](gpu/xid.md) - what each XID code means");
+    expect(out).toContain("- [RoCE loss](roce/loss.md) - packet loss on RoCE links");
+  });
+
+  it("keeps an operational harness on the library list", () => {
+    writeLibraries({
+      compute: "# Compute\n\n- [XID errors](gpu/xid.md) - what each XID code means",
+      network: "# Network\n\n- [RoCE loss](roce/loss.md) - packet loss on RoCE links",
+    });
+
+    const out = buildKnowledgeWikiCatalog(knowledgeDir);
+
+    expect(out).toContain("the catalog below lists libraries, not pages");
+    expect(out).not.toContain("## Library catalogs");
+    expect(out).not.toContain("XID errors");
+  });
+
+  it("carries catalogs whole while they fit and names the library that does not", () => {
+    const line = (library: string, i: number) => `- [${library} page ${i}](p/${i}.md) - ${"detail ".repeat(12)}`;
+    const compute = ["# Compute", ...Array.from({ length: 250 }, (_, i) => line("compute", i))].join("\n");
+    const network = ["# Network", ...Array.from({ length: 250 }, (_, i) => line("network", i))].join("\n");
+    expect(compute.length).toBeLessThan(48_000);
+    expect(compute.length + network.length).toBeGreaterThan(48_000);
+    writeLibraries({ compute, network });
+
+    const out = buildKnowledgeWikiCatalog(knowledgeDir, { operational: false });
+
+    expect(out).toContain("[compute page 249]");
+    expect(out).not.toContain("[network page 0]");
+    expect(out).toContain("## Library catalogs not included");
+    expect(out).toContain(`- Library network — \`${path.join(knowledgeDir, "repos", "network", "index.md")}\``);
+    expect(out).toContain("pick it by its domain, then Read its own index");
+  });
+
+  it("falls back to the library list when no catalog fits", () => {
+    const huge = ["# Huge", ...Array.from({ length: 800 }, (_, i) => `- [Page ${i}](p/${i}.md) - ${"detail ".repeat(12)}`)].join("\n");
+    writeLibraries({ compute: huge, network: huge });
+
+    const out = buildKnowledgeWikiCatalog(knowledgeDir, { operational: false });
+
+    expect(out).toContain("the catalog below lists libraries, not pages");
+    expect(out).not.toContain("## Library catalogs");
+  });
+
+  it("does not repeat a verified-route block it already lifted", () => {
+    const routes = [
+      "<!-- verified-routes:begin -->",
+      "## 已验证快速路由",
+      "",
+      "- **Diagnose XID** → [gpu/xid.md](gpu/xid.md)",
+      "<!-- verified-routes:end -->",
+    ].join("\n");
+    writeLibraries(
+      {
+        compute: `# Compute\n\n${routes}\n\n- [XID errors](gpu/xid.md) - what each XID code means`,
+        network: "# Network\n\n- [RoCE loss](roce/loss.md) - packet loss on RoCE links",
+      },
+      ["compute"],
+    );
+
+    const out = buildKnowledgeWikiCatalog(knowledgeDir, { operational: false });
+
+    expect(out.match(/Diagnose XID/g)).toHaveLength(1);
+    expect(out.indexOf("## Verified Fast Routes")).toBeLessThan(out.indexOf("## Library catalogs"));
+    expect(out).toContain("- [XID errors](gpu/xid.md) - what each XID code means");
+  });
+
   it("lifts routes from every library in a multi-library materialization", () => {
     fs.writeFileSync(
       path.join(knowledgeDir, "index.md"),

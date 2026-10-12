@@ -55,6 +55,8 @@ describe("config.getAgent", () => {
       icon: "bot", color: "#fff", idle_timeout_sec: 300,
       tool_capabilities: null,
       agent_type: "custom",
+      agent_engine: "pi-agent",
+      web_search_mode: "disabled",
       // No subagent_models column on this row → no tiers (null), which the
       // Gateway projects to a null menu and the box treats as a clear.
       subagent_model_tiers: null,

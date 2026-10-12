@@ -1,4 +1,7 @@
 import { ConversationClient, supportsConversations } from "../conversation-client.js";
+import { channelExecutionContext, executionAuditUser } from "../../shared/execution-context.js";
+import { openExecutionGrant } from "../execution-grants.js";
+import { ChannelAcceptanceReception, type ChannelAcceptanceScope } from "../channel-acceptance-scope.js";
 /**
  * Lark (飞书) channel handler.
  *
@@ -160,6 +163,26 @@ const GROUP_ACCESS_ADMIN_HINT_BY_LOCALE = {
   "zh-CN": "请联系管理员授权。",
   "en-US": "Ask an admin to grant access.",
 } as const;
+const GROUP_IDENTITY_NOTICE_BY_LOCALE = {
+  "zh-CN": "🔒 本群要求绑定 SiCore 身份，你尚未完成绑定，暂时不能发起请求。",
+  "en-US": "🔒 This group requires a linked SiCore identity before you can submit requests.",
+} as const;
+const GROUP_IDENTITY_LINK_HINT_BY_LOCALE = {
+  "zh-CN": "请点击“绑定我的身份”，登录你自己的 SiCore 账号并验证飞书身份。完成后，回到本话题重新发送消息。",
+  "en-US": "Select “Link my identity”, sign in with your own SiCore account and verify your Feishu identity. Then return to this topic and resend your message.",
+} as const;
+const GROUP_IDENTITY_UNAVAILABLE_BY_LOCALE = {
+  "zh-CN": "身份绑定暂不可用，本次请求未执行。请联系机器人管理员恢复绑定入口；恢复后，在群里重新 @我即可获取绑定按钮。",
+  "en-US": "Identity linking is temporarily unavailable; your request was not run. Ask the bot administrator to restore it, then mention me in the group again to get the linking button.",
+} as const;
+const PERSONAL_IDENTITY_LINK_HINT_BY_LOCALE = {
+  "zh-CN": "请点击“绑定我的身份”，登录你自己的 SiCore 账号并验证飞书身份。完成后，回到这里重新发送消息。",
+  "en-US": "Select “Link my identity”, sign in with your own SiCore account and verify your Feishu identity. Then return here and resend your message.",
+} as const;
+const PERSONAL_IDENTITY_UNAVAILABLE_BY_LOCALE = {
+  "zh-CN": "身份绑定暂不可用，本次请求未执行。请联系机器人管理员恢复绑定入口；恢复后，重新发送消息即可获取绑定按钮。",
+  "en-US": "Identity linking is temporarily unavailable; your request was not run. Ask the bot administrator to restore it, then resend your message to get the linking button.",
+} as const;
 // /apikey: the frontend RPC threw (transport down, or a frontend that doesn't
 // implement it at all). The user is waiting on a pickup link, so say something —
 // staying silent here reads as "the bot is broken".
@@ -238,6 +261,8 @@ const PERSONAL_ACCESS_ADMIN_HINT_BY_LOCALE = {
 // very reply this feature exists to deliver).
 const PERSONAL_DENIAL_COPY_BY_LOCALE: Record<LarkLocale, Map<string, string>> = {
   "zh-CN": new Map([
+    ["identity_link_required", "请绑定你自己的 SiCore 身份。此步骤只建立身份关联，不授予个人 Agent 或资源权限。完成后返回原群话题重试。"],
+    ["identity_linked", "你的 SiCore 身份已绑定，可以返回原群话题重试。私聊对话仍遵循单独配置的准入策略。"],
     // Not yet linked: send them to link, once.
     ["binding_required", "使用这个助手需要先关联你的 Sicore 账号。关联完回到这里，重新发送刚才那条消息即可。"],
     // ALREADY linked but unauthorized — must not say "go link", they did that.
@@ -246,6 +271,8 @@ const PERSONAL_DENIAL_COPY_BY_LOCALE: Record<LarkLocale, Map<string, string>> = 
     ["access_denied", "你没有这个助手的使用权限，请联系该助手的负责人开通。"],
   ]),
   "en-US": new Map([
+    ["identity_link_required", "Link your own SiCore identity. This step does not grant personal Agent or resource access. Return to the original group topic afterwards."],
+    ["identity_linked", "Your SiCore identity is linked. Return to the original group topic. Private conversations remain subject to their separate admission policy."],
     ["binding_required", "Using this assistant needs your Sicore account linked. Once linked, come back here and resend your message."],
     ["access_request_required", "You don't have access to this assistant yet — submit a request. Once it is approved, come back and resend your message."],
     ["access_denied", "You don't have access to this assistant. Ask its owner to grant it."],
@@ -256,10 +283,12 @@ const PERSONAL_DENIAL_COPY_BY_LOCALE: Record<LarkLocale, Map<string, string>> = 
 // it there would read as a stutter ("需要先关联账号。使用这个助手需要先关联…").
 const PERSONAL_DENIAL_TITLE_BY_LOCALE: Record<LarkLocale, Map<string, string>> = {
   "zh-CN": new Map([
+    ["identity_link_required", "绑定 SiCore 身份"],
     ["binding_required", "需要先关联账号"],
     ["access_request_required", "需要申请使用权限"],
   ]),
   "en-US": new Map([
+    ["identity_link_required", "Link SiCore identity"],
     ["binding_required", "Link your account first"],
     ["access_request_required", "Access request needed"],
   ]),
@@ -290,10 +319,12 @@ const PERSONAL_DENIAL_LINK_HINT_BY_LOCALE: Record<LarkLocale, (minutes: number |
 // gets a usable button rather than falling back to raw text.
 const PERSONAL_DENIAL_BUTTON_BY_LOCALE: Record<LarkLocale, Map<string, string>> = {
   "zh-CN": new Map([
+    ["identity_link_required", "绑定身份"],
     ["binding_required", "关联账号"],
     ["access_request_required", "申请权限"],
   ]),
   "en-US": new Map([
+    ["identity_link_required", "Link identity"],
     ["binding_required", "Link account"],
     ["access_request_required", "Request access"],
   ]),
@@ -386,6 +417,7 @@ export function createLarkHandler(
   agentBoxManager: AgentBoxManager,
   tlsOptions?: { cert: string; key: string; ca: string },
   frontendClient?: FrontendWsClient,
+  acceptanceScope?: ChannelAcceptanceScope,
 ): ChannelHandler {
   const channelId: string = channel.id;
   const config: LarkChannelConfig =
@@ -394,6 +426,7 @@ export function createLarkHandler(
       : channel.config;
 
   let wsClient: { close(params?: { force?: boolean }): void } | null = null;
+  const reception = acceptanceScope ? new ChannelAcceptanceReception(acceptanceScope) : undefined;
 
   return {
     async start() {
@@ -457,6 +490,11 @@ export function createLarkHandler(
         // immediately and kick the actual work onto a detached task so the
         // ACK ships in <1ms and redelivery never triggers.
         "im.message.receive_v1": (data: any) => {
+          if (reception && !reception.allowsMessage(data)) {
+            const candidate = reception.groupProbeCandidate(data);
+            if (candidate) console.log(`[lark] Acceptance group candidate channel=${channelId} chat=${candidate}`);
+            return Promise.resolve();
+          }
           setImmediate(() => {
             handleLarkMessage(data, larkClient, channelId, agentBoxManager, tlsOptions, frontendClient, localeForDomain(config.domain), config, botOpenId)
               .catch((err) => {
@@ -471,6 +509,7 @@ export function createLarkHandler(
         // handler to stay well within Feishu's ~3s callback window (see the
         // handleLarkCardAction doc comment / the 200671 fix).
         "card.action.trigger": (data: any) => {
+          if (reception && !reception.allowsCard(data)) return undefined;
           try {
             return handleLarkCardAction(data, larkClient, frontendClient, agentBoxManager, tlsOptions);
           } catch (err) {
@@ -1318,6 +1357,38 @@ export async function handleLarkMessage(
       return;
     }
     const pairMatch = text.match(/^PAIR\s+([A-Z0-9]{6})$/i);
+    // System-only identity linking never starts a model or consults private admission.
+    if (/^\/link(?:\s|$)/i.test(text.trim())) {
+      if (text.trim().toLowerCase() !== "/link") {
+        await replyToLark(larkClient, messageId, locale === "zh-CN" ? "身份绑定命令：/link" : "Identity linking command: /link");
+        return;
+      }
+      if (senderType !== "user" || frontendClient?.consumerDeclares?.("channelPolicyV1") !== true) {
+        await replyToLark(larkClient, messageId, PERSONAL_IDENTITY_UNAVAILABLE_BY_LOCALE[locale]);
+        return;
+      }
+      try {
+        const { denied } = await resolvePersonalBinding(personalChannelId, senderOpenId, frontendClient, senderType, true);
+        if (denied?.reason === "shared_identity_entry") {
+          await deliverSharedIdentityEntry(larkClient, messageId, locale, denied.actionUrl, "personal", denied.identityLinkLocalTest === true);
+        } else if (denied?.reason === "identity_linked") {
+          await replyToLark(larkClient, messageId, PERSONAL_DENIAL_COPY_BY_LOCALE[locale].get("identity_linked")!);
+        } else if (denied?.reason === "identity_link_required" && rendersActionLink(denied, locale)) {
+          await deliverSingleUseLink(larkClient, messageId, locale, {
+            body: PERSONAL_DENIAL_COPY_BY_LOCALE[locale].get(denied.reason)!,
+            title: PERSONAL_DENIAL_TITLE_BY_LOCALE[locale].get(denied.reason),
+            buttonLabel: PERSONAL_DENIAL_BUTTON_BY_LOCALE[locale].get(denied.reason)!,
+            url: denied.actionUrl!, expiresAtMs: denied.expiresAtMs, ttlMinutes: denied.ttlMinutes,
+          }, formatPersonalDenialReply(denied, locale) ?? PERSONAL_IDENTITY_UNAVAILABLE_BY_LOCALE[locale]);
+        } else {
+          await replyToLark(larkClient, messageId, PERSONAL_IDENTITY_UNAVAILABLE_BY_LOCALE[locale]);
+        }
+      } catch {
+        console.warn("[lark] System identity linking unavailable");
+        await replyToLark(larkClient, messageId, PERSONAL_IDENTITY_UNAVAILABLE_BY_LOCALE[locale]);
+      }
+      return;
+    }
     if (pairMatch) {
       // Gate on OPEN-ness, not on the one legacy gated spelling: a bot on any gated tier still
       // needs its pairing code forwarded. Comparing against the one legacy literal told a
@@ -1536,6 +1607,10 @@ export async function handleLarkMessage(
 
     const { binding, denied } = await resolvePersonalBinding(personalChannelId, senderOpenId, frontendClient!, senderType ?? undefined);
     if (!binding) {
+      if (denied?.reason === "shared_identity_entry") {
+        await deliverSharedIdentityEntry(larkClient, messageId, locale, denied.actionUrl, "personal", denied.identityLinkLocalTest === true);
+        return;
+      }
       // The frontend owns the admission decision; the runtime's whole gate is "did a binding come
       // back". All that is left is telling the sender what to do next.
       const deniedReply = denied ? formatPersonalDenialReply(denied, locale) : null;
@@ -1678,7 +1753,7 @@ export async function handleLarkMessage(
     );
     if (isChannelAccessDenied(modeBinding)) {
       if (modeExistingOnly) return;
-      await replyToLark(larkClient, messageId, formatGroupAccessDeniedReply(modeBinding, locale, dmCanResolveAccess(personalBot)));
+      await deliverGroupAccessDenied(larkClient,messageId,modeBinding,locale,personalBot);
       return;
     }
     if (!modeBinding) {
@@ -1790,7 +1865,7 @@ export async function handleLarkMessage(
     if (unmentionedGroupMessage) return;
     // Gated group: this sender isn't allowed. The message is either an explicit @ or a follow-up
     // in a previously established bot topic, so a single short hint is appropriate.
-    await replyToLark(larkClient, messageId, formatGroupAccessDeniedReply(binding, locale, dmCanResolveAccess(personalBot)));
+    await deliverGroupAccessDenied(larkClient,messageId,binding,locale,personalBot);
     return;
   }
   if (!binding) {
@@ -1963,14 +2038,20 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
     console.log(`[lark] Binding disappeared before queued run channel=${channelId} chat=${chatId} route=${route}`);
     return;
   }
-  if (!binding.createdBy) {
-    await replyToLark(larkClient, messageId, MISSING_OWNER_NOTICE_BY_LOCALE[locale], replyInThread);
+  let execution: import("../../shared/execution-context.js").ExecutionContext;
+  try { execution = channelExecutionContext(binding, frontendClient?.consumerDeclares?.("executionIdentity") === true); }
+  catch {
+    await replyToLark(larkClient, messageId, binding.identity || frontendClient?.consumerDeclares?.("executionIdentity") === true
+      ? AGENT_ERROR_NOTICE_BY_LOCALE[locale] : MISSING_OWNER_NOTICE_BY_LOCALE[locale], replyInThread);
     return;
   }
+  const auditUserId = executionAuditUser(execution, binding.createdBy) || senderOpenId;
+  if (!auditUserId) { await replyToLark(larkClient, messageId, AGENT_ERROR_NOTICE_BY_LOCALE[locale], replyInThread); return; }
+  const sessionOrigin = binding.origin ?? "channel";
 
   const agentId = binding.agentId;
   const sessionId = binding.sessionId;
-  sessionRegistry.remember(sessionId, binding.createdBy, agentId);
+  sessionRegistry.remember(sessionId, auditUserId, agentId);
   // Channel audit actor (NOT runtime identity — that stays `createdBy` via
   // remember() above). The sender's raw open_id is the "same person" key for
   // channel audit; it is stamped on the SESSION (chat_sessions), never falls
@@ -1985,7 +2066,8 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
   const persistedText = redactImageUrlsInText(effectiveText);
   let promptMessageId: string;
   try {
-    await ensureChatSession(sessionId, agentId, binding.createdBy, persistedText, persistedText, "channel", undefined, { senderExternalId, channelId, senderType });
+    await ensureChatSession(sessionId, agentId, auditUserId, persistedText, persistedText, sessionOrigin, undefined,
+      { senderExternalId, channelId, senderType, ...(binding.identity ? { identity: execution.identity, sender: execution.sender } : {}) });
     promptMessageId = await appendMessage({
       sessionId,
       role: "user",
@@ -2071,7 +2153,7 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
     if (milestones.length > MILESTONE_CAP) milestones.shift();
     return flushMilestoneCard();
   };
-  registerBackgroundChannelDelivery(sessionId, async (backgroundMessage) => {
+  const clearDelivery = registerBackgroundChannelDelivery(sessionId, async (backgroundMessage) => {
     if ("text" in backgroundMessage) {
       const display = stripVisualBlocks(backgroundMessage.text, { stripSourceBlocks: true })
         || (backgroundMessage.kind === "final" ? EMPTY_RESULT_NOTICE_BY_LOCALE[locale] : "");
@@ -2100,7 +2182,7 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
     // A synchronous request owns its answer stream. Detached assistant rows
     // remain history; they must not replace its card or start a second reply.
     return false;
-  });
+  }, undefined, promptMessageId);
 
   // One turn at a time for this session. The AgentBox's own 409 only sees its own
   // sessions, so once an agent runs more than one box two messages could be dispatched to
@@ -2120,7 +2202,8 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
     if (!remoteConversation) releaseTurn = await sessionTurnLocks.acquireRequest(sessionId, "sync");
     let client: Pick<AgentBoxClient, "prompt" | "streamEvents">;
     if (remoteConversation && frontendClient) {
-      client = new ConversationClient(frontendClient, { agentId, userId: binding.createdBy, sessionId, userMessageId: promptMessageId, origin: "channel" });
+      client = new ConversationClient(frontendClient, { agentId, userId: auditUserId, sessionId, userMessageId: promptMessageId,
+        origin: sessionOrigin, identity: execution.identity, sender: execution.sender });
     } else {
       const handle = await agentBoxManager.getOrCreate(agentId, undefined, sessionId);
       sessionTurnLocks.noteBox(sessionId, handle.boxId, handle.endpoint);
@@ -2159,6 +2242,11 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
       ? { discussion: drained.lines, truncated: drained.truncated, asker: senderLabel(senderOpenId) }
       : undefined;
     const promptOpts: PromptOptions = {
+      userId: auditUserId,
+      origin: sessionOrigin,
+      identity: execution.identity,
+      sender: execution.sender,
+      channelDeliveryId: promptMessageId,
       requestMode: "sync",
       text: buildChannelTurnPrompt(promptText, sharedContext),
       agentId,
@@ -2175,6 +2263,7 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
       ...(images.length ? { images } : {}),
     };
     // queue-until-idle: wait out a busy session instead of dumping a raw 409.
+    if (!remoteConversation) promptOpts.grantId = await openExecutionGrant(agentId, sessionId, execution.identity, execution.sender);
     const promptResult = remoteConversation ? await client.prompt(promptOpts) : await promptWithBusyRetry(client, promptOpts);
     void bindMessageTraceId(promptMessageId, promptResult.sessionId, promptResult.traceId).catch((bindErr) => {
       warnTraceBindFailure("lark prompt", promptResult.sessionId, promptMessageId, bindErr);
@@ -2207,6 +2296,7 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
       console.error(`[lark] Agent execution failed for session=${sessionId}:`, agentError);
     }
   } finally {
+    clearDelivery();
     releaseTurn?.();
   }
 
@@ -2597,6 +2687,14 @@ function formatGroupAccessDeniedReply(
   locale: "zh-CN" | "en-US",
   hasPersonalBot = false,
 ): string {
+  if (denied.identityLinkOnly === true) {
+    if (denied.reason !== "unbound") return locale === "zh-CN"
+      ? "🔒 当前身份不符合本群的准入要求，请联系管理员检查身份状态。"
+      : "🔒 This identity does not meet the group's admission requirements. Contact the administrator.";
+    const next = denied.identityLinkingEnabled === true && isSharedIdentityEntryUrl(denied.identityLinkUrl, denied.identityLinkLocalTest === true)
+      ? GROUP_IDENTITY_LINK_HINT_BY_LOCALE[locale] : GROUP_IDENTITY_UNAVAILABLE_BY_LOCALE[locale];
+    return `${GROUP_IDENTITY_NOTICE_BY_LOCALE[locale]}\n${next}`;
+  }
   // Only the explicit not-linked reason claims "you haven't linked yet". Every other value —
   // including one this build has never seen — gets the generic line: it is never wrong, whereas
   // telling an already-linked sender to go link sends them round a loop with no exit.
@@ -2622,6 +2720,59 @@ function formatGroupAccessDeniedReply(
   return notLinked && denied.authorizeUrl
     ? `${base}\n${GROUP_ACCESS_SELF_SERVE_HINT_BY_LOCALE[locale]}\n${denied.authorizeUrl}`
     : `${base}\n${GROUP_ACCESS_ADMIN_HINT_BY_LOCALE[locale]}`;
+}
+
+function isSharedIdentityEntryUrl(value: unknown, allowLocal = false): value is string {
+  if (typeof value !== "string") return false;
+  try {
+    const u = new URL(value);
+    const host = u.hostname.toLowerCase();
+    const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(host);
+    const allowedOrigin = loopback
+      ? allowLocal && (u.protocol === "http:" || u.protocol === "https:")
+      : u.protocol === "https:" && !host.endsWith(".localhost");
+    return allowedOrigin && !u.username && !u.password && !u.search && !u.hash
+      && /^\/siclaw\/channel-identity\/[A-Za-z0-9_-]+$/.test(u.pathname);
+  } catch {
+    return false;
+  }
+}
+
+async function deliverSharedIdentityEntry(
+  client: any,
+  messageId: string,
+  locale: LarkLocale,
+  url: unknown,
+  context: "group" | "personal" = "group",
+  allowLocal = false,
+): Promise<void> {
+  const personal = context === "personal";
+  if (!isSharedIdentityEntryUrl(url, allowLocal)) {
+    const notice = personal ? PERSONAL_IDENTITY_UNAVAILABLE_BY_LOCALE : GROUP_IDENTITY_UNAVAILABLE_BY_LOCALE;
+    await replyToLark(client, messageId, notice[locale]);
+    return;
+  }
+  const body = (personal ? PERSONAL_IDENTITY_LINK_HINT_BY_LOCALE : GROUP_IDENTITY_LINK_HINT_BY_LOCALE)[locale];
+  const note = allowLocal
+    ? (locale === "zh-CN" ? "本机测试链接：请在运行端口转发的这台电脑上打开。" : "Local test link: open it on the computer running the port forward.")
+    : personal
+      ? (locale === "zh-CN" ? "请使用自己的账号完成绑定。" : "Use your own account to complete the link.")
+      : (locale === "zh-CN" ? "群成员可重复使用这个按钮，各自绑定自己的身份。" : "Every group member can reuse this button to link their own identity.");
+  const sent = await sendLinkActionCard(client, messageId, {
+    body,
+    title: locale === "zh-CN" ? "绑定自己的身份" : "Link your own identity",
+    note,
+    buttonLabel: locale === "zh-CN" ? "绑定我的身份" : "Link my identity",
+    url,
+  });
+  if (!sent) await replyToLark(client, messageId, `${body}\n${note}\n${url}`);
+}
+
+async function deliverGroupAccessDenied(client:any,messageId:string,denied:ChannelAccessDenied,locale:LarkLocale,personalBot:LarkChannelConfig["personal_bot"]):Promise<void>{
+  if(denied.identityLinkOnly===true&&denied.reason==="unbound"&&denied.identityLinkingEnabled===true&&isSharedIdentityEntryUrl(denied.identityLinkUrl,denied.identityLinkLocalTest===true)){
+    await deliverSharedIdentityEntry(client,messageId,locale,denied.identityLinkUrl,"group",denied.identityLinkLocalTest===true);return;
+  }
+  await replyToLark(client,messageId,formatGroupAccessDeniedReply(denied,locale,denied.identityLinkOnly===true?Boolean(personalBot):dmCanResolveAccess(personalBot)));
 }
 
 async function handleNewCommand(
@@ -3387,6 +3538,12 @@ export async function collectChannelResponse(
   try {
     for await (const event of channelExecutionEvents(client.streamEvents(sessionId), client.conversationEvents)) {
       const ev = event as Record<string, any>;
+      if (ev.type === "native_subagent_progress" && options.onActivity &&
+          Number.isInteger(ev.total) && Number.isInteger(ev.done) && ev.total > 0 && ev.done >= 0 && ev.done <= ev.total) {
+        options.onActivity(ev.done === ev.total
+          ? options.locale === "en-US" ? "Combining sub-task results" : "正在汇总子任务结果"
+          : options.locale === "en-US" ? `Sub-tasks: ${ev.done}/${ev.total} finished` : `子任务：${ev.done}/${ev.total} 已结束`);
+      }
       if (ev.type === "agent_switch") {
         flushPendingNarration();
         const name = ev.toAgentName || ev.toAgentId;

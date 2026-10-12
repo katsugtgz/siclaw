@@ -26,29 +26,38 @@ interface DeliveryEntry {
 }
 
 const DEFAULT_TTL_MS = 30 * 60 * 1000;
-const deliveries = new Map<string, DeliveryEntry>();
+const deliveries = new Map<string, Map<string, DeliveryEntry>>();
 
 export function registerBackgroundChannelDelivery(
   sessionId: string,
   deliver: BackgroundChannelDelivery,
   ttlMs: number = DEFAULT_TTL_MS,
+  requestId?: string,
 ): () => void {
-  clearBackgroundChannelDelivery(sessionId);
+  const key = requestId ?? "";
+  const entries = deliveries.get(sessionId) ?? new Map<string, DeliveryEntry>();
+  const prior = entries.get(key); if (prior) clearTimeout(prior.timer);
   const expiresAt = Date.now() + ttlMs;
-  const timer = setTimeout(() => clearBackgroundChannelDelivery(sessionId), ttlMs);
+  const clear = () => {
+    if (deliveries.get(sessionId)?.get(key) !== entry) return;
+    clearTimeout(entry.timer); entries.delete(key);
+    if (!entries.size) deliveries.delete(sessionId);
+  };
+  const timer = setTimeout(clear, ttlMs);
   timer.unref?.();
-  deliveries.set(sessionId, { deliver, ttlMs, expiresAt, timer });
-  return () => clearBackgroundChannelDelivery(sessionId);
+  const entry = { deliver, ttlMs, expiresAt, timer };
+  entries.set(key, entry); deliveries.set(sessionId, entries);
+  return clear;
 }
 
 export function clearBackgroundChannelDelivery(sessionId: string): void {
   const existing = deliveries.get(sessionId);
-  if (existing) clearTimeout(existing.timer);
+  if (existing) for (const entry of existing.values()) clearTimeout(entry.timer);
   deliveries.delete(sessionId);
 }
 
 export function hasBackgroundChannelDelivery(sessionId: string | undefined): boolean {
-  return Boolean(sessionId && getEntry(sessionId));
+  return Boolean(sessionId && [...(deliveries.get(sessionId)?.keys() ?? [])].some(key => getEntry(sessionId, key)));
 }
 
 export async function deliverBackgroundChannelMessage(
@@ -58,7 +67,7 @@ export async function deliverBackgroundChannelMessage(
   const entry = getEntry(message.sessionId);
   if (!entry) return false;
   const delivered = await entry.deliver(message);
-  if (delivered && deliveries.get(message.sessionId) === entry) refreshEntry(message.sessionId, entry);
+  if (delivered && deliveries.get(message.sessionId)?.get("") === entry) refreshEntry(message.sessionId, "", entry);
   return delivered;
 }
 
@@ -66,19 +75,22 @@ export async function deliverChannelVisibleMessage(
   message: ChannelDeliverMessagePayload,
 ): Promise<boolean> {
   if (!message.text.trim()) return false;
-  const entry = getEntry(message.sessionId);
+  const key = message.requestId ?? "";
+  const entry = getEntry(message.sessionId, key);
   if (!entry) return false;
   const delivered = await entry.deliver(message);
-  if (delivered && deliveries.get(message.sessionId) === entry) refreshEntry(message.sessionId, entry);
+  if (delivered && deliveries.get(message.sessionId)?.get(key) === entry) refreshEntry(message.sessionId, key, entry);
   return delivered;
 }
 
-function getEntry(sessionId: string | undefined): DeliveryEntry | undefined {
+function getEntry(sessionId: string | undefined, key = ""): DeliveryEntry | undefined {
   if (!sessionId) return undefined;
-  const entry = deliveries.get(sessionId);
+  const entries = deliveries.get(sessionId);
+  const entry = entries?.get(key);
   if (!entry) return undefined;
   if (entry.expiresAt <= Date.now()) {
-    clearBackgroundChannelDelivery(sessionId);
+    clearTimeout(entry.timer); entries!.delete(key);
+    if (!entries!.size) deliveries.delete(sessionId);
     return undefined;
   }
   return entry;
@@ -90,9 +102,13 @@ function getEntry(sessionId: string | undefined): DeliveryEntry | undefined {
  * (long investigations are exactly what channel_update targets) would silently
  * lose delivery mid-run.
  */
-function refreshEntry(sessionId: string, entry: DeliveryEntry): void {
+function refreshEntry(sessionId: string, key: string, entry: DeliveryEntry): void {
   clearTimeout(entry.timer);
   entry.expiresAt = Date.now() + entry.ttlMs;
-  entry.timer = setTimeout(() => clearBackgroundChannelDelivery(sessionId), entry.ttlMs);
+  entry.timer = setTimeout(() => {
+    if (deliveries.get(sessionId)?.get(key) !== entry) return;
+    deliveries.get(sessionId)!.delete(key);
+    if (!deliveries.get(sessionId)!.size) deliveries.delete(sessionId);
+  }, entry.ttlMs);
   entry.timer.unref?.();
 }

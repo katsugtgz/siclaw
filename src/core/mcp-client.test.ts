@@ -1,4 +1,5 @@
 import { createMcpToolDefinition } from "./mcp-client.js";
+import { McpModelSecurity } from "./mcp-security.js";
 import { describe, it, expect, vi } from "vitest";
 import {
   jsonSchemaToTypebox,
@@ -100,6 +101,16 @@ describe("jsonSchemaToTypebox", () => {
     const configProp = (result as any).properties.config;
     expect(configProp).toMatchObject({ type: "object" });
     expect(configProp.properties.host).toMatchObject({ type: "string" });
+  });
+});
+
+describe("effective MCP argument safety",()=>{
+  it.each(["/etc/shadow","file:///root/.ssh/id_rsa","%2Fetc%2Fshadow"])("blocks policy-injected sensitive paths before Pi dispatch (%s)",async target=>{
+    const callTool=vi.fn().mockResolvedValue({content:[{type:"text",text:"must-not-run"}]});
+    const tool=createMcpToolDefinition("fixture",undefined,{name:"read_fixture"},{callTool},undefined,
+      {security:new McpModelSecurity(),argumentRule:{effect:"read",fixedArguments:{"/path":target}}});
+    const result=await tool.execute("owned-call",{},new AbortController().signal);
+    expect(callTool).not.toHaveBeenCalled();expect(result.details).toHaveProperty("error");
   });
 });
 
@@ -318,12 +329,12 @@ describe("normalizeMcpInputSchema", () => {
   });
 });
 
-it("shares MCP cancellation and preserves raw structured data only for trusted SDK consumers", async () => {
+it("shares MCP cancellation and returns only sanitized structured data to trusted SDK consumers", async () => {
   const controller = new AbortController();
   const response = { content: [{ type: "resource_link", uri: "https://example.test/report", name: "report" }], structuredContent: { rows: [1, 2] } };
   const client = { callTool: vi.fn(async () => response) };
   const tool = createMcpToolDefinition("metrics", undefined, { name: "query" }, client, 15000, { includeRawResult: true });
-  expect((await tool.execute("1", {}, controller.signal, undefined, {} as any)).details).toMatchObject({ rawResult: response });
+  expect((await tool.execute("1", {}, controller.signal, undefined, {} as any)).details).toMatchObject({ rawResult: { content: [{ type: "text", text: "MCP opaque content suppressed by the output security policy." }], structuredContent: response.structuredContent } });
   expect(client.callTool).toHaveBeenCalledWith({ name: "query", arguments: {} }, undefined, { timeout: 15000, signal: controller.signal });
   controller.abort();
   const stopped = await tool.execute("2", {}, controller.signal, undefined, {} as any);

@@ -1,5 +1,7 @@
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { McpClientManager, type McpServersConfig } from "./mcp-client.js";
+import { McpClientManager, buildMcpToolName, type McpServersConfig } from "./mcp-client.js";
+import { resolveMcpReadOnlyPolicy } from "./mcp-security.js";
+import type { SensitiveValueSource } from "../shared/model-output-redactor.js";
 
 /** A sandbox-only selection must also gate dynamic tools outside the registry. */
 export async function resolveSessionMcpTools(options: {
@@ -8,6 +10,8 @@ export async function resolveSessionMcpTools(options: {
   mcpServers?: Record<string, unknown>;
   mcpManager?: McpClientManager;
   mcpTools?: ToolDefinition[];
+  sensitiveValues?: SensitiveValueSource;
+  privateRoots?: () => readonly string[];
 }): Promise<{ mcpManager?: McpClientManager; mcpTools: ToolDefinition[] }> {
   const { allowedTools, mcpServers } = options;
   if (options.enabled === false || (allowedTools?.length && allowedTools.every(name => name === "run_script"))) {
@@ -15,13 +19,21 @@ export async function resolveSessionMcpTools(options: {
     // whose operator-reviewed operation/argument policy must remain in charge.
     return { mcpTools: [] };
   }
-  // Other agents retain the existing independent MCP-binding authorization.
-  if (options.mcpManager) return { mcpManager: options.mcpManager, mcpTools: options.mcpTools ?? options.mcpManager.getTools() };
+  const selected = mcpServers ?? options.mcpManager?.getConfig?.().mcpServers ?? {};
+  const admitted = new Set<string>();
+  for (const [name, config] of Object.entries(selected)) {
+    try {
+      for (const tool of resolveMcpReadOnlyPolicy(config as McpServersConfig["mcpServers"][string]).tools) admitted.add(buildMcpToolName(name, tool));
+    } catch { /* Invalid policy grants nothing, including shared tools. */ }
+  }
+  const filter = (tools: ToolDefinition[]) => tools.filter(tool => admitted.has(tool.name));
+  if (options.mcpManager) return { mcpManager: options.mcpManager,
+    mcpTools: filter(options.mcpTools ?? options.mcpManager.getTools()) };
   if (!mcpServers || !Object.keys(mcpServers).length) return { mcpTools: [] };
-  const mcpManager = new McpClientManager({ mcpServers } as McpServersConfig);
+  const mcpManager = new McpClientManager({ mcpServers } as McpServersConfig, options.sensitiveValues, { privateRoots: options.privateRoots });
   try {
     await mcpManager.initialize();
-    return { mcpManager, mcpTools: mcpManager.getTools() };
+    return { mcpManager, mcpTools: filter(mcpManager.getTools()) };
   } catch {
     await mcpManager.shutdown().catch(() => {});
     console.warn("[agent-factory] MCP initialization failed");

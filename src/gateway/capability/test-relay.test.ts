@@ -70,6 +70,24 @@ describe("driveTestSession", () => {
     expect(frames.some((f) => f.payload.text === "MUST NOT APPEAR")).toBe(false);
   });
 
+  it("error frames carry the box's validated failure tokens", async () => {
+    const { frontend, emitted } = fakeFrontend();
+    await driveTestSession({
+      client: fakeClient([
+        { type: "error", error: "provider said no", code: "test_model_failed", failure_code: "model_request_failed", api_error_status: 503 },
+        { type: "error", error: "free text", code: "not a token!", api_error_status: 7 },
+        { type: "end" },
+      ]),
+      runId: "run-1",
+      testSessionId: "tid-1",
+      frontendClient: frontend,
+    });
+    const [first, second] = emitted.map((e) => e.frame.payload);
+    expect(first).toMatchObject({ kind: "error", code: "test_model_failed", failure_code: "model_request_failed", api_error_status: 503 });
+    expect(second).not.toHaveProperty("code");
+    expect(second).not.toHaveProperty("api_error_status");
+  });
+
   it("is stateless: never persists turns, artifacts, or lifecycle", async () => {
     const { frontend, emitted, requests } = fakeFrontend();
     await driveTestSession({

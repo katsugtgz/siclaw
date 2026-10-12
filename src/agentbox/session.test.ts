@@ -56,7 +56,7 @@ vi.mock("../core/agent-factory.js", async () => {
   const g = globalThis as any;
   g.__createSessionCalls = g.__createSessionCalls ?? [];
   g.__fakeBrainFactories = g.__fakeBrainFactories ?? [];
-  function createFakeBrain() {
+  function createFakeBrain(engine: "pi-agent" | "codex" = "pi-agent") {
     const emitter = new EventEmitter();
     const behaviorFactory = g.__fakeBrainFactories.shift();
     const behavior = behaviorFactory ? behaviorFactory(emitter) : {};
@@ -65,6 +65,7 @@ vi.mock("../core/agent-factory.js", async () => {
       return () => emitter.off("event", cb);
     };
     return {
+      brainType: engine,
       emitter,
       subscribe,
       reload: async () => {},
@@ -91,7 +92,7 @@ vi.mock("../core/agent-factory.js", async () => {
     createSiclawSession: async (opts: any) => {
       g.__createSessionCalls.push(opts);
       return {
-        brain: createFakeBrain(),
+        brain: createFakeBrain(opts.agentEngine),
         session: { sessionId: "fake-session", messages: [], sendCustomMessage: async (message: any, options: any) => {
           (g.__inheritedContextMessages ??= []).push({ message, options });
         } },
@@ -213,18 +214,18 @@ describe("AgentBoxSessionManager — placing a child on its model", () => {
     modelConfig: { apiKey: "k", models: [], params: { reasoning_effort: "high" } },
   };
 
-  it("does NOT touch runtime params when no tier was involved", async () => {
-    // Compatibility contract: before tiering, a child was placed with
-    // registerProvider + setModel and nothing else. Applying the parent
-    // candidate's params here would start honouring a reasoning_effort that every
-    // child has ignored, changing behaviour for deployments with no tiers at all.
+  it("keeps reasoning inherited but applies Fast mode when no tier was involved", async () => {
+    // Fast mode is independent of thinking. Preserve the existing untiered
+    // reasoning default instead of applying the parent's reasoning override.
     const mgr = new AgentBoxSessionManager();
     const brain = fakeBrain();
 
     await (mgr as any).putBrainOnCandidate(brain, candidate, "briefing", false, false);
 
-    expect(brain.calls).toEqual(["register:p", "setModel:m"]);
-    expect(brain.applied).toHaveLength(0);
+    expect(brain.calls).toEqual(["register:p", "setModel:m", "applyParams"]);
+    expect(brain.applied).toEqual([{ reasoningEffort: undefined, fastMode: false }]);
+    await (mgr as any).putBrainOnCandidate(brain, { ...candidate, modelConfig: { ...candidate.modelConfig, params: { ...candidate.modelConfig.params, service_tier: "priority" } } }, "briefing", false, false);
+    expect(brain.applied.at(-1)).toEqual({ reasoningEffort: undefined, fastMode: true });
   });
 
   it("applies the candidate's params once a tier is in play", async () => {
@@ -234,7 +235,7 @@ describe("AgentBoxSessionManager — placing a child on its model", () => {
     await (mgr as any).putBrainOnCandidate(brain, candidate, "briefing", true, true);
 
     expect(brain.calls).toContain("applyParams");
-    expect(brain.applied[0]).toEqual({ reasoningEffort: "high" });
+    expect(brain.applied[0]).toEqual({ reasoningEffort: "high", fastMode: false });
   });
 
   it("restores the parent's params BEFORE the candidate's, so an explicit setting wins", async () => {
@@ -247,7 +248,7 @@ describe("AgentBoxSessionManager — placing a child on its model", () => {
       brain, candidate, "briefing", false, true, { reasoningEffort: "low" },
     );
 
-    expect(brain.applied).toEqual([{ reasoningEffort: "low" }, { reasoningEffort: "high" }]);
+    expect(brain.applied).toEqual([{ reasoningEffort: "low" }, { reasoningEffort: "high", fastMode: false }]);
     // And both land after the model switch, which is what re-clamps to the target.
     expect(brain.calls.indexOf("setModel:m")).toBeLessThan(brain.calls.indexOf("applyParams"));
   });
@@ -306,6 +307,22 @@ describe("AgentBoxSessionManager — getOrCreate", () => {
     await mgr.closeAll();
   });
 
+  it("keeps Codex free code native and binds MCP authorization to its trusted session", async () => {
+    const mgr = new AgentBoxSessionManager();
+    const scriptSandboxInfo = vi.fn(async () => ({ enabled: true })), runScript = vi.fn(), authorizeNativeMcp = vi.fn(async () => ({ protocol: 1 }));
+    mgr.gatewayClient = { scriptSandboxInfo, runScript, authorizeNativeMcp } as any;
+    // The fixture follows the same explicit engine argument as production.
+    await mgr.getOrCreate("native-js-session", "web", undefined, "normal", undefined, undefined, undefined, undefined, undefined, "codex");
+    const created = lastCreateSiclawSession.calls.at(-1);
+    if (created.agentEngine !== "codex") throw new Error("Native engine fixture did not select Codex");
+    expect(scriptSandboxInfo).not.toHaveBeenCalled();
+    expect(created.scriptExecutor).toBeUndefined(); expect(created.scriptSandboxInfo).toBeUndefined();
+    const signal = new AbortController().signal, operation = { server: "metrics", name: "query" };
+    await created.authorizeNativeMcp(operation, signal, "before");
+    expect(authorizeNativeMcp).toHaveBeenCalledWith("native-js-session", operation, signal, undefined);
+    expect(runScript).not.toHaveBeenCalled(); await mgr.closeAll();
+  });
+
   it("a refused tool is an ERROR in the tool_call diagnostic, not a success", async () => {
     // The third hand-rolled copy of the outcome judgement lived here, on the telemetry
     // channel, and an invariant test is the only reason it was found. An invariant proves
@@ -346,6 +363,20 @@ describe("AgentBoxSessionManager — getOrCreate", () => {
     const s2 = await mgr.getOrCreate("sess-1");
     expect(s1).toBe(s2);
     expect(lastCreateSiclawSession.calls).toHaveLength(1);
+  });
+
+  it("uses the explicitly selected Codex engine for new and restored transcripts", async () => {
+    const mgr = new AgentBoxSessionManager();
+    const codex = await mgr.getOrCreate("fresh", undefined, undefined, "normal", undefined,
+      false, false, undefined, false, "codex");
+    expect(codex.brain.brainType).toBe("codex");
+    (globalThis as any).__frameworkEntriesState.entries = [
+      { type: "message", message: { role: "user", content: "previous Pi turn" } },
+    ];
+    const legacy = await mgr.getOrCreate("legacy", undefined, undefined, "normal", undefined,
+      false, false, undefined, false, "codex");
+    expect(legacy.brain.brainType).toBe("codex");
+    expect(lastCreateSiclawSession.calls.map((call: any) => call.agentEngine)).toEqual(["codex", "codex"]);
   });
 
   it("uses defaultSessionId when id is omitted", async () => {
@@ -491,6 +522,22 @@ describe("AgentBoxSessionManager — getOrCreate", () => {
     expect(createMemoryIndexer).not.toHaveBeenCalled();
     expect(lastCreateSiclawSession.calls[0].memoryIndexer).toBeUndefined();
     expect(fs.existsSync(path.join(_cfgUserDataDir, "memory"))).toBe(false);
+  });
+
+  it("keeps Codex independent of Siclaw memory even when the legacy switch is enabled", async () => {
+    _memoryEnabled = true;
+    const mgr = new AgentBoxSessionManager();
+    await mgr.getOrCreate("native-memory", "web", undefined, "normal", "alice",
+      false,false,undefined,false,"codex");
+    expect(createMemoryIndexer).not.toHaveBeenCalled();
+    expect(lastCreateSiclawSession.calls[0].memoryIndexer).toBeUndefined();
+    expect(fs.existsSync(path.join(_cfgUserDataDir,"memory"))).toBe(false);
+    await mgr.release("native-memory");
+    expect(saveSessionKnowledge).not.toHaveBeenCalled();
+    await mgr.getOrCreate("pi-memory","web",undefined,"normal","alice");
+    expect(createMemoryIndexer).toHaveBeenCalledTimes(1);
+    expect(lastCreateSiclawSession.calls[1].memoryIndexer).toBeDefined();
+    await mgr.closeAll();
   });
 
   it("populates sessionIdRef.current so skill_call events can attribute the session", async () => {
@@ -2543,6 +2590,61 @@ it("persists guidance delivered to a live child", async () => {
   ]);
 });
 
+
+it("records a sub-agent's pre-execution security block as outcome=blocked, not success", async () => {
+  // Regression: delegated (a2a) sessions derived the tool outcome from isError alone. A checker
+  // block returns isError=false with details.blocked=true and the block JSON as content, so
+  // 2,120 of 3,404 production blocks were stored as "success" (top-level rows say "blocked").
+  const mgr = new AgentBoxSessionManager() as any;
+  const persisted: any[] = [];
+  mgr.persistEnsureChatSession = async () => {};
+  mgr.persistAppendMessage = async (row: any) => { persisted.push(row); return "row"; };
+  mgr.persistAppendDelegationEvent = async () => {};
+  const blockJson = JSON.stringify({ error: 'journalctl "-24h" is not allowed.' }, null, 2);
+  const steps: any[] = [];
+  (globalThis as any).__fakeBrainFactories.push((emitter: any) => ({
+    prompt: async () => {
+      const tool = (id: string, result: any, isError: boolean, cmd: string) => {
+        emitter.emit("event", { type: "tool_execution_start", toolCallId: id, toolName: "node_exec", args: { command: cmd } });
+        emitter.emit("event", { type: "tool_execution_end", toolCallId: id, toolName: "node_exec", result, isError });
+      };
+      tool("c1", { content: [{ type: "text", text: blockJson }], details: { blocked: true, reason: "command_blocked" } }, false, "journalctl -u containerd --since '-24h'");
+      tool("c2", { content: [{ type: "text", text: "boom" }], details: { error: true } }, false, "false");
+      tool("c3", { content: [{ type: "text", text: "thrown" }] }, true, "exit 1");
+      tool("c4", { content: [{ type: "text", text: "ok" }], details: { exitCode: 0 } }, false, "uptime");
+      emitter.emit("event", { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Done" }] } });
+    },
+  }));
+  const req = { description: "Inspect node", renderedTasks: [{ item: "node", prompt: "Inspect containerd" }],
+    subagentType: "general-purpose", runInBackground: false, parentSessionId: "parent", parentAgentId: "agent", userId: "user", taskListId: "ledger", spawnId: "initial" };
+  await mgr.createSpawnSubagentExecutor()(req, (p: any) => {
+    if (p?.steps) steps.splice(0, steps.length, ...p.steps);
+  });
+  await vi.waitFor(() => expect(mgr.subagentRuns.size).toBe(0));
+  const tools = persisted.filter(row => row.role === "tool");
+  expect(tools.map(row => row.outcome)).toEqual(["blocked", "error", "error", "success"]);
+  expect(tools[0]).toMatchObject({ toolName: "node_exec", content: blockJson, sessionId: expect.any(String), delegationId: "initial" });
+  // The persisted metadata drops the blocked/error flags (they are the outcome) but keeps the reason.
+  expect(tools[0].metadata).toMatchObject({ reason: "command_blocked" });
+  expect(tools[0].metadata.blocked).toBeUndefined();
+  // Live cards keep a binary outcome: a blocked call is shown as an error,
+  // while the persisted row above retains the distinct blocked outcome.
+  const liveTools = steps.filter(s => s.kind === "tool");
+  expect(liveTools).toHaveLength(4);
+  expect(liveTools.map(s => s.outcome)).toEqual(["error", "error", "error", "success"]);
+});
+
+it("records a synthetic-turn tool result's security block as outcome=blocked", async () => {
+  const mgr = new AgentBoxSessionManager() as any;
+  const persisted: any[] = [];
+  mgr.persistAppendMessage = async (row: any) => { persisted.push(row); return "row"; };
+  await mgr.persistSyntheticMessage("s", { role: "toolResult", toolName: "bash", isError: false,
+    content: [{ type: "text", text: '{"error": "rm is not allowed."}' }], details: { blocked: true, reason: "command_blocked" } });
+  await mgr.persistSyntheticMessage("s", { role: "toolResult", toolName: "bash", isError: true, content: [{ type: "text", text: "x" }] });
+  await mgr.persistSyntheticMessage("s", { role: "toolResult", toolName: "bash", isError: false, content: [{ type: "text", text: "x" }] });
+  expect(persisted.map(row => row.outcome)).toEqual(["blocked", "error", "success"]);
+  expect(persisted[0].metadata).toEqual({ reason: "command_blocked" });
+});
 
 it("rejects an unusable transcript instead of silently resuming empty context", async () => {
   const mgr = new AgentBoxSessionManager() as any;

@@ -8,6 +8,7 @@ import {
 import type { FrontendWsClient } from "./frontend-ws-client.js";
 import type { Identity } from "../shared/credential-types.js";
 import { SessionRegistry } from "./session-registry.js";
+import { ExecutionGrantRegistry } from "./execution-grants.js";
 
 /**
  * Minimal fake FrontendWsClient that records every `request` invocation
@@ -43,6 +44,36 @@ let fake: FakeFrontendClient;
 let svc: CredentialService;
 let registry: SessionRegistry;
 
+describe("immutable identity credential boundary", () => {
+  it("uses the grant's binding, not the latest speaker, and clips later expansions", async () => {
+    const grants = new ExecutionGrantRegistry(async () => ({ clusters: ["A"], hosts: [] }));
+    svc.attachGrants(grants);
+    const first = await grants.open("a1", "sess-1", { kind: "binding", id: "group" }, { userId: "alice" });
+    registry.remember("sess-1", "bob", "a1");
+    fake.responses.set("credential.list:cluster", { clusters: [{ name: "A" }, { name: "B" }] });
+    expect(await svc.listClusters({ ...identity, grantId: first.grantId })).toEqual([{ name: "A" }]);
+    expect(fake.calls[0].params).toMatchObject({ userId: "", identity: { kind: "binding", id: "group" } });
+    expect(first.sender?.userId).toBe("alice");
+  });
+  it("none and missing grants never reach the credential provider", async () => {
+    const grants = new ExecutionGrantRegistry(async () => { throw new Error("must not resolve none"); });
+    svc.attachGrants(grants);
+    const none = await grants.open("a1", "sess-1", { kind: "none", id: "" });
+    expect(await svc.listClusters({ ...identity, grantId: none.grantId })).toEqual([]);
+    expect(await svc.listHosts(identity)).toEqual([]);
+    await expect(svc.getClusterCredential(identity, "A", "inspect")).rejects.toThrow();
+    expect(fake.calls).toEqual([]);
+  });
+  it("rejects a foreign session, agent, or private box before provider access", async () => {
+    const grants = new ExecutionGrantRegistry(async () => ({ clusters: ["A"], hosts: [] }));
+    svc.attachGrants(grants);
+    const group = await grants.open("a1", "sess-1", { kind: "binding", id: "group" });
+    for (const principal of [{ ...identity, sessionId: "other" }, { ...identity, agentId: "a2" }, { ...identity, privateUserId: "u1" }])
+      await expect(svc.listClusters({ ...principal, grantId: group.grantId })).rejects.toThrow();
+    expect(fake.calls).toEqual([]);
+  });
+});
+
 beforeEach(() => {
   fake = new FakeFrontendClient();
   // Pre-seed a session → user mapping so we can assert audit attribution
@@ -65,6 +96,7 @@ describe("CredentialService.listClusters", () => {
     expect(fake.calls[0].params).toEqual({
       kind: "cluster",
       userId: "u1",       // resolved from session registry, not from cert
+      identity: { kind: "user", id: "u1" },
       agentId: "a1",
       orgId: "o1",
       boxId: "b1",

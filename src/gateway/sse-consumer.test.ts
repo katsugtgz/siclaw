@@ -73,6 +73,15 @@ beforeEach(() => {
 // ── Tests ──────────────────────────────────────────────
 
 describe("consumeAgentSse — empty stream", () => {
+  it("persists and relays structured native question identity for history rendering", async () => {
+    const nativeUserInput = { engine: "codex", requestId: "4c943852-3db6-44bb-a8a5-89dd451f0543",
+      questions: [{ id: "format", header: "Format", question: "Which format?", options: [{ label: "Detailed", description: "Two sentences" }] }] };
+    const onEvent = vi.fn();
+    await consumeAgentSse({ client: mkClient([{ type: "message_end", message: { role: "assistant", stopReason: "stop",
+      nativeUserInput, content: [{ type: "text", text: "Which format?" }] } }]), sessionId: "s", userId: "u", persistMessages: true, onEvent });
+    expect(appendCalls.some(row => row.metadata?.native_user_input?.requestId === nativeUserInput.requestId)).toBe(true);
+    expect(onEvent.mock.calls.some(([event]) => event.nativeUserInput?.requestId === nativeUserInput.requestId)).toBe(true);
+  });
   it("returns zero eventCount and empty strings", async () => {
     const result = await consumeAgentSse({ client: mkClient([]), sessionId: "s", userId: "u" });
     expect(result.eventCount).toBe(0);
@@ -1596,6 +1605,19 @@ describe("consumeAgentSse — redaction and abort", () => {
 // ── onEvent callback ───────────────────────────────────
 
 describe("consumeAgentSse — onEvent callback", () => {
+  it("relays native input identity and prompt/steer kind separately from acknowledgement", async () => {
+    const seen: Array<{ id?: string; kind?: unknown }> = [];
+    const consumed = vi.fn(async (_text: string, id?: string) => ({ messageId: id ?? "prompt-row", kind: id ? "steer" as const : "prompt" as const }));
+    await consumeAgentSse({
+      client: mkClient([
+        { type: "message_start", message: { role: "user", content: "same" } },
+        { type: "message_start", inputMessageId: "steer-row", message: { role: "user", content: [{type:"text",text:"same"}] } },
+      ]), sessionId: "s", userId: "u", onUserMessageStarted: consumed,
+      onEvent: (evt, _type, extras) => seen.push({id:extras.dbMessageId,kind:(evt as Record<string,unknown>).inputMessageKind}),
+    });
+    expect(consumed.mock.calls).toEqual([["same"],["same","steer-row"]]);
+    expect(seen).toEqual([{id:"prompt-row",kind:"prompt"},{id:"steer-row",kind:"steer"}]);
+  });
   it("invokes onEvent for each event with the dbMessageId when one was inserted", async () => {
     const seen: Array<{ type: string; dbMessageId: string | undefined }> = [];
     const events = [

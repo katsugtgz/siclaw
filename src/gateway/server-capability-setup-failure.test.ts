@@ -119,7 +119,7 @@ describe("startRuntime — capability session setup", () => {
       config: { port: 0, internalPort: 0, host: "127.0.0.1", serverUrl: "", portalSecret: "" } as any,
       agentBoxManager: manager,
       frontendClient: frontend,
-      credentialService: {} as any,
+      credentialService: { attachGrants: () => {}, resolveActorResources: async () => ({ clusters: [], hosts: [] }) } as any,
     });
 
     await vi.waitFor(() => expect(streamPathMock).toHaveBeenCalled());
@@ -139,7 +139,7 @@ describe("startRuntime — capability session setup", () => {
       config: { port: 0, internalPort: 0, host: "127.0.0.1", serverUrl: "", portalSecret: "" } as any,
       agentBoxManager: fakeAgentBoxManager(),
       frontendClient: frontend,
-      credentialService: {} as any,
+      credentialService: { attachGrants: () => {}, resolveActorResources: async () => ({ clusters: [], hosts: [] }) } as any,
     });
 
     expect(frontend.onConnected).toHaveBeenCalledTimes(1);
@@ -157,7 +157,7 @@ describe("startRuntime — capability session setup", () => {
       config: { port: 0, internalPort: 0, host: "127.0.0.1", serverUrl: "", portalSecret: "" } as any,
       agentBoxManager: manager,
       frontendClient: fakeFrontendClient(),
-      credentialService: {} as any,
+      credentialService: { attachGrants: () => {}, resolveActorResources: async () => ({ clusters: [], hosts: [] }) } as any,
     });
     const start = server.rpcMethods.get("capability.start")!;
     await expect(start({ profile: "kb-compile", input: { instruction: "go" } })).rejects.toThrow(/box unreachable/);
@@ -180,7 +180,7 @@ describe("startRuntime — capability session setup", () => {
       config: { port: 0, internalPort: 0, host: "127.0.0.1", serverUrl: "", portalSecret: "" } as any,
       agentBoxManager: manager,
       frontendClient: fakeFrontendClient(),
-      credentialService: {} as any,
+      credentialService: { attachGrants: () => {}, resolveActorResources: async () => ({ clusters: [], hosts: [] }) } as any,
     });
 
     const start = server.rpcMethods.get("capability.start")!;
@@ -202,7 +202,7 @@ describe("startRuntime — capability session setup", () => {
       config: { port: 0, internalPort: 0, host: "127.0.0.1", serverUrl: "", portalSecret: "" } as any,
       agentBoxManager: manager,
       frontendClient: fakeFrontendClient(),
-      credentialService: {} as any,
+      credentialService: { attachGrants: () => {}, resolveActorResources: async () => ({ clusters: [], hosts: [] }) } as any,
     });
 
     const start = server.rpcMethods.get("capability.start")!;
@@ -232,7 +232,7 @@ describe("startRuntime — capability session setup", () => {
         config: { port: 0, internalPort: 0, host: "127.0.0.1", serverUrl: "", portalSecret: "" } as any,
         agentBoxManager: manager,
         frontendClient: fakeFrontendClient(),
-        credentialService: {} as any,
+        credentialService: { attachGrants: () => {}, resolveActorResources: async () => ({ clusters: [], hosts: [] }) } as any,
       });
 
       const start = server.rpcMethods.get("capability.start")!;

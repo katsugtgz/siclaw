@@ -359,6 +359,10 @@ def parse_request(payload: dict[str, Any]) -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="siclaw-ocr-") as tmp:
         input_path = materialize_source(payload, Path(tmp))
         input_path, preflight_warnings = preflight_source(input_path, Path(tmp))
+        pdf_text = extract_pdf_text(input_path, language_hint)
+        if pdf_text is not None:
+            prepend_warnings(pdf_text, preflight_warnings)
+            return pdf_text
         route = choose_route(input_path, kind_hint)
         if route == "text":
             result = parse_with_ocr(input_path, kind_hint, language_hint, Path(tmp))
@@ -389,6 +393,32 @@ def parse_request(payload: dict[str, Any]) -> dict[str, Any]:
             prepend_warnings(result, [f"Structured OCR failed; fell back to text OCR: {exc}"])
             prepend_warnings(result, preflight_warnings)
             return result
+
+
+def extract_pdf_text(input_path: str, language_hint: str) -> dict[str, Any] | None:
+    """Use the existing PDF library for text layers; scanned pages keep OCR."""
+    if Path(input_path).suffix.lower() != ".pdf":
+        return None
+    from pypdf import PdfReader
+
+    reader = PdfReader(input_path)
+    texts: list[str] = []
+    total = 0
+    for page in reader.pages:
+        text = page.extract_text() or ""
+        if not text.strip():
+            # Mixed/scanned PDFs need the existing whole-document OCR path.
+            return None
+        total += len(text.encode("utf-8"))
+        if total > 8 * 1024 * 1024:
+            raise ValueError("PDF text exceeds the attachment evidence limit")
+        texts.append(text)
+    if not texts:
+        return None
+    text = "\n\n".join(texts)
+    return {"kind": "pdf", "route": "pdf_text", "language": normalize_language(language_hint, text),
+            "confidence": 1.0, "text": text, "blocks": [{"type": "pdf_text", "text": text}],
+            "tables": [], "warnings": ["Extracted the PDF text layer; visual layout is not preserved."]}
 
 
 def choose_route(input_path: str, kind_hint: str) -> str:

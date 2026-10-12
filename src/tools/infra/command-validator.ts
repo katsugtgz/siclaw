@@ -102,7 +102,7 @@ export function globToPathRegExp(glob: string): RegExp | null {
  * `cat /etc/*release*`, which names no secret and is an ordinary diagnostic — hence the compile-and-test
  * approach rather than a prefix rule.
  */
-function globReachesSensitivePath(arg: string, examples: readonly string[]): string | null {
+export function globReachesSensitivePath(arg: string, examples: readonly string[]): string | null {
   if (!GLOB_METACHARS.test(arg)) return null;
   const rx = globToPathRegExp(arg);
   if (!rx) return null;
@@ -701,6 +701,12 @@ export function validateCommand(command: string, options?: ValidateCommandOption
   const violations: string[] = [];
 
   for (const cmd of commands) {
+    if (context === "local") {
+      for (const token of parseArgs(cmd)) {
+        if (!/^[A-Za-z_][A-Za-z0-9_]*=/.test(token)) break;
+        if (token.startsWith("SIFORGECTL_CREDENTIAL_FILE=")) return "Blocked: delivery credential path is owned by the execution grant.";
+      }
+    }
     const binary = getCommandBinary(cmd);
     if (!binary) continue;
 

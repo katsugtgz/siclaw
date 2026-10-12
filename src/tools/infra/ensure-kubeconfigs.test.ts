@@ -166,7 +166,8 @@ describe("ensureDevopsCredentialForTool", () => {
     const calls: string[] = [];
     return {
       calls,
-      broker: { ensureDevopsCredential: async (p: string) => { calls.push(p); } } as any,
+      broker: { ensureDevopsCredential: async (p: string) => { calls.push(p); },
+        getDevopsCredentialPath: () => "/private/grant/delivery.json" } as any,
     };
   }
 
@@ -215,7 +216,8 @@ describe("ensureDevopsCredentialForTool — credential-free subcommands", () => 
     const calls: string[] = [];
     return {
       calls,
-      broker: { ensureDevopsCredential: async (p: string) => { calls.push(p); } } as any,
+      broker: { ensureDevopsCredential: async (p: string) => { calls.push(p); },
+        getDevopsCredentialPath: () => "/private/grant/delivery.json" } as any,
     };
   }
 
@@ -293,7 +295,8 @@ describe("ensureDevopsCredentialForTool — no declaration", () => {
       [DEVOPS_CLI_BINARY]: { category: "general", allowedSubcommands: { position: 0, allowed: ["describe"] } },
     });
     const calls: string[] = [];
-    const broker = { ensureDevopsCredential: async (p: string) => { calls.push(p); } } as any;
+    const broker = { ensureDevopsCredential: async (p: string) => { calls.push(p); },
+      getDevopsCredentialPath: () => "/private/grant/delivery.json" } as any;
     await ensureDevopsCredentialForTool(broker, [`${DEVOPS_CLI_BINARY} describe`], "p");
     expect(calls).toEqual(["p"]);
   });

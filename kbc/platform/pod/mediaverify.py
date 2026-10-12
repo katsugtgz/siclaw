@@ -1,29 +1,9 @@
-"""Blind image transcription + mechanical claim comparison (图像复核 v2).
+"""Optional independent image review.
 
-Replaces the prompt-only re-verification pass. Two live failures (2026-07-06/07)
-proved the old shape — "re-open the image WITH the page's claims in context" —
-is a confirmation check, not a check: any claim with a shadow in the image
-passes ("87-96%" exists — in the MEM column; "H20" exists — in a different
-screenshot). De-anchor by splitting perceive from judge:
-
-  transcribe  (vision, fresh session, sees ONLY the image, never the page)
-              → structured facts, cached per image content hash
-  compare     (text-only, sees page text + transcripts, NEVER the image)
-              → findings in two kinds:
-                不一致       — the page contradicts the transcript (misread)
-                超出转写范围 — the page cites this image for a claim the image
-                              cannot support (hidden inference wearing a
-                              source tag — the H20 case)
-
-Deterministic code owns orchestration, caching and the repair prompt; models
-only ever transcribe or compare. Engine-neutral: depends on
-engine.ReadonlyAgentEngine only (same seam as redblue.py).
-
-Locale: prompts and progress strings render in English by default (locale of
-None/'en') and in Chinese for locale='zh'. The finding "kind" values above are
-STORED tokens compared downstream — both locales instruct the model to emit
-those exact tokens; only build_repair_prompt translates them into display
-labels at render time.
+A fresh transcriber and text comparer offer hypotheses to the context-aware
+compiler. Neither transcript completeness nor factual correctness is certified
+by this workflow. The compiler must inspect original evidence before accepting
+corrections. Deterministic code owns transport, budgets and durable receipts.
 """
 
 from __future__ import annotations
@@ -34,17 +14,20 @@ import json
 import os
 import shutil
 import tempfile
+import time
 from pathlib import Path
 
-import re
 
 from redblue import _agent_json  # JSON call + one lenient retry, shared shape
-from selfcheck import _is_en, parse_okf_sources, source_inventory, read_selfcheck
+from selfcheck import _is_en, candidate_pages, embedded_image_edges, read_selfcheck
 from media_progress import MediaProgress
 
 TRANSCRIPTS_PATH = "authoring/MEDIA_TRANSCRIPTS.json"
 TRANSCRIPTS_DIR = "authoring/media-transcripts"
 _TRANSCRIPT_CHAR_CAP = 6000  # per image, persisted
+_COMPARE_PAGE_CHARS = 24000
+_COMPARE_OVERLAP_CHARS = 1000
+TRANSCRIPT_CONTRACT_VERSION = 2
 
 
 def _env(name: str, default: str) -> str:
@@ -92,7 +75,7 @@ TRANSCRIBE_USER_ZH = """用 Read 打开这张图并转写:{img}
   "notes": "其他可见要点(仍然只写图里有的)"}}"""
 
 COMPARE_SYSTEM_EN = """You are the comparer for knowledge-base image claims. You cannot see the images themselves — only the
-structured transcripts produced by a separate transcriber (each is the complete inventory of what is visible in its image)
+structured transcripts produced by a separate transcriber (each may be incomplete or mistaken)
 and the body text of the knowledge page that cites those images.
 Your job: check every claim on the page whose source annotation names one of these images, and report exactly two kinds of problems:
 - "不一致" (inconsistent): the claim conflicts with the transcript's value or attribution (e.g. a memory-column
@@ -104,7 +87,7 @@ Do not report claims that agree with the transcript; content citing other, non-i
 when unsure whether something qualifies, lean toward reporting it and let a human decide."""
 
 COMPARE_SYSTEM_ZH = """你是知识库图像断言的【比对员】。你看不到图片本身——只有另一位转写员产出的
-结构化转写(它是图内可见信息的完整清单)和引用了该图的知识页正文。
+结构化转写(它可能遗漏信息或读错)和引用了该图的知识页正文。
 你的任务:逐条核对页面里标注来源为这些图片的断言,只报两类问题:
 - 不一致:断言与转写的值/归属冲突(如把显存列的数值写成利用率、把 P0 系列写成 P1);
 - 超出转写范围:断言挂着该图的来源标注,但转写里根本没有能支撑它的信息
@@ -117,7 +100,7 @@ Full page text:
 {page_text}
 --------
 
-Transcripts of the images this page cites (produced by a transcriber who saw only the image — the complete inventory of what is visible):
+Transcripts of the images this page cites (produced by a transcriber who saw only the image — an independent, potentially incomplete reading):
 {transcripts_json}
 
 Output valid JSON only (no other text):
@@ -133,7 +116,7 @@ COMPARE_USER_ZH = """知识页:{page}
 {page_text}
 --------
 
-该页引用的图片转写(转写员只看图产出,是图内可见信息的完整清单):
+该页引用的图片转写(转写员只看图产出,可能遗漏或误读图中信息):
 {transcripts_json}
 
 只输出合法 JSON(不要其他文字):
@@ -176,7 +159,7 @@ def load_transcripts(workdir: str) -> dict:
         item = json.loads(shard.read_text("utf-8"))
         if not isinstance(item, dict) or not isinstance(item.get("image"), str) or not isinstance(item.get("transcript"), dict):
             raise ValueError("invalid media transcript cache shard")
-        cache[item["image"]] = {"sha8": item.get("sha8"), "transcript": item["transcript"]}
+        cache[item["image"]] = {k: item[k] for k in ("sha8", "sha256", "contract", "transcript") if k in item}
     return cache
 
 
@@ -206,125 +189,116 @@ async def transcribe_image(engine, workdir: str, img_rel: str, cache: dict,
     img_path = Path(workdir) / "raw" / img_rel
     if not img_path.is_file():
         return None
-    sha = _sha8(img_path)
+    sha = hashlib.sha256(img_path.read_bytes()).hexdigest()
+    system, user = _transcribe_prompts(locale)
+    contract = hashlib.sha256(json.dumps(
+        [TRANSCRIPT_CONTRACT_VERSION, _transcribe_model(), system, user],
+        ensure_ascii=False).encode("utf-8")).hexdigest()
     hit = cache.get(img_rel)
-    if hit and hit.get("sha8") == sha and isinstance(hit.get("transcript"), dict):
+    if (isinstance(hit, dict) and hit.get("sha256") == sha
+            and hit.get("contract") == contract and isinstance(hit.get("transcript"), dict)):
         return hit["transcript"]
     raw_dir = str(Path(workdir) / "raw")
-    system, user = _transcribe_prompts(locale)
     data = await _agent_json(
         engine, stage="transcribe", system=system,
         user=user.format(img=str(img_path.resolve())),
         model=_transcribe_model(), role="transcribe", cwd=raw_dir, roots=[raw_dir],
         timeout=float(_env("KBC_MV_TRANSCRIBE_TIMEOUT", "240")))
-    if not isinstance(data, dict):
-        return None
+    if not isinstance(data, dict) or not isinstance(data.get("facts"), list):
+        raise ValueError("Image transcription did not return a facts list")
     if len(json.dumps(data, ensure_ascii=False)) > _TRANSCRIPT_CHAR_CAP:
-        data = {"chart_type": data.get("chart_type"), "legend": data.get("legend"),
-                "axes": data.get("axes"),
-                "facts": (data.get("facts") or [])[:80],
-                "notes": ("(transcript truncated — over the length cap)" if _is_en(locale)
-                          else "(转写超长已截断)")}
-    cache[img_rel] = {"sha8": sha, "transcript": data}
+        raise ValueError("Image transcript exceeds the bounded evidence budget; incomplete transcripts cannot verify a page")
+    cache[img_rel] = {"sha8": sha[:8], "sha256": sha, "contract": contract, "transcript": data}
     save_transcript(workdir, img_rel, cache[img_rel])
     return data
 
 
+def comparison_segments(text: str):
+    """Cover every character, retaining overlap for claims at segment edges."""
+    start = 0
+    while start < len(text):
+        end = min(len(text), start + _COMPARE_PAGE_CHARS)
+        if end < len(text):
+            # Prefer a paragraph/line boundary without creating tiny chunks.
+            boundary = text.rfind("\n", start + _COMPARE_PAGE_CHARS // 2, end)
+            if boundary >= 0:
+                end = boundary + 1
+        yield start, end, text[start:end]
+        if end == len(text):
+            break
+        start = max(start + 1, end - _COMPARE_OVERLAP_CHARS)
+
+
+def _embedding_note(embedded_by: dict[str, list[str]] | None, locale: str | None) -> str:
+    """Tell the comparer which cited documents carry each image.
+
+    A page that learned from a document tags the DOCUMENT, not the screenshot
+    inside it, so an image-tag-only comparison checks nothing on such a page.
+    Document-tagged claims may only be reported as visible contradictions: the
+    document text legitimately says more than any one screenshot shows."""
+    if not embedded_by:
+        return ""
+    mapping = json.dumps(embedded_by, ensure_ascii=False, sort_keys=True)
+    if _is_en(locale):
+        return ("\nSome transcribed images reach this page through a document it cites, which embeds them "
+                f"(image → embedding documents): {mapping}\n"
+                "A claim tagged with such a document may describe that document's screenshot. For those claims "
+                "report only \"不一致\" (inconsistent) — the transcript visibly contradicts the claim, e.g. the text "
+                "describes fields, options or steps the screenshot of the same dialog does not show. Never report "
+                "\"超出转写范围\" for a document-tagged claim: the document text may support what the image does not show.")
+    return ("\n部分已转写图片是经本页引用的文档嵌入而来(图片 → 嵌入它的文档):" + mapping + "\n"
+            "挂这些文档来源的断言可能在描述文档里的截图。对这类断言只报「不一致」——转写明显与断言冲突,"
+            "例如正文写的字段、选项或步骤在同一弹窗截图里并不存在;不要对挂文档来源的断言报「超出转写范围」,"
+            "文档正文本来就可以支持图片里没有的信息。")
+
+
 async def compare_page(engine, tmp_dir: str, page_rel: str, page_text: str,
-                       transcripts: dict[str, dict], locale: str | None = None) -> list[dict]:
-    """Text-only comparison — cwd/roots point at an EMPTY dir so the comparer
-    cannot open the image (or anything else); everything it may see is inline."""
+                       transcripts: dict[str, dict], locale: str | None = None,
+                       embedded_by: dict[str, list[str]] | None = None) -> list[dict]:
+    """Compare the entire page in bounded, overlapping text-only sessions.
+
+    A single deadline covers the whole page. A failed/malformed segment raises:
+    the caller may retry or record exhaustion, but cannot mark the page passed.
+    `embedded_by` (image → cited documents embedding it) lets the comparer
+    check document-tagged claims against those documents' screenshots.
+    """
+    if not page_text.strip():
+        raise ValueError("Cannot verify an empty page")
     system, user = _compare_prompts(locale)
-    data = await _agent_json(
-        engine, stage="compare", system=system,
-        user=user.format(page=page_rel, page_text=page_text[:24000],
-                         transcripts_json=json.dumps(transcripts, ensure_ascii=False)),
-        model=_compare_model(), role="compare", cwd=tmp_dir, roots=[tmp_dir],
-        timeout=float(_env("KBC_MV_COMPARE_TIMEOUT", "300")))
-    findings = data.get("findings") if isinstance(data, dict) else None
-    out = []
-    for f in findings or []:
-        if isinstance(f, dict) and f.get("claim"):
-            out.append({"page": page_rel, "image": str(f.get("image", "")),
-                        "kind": str(f.get("kind", "不一致")),
-                        "claim": str(f.get("claim"))[:200],
-                        "expected": str(f.get("expected", ""))[:200],
-                        "fix": str(f.get("fix", ""))[:200]})
+    embedding = _embedding_note(embedded_by, locale)
+    out, seen = [], set()
+    budget = float(_env("KBC_MV_COMPARE_TIMEOUT", "300"))
+    deadline = time.monotonic() + budget
+    async with asyncio.timeout(budget):
+        for start, end, segment in comparison_segments(page_text):
+            scope = (f"\nThis is character range [{start},{end}) of a {len(page_text)}-character page. "
+                     "Ranges overlap. Judge claims visible in this excerpt; do not assume omitted surrounding text is absent from the page."
+                     if _is_en(locale) else
+                     f"\n本段覆盖全页 {len(page_text)} 字符中的 [{start},{end})，分段间有重叠。"
+                     "只判断本段可见断言，不要把本段未展示的上下文当成整页缺失。")
+            data = await _agent_json(
+                engine, stage="compare", system=system,
+                user=user.format(page=page_rel, page_text=segment,
+                                 transcripts_json=json.dumps(transcripts, ensure_ascii=False)) + embedding + scope,
+                model=_compare_model(), role="compare", cwd=tmp_dir, roots=[tmp_dir],
+                timeout=max(0.001, deadline - time.monotonic()))
+            if not isinstance(data, dict) or not isinstance(data.get("findings"), list):
+                raise ValueError("Image comparison did not return a findings list")
+            for finding in data["findings"]:
+                if not isinstance(finding, dict) or not isinstance(finding.get("claim"), str) or not finding["claim"].strip():
+                    raise ValueError("Image comparison returned a malformed finding")
+                if finding.get("image") not in transcripts or finding.get("kind") not in {"不一致", "超出转写范围"}:
+                    raise ValueError("Image comparison referenced unknown evidence or finding kind")
+                value = {"page": page_rel, "image": str(finding.get("image", "")),
+                         "kind": str(finding.get("kind", "不一致")),
+                         "claim": finding["claim"][:200],
+                         "expected": str(finding.get("expected", ""))[:200],
+                         "fix": str(finding.get("fix", ""))[:200]}
+                identity = (value["image"], finding["claim"].strip(), value["kind"])
+                if identity not in seen:
+                    seen.add(identity)
+                    out.append(value)
     return out
-
-
-_TEXT_SOURCE_SUFFIXES = (".md", ".txt", ".log", ".json", ".csv")
-_CLAIM_NUM_RE = re.compile(r"[+\-]?\d[\d.,]*%?")
-_TEXT_SOURCE_READ_CAP = 2 * 1024 * 1024  # per source file
-
-
-def _distinctive_tokens(claim: str) -> list[str]:
-    """Numeric tokens strong enough to identify the claim in a text source.
-    Percentages and decimals first (46%, 39.7 — near-unique in practice);
-    plain integers only when >=3 digits (13440), never bare '8'/'70'."""
-    strong, plain = [], []
-    for tok in _CLAIM_NUM_RE.findall(claim):
-        core = tok.lstrip("+-").rstrip("%").rstrip(".,")
-        if not core:
-            continue
-        if "%" in tok or "." in core:
-            strong.append(tok.lstrip("+-"))
-        elif len(core) >= 3:
-            plain.append(core)
-    return strong or plain
-
-
-def _co_cited_text(workdir: str, page_text: str) -> str:
-    """Concatenated body of the page's co-cited TEXT sources (raw-relative)."""
-    sources, _, _ = parse_okf_sources(page_text, set(source_inventory(workdir)))
-    raw = Path(workdir) / "raw"
-    chunks: list[str] = []
-    for src in sources:
-        if not src.lower().endswith(_TEXT_SOURCE_SUFFIXES):
-            continue
-        fp = raw / src
-        try:
-            if fp.is_file():
-                chunks.append(fp.read_text(encoding="utf-8", errors="replace")
-                              [:_TEXT_SOURCE_READ_CAP])
-        except OSError:
-            continue
-    return "\n".join(chunks)
-
-
-def suppress_text_backed(workdir: str, page: str, page_text: str,
-                         findings: list[dict]) -> tuple[list[dict], list[dict]]:
-    """Split compare findings into (kept, suppressed).
-
-    A 超出转写范围 finding says "the cited image cannot support this claim".
-    That inference only holds when the image is the claim's SOLE source — but
-    curated pages routinely cite whole asset sets as corroboration while the
-    figure itself comes from a co-cited text export (live adoption run,
-    2026-07-22: "FP4 +46%" flagged although the co-cited markdown states
-    "FP4有46%提升" verbatim). When the claim's distinctive numeric tokens are
-    found in a co-cited text source, the image is corroboration, not the
-    authority — reclassify silently instead of asking the owner.
-
-    不一致 findings are NEVER suppressed: a text-backed claim that contradicts
-    what the image actually shows is a genuine cross-source conflict."""
-    beyond = [f for f in findings if f.get("kind") == "超出转写范围"]
-    if not beyond:
-        return findings, []
-    text = _co_cited_text(workdir, page_text)
-    if not text:
-        return findings, []
-    kept, suppressed = [], []
-    for f in findings:
-        if f.get("kind") != "超出转写范围":
-            kept.append(f)
-            continue
-        tokens = _distinctive_tokens(str(f.get("claim") or ""))
-        if tokens and any(tok in text for tok in tokens):
-            suppressed.append({**f, "page": page,
-                               "suppressed_reason": "text_source_backed"})
-        else:
-            kept.append(f)
-    return kept, suppressed
 
 
 async def run_blind_verify(engine, workdir: str, pending: dict[str, list[str]],
@@ -346,6 +320,23 @@ async def run_blind_verify(engine, workdir: str, pending: dict[str, list[str]],
     errors: list[str] = []
     transcripts: dict[str, dict] = {}
     hits = 0
+    try:
+        # Which cited documents carry each pending image. Advisory context for
+        # the comparer only; a failure falls back to image-tag comparison.
+        embed_edges = embedded_image_edges(workdir)
+        page_sources = {rel: list(page.get("sources") or [])
+                        for rel, page in candidate_pages(workdir).items()
+                        if rel in pending and "error" not in page}
+    except Exception:
+        embed_edges, page_sources = {}, {}
+
+    def _embedded_by(page: str, imgs: list[str]) -> dict[str, list[str]]:
+        out = {}
+        for img in imgs:
+            docs = sorted(d for d in page_sources.get(page, []) if img in embed_edges.get(d, ()))
+            if docs:
+                out[img] = docs
+        return out
 
     async def _one(img: str):
         nonlocal hits
@@ -406,8 +397,9 @@ async def run_blind_verify(engine, workdir: str, pending: dict[str, list[str]],
             return
         async with sem:
             try:
-                raw_findings = await compare_page(engine, empty, page, text, ts, locale=locale)
-                kept, suppressed = suppress_text_backed(workdir, page, text, raw_findings)
+                raw_findings = await compare_page(engine, empty, page, text, ts, locale=locale,
+                                                  embedded_by=_embedded_by(page, imgs))
+                kept, suppressed = raw_findings, []  # Numeric overlap is not proof of semantic support.
                 findings.extend(kept)
                 suppressed_all.extend(suppressed)
             except Exception as e:
@@ -445,27 +437,24 @@ def build_repair_prompt(findings: list[dict], locale: str | None = None) -> str:
     concrete expected values, BOX_ROLE contract language. Rendered in the run's
     locale (see _is_en); stored kind tokens are mapped to display labels for en."""
     if _is_en(locale):
-        lines = ["[System self-check · image verification] The system blind-transcribed each cited image "
-                 "independently and mechanically compared the transcripts against the page claims; the claims "
-                 "below contradict the image or go beyond what it can support. Handle each item: if the value "
-                 "is wrong, change it to the transcribed value; if it is beyond the transcript (the image simply "
-                 "does not contain the information it is cited for) — re-attribute the claim to a real source if "
-                 "one exists, otherwise downgrade it to ⚠️ uncertain and file a ticket through the "
-                 "contradiction-ticket flow. Touch only the affected claims; do not rewrite unrelated content:"]
+        lines = ["[Optional image review] These are model hypotheses, not confirmed errors. Read the original image "
+                 "and surrounding source text before deciding. Transcripts may be wrong or incomplete. Accept or reject "
+                 "suggestions with evidence; never replace a correct value merely to agree with the transcript. "
+                 "Use file_ticket(review_action=investigate) for unresolved material questions, not owner escalation "
+                 "for reviewer disagreement. Preserve uncertainty; only edit evidence-supported corrections:"]
         for f in findings[:40]:
             kind = _KIND_LABELS_EN.get(f["kind"], f["kind"])
             lines.append(f"- [{kind}] {f['page']} ← raw/{f['image']}\n"
-                         f"  Claim: {f['claim']}\n  Transcript: {f['expected']}\n  Fix: {f['fix']}")
+                         f"  Claim: {f['claim']}\n  Transcript: {f['expected']}\n  Suggestion: {f['fix']}")
         if len(findings) > 40:
             lines.append(f"- …{len(findings)} total (see authoring/SELFCHECK.json for the rest)")
         return "\n".join(lines)
-    lines = ["【系统自检 · 图像复核】系统对图片做了独立盲转写并与页面断言机械比对,以下断言与图不符"
-             "或超出该图可支持的范围。逐条处理:值错的改成转写值;超出范围的(图里根本没有的信息被"
-             "标注成该图来源)——有其他真实来源就改挂正确来源,没有就降级为 ⚠️ 存疑并按矛盾工单流程"
-             "落一条工单。只动相关断言,不要重写无关内容:"]
+    lines = ["【可选图像复核】以下是模型疑点，不是已确认错误。请先阅读原图及附近原文，结合业务上下文和其他来源判断。"
+             "转写可能错误或不完整；可按证据接受或驳回建议，不得为迎合转写修改正确值。重要未解问题用 file_ticket 的 investigate "
+             "记录查证，不因审核模型分歧自动提单。保留不确定性，只修正有证据支持的断言："]
     for f in findings[:40]:
         lines.append(f"- [{f['kind']}] {f['page']} ← raw/{f['image']}\n"
-                     f"  断言: {f['claim']}\n  转写: {f['expected']}\n  修法: {f['fix']}")
+                     f"  断言: {f['claim']}\n  转写: {f['expected']}\n  建议: {f['fix']}")
     if len(findings) > 40:
         lines.append(f"- …等共 {len(findings)} 条(其余见 authoring/SELFCHECK.json)")
     return "\n".join(lines)

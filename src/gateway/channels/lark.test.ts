@@ -17,6 +17,7 @@ import {
 } from "./background-delivery.js";
 import { sessionRegistry } from "../session-registry.js";
 import { resetFeedbackEchoForTest } from "./lark-card.js";
+import { parseChannelAcceptanceScope } from "../channel-acceptance-scope.js";
 
 const supportsConversationsMock = vi.hoisted(() => vi.fn());
 vi.mock("../conversation-client.js", async (original) => ({
@@ -116,6 +117,18 @@ vi.mock("../chat-repo.js", () => ({
 // ── Event transport has a channel lifetime, not a provider/request lifetime ─
 
 describe("createLarkHandler — independent transport lifetime", () => {
+  it("acceptance fence drops unselected group events and callbacks before any RPC or task", async () => {
+    const agentId = "79068105-473b-4417-8935-b4f11c16c5b3";
+    const scope = parseChannelAcceptanceScope(JSON.stringify({ agent_id: agentId, group_ids: ["oc_allowed"] }))!;
+    const handler = createLarkHandler({ id: "test-only", config: { app_id: "test", app_secret: "test", group_channel_id: "test-only", personal_bot: { agent_id: agentId, access_mode: "granted" } } },
+      makeAgentBoxManager(agentId) as any, undefined, {} as any, scope);
+    await handler.start();
+    await larkSdk.handlers["im.message.receive_v1"](makeTextEvent("PAIR ABC123", { chat_type: "group", chat_id: "oc_not_allowed" }));
+    expect(larkSdk.handlers["card.action.trigger"]({ context: { open_chat_id: "oc_not_allowed" }, action: { value: { kind: "feedback" } } })).toBeUndefined();
+    expect(resolveBindingMock).not.toHaveBeenCalled(); expect(handlePairingCodeMock).not.toHaveBeenCalled();
+    expect(promptMock).not.toHaveBeenCalled(); expect(recordChannelFeedbackMock).not.toHaveBeenCalled();
+    await handler.stop();
+  });
   it("closes the event transport only when the channel is stopped", async () => {
     const handler = createLarkHandler(
       { id: "c1", config: { app_id: "x", app_secret: "y" } },
@@ -829,6 +842,94 @@ describe("handleLarkMessage — routing to AgentBox", () => {
     expect(promptMock).not.toHaveBeenCalled();
   });
 
+  it.each(["zh-CN", "en-US"] as const)("published group requests identity linking, never private authorization (%s)", async (locale) => {
+    resolveBindingMock.mockResolvedValue({ walled: true, reason: "unbound", identityLinkOnly: true, identityLinkingEnabled: true,
+      identityLinkUrl: "https://console.example/siclaw/channel-identity/a1", authorizeUrl: "https://console.example/unused" });
+    const lark = makeLarkClient();
+    const mgr = makeAgentBoxManager();
+    await handleLarkMessage(makeTextEvent("hi"), lark, "lark-runtime", mgr as any, undefined, {} as any, locale,
+      { app_id: "cli_x", app_secret: "secret", group_channel_id: "lark:personal:pb-1",
+        personal_bot: { channel_id: "pb-1", agent_id: "a1", access_mode: "public", owner_user_id: "owner-1" } });
+    const text = JSON.parse(lark.im.message.reply.mock.calls[0][0].data.content).text as string;
+    expect(text).toContain("/siclaw/channel-identity/a1");
+    expect(text).not.toMatch(/完成授权|申请权限|DM me|\/link|Request access/i);
+    expect(text).not.toContain("/agent-access/");
+    expect(mgr.getOrCreate).not.toHaveBeenCalled();
+    expect(promptMock).not.toHaveBeenCalled();
+  });
+
+  it("all group members get the same reusable identity card with no one-time ticket", async () => {
+    resolveBindingMock.mockResolvedValue({ walled: true, reason: "unbound", identityLinkOnly: true, identityLinkingEnabled: true,
+      identityLinkUrl: "https://console.example/siclaw/channel-identity/a1" });
+    const lark = makeLarkClient(); lark.cardkit = { v1: { card: { create: vi.fn().mockResolvedValue({ data: { card_id: "shared-card" } }) } } };
+    const config={app_id:"cli_x",app_secret:"synthetic",group_channel_id:"lark:personal:pb-1",personal_bot:{channel_id:"pb-1",agent_id:"a1",access_mode:"granted"}};
+    await handleLarkMessage(makeTextEvent("request", {}, "ou_A", "user"),lark,"lark-runtime",makeAgentBoxManager() as any,undefined,{} as any,"zh-CN",config);
+    await handleLarkMessage(makeTextEvent("request", {message_id:"mid-2"}, "ou_B", "user"),lark,"lark-runtime",makeAgentBoxManager() as any,undefined,{} as any,"zh-CN",{...config,personal_bot:{...config.personal_bot,access_mode:"public"}});
+    const cards=lark.cardkit.v1.card.create.mock.calls.map(c=>String(c[0].data.data));
+    expect(cards).toHaveLength(2);expect(cards[0]).toBe(cards[1]);
+    expect(cards[0]).toContain("绑定我的身份");expect(cards[0]).toContain("群成员可重复使用");
+    expect(cards[0]).not.toMatch(/ou_A|ou_B|agent-access|一次|10 分钟|\/link/);
+    expect(promptMock).not.toHaveBeenCalled();expect(resolvePersonalBindingMock).not.toHaveBeenCalled();
+  });
+
+  it.each(["public", "disabled", "granted"])("/link is system-only, independent of private admission %s", async (mode) => {
+    resolvePersonalBindingMock.mockResolvedValue({ binding: null, denied: { reason: "shared_identity_entry",
+      actionUrl: "https://console.example/siclaw/channel-identity/a1" } });
+    const lark = makeLarkClient(); const mgr = makeAgentBoxManager();
+    lark.cardkit = { v1: { card: { create: vi.fn().mockResolvedValue({ data: { card_id: "identity-test-card" } }) } } };
+    await handleLarkMessage(makeTextEvent("/link", { chat_type: "p2p" }, "ou_user_1", "user"), lark,
+      "lark-runtime", mgr as any, undefined, { consumerDeclares: () => true } as any, "zh-CN",
+      { app_id: "cli_x", app_secret: "secret", personal_bot: { channel_id: "pb-1", agent_id: "a1", access_mode: mode } });
+    expect(resolvePersonalBindingMock).toHaveBeenCalledWith("pb-1", "ou_user_1", expect.anything(), "user", true);
+    const content = String(lark.cardkit.v1.card.create.mock.calls[0][0].data.data);
+    expect(content).toContain("绑定我的身份");
+    expect(content).not.toContain("申请权限");
+    expect(mgr.getOrCreate).not.toHaveBeenCalled(); expect(promptMock).not.toHaveBeenCalled();
+    expect(issuePersonalApiKeyMock).not.toHaveBeenCalled(); expect(issuePersonalWebChatLinkMock).not.toHaveBeenCalled();
+  });
+
+  it("malformed /link never reaches a model or issues an identity token", async () => {
+    await handleLarkMessage(makeTextEvent("/link admin", { chat_type: "p2p" }, "ou_user_1", "user"),
+      makeLarkClient(), "lark-runtime", makeAgentBoxManager() as any, undefined, {} as any, "zh-CN", makePersonalConfig("public"));
+    expect(resolvePersonalBindingMock).not.toHaveBeenCalled(); expect(promptMock).not.toHaveBeenCalled();
+  });
+
+  it.each(["zh-CN", "en-US"] as const)("DM identity card describes steps in this conversation, not a group (%s)", async (locale) => {
+    resolvePersonalBindingMock.mockResolvedValue({ binding: null, denied: { reason: "shared_identity_entry",
+      actionUrl: "https://console.example/siclaw/channel-identity/a1" } });
+    const lark = makeLarkClient();
+    lark.cardkit = { v1: { card: { create: vi.fn().mockResolvedValue({ data: { card_id: "self-card" } }) } } };
+    await handleLarkMessage(makeTextEvent("hello", {chat_type: "p2p"}, "ou_A", "user"), lark,
+      "lark-runtime", makeAgentBoxManager() as any, undefined, {} as any, locale, makePersonalConfig("identified"));
+    const card = String(lark.cardkit.v1.card.create.mock.calls[0][0].data.data);
+    expect(card).toContain(locale === "zh-CN" ? "回到这里重新发送消息" : "return here and resend");
+    expect(card).not.toMatch(/群成员|群权限|本话题|topic|group member/i);
+    expect(promptMock).not.toHaveBeenCalled();
+  });
+
+  it("unconfigured DM identity entry never uses a group-only diagnostic", async () => {
+    resolvePersonalBindingMock.mockResolvedValue({ binding: null, denied: {reason: "shared_identity_entry"} });
+    const lark = makeLarkClient();
+    await handleLarkMessage(makeTextEvent("hello", {chat_type: "p2p"}, "ou_A", "user"), lark,
+      "lark-runtime", makeAgentBoxManager() as any, undefined, {} as any, "zh-CN", makePersonalConfig("identified"));
+    const text = JSON.parse(lark.im.message.reply.mock.calls[0][0].data.content).text;
+    expect(text).toContain("重新发送消息即可获取绑定按钮");
+    expect(text).not.toMatch(/群成员|群里|HTTPS|测试地址|\/link|PAIR/);
+    expect(promptMock).not.toHaveBeenCalled();
+  });
+
+  it.each([true, false, "true"])("loopback group entry requires the trusted boolean local-test flag (%s)", async (localTest) => {
+    resolveBindingMock.mockResolvedValue({walled: true, reason: "unbound", identityLinkOnly: true,
+      identityLinkingEnabled: true, identityLinkUrl: "http://127.0.0.1:30105/siclaw/channel-identity/a1", identityLinkLocalTest: localTest});
+    const lark = makeLarkClient();
+    await handleLarkMessage(makeTextEvent("hello"), lark, "lark-runtime", makeAgentBoxManager() as any,
+      undefined, {} as any, "zh-CN", {app_id:"cli_x",app_secret:"synthetic",group_channel_id:"lark:personal:pb-1",
+        personal_bot:{channel_id:"pb-1",agent_id:"a1",access_mode:"identified"}});
+    const text = JSON.parse(lark.im.message.reply.mock.calls[0][0].data.content).text;
+    expect(text.includes("http://127.0.0.1:30105/")).toBe(localTest === true);
+    expect(promptMock).not.toHaveBeenCalled();
+  });
+
   it("group-only channel does NOT offer the linking page to an already-linked sender", async () => {
     // reason "denied" = linked but lacks agent access. Telling them to "complete authorization" on
     // the linking page points at something they already did — the same loop, different path.
@@ -992,7 +1093,7 @@ describe("handleLarkMessage — routing to AgentBox", () => {
     sessionRegistry.forget("session-agent-7");
   });
 
-  it("does not pass userId into the AgentBox prompt payload", async () => {
+  it("passes attribution separately from the execution identity", async () => {
     // (keep this one near the bottom — it's the same shape as above)
     resolveBindingMock.mockResolvedValue(makeBinding({ agentId: "a" }));
     promptMock.mockResolvedValue({ sessionId: "s" });
@@ -1008,7 +1109,8 @@ describe("handleLarkMessage — routing to AgentBox", () => {
     );
 
     const promptArg = promptMock.mock.calls[0][0];
-    expect(promptArg).not.toHaveProperty("userId");
+    expect(promptArg.userId).toBe("user-1");
+    expect(promptArg.identity).toEqual({ kind: "user", id: "user-1" });
   });
 
   it("passes the resolved agent model binding into the AgentBox prompt payload", async () => {
@@ -1180,6 +1282,19 @@ describe("handleLarkMessage — routing to AgentBox", () => {
       "open_id:ou_user_2",
       "open_id:ou_user_2",
     ]);
+  });
+
+  it("runs a dedicated group with its binding identity and no legacy creator", async () => {
+    const binding = makeBinding({ createdBy: "" });
+    resolveBindingMock.mockResolvedValue({ ...binding, identity: { kind: "binding", id: binding.bindingId },
+      sender: { userId: "alice", openId: "ou_user_1", member: true }, origin: "channel" });
+    promptMock.mockResolvedValue({ sessionId: "session-fixed" });
+    streamEventsMock.mockImplementation(async function* () {});
+    await handleLarkMessage(makeTextEvent("count resources"), makeLarkClient(), "lark",
+      makeAgentBoxManager("a1") as any, undefined, {} as any);
+    expect(promptMock).toHaveBeenCalledTimes(1);
+    expect(promptMock.mock.calls[0][0]).toMatchObject({ userId: "alice", identity: { kind: "binding", id: binding.bindingId } });
+    expect(ensureChatSessionMock.mock.calls[0][7]).toMatchObject({ identity: { kind: "binding", id: binding.bindingId }, sender: { userId: "alice" } });
   });
 
   it("rejects legacy bindings without an owner instead of writing lark chat ids as users", async () => {
@@ -3034,6 +3149,7 @@ describe("handleLarkMessage — streaming card flow", () => {
       await expect(deliverChannelVisibleMessage({
         sessionId,
         kind: "final",
+        requestId: promptMock.mock.calls[0][0].channelDeliveryId,
         text: '```visual-card\n{"type":"report","title":"legacy"}\n```',
       })).resolves.toBe(true);
 
@@ -3078,6 +3194,7 @@ describe("handleLarkMessage — streaming card flow", () => {
         sessionId,
         kind: "milestone",
         text: "```mermaid\nflowchart TD\nA --> B\n```",
+        requestId: promptMock.mock.calls[0][0].channelDeliveryId,
       })).resolves.toBe(true);
       expect(lark.cardkit.v1.cardElement.content.mock.calls).toHaveLength(updatesBeforeMilestone);
 
@@ -3246,16 +3363,19 @@ describe("handleLarkMessage — streaming card flow", () => {
         sessionId,
         kind: "milestone",
         text: "里程碑 1：已拿到节点列表。",
+        requestId: promptMock.mock.calls[0][0].channelDeliveryId,
       })).resolves.toBe(true);
       await expect(deliverChannelVisibleMessage({
         sessionId,
         kind: "artifact",
         text: "产物提示：已生成诊断草稿。",
+        requestId: promptMock.mock.calls[0][0].channelDeliveryId,
       })).resolves.toBe(true);
       await expect(deliverChannelVisibleMessage({
         sessionId,
         kind: "milestone",
         text: "这条应该被 Gateway 策略压掉。",
+        requestId: promptMock.mock.calls[0][0].channelDeliveryId,
       })).resolves.toBe(true);
 
       const inFlightContentCalls = lark.cardkit.v1.cardElement.content.mock.calls;
@@ -4135,6 +4255,20 @@ describe("collectResponse — SSE event flattening", () => {
     expect(text).toBe("Hello! How can I help?");
   });
 
+  it("keeps native child progress inside the same channel stream until parent synthesis", async () => {
+    const activity = vi.fn();
+    const events = [
+      { type: "native_subagent_progress", total: 2, done: 0 },
+      { type: "message_end", awaitingSubagents: true, message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Waiting for checks" }] } },
+      { type: "agent_end", awaitingSubagents: true },
+      { type: "native_subagent_progress", total: 2, done: 1 },
+      { type: "native_subagent_progress", total: 2, done: 2 },
+      { type: "message_end", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "PARENT_FINAL_REPORT" }] } },
+    ];
+    const result = await collectChannelResponse(fakeClient(events), "native-progress", "lark", { onActivity: activity, locale: "zh-CN" });
+    expect(result.text).toBe("PARENT_FINAL_REPORT");
+    expect(activity.mock.calls.map(([text]) => text)).toEqual(["子任务：0/2 已结束", "子任务：1/2 已结束", "正在汇总子任务结果"]);
+  });
   it("appends registered knowledge sources to a Feishu answer", async () => {
     const events = [
       { type: "knowledge_sources", sources: [{ title: "GPU Runbook", url: "https://docs.feishu.cn/wiki/a" }] },

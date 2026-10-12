@@ -1,7 +1,14 @@
 import { webExecutionScope, sourceAgentId } from "../shared/web-execution-scope.js";
+import { parseWireIdentity, userIdentity } from "../shared/execution-identity.js";
+import { parseExecutionSender } from "../shared/execution-context.js";
+import { ExecutionGrantRegistry, registerExecutionGrants, unregisterExecutionGrants } from "./execution-grants.js";
+import { handleExecutionGrantRenew } from "./execution-grant-api.js";
 import { AgentRetiredError } from "../shared/agent-retirement.js";
 import { parseHandoffPolicy } from "../shared/agent-handoff.js";
 import { parseRequestMode } from "../shared/request-mode.js";
+import { dispatchQueuedPrompt } from "./queued-prompt.js";
+import { createNativeUserInputHandlers } from "./native-user-input.js";
+import { resolveAgentEngine, runtimeChatCapabilities } from "../shared/agent-engine.js";
 /**
  * Siclaw Agent Runtime — stateless execution engine (DB-free).
  *
@@ -25,6 +32,7 @@ import { parseRequestMode } from "../shared/request-mode.js";
 import { normalizeHandoffTrace } from "../shared/handoff-trace.js";
 import { createScriptSandboxApi } from "./script-sandbox/api.js";
 import { SandboxTurnContext } from "./script-sandbox/turn-context.js";
+import { NativeMcpAuthorization } from "./mcp-authorization.js";
 import crypto from "node:crypto";
 import http from "node:http";
 import https from "node:https";
@@ -40,7 +48,7 @@ import { CapabilityImageUpgrade, type ImageUpgradeAdmission } from "./capability
 import { acquireCapabilityBox } from "./capability/box-acquire.js";
 import { CAPABILITY_OBSERVE_CONTAINER } from "./capability/contract.js";
 import { driveCapabilitySession } from "./capability/session-driver.js";
-import { asFailureToken } from "./capability/failure.js";
+import { asFailureToken, capabilityStartFailure } from "./capability/failure.js";
 import { driveTestSession, shouldRelayTestSession } from "./capability/test-relay.js";
 import { CAPABILITY_GET_RUN, CAPABILITY_FETCH_INPUT, INPUT_REF_UPGRADE_ADMISSION, isTerminalCapabilityStatus } from "./capability/contract.js";
 import type {
@@ -189,6 +197,9 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
   // ── Credential Service ───────────────────────────────────
   if (!opts.credentialService) throw new Error("credentialService is required in StartRuntimeOptions");
   const credentialService = opts.credentialService;
+  const executionGrants = new ExecutionGrantRegistry((agent, actor, sessionId, sender) => credentialService.resolveActorResources(agent, actor, sessionId,sender));
+  credentialService.attachGrants(executionGrants);
+  registerExecutionGrants(executionGrants);
 
   // ── Session Registry resolver ────────────────────────────
   // Cache misses (e.g. async AgentBox callbacks arriving after a Runtime
@@ -246,6 +257,8 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
   };
 
   const sandboxTurns = new SandboxTurnContext();
+  const nativeMcpAuthorization = new NativeMcpAuthorization(frontendClient, (sessionId, agentId) => sandboxTurns.user(sessionId, agentId),
+    (certificate, sessionId, grantId) => credentialService.executionGrant({ ...certificate, sessionId, grantId, channelPolicyV1:true,channelPolicyV2:true,channelAgentScope:true }));
   const scriptSandbox = createScriptSandboxApi(spawner?.name ?? "local", frontendClient, async (principal, args, signal, approval) => {
     const handle = await agentBoxManager.getForSession(webExecutionScope(principal.agentId, (await sessionRegistry.get(principal.sessionId))?.userId), principal.sessionId);
     // K8s pool replicas share a certificate whose boxId names the pool, not a Pod.
@@ -701,7 +714,26 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     }
   };
 
-  rpcMethods.set("chat.capabilities", async () => ({ requestModes: ["sync", "async"] }));
+  rpcMethods.set("chat.capabilities", async params => {
+    if (typeof params.agentId !== "string" || !params.agentId) return runtimeChatCapabilities();
+    const agent = await frontendClient.request("config.getAgent", { agentId: params.agentId });
+    if (!agent) throw new Error("Agent configuration unavailable");
+    return runtimeChatCapabilities(resolveAgentEngine(agent.agent_engine));
+  });
+  rpcMethods.set("channel.policy.invalidate",async params=>{
+    const agentId=params.agentId as string;if(!agentId)throw new Error("Agent ID required");
+    const revoked=executionGrants.revokeAgent(agentId);
+    const handles=new Set<string>();
+    for(const grant of revoked){
+      const handle=await agentBoxManager.getForSession(webExecutionScope(agentId,grant.actor.kind==="user"?grant.actor.id:undefined),grant.sessionId);
+      if(handle)handles.add(handle.endpoint);
+    }
+    await Promise.all([...handles].map(async endpoint=>{
+      const client=new AgentBoxClient(endpoint,undefined,agentBoxTlsOptions);
+      for(let offset=0;offset<revoked.length;offset+=128)await client.postJson("/api/internal/execution-grants/revoke",{grant_ids:revoked.slice(offset,offset+128).map(grant=>grant.grantId)},5000);
+    }));
+    return {ok:true,revoked:revoked.length};
+  });
 
   rpcMethods.set("chat.send", async (params, context: RpcContext) => {
     const requestMode = parseRequestMode(params.requestMode);
@@ -715,6 +747,13 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // channels stamp "channel" via their own ensureChatSession. Only consumed
     // when THIS handler creates the session row.
     const origin = params.origin as string | undefined;
+    const executionIdentity = parseWireIdentity(params.identity);
+    if (Object.hasOwn(params, "identity") && !executionIdentity)
+      throw new Error("IDENTITY_REQUIRED: malformed execution identity");
+    if ((origin === "channel" || origin === "dm") && frontendClient.consumerDeclares?.("executionIdentity") === true && !executionIdentity)
+      throw new Error("IDENTITY_REQUIRED: channel execution identity missing");
+    const executionActor = executionIdentity ?? userIdentity(userId);
+    const executionSender = parseExecutionSender(params.sender) ?? { userId };
     if (params.delegation || origin === "delegation") {
       throw new AgentRetiredError();
     }
@@ -824,11 +863,15 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         `不要提"交接"、不要复述、不要重新自我介绍。要办的事:]\n${text}`
       : text;
     const promptOpts: PromptOptions = {
+      requiredAgentEngine: params.requiredAgentEngine === "codex" ? "codex" : undefined,
+      identity: executionActor,
+      sender: executionSender,
       apiRequestId: typeof params.apiRequestId === "string" ? params.apiRequestId : undefined,
       requestMode,
       sessionId,
       turnId,
       requiredResultToolName,
+      toolPolicy: params.toolPolicy === "ticket_fill_once" ? "ticket_fill_once" : undefined,
       userId,
       text: promptText,
       handoffTrace: handoff ? normalizeHandoffTrace(handoffParam?.traceContext) : undefined,
@@ -895,7 +938,8 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       ? params.userMessageId : undefined;
     if (!skipInitialPersistence) {
       try {
-        await ensureChatSession(sessionId, agentId, userId, text, undefined, origin);
+        await ensureChatSession(sessionId, agentId, userId, text, undefined, origin, undefined,
+          executionIdentity ? { identity: executionActor, sender: executionSender } : undefined);
         promptMessageId = await appendMessage({ sessionId, role: "user", content: text, deferSequence: true });
         await incrementMessageCount(sessionId);
       } catch (persistErr) {
@@ -919,6 +963,8 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       err.name = "AbortError";
       throw err;
     };
+    // Reuse the persisted input already forwarded across control-plane hops.
+    promptOpts.channelDeliveryId = origin === "channel" ? promptMessageId : undefined;
 
     (async () => {
       // One turn at a time for this session, across every box. The AgentBox's own 409
@@ -929,7 +975,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       let steeredIntoExistingTurn = false;
       const acquireTurn = () => strictFixedExecutor
         ? sessionTurnLocks.acquire(sessionId, undefined, { signal: turnAbort.signal })
-        : sessionTurnLocks.acquireRequest(sessionId, requestMode, turnAbort.signal, typeof params.logicalTurnId === "string");
+        : sessionTurnLocks.acquireRequest(sessionId, requestMode, turnAbort.signal, typeof params.logicalTurnId === "string", params.requiredAgentEngine === "codex");
       try {
         // One turn at a time for this session, across every box (see session-turn-lock.ts).
         // If the session is already running, fall back to the SAME steer the AgentBox's own
@@ -943,10 +989,10 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           // A strict machine request is one distinct turn with one distinct
           // result. Folding it into the running turn as a steer would lose its
           // required-result contract, so surface busy and let the caller retry.
-          if (requiredResultToolName || requestMode === "sync" || !sessionTurnLocks.canSteer(sessionId)) throw busyErr;
+          if (requiredResultToolName || requestMode === "sync" || params.requiredAgentEngine === "codex" || !sessionTurnLocks.canSteer(sessionId)) throw busyErr;
           const running = sessionTurnLocks.busyOn(sessionId);
           const steered = running ? await new AgentBoxClient(running.endpoint, 10000, agentBoxTlsOptions)
-            .steerSession(sessionId, text, { images, files })
+            .steerSession(sessionId, text, { images, files }, promptMessageId ?? undefined)
             .catch((e) => { console.warn(`[runtime] steer into ${running.boxId} failed session=${sessionId}:`, e); return undefined; })
             : undefined;
           if (steered) {
@@ -955,7 +1001,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
             // The input WAS delivered (it rides the in-flight turn), so this
             // dispatch happened: confirm it rather than leaving it pending.
             confirmDispatch(dispatchKey);
-            if (promptMessageId) pendingUserRows.push(sessionId, promptMessageId, text);
+            if (promptMessageId && !steered.deliveryTracked) pendingUserRows.push(sessionId, promptMessageId, text, "steer");
             if (promptMessageId) await updateMessage({ messageId: promptMessageId, sessionId, content: text, metadata: { kind: "steer" } })
               .catch((e) => console.warn(`[runtime] failed to mark steer message session=${sessionId}:`, e));
             if (promptMessageId) void bindMessageTraceId(promptMessageId, sessionId, steered.traceId).catch((bindErr) => {
@@ -1003,7 +1049,13 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         let ackTraceId: string | undefined;
         const promptStartedAt = Date.now();
         try {
-          promptResult = await client.prompt(promptOpts);
+          const dispatch = async () => {
+            throwIfStoppedBeforePrompt();
+            promptOpts.grantId = (await executionGrants.open(agentId, sessionId, executionActor, executionSender)).grantId;
+            return client.prompt(promptOpts);
+          };
+          promptResult = params.requiredAgentEngine === "codex"
+            ? await dispatchQueuedPrompt(dispatch,turnAbort.signal) : await dispatch();
           // The box has the turn. THIS is the moment the reservation becomes a
           // record of a real dispatch; everything before it could still fail
           // and release, so that a retry re-dispatches instead of being told
@@ -1062,8 +1114,8 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           // prompt will fire its own when it actually finishes, and an
           // extra one would close the frontend stream prematurely.
           if (err instanceof Error && err.message.includes("Session is already running")) {
-            if (requiredResultToolName || requestMode === "sync") throw err;
-            const steerResult = await client.steerSession(sessionId, text, { images, files });
+            if (requiredResultToolName || requestMode === "sync" || params.requiredAgentEngine === "codex") throw err;
+            const steerResult = await client.steerSession(sessionId, text, { images, files }, promptMessageId ?? undefined);
             steeredIntoExistingTurn = true;
             // Delivered as a steer onto the running turn — the dispatch did
             // take effect, so it stays recorded (see the busy-degrade path).
@@ -1072,7 +1124,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
             // Keep the row for an unconsumed steer that pi can replay on the next
             // prompt, where onUserMessageStarted can sequence it. This depends
             // on pi retaining its queue; the AgentBox abort path clears that queue.
-            if (promptMessageId) pendingUserRows.push(sessionId, promptMessageId, text);
+            if (promptMessageId && !steerResult.deliveryTracked) pendingUserRows.push(sessionId, promptMessageId, text, "steer");
             // chat.send persisted this row before it knew the active session would
             // reject a fresh prompt. Once the fallback steer is accepted, label the
             // existing row so transcript/trace readers do not mistake it for the
@@ -1158,12 +1210,14 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
             persistMessages: true,
             // The box has started consuming a user message: give that row its place in
             // the conversation now, which is the only moment processing order is visible.
-            onUserMessageStarted: async (echoedText) => {
-              const messageId = pendingUserRows.claim(promptResult.sessionId, echoedText);
+            onUserMessageStarted: async (echoedText, inputMessageId) => {
+              const consumed = inputMessageId ? {messageId:inputMessageId,kind:"steer" as const} : pendingUserRows.claimInput(promptResult.sessionId, echoedText);
+              const messageId = consumed?.messageId;
               if (!messageId) return; // an echo for a turn this Runtime did not start
               await sequenceMessage(messageId, promptResult.sessionId).catch((err) => {
                 warnTraceBindFailure("sequence", promptResult.sessionId, messageId, err);
               });
+              return consumed;
             },
             redactionConfig,
             signal: abortCtrl.signal,
@@ -1582,12 +1636,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       capabilityStartsTotal.inc({ outcome: "failure" });
       capabilityStartDurationMs.observe({ outcome: "failure" }, Date.now() - startedAt);
       if (startedRunId) {
-        await capabilityRunManager.endRun(startedRunId, "failed", {
-          code: "start_failed",
-          stage: "capability_start",
-          message: `start_failed:${err instanceof Error ? err.name : "Error"}`,
-          exception_class: err instanceof Error ? err.name : undefined,
-        });
+        await capabilityRunManager.endRun(startedRunId, "failed", capabilityStartFailure(err));
       }
       throw err;
     }
@@ -2104,6 +2153,23 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     return { ok: true, ...(requestedTurnId ? { turnId: requestedTurnId, stopped } : {}) };
   });
 
+  const nativeUserInput = createNativeUserInputHandlers({
+    client: async (params) => {
+      const agentId = params.agentId, sessionId = params.sessionId, userId = params.userId;
+      if (typeof agentId !== "string" || typeof sessionId !== "string" || typeof userId !== "string" || !agentId || !sessionId || !userId)
+        throw new Error("USER_INPUT_INVALID: Agent, session and authenticated owner are required");
+      const owner = await sessionRegistry.get(sessionId);
+      if (!owner || owner.userId !== userId) throw new Error("USER_INPUT_EXPIRED: The question is not owned by this caller");
+      const scope = webExecutionScope(agentId, owner.userId);
+      const handle = await (agentBoxManager.getForSession?.(scope, sessionId) ?? agentBoxManager.getAsync(scope));
+      return handle ? new AgentBoxClient(handle.endpoint, 10000, agentBoxTlsOptions) : undefined;
+    },
+    persist: (sessionId, requestId, text, traceId) => appendMessage({ sessionId, role: "user", content: text,
+      metadata: { kind: "steer", native_user_input_request_id: requestId }, traceId }),
+  });
+  rpcMethods.set("chat.userInput", nativeUserInput.state);
+  rpcMethods.set("chat.answerUserInput", nativeUserInput.answer);
+
   rpcMethods.set("chat.steer", async (params, context: RpcContext) => {
     const requestMode = parseRequestMode(params.requestMode);
     const agentId = params.agentId as string;
@@ -2150,7 +2216,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     for (;;) {
       const client = await boxForRunningTurn(agentId, sessionId);
       try {
-        steerResult = await client.steerSession(sessionId, text, { images, files });
+        steerResult = await client.steerSession(sessionId, text, { images, files }, steerMessageId);
         break;
       } catch (err) {
         if (!isSessionNotFound(err) || Date.now() >= deadline) throw err;
@@ -2160,7 +2226,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // Accepted by the box: this row is now in line to be processed, and is ordered when
     // the box says it started (see pending-user-rows.ts). A steer that never got that far
     // is deliberately NOT queued — it would take the place of the next message instead.
-    pendingUserRows.push(sessionId, steerMessageId, text);
+    if (!steerResult?.deliveryTracked) pendingUserRows.push(sessionId, steerMessageId, text, "steer");
     void bindMessageTraceId(steerMessageId, sessionId, steerResult.traceId).catch((bindErr) => {
       warnTraceBindFailure("explicit steer", sessionId, steerMessageId, bindErr);
     });
@@ -2529,7 +2595,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     }
     const requested = Number(params.timeoutMs);
     const timeoutMs = Number.isFinite(requested) ? Math.min(Math.max(Math.trunc(requested), 1_000), 30_000) : 10_000;
-    const manager = new McpClientManager({ mcpServers: { [name]: { ...server, transport } as any } });
+    const manager = new McpClientManager({ mcpServers: { [name]: { ...server, transport } as any } }, undefined, { discoveryOnly: true });
     let timer: NodeJS.Timeout | undefined;
     const timedOut = new Promise<"timeout">((resolve) => { timer = setTimeout(() => resolve("timeout"), timeoutMs); });
     try {
@@ -2831,6 +2897,15 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           }
 
           // MCP servers — filtered by agent binding (via RPC)
+          if (url === "/api/internal/execution-grant/renew" && method === "POST") {
+            if (!identity) { res.writeHead(401); res.end(); return; }
+            void handleExecutionGrantRenew(req, res, identity, credentialService);
+            return;
+          }
+          if (url === "/api/internal/mcp-authorize" && method === "POST") {
+            void nativeMcpAuthorization.handle(req, res, identity);
+            return;
+          }
           if (url === "/api/internal/mcp-servers" && method === "GET") {
             if (!identity) { res.writeHead(401, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "Client certificate required" })); return; }
             handleMcpServers(req, res, identity, frontendClient);
@@ -2992,6 +3067,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     agentBoxTlsOptions,
     credentialService,
     async close() {
+      unregisterExecutionGrants(executionGrants);
       await containerObservation?.stop();
       metricsAggregator?.destroy();
       unsubscribeCapabilityReconnect?.();
