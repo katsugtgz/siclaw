@@ -28,6 +28,7 @@ export class CodexWorkflow {
     projectArguments?: (args: Record<string, unknown>) => Record<string, unknown>;
     cwd?: string;
     canFinalize?: () => boolean;
+    authorizeTool?: (name: string) => void;
   }) {
     this.tools = [
       ...(options.clusterList && options.kubeconfigRef?.credentialBroker ? [{ name: "cluster_list",
@@ -100,6 +101,7 @@ export class CodexWorkflow {
     }
     const call = this.calls.get(callId);
     const check = () => {
+      this.options.authorizeTool?.(name);
       signal.throwIfAborted();
       if (this.closed || !call || this.calls.get(callId) !== call || call.controller.signal.aborted || call.tool !== name ||
           !this.owns(call.threadId, call.turnId, name) || mcpDigest(this.options.projectArguments?.(call.args) ?? call.args) !== mcpDigest(args))

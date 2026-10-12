@@ -167,6 +167,7 @@ export class CodexAgentBrain implements BrainSession {
   private injectedSteers: PendingSteer[] = [];
   private consumedUserItems = new Set<string>();
   private steeringFlush = false;
+  private ticketResultTool: string | undefined;
   private assistantTexts = new Map<string, string>();
   private toolItems = new Map<string, { name: string; args: unknown }>();
   private totalUsage: BrainSessionStats["tokens"] = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
@@ -209,7 +210,10 @@ export class CodexAgentBrain implements BrainSession {
     private readonly onPlanUpdate?: (plan: unknown) => void,
   ) {
     const sessionDir = sessionManager.getSessionDir();
-    this.mcpAuthorization = new CodexMcpAuthorization({ authorize: native.authorizeMcp,
+    this.mcpAuthorization = new CodexMcpAuthorization({ authorize: native.authorizeMcp ? async (operation, signal, phase) => {
+      this.authorizePromptTool(buildMcpToolName(operation.server, operation.name));
+      return native.authorizeMcp!(operation, signal, phase);
+    } : undefined,
       owns: (id, turnId) => !this.closed && !this.abortPending && (id === this.threadId
         ? !!this.active && this.active.id === turnId : this.children?.ownsActive(id, turnId) === true),
       projectArguments: (server, name, args) => {
@@ -242,16 +246,17 @@ export class CodexAgentBrain implements BrainSession {
       }
     }
     this.inputDirectory = path.join(inputRoot, sessionId);
-    native.grants = { ...native.grants, inputRoots: [this.inputDirectory], deniedRoots: [...native.grants.deniedRoots, path.join(cwd, ".attachments")], redactOutput: outputGate, sensitiveValues };
+    native.grants = { ...native.grants, promptReadOnly: () => Boolean(this.ticketResultTool), inputRoots: [this.inputDirectory], deniedRoots: [...native.grants.deniedRoots, path.join(cwd, ".attachments")], redactOutput: outputGate, sensitiveValues };
     native.environments = native.environments?.map(environment => ({ ...environment,
-      grants: { ...environment.grants, inputRoots: [this.inputDirectory], deniedRoots: [...environment.grants.deniedRoots, path.join(cwd, ".attachments")], redactOutput: outputGate, sensitiveValues } }));
+      grants: { ...environment.grants, promptReadOnly: () => Boolean(this.ticketResultTool), inputRoots: [this.inputDirectory], deniedRoots: [...environment.grants.deniedRoots, path.join(cwd, ".attachments")], redactOutput: outputGate, sensitiveValues } }));
     if (native.workflow) {
       this.workflow = new CodexWorkflow({ ...native.workflow, cwd: this.cwd,
         active: () => !this.closed && !this.abortPending && this.active?.id && this.threadId
           ? { threadId: this.threadId, turnId: this.active.id } : undefined,
         ownsRead: (id, turnId) => !this.closed && !this.abortPending && this.children?.ownsActive(id, turnId) === true,
         projectArguments: args => this.mcpGateway.projectProductArguments(args),
-        canFinalize: () => !this.requestWork?.pending });
+        canFinalize: () => !this.requestWork?.pending,
+        authorizeTool: name => this.authorizePromptTool(name) });
       if (this.workflow.tools.length) this.mcpGateway.registerService("siclaw_workflow", this.workflow.tools,
         (args, id, signal, name) => this.workflow!.call(args, id, signal, name));
     }
@@ -307,7 +312,10 @@ export class CodexAgentBrain implements BrainSession {
           if (id === this.threadId) native.knowledge!.emit({ type: "knowledge_sources", sources });
           else this.children.setKnowledgeSources(id, sources);
         } });
-      this.mcpGateway.registerKnowledge(this.knowledge.tool, (args, id, signal) => this.knowledge!.call(args, id, signal));
+      this.mcpGateway.registerKnowledge(this.knowledge.tool, (args, id, signal) => {
+        this.authorizePromptTool("knowledge_cite");
+        return this.knowledge!.call(args, id, signal);
+      });
     }
     this.messages = sessionManager.getBranch()
       .filter((entry) => entry.type === "message")
@@ -534,6 +542,12 @@ export class CodexAgentBrain implements BrainSession {
   async prompt(text: string, media?: PromptMedia, requirements?: PromptRequirements): Promise<void> {
     if (this.closed) throw new Error("Codex session has closed");
     if (!this.model) throw new Error("Codex model is not bound");
+    if (requirements?.toolPolicy === "ticket_fill_once") {
+      if (!requirements.requiredResultToolName || !this.getTools().some(tool => tool.name === requirements.requiredResultToolName))
+        throw new Error("ticket_fill_once requires an active result tool");
+      if (this.promptInFlight || this.requestWork?.pending) throw new Error("ticket_fill_once requires an idle execution boundary");
+      this.ticketResultTool = requirements.requiredResultToolName;
+    }
     this.promptInFlight = true;
     this.abortPending = false;
     const recovery = this.nativeChildRecovery;
@@ -543,6 +557,11 @@ export class CodexAgentBrain implements BrainSession {
     }, execution => this.interruptChild(execution), () => recovery?.(work.id), this.llmCalls?.captureContext());
     this.requestWork = work; this.requestScopes.add(work);
     try {
+      if (this.ticketResultTool) {
+        this.executor.cancelProcesses();
+        for (const executor of this.clusterExecutors.values()) executor.cancelProcesses();
+        await this.resetNativeClient();
+      }
       const transformed = await this.transformInput(text, media, "interactive");
       if (!transformed) return;
       text = transformed.text;
@@ -613,6 +632,10 @@ export class CodexAgentBrain implements BrainSession {
       this.promptInFlight = false;
       this.abortPending = false;
       this.rejectPendingSteers(new Error("Codex turn ended before steering was accepted"));
+      if (this.ticketResultTool) {
+        try { await this.resetNativeClient(); }
+        finally { this.ticketResultTool = undefined; }
+      }
     }
   }
 
@@ -848,6 +871,18 @@ export class CodexAgentBrain implements BrainSession {
     }
   }
 
+  private authorizePromptTool(name: string): void {
+    if (this.ticketResultTool && name !== this.ticketResultTool)
+      throw new Error("ticket_fill_once allows only scoped file reads and the result tool");
+  }
+
+  private async resetNativeClient(): Promise<void> {
+    const client = this.client;
+    this.client = undefined;
+    this.loadedThreadId = undefined;
+    await client?.close();
+  }
+
   private currentProviderConfig(): JsonObject {
     const provider = this.model?.provider;
     const config = provider && this.providers.get(provider);
@@ -857,32 +892,38 @@ export class CodexAgentBrain implements BrainSession {
 
   private codexConfig(): JsonObject {
     const provider = this.currentProviderConfig();
+    const restricted = Boolean(this.ticketResultTool);
+    const memoryEnabled = !restricted && this.native?.codexMemoryEnabled !== false;
+    const servers = restricted ? Object.fromEntries(Object.entries(this.nativeMcpServers ?? {}).map(([server, config]) => [server,
+      { ...(record(config) ? config : {}), enabled_tools: server === "siclaw_workflow"
+        ? (this.workflow?.tools ?? []).filter(tool => tool.name === this.ticketResultTool).map(tool => tool.name)
+        : this.mcpGateway.getTools().filter(item => item.server === server && buildMcpToolName(server,item.tool.name) === this.ticketResultTool).map(item => item.tool.name) }])) : this.nativeMcpServers;
     return {
       // Enabled means the upstream default, not an adapter-selected cache/live mode.
-      ...(resolveWebSearchMode(this.native?.webSearchMode)==="enabled"?{}:{web_search:resolveWebSearchMode(this.native?.webSearchMode)}),
+      ...(restricted ? {web_search:"disabled"} : resolveWebSearchMode(this.native?.webSearchMode)==="enabled"?{}:{web_search:resolveWebSearchMode(this.native?.webSearchMode)}),
       ...(this.model?.contextWindow ? { model_context_window: this.model.contextWindow } : {}),
       // Siclaw supplies its own compiled prompt and scoped skills. Do not
       // prepend an ambient AGENTS.md from the AgentBox working directory.
       project_doc_max_bytes: 0,
-      agents: { enabled: this.native?.allowSubagents ?? false },
-      memories: { use_memories: this.native?.codexMemoryEnabled!==false, generate_memories:this.native?.codexMemoryEnabled!==false, dedicated_tools: this.native?.codexMemoryEnabled!==false,
+      agents: { enabled: !restricted && (this.native?.allowSubagents ?? false) },
+      memories: { use_memories: memoryEnabled, generate_memories:memoryEnabled, dedicated_tools: memoryEnabled,
         ...(this.model ? {extract_model:this.model.id, consolidation_model:this.model.id} : {}) },
-      tools: { experimental_request_user_input: { enabled: Boolean(this.userInput) },
-        update_plan: { enabled: this.nativePlanEnabled } },
+      tools: { experimental_request_user_input: { enabled: !restricted && Boolean(this.userInput) },
+        update_plan: { enabled: !restricted && this.nativePlanEnabled } },
       model_providers: { siclaw_model: {
         ...nativeCodexModelProvider(provider, this.model?.api),
         // Responses Lite cannot carry hosted tools. Its native web.run uses
         // the same trusted provider's /alpha/search endpoint instead.
-        supports_standalone_web_search: resolveWebSearchMode(this.native?.webSearchMode) !== "disabled",
+        supports_standalone_web_search: !restricted && resolveWebSearchMode(this.native?.webSearchMode) !== "disabled",
       } },
-      mcp_servers: this.nativeMcpServers,
+      mcp_servers: servers,
       features: { shell_tool: Boolean(this.native?.grants?.inputRoots?.length || this.native?.grants?.allowCommands || this.native?.grants?.allowFileCommands || this.native?.grants?.writeRoots.length || this.native?.grants.infrastructure ||
           this.native?.grants.skillScripts && Object.values(this.native.grants.skillScripts.allowed).some(Boolean) ||
           this.native?.environments?.some(environment => environment.grants.allowCommands)),
-        code_mode_host: true, memories: this.native?.codexMemoryEnabled!==false, request_permissions_tool: false, send_message_to_user_async: Boolean(this.userInput),
-        default_mode_request_user_input: Boolean(this.userInput),
+        code_mode_host: true, memories: memoryEnabled, request_permissions_tool: false, send_message_to_user_async: !restricted && Boolean(this.userInput),
+        default_mode_request_user_input: !restricted && Boolean(this.userInput),
         apps: false, plugins: false, browser_use: false, computer_use: false, image_generation: false,
-        multi_agent: this.native?.allowSubagents ?? false,
+        multi_agent: !restricted && (this.native?.allowSubagents ?? false),
         // Arbitrary image bytes cannot be text-redacted. Reviewed renderer MCP
         // results retain their separate, sanitized-input provenance boundary.
         view_image: false, goals: false },

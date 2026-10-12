@@ -27,6 +27,18 @@ const start = (cwd: string, command: string, processId = "process-1") => ({
 });
 
 describe("Codex native executor policy", () => {
+  it("restricts terminal ticket fills to scoped file reads across live executor RPCs", () => {
+    const {read,write,denied} = fixture();
+    fs.writeFileSync(path.join(read,"evidence.txt"),"evidence");
+    let restricted = true;
+    const policy = new CodexExecutorPolicy({readRoots:[read],writeRoots:[write],deniedRoots:[denied],allowCommands:true,allowFileCommands:true,production:false,promptReadOnly:()=>restricted});
+    expect(policy.authorize("process/start",start(read,`cat ${path.join(read,"evidence.txt")}`)).params).toBeDefined();
+    for(const method of ["fs/writeFile","fs/createDirectory","fs/remove","fs/copy"])
+      expect(()=>policy.authorize(method,{path:uri(path.join(write,"out"))})).toThrow("ticket_fill_once");
+    expect(()=>policy.authorize("process/start",start(read,"kubectl get pods","infra"))).toThrow("ticket_fill_once");
+    restricted=false;
+    expect(policy.authorize("fs/writeFile",{path:uri(path.join(write,"out"))}).params).toBeDefined();
+  });
   it("reads only a selected Skill link without opening private native home", () => {
     const { root, read, write, denied } = fixture();
     const home = path.join(write, "private-native-home"), target = path.join(read, "selected-skill");

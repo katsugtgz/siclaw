@@ -11,6 +11,10 @@ it("materializes only selected repository bytes and a filtered root index",()=>{
   for(const id of ["one","two"]){fs.mkdirSync(path.join(root,"repos",id),{recursive:true});fs.writeFileSync(path.join(root,"repos",id,"INDEX.md"),`CONTENT-${id}`);}
   fs.writeFileSync(path.join(root,"INDEX.md"),"PRIVATE-OTHER-ROOT-INDEX");fs.writeFileSync(path.join(root,".citation-manifest.json"),JSON.stringify({version:1,repos:[{id:"one",root:"repos/one"},{id:"two",root:"repos/two"}]}));
   const view=createChannelKnowledgeView(root,policy);roots.push(view);
+  expect(fs.statSync(view).mode&0o777).toBe(0o755);
+  expect(fs.statSync(path.join(view,"repos","one")).mode&0o777).toBe(0o755);
+  for(const file of ["index.md",".citation-manifest.json","repos/one/INDEX.md"])
+    expect(fs.statSync(path.join(view,file)).mode&0o777).toBe(0o444);
   expect(fs.existsSync(path.join(view,"repos","two"))).toBe(false);expect(fs.readFileSync(path.join(view,"index.md"),"utf8")).not.toContain("PRIVATE");expect(fs.readFileSync(path.join(view,"repos","one","INDEX.md"),"utf8")).toBe("CONTENT-one");
 });
 it("preserves selected citation sidecars and only cleans views owned by this process",()=>{

@@ -43,6 +43,8 @@ export interface CodexExecutorGrants {
   sensitiveValues?: SensitiveValueSource;
   channelPolicy?: ChannelExecutionPolicy;
   validateChannelPolicy?: () => Promise<void>;
+  /** Per-prompt restriction for terminal ticket filling; rechecked on every RPC. */
+  promptReadOnly?: () => boolean;
 }
 
 export interface AuthorizedCodexRequest {
@@ -74,8 +76,10 @@ export class CodexExecutorPolicy {
   private readonly skillScripts?: NativeSkillScriptGrants;
   private readonly skillReadAliases: Array<{ alias: string; target: string }>;
   private readonly channelPolicy?: ChannelExecutionPolicy;
+  private readonly promptReadOnly?: () => boolean;
 
   constructor(grants: CodexExecutorGrants) {
+    this.promptReadOnly = grants.promptReadOnly;
     this.channelPolicy = grants.channelPolicy;
     this.skillReadAliases = (grants.skillReadAliases ?? []).map(value => ({ alias: path.resolve(value.alias), target: canonicalPath(value.target) }));
     this.inputRoots = (grants.inputRoots ?? []).map(canonicalPath);
@@ -100,6 +104,8 @@ export class CodexExecutorPolicy {
   }
 
   authorize(method: string, input: unknown): AuthorizedCodexRequest {
+    if (this.promptReadOnly?.() && ["fs/writeFile", "fs/createDirectory", "fs/remove", "fs/copy"].includes(method))
+      throw new Error("ticket_fill_once allows only scoped file reads and the result tool");
     if (!isObject(input)) throw new Error("Invalid native executor request");
     if (this.infrastructure?.kind === "host" && method.startsWith("fs/")) throw new Error("SSH environment filesystem RPCs are not authorized");
     const params = { ...input };
@@ -205,6 +211,8 @@ export class CodexExecutorPolicy {
       return authorized;
     });
     const command = fileCommand ?? argv[2];
+    if (this.promptReadOnly?.() && (infrastructure || !fileCommand))
+      throw new Error("ticket_fill_once allows only scoped file reads and the result tool");
     if (!infrastructure && (fileCommand ? !this.allowFileCommands && !inputCommand : !this.allowCommands)) throw new Error("Native commands are not authorized");
     const security: PreExecResult = infrastructure ? infrastructure.security : fileCommand ? { error: null, action: null, hasSensitiveKubectl: false }
       : preExecSecurity(command, { context: "local", extraAllowed: new Set(["kubectl"]),

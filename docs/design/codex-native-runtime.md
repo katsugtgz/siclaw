@@ -15,6 +15,12 @@ direction supersedes wrapping Siclaw's Pi tool definitions in an MCP bridge.
 - Keep the official Codex source and native model/tool behavior intact wherever
   upstream extension points suffice. Keep unavoidable patches small and reviewed
   on the protected GitLab source branch.
+- Terminal `ticket_fill_once` prompts retain only scoped file reads and their
+  selected result tool. The native session is resumed with a result-only MCP
+  catalog, search/memory/child tools disabled, and executor writes/diagnostics
+  refused at each RPC. Product and external MCP dispatch also recheck this
+  prompt restriction. Closing the temporary native client restores normal
+  configuration on the next prompt without changing the stored conversation.
 - Preserve whitelist-only execution, credential brokering, OS user isolation,
   path authorization, output sanitization, and cancellation guarantees.
 - Free code is native JavaScript Code Mode only. Do not add a Python/Bash

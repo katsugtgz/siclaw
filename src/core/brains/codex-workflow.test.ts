@@ -4,6 +4,17 @@ vi.mock("../schedule-service.js", () => ({ manageSchedule }));
 import { CodexWorkflow } from "./codex-workflow.js";
 
 describe("native product operations", () => {
+  it("enforces a per-prompt result-only restriction before product side effects", async () => {
+    const allowed = "task_report";
+    const service = new CodexWorkflow({schedule:true,report:true,sessionId:()=>"session",active:()=>({threadId:"root",turnId:"turn"}),
+      authorizeTool:name=>{if(name!==allowed)throw new Error("ticket_fill_once");}});
+    start(service,"schedule","manage_schedule","root",{action:"create",name:"forbidden",schedule:"0 9 * * *"});
+    manageSchedule.mockClear();
+    await expect(service.call({action:"create",name:"forbidden",schedule:"0 9 * * *"},"schedule",new AbortController().signal,"manage_schedule")).rejects.toThrow("ticket_fill_once");
+    expect(manageSchedule).not.toHaveBeenCalled();
+    start(service,"result","task_report","root",{summary:"Final fill"});
+    await expect(service.call({summary:"Final fill"},"result",new AbortController().signal,"task_report")).resolves.toMatchObject({structuredContent:{summary:"Final fill"}});
+  });
   const make = () => new CodexWorkflow({ schedule: true, report: true, sessionId: () => "owner-session",
     active: () => ({ threadId: "root", turnId: "turn" }) });
   const start = (service: CodexWorkflow, id: string, tool: string, threadId = "root", args = {}) => service.observe({ method: "item/started",

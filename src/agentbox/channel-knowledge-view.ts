@@ -18,7 +18,9 @@ export function disposeChannelKnowledgeView(target: string): void {
  * Missing/unsafe manifests fail closed; there is no whole-mount fallback. */
 export function createChannelKnowledgeView(source: string, policy: ChannelExecutionPolicy): string {
   const target = fs.mkdtempSync(path.join(os.tmpdir(), "siclaw-channel-knowledge-"));
-  fs.chmodSync(target, 0o700);
+  // Like the authoritative knowledge mount, selected bytes must be readable
+  // by the separate sandbox UID. Executor read grants still scope each view.
+  fs.chmodSync(target, 0o755);
   ownedViews.add(target);
   try {
     if (!policy.operations.includes("knowledge") || !policy.knowledgeIds.length) return target;
@@ -35,14 +37,14 @@ export function createChannelKnowledgeView(source: string, policy: ChannelExecut
       const stat = fs.lstatSync(from);
       if (stat.isSymbolicLink() || !stat.isDirectory() && !stat.isFile()) throw new Error("Unsafe knowledge entry");
       if (stat.isDirectory()) {
-        fs.mkdirSync(to, { recursive: true, mode: 0o700 });
+        fs.mkdirSync(to, { recursive: true, mode: 0o755 });
         for (const name of fs.readdirSync(from))
           if (!name.startsWith(".") || admittedSidecars.has(name)) copy(path.join(from, name), path.join(to, name));
       } else {
         bytes += stat.size; files++;
         if (bytes > 64 * 1024 * 1024 || files > 10000) throw new Error("Channel knowledge view exceeds its budget");
-        fs.mkdirSync(path.dirname(to), { recursive: true, mode: 0o700 });
-        fs.copyFileSync(from, to); fs.chmodSync(to, 0o400);
+        fs.mkdirSync(path.dirname(to), { recursive: true, mode: 0o755 });
+        fs.copyFileSync(from, to); fs.chmodSync(to, 0o444);
       }
     };
     for (const repo of repos) {
@@ -58,8 +60,8 @@ export function createChannelKnowledgeView(source: string, policy: ChannelExecut
       copy(real, path.join(target, "repos", repo.id));
     }
     fs.writeFileSync(path.join(target, ".citation-manifest.json"), JSON.stringify({ version: manifest.version ?? 1,
-      repos: repos.map(repo => ({ ...repo, root: `repos/${repo.id}` })) }), { mode: 0o400 });
-    fs.writeFileSync(path.join(target, "index.md"), repos.map(repo => `- [[repos/${repo.id}/index]] - ${repo.id}`).join("\n"), { mode: 0o400 });
+      repos: repos.map(repo => ({ ...repo, root: `repos/${repo.id}` })) }), { mode: 0o444 });
+    fs.writeFileSync(path.join(target, "index.md"), repos.map(repo => `- [[repos/${repo.id}/index]] - ${repo.id}`).join("\n"), { mode: 0o444 });
     return target;
   } catch (error) {
     disposeChannelKnowledgeView(target);
